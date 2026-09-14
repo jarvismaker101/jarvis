@@ -671,6 +671,30 @@ def _stop_whisper_daemon():
     return False
 
 
+def _env_seconds(name, default, minimum=0.0):
+    """A duration from the environment, never a crash (F55)."""
+    try:
+        return max(minimum, float(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# F55 — a bound daemon answers /health in milliseconds, so this window is
+# "the spawn failed", not a model-load budget. It is deliberately short: the
+# cost of waiting it out is nothing, while the cost of the old 60s window was
+# a second resident copy of the model on a machine that had no room for it.
+WHISPER_READY_TIMEOUT = _env_seconds("JARVIS_WHISPER_READY_TIMEOUT", 12.0, 1.0)
+# F55 — a launcher process can exit while the interpreter it started keeps
+# serving (the Windows venv shim does exactly that), so an exit earns a short
+# window to bind instead of an immediate in-process model load.
+WHISPER_EXIT_GRACE = _env_seconds("JARVIS_WHISPER_EXIT_GRACE", 4.0, 0.5)
+# F55 — the same launcher-exit ambiguity applies to the backend: this venv's
+# python.exe is a shim that starts the real interpreter, so its exit is not
+# proof that the backend died. The health probe decides, and an exit earns a
+# short grace first - without it a healthy backend was thrown away and killed.
+BACKEND_EXIT_GRACE = _env_seconds("JARVIS_BACKEND_EXIT_GRACE", 4.0, 0.5)
+
+
 def ensure_whisper_daemon():
     """Connect to the persistent whisper daemon, spawning it if needed.
 
@@ -678,6 +702,12 @@ def ensure_whisper_daemon():
     watcher restarts, so re-running the watcher starts listening instantly
     instead of reloading the model. Returns True when the daemon is ready;
     on failure the caller falls back to the in-process model.
+
+    F55 — "ready" means the daemon is alive and serving, which its
+    bind-before-load design makes a sub-second event. The old contract only
+    answered once a 10-20s model load had finished, so this wait expired on
+    cold starts and the caller loaded a SECOND copy of the model in-process:
+    a slow boot became a stuck one on any machine short of memory.
     """
     global whisper_daemon_proc, whisper_daemon_ok
 
@@ -694,6 +724,22 @@ def ensure_whisper_daemon():
             _register_owned("whisper_daemon", None, pid=adopted_pid, adopted=True)
         return True
 
+    # A daemon that is alive and bound is adopted by the health probe below, so
+    # a leftover daemon from an earlier launch is REUSED (model and memory
+    # included) rather than duplicated - and because a launch that finds one
+    # never spawns another, they cannot accumulate.
+    holders = _pids_on_port(WHISPER_DAEMON_PORT)
+    if holders:
+        # A listener that does not answer /health is not this supervisor's to
+        # kill (F52), and spawning a second binder would only produce two
+        # processes sharing one port on Windows.
+        print(
+            f"[WATCHER] Port {WHISPER_DAEMON_PORT} is held by pid(s) "
+            f"{sorted(holders)} that do not serve the whisper API; refusing to "
+            "start a second binder - using in-process model."
+        )
+        return False
+
     print(f"[WATCHER] Starting whisper daemon on port {WHISPER_DAEMON_PORT}...")
     try:
         whisper_daemon_proc = subprocess.Popen(
@@ -707,19 +753,33 @@ def ensure_whisper_daemon():
 
     _register_owned("whisper_daemon", whisper_daemon_proc)
 
-    deadline = time.time() + 60
-    while time.time() < deadline:
+    started = time.time()
+    deadline = started + WHISPER_READY_TIMEOUT
+    exited_at = None
+    while True:
         if _whisper_daemon_healthy():
-            print("[WATCHER] Whisper daemon ready.")
+            print(f"[WATCHER] Whisper daemon ready in {time.time() - started:.1f}s.")
             whisper_daemon_ok = True
             return True
-        if whisper_daemon_proc.poll() is not None:
-            print("[WATCHER] Whisper daemon exited early - using in-process model.")
-            return False
-        time.sleep(0.5)
 
-    print("[WATCHER] Whisper daemon did not become ready - using in-process model.")
-    return False
+        now = time.time()
+        if exited_at is None and whisper_daemon_proc.poll() is not None:
+            exited_at = now
+        if exited_at is not None and now - exited_at >= WHISPER_EXIT_GRACE:
+            # Dead pid must not stay tracked: Windows recycles pids (F52).
+            print(
+                "[WATCHER] Whisper daemon exited before it served "
+                f"(exit code {whisper_daemon_proc.returncode}) - using in-process model."
+            )
+            whisper_daemon_proc = None
+            return False
+        if now >= deadline:
+            print(
+                "[WATCHER] Whisper daemon did not serve within "
+                f"{WHISPER_READY_TIMEOUT:.0f}s - using in-process model."
+            )
+            return False
+        time.sleep(0.25)
 
 
 def _load_in_process_whisper():
@@ -741,6 +801,13 @@ def _load_in_process_whisper():
             whisper_model = None
 
 
+# F55 — this must outlast the daemon's own wait for a model that is still
+# loading (``JARVIS_WHISPER_TRANSCRIBE_WAIT``, 20s), or the first utterance
+# after a cold boot fails here as a client timeout instead of being
+# transcribed by the daemon that was about to answer.
+WHISPER_TRANSCRIBE_TIMEOUT = _env_seconds("JARVIS_WHISPER_TRANSCRIBE_TIMEOUT", 25.0, 5.0)
+
+
 def _transcribe_with_daemon(wav_bytes):
     """POST wav bytes to the whisper daemon. Returns (text, info) or None."""
     request = Request(
@@ -749,7 +816,7 @@ def _transcribe_with_daemon(wav_bytes):
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
     )
-    with urlopen(request, timeout=15.0) as response:
+    with urlopen(request, timeout=WHISPER_TRANSCRIBE_TIMEOUT) as response:
         payload = json.load(response)
     if not payload.get("ok"):
         return None
@@ -1138,14 +1205,29 @@ def _backend_has_research_endpoint():
 
 
 def wait_for_backend_ready(timeout_seconds=45, proc=None):
+    """Wait until the backend answers /health, or prove it never will.
+
+    F55 — the health probe decides. ``proc`` is only a hint: this venv's
+    python.exe is a shim that can exit while the interpreter it started keeps
+    serving, so an exit is not proof of death and gets a short grace instead
+    of an immediate ``False`` (which used to kill a live backend and spend two
+    more 45s attempts on it).
+    """
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
+    exited_at = None
     while time.monotonic() < deadline:
-        if proc is not None and proc.poll() is not None:
-            return False
         health = _backend_health()
         if health and health.get("service") == "jarvis-backend":
             return True
+
+        now = time.monotonic()
+        if proc is not None and proc.poll() is not None:
+            if exited_at is None:
+                exited_at = now
+            if now - exited_at >= BACKEND_EXIT_GRACE:
+                return False
+
         attempts += 1
         if attempts % 10 == 1:
             print(f"[WATCHER] Waiting for backend... ({int(deadline - time.monotonic())}s left)")
@@ -1643,6 +1725,11 @@ def launch_jarvis():
     # lives is recovered within a bounded budget instead of leaving the stack
     # half-dead until the next wake.
     start_worker_supervisor()
+    # F55 — the runtime is up, so the whisper model may load now. Deferring it
+    # to this point keeps the boot window free of a ~1.5 GB load that used to
+    # run beside the backend's own model warm-up and starve it on a machine
+    # with ~1 GB RAM free (three failed backend attempts, no Jarvis window).
+    warm_whisper_daemon_model()
     print("[OK] Jarvis launched - watcher paused\n")
 
 
@@ -1679,6 +1766,35 @@ def _cleanup_watcher_exit():
 
 
 atexit.register(_cleanup_watcher_exit)
+
+
+def warm_whisper_daemon_model():
+    """Ask the whisper daemon to load its model, off the caller's thread (F55).
+
+    Best effort and never raising: the warm-up is an optimisation (without it
+    the first wake pays for the load), and it must never hold up the launch it
+    runs after. Returns the worker thread.
+    """
+
+    def _request_warmup():
+        try:
+            request = Request(
+                f"{WHISPER_DAEMON_URL}/warm",
+                data=b"",
+                headers={"Content-Type": "application/octet-stream"},
+                method="POST",
+            )
+            with urlopen(request, timeout=5.0) as response:
+                response.read()
+            print("[WATCHER] Whisper model warm-up requested.")
+        except Exception as exc:
+            print(f"[WATCHER] Whisper model warm-up request failed: {exc}")
+
+    thread = threading.Thread(
+        target=_request_warmup, name="whisper-model-warmup", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def warm_browser_task_engine():

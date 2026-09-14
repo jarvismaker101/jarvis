@@ -6,10 +6,35 @@ spawns this process detached on first use and reconnects to it on later
 launches, so wake-word listening starts instantly instead of reloading the
 model every time the watcher starts.
 
+F55 — the port is bound BEFORE the model is loaded, and the load itself only
+starts when it is asked for:
+
+* A cold start used to hold the port until ``WhisperModel`` finished (10-20s
+  on CUDA, minutes when the machine is thrashing). Every supervisor that
+  waited for the port therefore looked at a daemon that "was not there" and
+  loaded a SECOND copy of a ~1.5 GB model in its own process, which is
+  exactly how a slow boot turned into a stuck one on a memory-tight machine.
+* ``/health`` now answers within milliseconds and reports ``ready`` /
+  ``loading`` honestly, so the supervisor adopts this daemon immediately and
+  never duplicates the model.
+* The load is *on demand* — ``POST /warm`` (sent by the supervisor once the
+  runtime is up) or the first ``/transcribe``. Loading it at daemon startup
+  instead put a ~1.5 GB spike next to the backend's own model warm-up; on a
+  machine with ~1 GB free the backend then never became ready and the
+  supervisor killed and retried it three times, leaving nothing but console
+  windows on screen.
+* ``/transcribe`` waits for the model (bounded) instead of failing, so the
+  first utterance after a cold boot still transcribes.
+* The listener binds exclusively (no ``SO_REUSEADDR``): on Windows that flag
+  lets a second daemon bind the same port and silently steal connections from
+  the live one, which looks healthy while nothing is served.
+
 Endpoints:
   GET  /health      -> {"ok": true, "service": "jarvis-whisper", "pid": ...,
                         "instance_id": ..., "protocol": ..., "model": ...,
-                        "device": ...}
+                        "device": ..., "ready": bool, "loading": bool,
+                        "error": str|None}
+  POST /warm        -> start loading the model now (idempotent)
   POST /transcribe  -> body = wav bytes; returns
                        {"ok": true, "text": ..., "language": ..., "language_probability": ...}
 
@@ -24,6 +49,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Load DLL search paths on Windows to prevent faster-whisper/ctranslate2 crash in virtual environment
@@ -47,39 +73,72 @@ if sys.platform == "win32":
                 except Exception:
                     pass
 
-from faster_whisper import WhisperModel
-
 from backend.services import runtime_identity
 
 PORT = int(os.getenv("JARVIS_WHISPER_PORT", "8767"))
 MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
 INITIAL_PROMPT = "Jarvis, wake up, jervis, utho, jago, chalu"
+# Bounded wait for a still-loading model on the transcription path (F55).
+TRANSCRIBE_MODEL_WAIT = float(os.getenv("JARVIS_WHISPER_TRANSCRIBE_WAIT", "20"))
 
 model = None
-device = "cpu"
+device = "unknown"
+_model_error = None
+# Set when the load ATTEMPT has finished (success or failure), never before.
+_model_load_finished = threading.Event()
+_model_load_started = False
+_load_lock = threading.Lock()
 _lock = threading.Lock()
 
 
+def ensure_model_loading():
+    """Start the model load once, on demand (F55).
+
+    Returns True when this call started it. Deferring the load keeps the boot
+    window free: the model is warmed by the supervisor once the runtime is up,
+    or by the first transcription that needs it.
+    """
+    global _model_load_started
+
+    with _load_lock:
+        if _model_load_started:
+            return False
+        _model_load_started = True
+        threading.Thread(
+            target=load_model, name="whisper-model-load", daemon=True
+        ).start()
+        return True
+
+
 def load_model():
-    global model, device
-    print(f"[WHISPER-DAEMON] Loading {MODEL_SIZE} model...")
+    """Load the model into memory. Runs on a background thread (F55)."""
+    global model, device, _model_error
+
+    print(f"[WHISPER-DAEMON] Loading {MODEL_SIZE} model...", flush=True)
     try:
-        model = WhisperModel(
-            MODEL_SIZE, device="cuda", compute_type="float16", local_files_only=True
-        )
-        device = "cuda"
-        print("[WHISPER-DAEMON] Loaded on GPU (CUDA).")
-    except Exception as exc:
-        print(f"[WHISPER-DAEMON] CUDA load failed: {exc}. Trying CPU fallback...")
+        # Imported here, not at module scope: the heavy CUDA/ctranslate2 import
+        # must not delay the port bind that makes this daemon adoptable.
+        from faster_whisper import WhisperModel
+
         try:
-            model = WhisperModel(
+            candidate = WhisperModel(
+                MODEL_SIZE, device="cuda", compute_type="float16", local_files_only=True
+            )
+            device = "cuda"
+            print("[WHISPER-DAEMON] Loaded on GPU (CUDA).", flush=True)
+        except Exception as exc:
+            print(f"[WHISPER-DAEMON] CUDA load failed: {exc}. Trying CPU fallback...", flush=True)
+            candidate = WhisperModel(
                 MODEL_SIZE, device="cpu", compute_type="int8", local_files_only=True
             )
             device = "cpu"
-            print("[WHISPER-DAEMON] Loaded on CPU.")
-        except Exception as exc_cpu:
-            print(f"[WHISPER-DAEMON] Model load failed: {exc_cpu}")
-            sys.exit(1)
+            print("[WHISPER-DAEMON] Loaded on CPU.", flush=True)
+        model = candidate
+    except Exception as exc_all:
+        _model_error = str(exc_all)
+        print(f"[WHISPER-DAEMON] Model load failed: {exc_all}", flush=True)
+    finally:
+        _model_load_finished.set()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -101,6 +160,9 @@ class Handler(BaseHTTPRequestHandler):
         # F52 — identity surface: which daemon (instance + pid) owns this
         # port, so a supervisor can attribute the listener to a process it
         # started instead of killing "whatever is listening".
+        # F55 — ``ok`` means "this daemon is alive and bound"; ``ready`` says
+        # whether the model can transcribe yet. A supervisor adopts on ``ok``
+        # so a loading model is never duplicated in another process.
         self._send_json(
             200,
             {
@@ -112,10 +174,27 @@ class Handler(BaseHTTPRequestHandler):
                 "build": runtime_identity.build_id(),
                 "model": MODEL_SIZE,
                 "device": device,
+                "ready": model is not None,
+                "loading": _model_load_started and not _model_load_finished.is_set(),
+                "error": _model_error,
             },
         )
 
     def do_POST(self):
+        if self.path == "/warm":
+            # F55 — the supervisor asks for the warm-up once the runtime is
+            # up, so the load never competes with the backend's own startup.
+            started = ensure_model_loading()
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "started": started,
+                    "ready": model is not None,
+                    "loading": _model_load_started and not _model_load_finished.is_set(),
+                },
+            )
+            return
         if self.path != "/transcribe":
             self._send_json(404, {"ok": False, "error": "not found"})
             return
@@ -124,6 +203,18 @@ class Handler(BaseHTTPRequestHandler):
             wav_bytes = self.rfile.read(length)
             if not wav_bytes:
                 self._send_json(400, {"ok": False, "error": "empty body"})
+                return
+            # F55 — a wake that arrives before the warm-up still works: the
+            # load starts here and the request waits for it (bounded).
+            ensure_model_loading()
+            if not _model_load_finished.wait(TRANSCRIBE_MODEL_WAIT):
+                self._send_json(503, {"ok": False, "error": "model still loading"})
+                return
+            if model is None:
+                self._send_json(
+                    503,
+                    {"ok": False, "error": _model_error or "model unavailable"},
+                )
                 return
             with _lock:
                 segments, info = model.transcribe(
@@ -147,16 +238,44 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(exc)})
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """HTTP server that refuses to share its port (F55).
+
+    ``ThreadingHTTPServer`` defaults to ``allow_reuse_address = True``. On
+    Windows that is not a mere "reuse a TIME_WAIT port": a second daemon can
+    bind an already-listening port, after which connections land on whichever
+    socket the stack picks. Two "healthy" daemons then serve one port and the
+    adopted one silently stops receiving requests.
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+def build_server(port, bind_retry_seconds=6.0):
+    """Bind ``port`` exclusively, retrying briefly while it is still busy."""
+    deadline = time.time() + max(0.0, bind_retry_seconds)
+    while True:
+        try:
+            return _ExclusiveServer(("127.0.0.1", port), Handler)
+        except OSError as exc:
+            if time.time() >= deadline:
+                raise
+            print(f"[WHISPER-DAEMON] Port {port} not free yet ({exc}); retrying...", flush=True)
+            time.sleep(0.5)
+
+
 def main():
-    load_model()
+    server = build_server(PORT)
     # F52 — ownership stamp for this daemon (best effort): the supervisor
     # reads it to attribute the port to the daemon it launched.
     runtime_identity.write_instance_file(
         "whisper_daemon",
         extra={"port": PORT, "auth": "whisper"},
     )
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"[WHISPER-DAEMON] Serving on 127.0.0.1:{PORT}")
+    print(f"[WHISPER-DAEMON] Serving on 127.0.0.1:{PORT} (model loads on demand)", flush=True)
+    # F55 — no model load here: the supervisor warms it once the runtime is
+    # up (POST /warm), and a wake that arrives first triggers it itself.
     try:
         server.serve_forever()
     finally:
