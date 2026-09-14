@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; media-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none';">
+  <title>J.A.R.V.I.S</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- ── Background Layers ── -->
+  <canvas id="particle-canvas"></canvas>
+  <div class="bg-grid"></div>
+  <div class="bg-orbs">
+    <div class="orb orb--1"></div>
+    <div class="orb orb--2"></div>
+    <div class="orb orb--3"></div>
+  </div>
+  <div class="scanlines"></div>
+  <div class="vignette"></div>
+  <div class="noise"></div>
+
+  <!-- ── App Shell with 3D perspective ── -->
+  <div class="app" id="app">
+    <!-- HUD Header -->
+    <header class="header" id="header">
+      <div class="header-glow"></div>
+      <div class="header-left">
+        <div class="reactor-wrap" id="reactor">
+          <div class="reactor-ring outer"></div>
+          <div class="reactor-ring inner"></div>
+          <div id="status-ring" class="status-ring listening"></div>
+          <div class="reactor-pulse"></div>
+        </div>
+        <div class="brand">
+          <span class="header-title">J.A.R.V.I.S</span>
+          <span class="header-subtitle">JUST A RATHER VERY INTELLIGENT SYSTEM</span>
+        </div>
+        <div class="header-divider"></div>
+        <div class="live-block">
+          <span class="live-dot"></span>
+          <span id="live-status" class="header-sub">Ready for your voice</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button class="btn-hamburger" id="btn-hamburger" title="Text response model" aria-label="Toggle model sidebar">
+          <span class="burger-line"></span>
+          <span class="burger-line"></span>
+          <span class="burger-line"></span>
+        </button>
+        <div class="hud-corners">
+          <span class="corner tl"></span><span class="corner tr"></span>
+          <span class="corner bl"></span><span class="corner br"></span>
+          <div id="status-badge" class="badge listening">LISTENING</div>
+        </div>
+        <button class="btn-stop" onclick="stopJarvis()">
+          <span class="btn-stop-icon">◼</span> STOP
+        </button>
+      </div>
+      <div class="header-scanline"></div>
+    </header>
+    <div id="projection-cone" aria-hidden="true"></div>
+
+    <!-- Mode Bar -->
+    <nav class="mode-bar" id="mode-bar">
+      <div class="mode-indicator" id="mode-indicator"></div>
+      <button class="mode-btn active" id="tab-chat" onclick="setMode('chat')">
+        <span class="mode-ico">◈</span> CHAT
+      </button>
+      <button class="mode-btn" id="tab-command" onclick="setMode('command')">
+        <span class="mode-ico">⬢</span> COMMAND
+      </button>
+      <button class="mode-btn" id="tab-memory" onclick="clearMemory()">
+        <span class="mode-ico">⟲</span> CLEAR MEMORY
+      </button>
+      <button class="mode-btn btn-capsule" id="btn-capsule" title="Open floating capsule">
+        <span class="mode-ico">⧉</span> Capsule
+      </button>
+      <button class="mode-btn btn-voice-toggle" id="btn-voice-toggle" title="Toggle voice input">
+        <span class="mode-ico">🎙</span> Voice: On
+      </button>
+      <div class="mode-bar-glow"></div>
+    </nav>
+
+    <!-- Chat Viewport -->
+    <div class="viewport">
+      <div class="viewport-frame frame-tl"></div>
+      <div class="viewport-frame frame-tr"></div>
+      <div class="viewport-frame frame-bl"></div>
+      <div class="viewport-frame frame-br"></div>
+      <div class="scroll-progress" id="scroll-progress"></div>
+
+      <div id="chat-box">
+        <div class="message bot hero-msg">
+          <span class="bot-label">JARVIS · ONLINE</span>
+          <span class="msg-text">Systems nominal, sir. <em>I'm online and ready.</em> Chat normally, switch to <strong>COMMAND</strong> to open apps & sites, or say <strong>turn on screen controls</strong> for agentic clicks & typing.</span>
+          <span class="msg-meta">● encrypted · local inference ready</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Dock -->
+    <div class="input-area" id="input-area">
+      <div class="input-glow"></div>
+      <div class="input-wrapper" id="input-wrapper">
+        <span id="mode-prefix" class="mode-prefix">ASK</span>
+        <span id="waveform" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+        <input
+          id="user-input"
+          placeholder="Type your message..."
+          onkeydown="handleKey(event)"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <span class="input-caret"></span>
+      </div>
+      <button class="btn-send" id="send-button" onclick="sendMessage()">
+        <span class="send-text">SEND</span>
+        <span class="send-ico">➤</span>
+        <span class="send-ripple"></span>
+      </button>
+    </div>
+
+    <!-- Footer HUD -->
+    <footer class="footer-hud">
+      <span class="hud-tick">SYS • 60FPS</span>
+      <span class="hud-sep">·</span>
+      <span class="hud-tick">VOICE • ADAPTIVE POLL</span>
+      <span class="hud-sep">·</span>
+      <span class="hud-tick">HUD v2.1</span>
+      <span class="footer-line"></span>
+    </footer>
+
+    <!-- Model sidebar (hamburger): per-role model switchers -->
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+    <aside class="model-sidebar" id="model-sidebar" aria-hidden="true">
+      <div class="sidebar-head">
+        <span class="sidebar-title">MODEL SWITCHER</span>
+        <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+      </div>
+      <div class="sidebar-section" id="section-chat">
+        <div class="sidebar-section-title">TEXT CHAT</div>
+        <div class="sidebar-body" id="model-provider-list"></div>
+      </div>
+      <div class="sidebar-section" id="section-tts">
+        <div class="sidebar-section-title">VOICE MODEL (TTS)</div>
+        <div class="sidebar-body" id="tts-provider-list"></div>
+      </div>
+      <div class="sidebar-section" id="section-listening">
+        <div class="sidebar-section-title">LISTENING MODEL (STT)</div>
+        <div class="sidebar-body" id="listening-provider-list"></div>
+      </div>
+      <div class="sidebar-section" id="section-vision">
+        <div class="sidebar-section-title">VISION MODEL</div>
+        <div class="sidebar-body" id="vision-provider-list"></div>
+      </div>
+      <div class="sidebar-section" id="section-browser">
+        <div class="sidebar-section-title">BROWSER TOOL MODEL</div>
+        <div class="sidebar-body" id="browser-provider-list"></div>
+        <div class="browser-tool-form" id="browser-tool-form">
+          <input id="browser-model-input" placeholder="e.g. accounts/fireworks/models/qwen3p7-plus" autocomplete="off" spellcheck="false" />
+          <input id="browser-model-provider" placeholder="provider (gemini/fireworks/openrouter/cline/groq)" autocomplete="off" spellcheck="false" />
+          <span class="provider-form-error" id="browser-form-error"></span>
+          <button type="button" class="btn-provider-save" id="btn-browser-save">SAVE BROWSER MODEL</button>
+        </div>
+      </div>
+      <div class="sidebar-section" id="section-planner">
+        <div class="sidebar-section-title">PLANNER MODEL (ORCHESTRATOR)</div>
+        <div class="sidebar-body" id="planner-provider-list"></div>
+      </div>
+      <div class="sidebar-add">
+        <button class="btn-add-provider" id="btn-add-provider" type="button">+ ADD PROVIDER</button>
+        <form class="add-provider-form" id="add-provider-form" hidden>
+          <input id="provider-name" placeholder="Name (e.g. OpenRouter)" autocomplete="off" spellcheck="false" />
+          <input id="provider-key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" />
+          <input id="provider-base-url" placeholder="Base URL (https://…/v1)" autocomplete="off" spellcheck="false" />
+          <span class="provider-form-error" id="provider-form-error"></span>
+          <button type="submit" class="btn-provider-save">VALIDATE &amp; SAVE</button>
+        </form>
+      </div>
+    </aside>
+  </div>
+
+<script src="renderer.js"></script>
+</body>
+</html>

@@ -1,0 +1,409 @@
+/* Jarvis Research — photorealistic floating glass panel
+   1) Strong baked-in blur so screen content behind barely bleeds through.
+   2) Visible glass thickness on the edges (bevel + side shadows).
+   3) Playful reflections/sheen for realism.
+   4) Header is draggable; min + close window controls.
+*/
+
+:root {
+  --edge-light: rgba(255, 255, 255, 0.35);
+  --edge-dark: rgba(0, 0, 0, 0.45);
+  --rim: rgba(160, 190, 255, 0.18);
+  --text: #f7f9ff;
+  --text-soft: rgba(247, 249, 255, 0.82);
+  --text-faint: rgba(247, 249, 255, 0.58);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  color: var(--text);
+  user-select: none;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 26px;
+}
+
+/* ── The glass slab ─────────────────────────────── */
+.glass-panel {
+  position: relative;
+  width: 100%;
+  max-width: 1000px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 16px 26px 22px;
+
+  border-radius: 28px;
+
+  /* real pane — frosty, dark-backed so text pops */
+  background:
+    radial-gradient(120% 120% at 20% -10%, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0) 40%),
+    radial-gradient(120% 100% at 100% 110%, rgba(90, 130, 255, 0.16) 0%, rgba(255, 255, 255, 0) 55%),
+    linear-gradient(165deg, rgba(26, 32, 58, 0.72) 0%, rgba(14, 18, 36, 0.66) 60%, rgba(8, 11, 24, 0.78) 100%);
+  backdrop-filter: blur(44px) saturate(190%);
+  -webkit-backdrop-filter: blur(44px) saturate(190%);
+
+  /* ── visible glass EDGE THICKNESS ──────────────────
+     inner rim ring + bevel highlight + outer side slabs */
+  border: 1px solid var(--edge-light);
+
+  box-shadow:
+    /* outer drop */
+    0 34px 80px -18px rgba(0, 0, 0, 0.85),
+    0 10px 28px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(0, 0, 0, 0.28),
+
+    /* thickness: light catching the top/left face */
+    inset 0 2px 0 rgba(255, 255, 255, 0.30),
+    inset 2px 0 0 rgba(255, 255, 255, 0.12),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.35),
+    inset -3px 0 0 rgba(0, 0, 0, 0.28),
+
+    /* inner frost ring that reads as the pane wall */
+    inset 0 0 0 1.5px rgba(255, 255, 255, 0.06),
+    inset 0 0 34px rgba(255, 255, 255, 0.045);
+}
+
+/* Top sheen — big soft light streak like sunlight on glass */
+.glass-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    linear-gradient(115deg,
+      rgba(255, 255, 255, 0.24) 0%,
+      rgba(255, 255, 255, 0.06) 12%,
+      rgba(255, 255, 255, 0.0) 26%,
+      rgba(255, 255, 255, 0.0) 74%,
+      rgba(255, 255, 255, 0.10) 90%,
+      rgba(255, 255, 255, 0.22) 100%);
+  z-index: 5;
+}
+
+/* sharp thin specular line near the very top edge */
+.glass-panel .edge-line,
+.glass-panel::after {
+  content: "";
+  position: absolute;
+  left: 12%; right: 12%;
+  top: 2px;
+  height: 1.5px;
+  border-radius: 999px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.75) 30%, rgba(255,255,255,0.85) 50%, rgba(255,255,255,0.75) 70%, transparent);
+  filter: blur(0.3px);
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.5);
+  z-index: 6;
+}
+
+/* fine film grain */
+.glass-panel::after {
+  top: 0; bottom: 0; left: 0; right: 0; height: auto;
+  box-shadow: none; filter: none;
+  opacity: 0.045;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* lower-left ambient reflection under the slab */
+.glass-panel .floor-reflect {
+  position: absolute;
+  left: 8%; right: 8%; bottom: -26px;
+  height: 60px;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(50% 100% at 50% 0%, rgba(150, 170, 255, 0.28), transparent 70%);
+  filter: blur(10px);
+  z-index: 0;
+}
+
+/* ── Header (draggable) ─────────────────────────── */
+.r-header {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 4px 2px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  -webkit-app-region: drag;
+}
+
+.r-brand { display: flex; align-items: center; gap: 11px; }
+
+.r-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #d6e9ff, #5c9bff 70%);
+  box-shadow: 0 0 12px rgba(92, 155, 255, 0.95), inset 0 0 4px rgba(255,255,255,0.85);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50%      { opacity: 1;    transform: scale(1.16); }
+}
+
+.r-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+}
+
+.r-tools { display: flex; align-items: center; gap: 10px; -webkit-app-region: no-drag; }
+
+.win-btn {
+  width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--edge-light);
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 2px 6px rgba(0,0,0,0.4);
+  transition: background 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
+}
+.win-btn.min:hover { background: rgba(110, 180, 255, 0.35); transform: scale(1.08); }
+.win-btn.max:hover { background: rgba(110, 255, 160, 0.3);  transform: scale(1.08); }
+.win-btn.close:hover {
+  background: rgba(255, 82, 82, 0.45);
+  transform: scale(1.1);
+  box-shadow: 0 0 16px rgba(255, 82, 82, 0.55), inset 0 1px 0 rgba(255,255,255,0.35);
+}
+
+/* ── Query chip ──────────────────────────────────── */
+.r-query {
+  position: relative;
+  z-index: 10;
+  align-self: flex-start;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  padding: 5px 14px;
+  margin-bottom: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+}
+
+/* ── Live progress + incremental evidence (F28) ── */
+.r-live {
+  position: relative;
+  z-index: 10;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+  max-height: 38vh;
+  overflow-y: auto;
+}
+.r-live-msg {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  margin-bottom: 8px;
+  user-select: text;
+}
+.r-live-msg::before {
+  content: "◌ ";
+  color: #9cc4ff;
+}
+.r-live-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--text-faint);
+  margin: 2px 0 8px;
+}
+.r-live-evidence { display: flex; flex-direction: column; gap: 7px; }
+.r-le-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 11px;
+  padding: 8px 11px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.r-le-badge {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  padding: 2px 9px;
+  color: #fff;
+  background: rgba(92, 155, 255, 0.35);
+  border: 1px solid rgba(156, 196, 255, 0.45);
+}
+.r-le-badge.b-quoted,
+.r-le-badge.b-externally_checked { background: rgba(72, 199, 142, 0.32); border-color: rgba(120, 255, 190, 0.5); }
+.r-le-badge.b-inferred { background: rgba(255, 193, 84, 0.28); border-color: rgba(255, 210, 120, 0.5); color: #ffe9bd; }
+.r-le-badge.b-secondary { background: rgba(190, 140, 255, 0.30); border-color: rgba(200, 170, 255, 0.5); }
+.r-le-body { min-width: 0; color: var(--text-soft); user-select: text; }
+.r-le-title { color: var(--text); font-weight: 600; }
+.r-le-item a {
+  color: #9cc4ff;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(156, 196, 255, 0.4);
+}
+.r-le-item a:hover { color: #fff; border-bottom-color: #fff; }
+.r-le-snippet { display: block; margin-top: 2px; color: var(--text-faint); }
+
+/* ── Body ────────────────────────────────────────── */
+.r-body {
+  position: relative;
+  z-index: 10;
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 10px;
+  font-size: 14px;
+  line-height: 1.66;
+  color: var(--text);
+  user-select: text;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.35);
+}
+.r-body::-webkit-scrollbar { width: 8px; }
+.r-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+}
+.r-body::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+
+.r-body h1 { font-size: 19px; margin-bottom: 10px; color: #ffffff; }
+.r-body h2 {
+  font-size: 15.5px;
+  margin: 18px 0 8px;
+  padding-bottom: 6px;
+  padding-left: 10px;
+  border-left: 3px solid #6fa3ff;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  color: #ffe7a8;
+  letter-spacing: 0.02em;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);
+}
+.r-body p { margin: 7px 0; }
+.r-body ul { margin: 7px 0 7px 6px; list-style: none; }
+.r-body ul li {
+  position: relative;
+  padding-left: 18px;
+  margin: 6px 0;
+}
+.r-body ul li::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 9px;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #a8c8ff, #5c9bff);
+  box-shadow: 0 0 8px rgba(92,155,255,0.85);
+}
+.r-body a {
+  color: #9cc4ff;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(156, 196, 255, 0.45);
+}
+.r-body a:hover { color: #ffffff; border-bottom-color: #fff; }
+.r-body code {
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 12.5px;
+}
+.r-placeholder { color: var(--text-faint); font-style: italic; }
+
+/* ── Related videos ─────────────────────────────── */
+.r-videos {
+  position: relative;
+  z-index: 10;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+}
+.r-video-head {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+  margin-bottom: 10px;
+}
+.r-video-list { display: flex; flex-wrap: wrap; gap: 9px; }
+
+.video-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 100%;
+  padding: 9px 15px;
+  border-radius: 13px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.04));
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: transform 0.13s ease, box-shadow 0.13s ease, background 0.13s ease;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 3px 10px rgba(0,0,0,0.35);
+}
+.video-chip .vp {
+  flex: 0 0 auto;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #ff6b78, #d81f3a);
+  color: #fff;
+  font-size: 9px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 8px rgba(216, 31, 58, 0.6);
+}
+.video-chip:hover {
+  transform: translateY(-2px) scale(1.03);
+  background: linear-gradient(135deg, rgba(255,255,255,0.22), rgba(255,255,255,0.07));
+  box-shadow: 0 10px 24px rgba(0,0,0,0.55);
+}
+.video-chip .vt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.hidden { display: none !important; }
+
+/* ── Live self-diagnostic strip ─────────────────── */
+.r-status {
+  position: relative;
+  z-index: 10;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 11px;
+  font-family: Consolas, "Courier New", monospace;
+  color: rgba(210, 225, 255, 0.75);
+  letter-spacing: 0.02em;
+  user-select: text;
+  line-height: 1.5;
+}
+.r-status.err { color: #ffb4b4; }
+.r-status.ok  { color: #b9e6b4; }

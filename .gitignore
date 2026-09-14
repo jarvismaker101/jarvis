@@ -1,0 +1,65 @@
+﻿# â”€â”€ Python â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# â”€â”€ Secrets / environment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.env
+*.env
+# Backups/copies of .env hold the same secrets — never commit them.
+.env.*
+*.env.*
+!*.env.example
+!frontend/.env.example
+
+# â”€â”€ Node / Electron â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+node_modules/
+npm-debug.log*
+yarn-error.log*
+dist-ssr/
+out/
+release/
+*.map
+
+# â”€â”€ Logs / runtime artifacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+*.log
+logs/
+screen_commands.log
+test_ollama.py
+tmp/
+temp/
+*.audio.bin
+*.flac
+*.wav
+*.mp3
+
+# â”€â”€ Graphify / knowledge-graph outputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+graphify-out/
+graphify-out.zip
+
+# â”€â”€ OS / editor / IDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+# User data: real Chrome profile copy (sensitive) + research reports
+data/
+
+# opencode local agent state (contains live pilot token)
+.opencode/

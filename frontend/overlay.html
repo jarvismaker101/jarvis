@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; media-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jarvis Screen Overlay</title>
+  <link rel="stylesheet" href="overlay.css" />
+</head>
+<body>
+
+  <div id="overlay" class="overlay-container">
+
+    <!-- ── TIP Card ──────────────────────────────── -->
+    <div class="glass-card tip-card" id="tip-card" onclick="dismissOverlay()">
+      <div class="tip-header">
+        <div class="tip-icon">💡</div>
+        <span class="tip-label">TIP</span>
+      </div>
+      <div class="tip-text" id="tip-text">Analyzing your screen…</div>
+      <span class="region-badge hidden" id="region-badge"></span>
+      <div class="dismiss-progress" id="tip-progress"></div>
+    </div>
+
+    <!-- ── EXPLORE Links Card ────────────────────── -->
+    <div class="glass-card links-card hidden" id="links-card">
+      <div class="links-header">
+        <div class="links-icon">🧭</div>
+        <span class="links-label">EXPLORE</span>
+      </div>
+      <div class="links-items" id="links-items">
+        <!-- Populated by JS -->
+      </div>
+    </div>
+
+    <!-- ── EVIDENCE Card ─────────────────────────── -->
+    <div class="glass-card evidence-card hidden" id="evidence-card" onclick="dismissOverlay()">
+      <div class="evidence-header">
+        <div class="evidence-icon">🔍</div>
+        <span class="evidence-label">EVIDENCE</span>
+      </div>
+      <div class="evidence-items" id="evidence-items">
+        <!-- Populated by JS -->
+      </div>
+    </div>
+
+  </div>
+
+  <script src="overlay_renderer.js"></script>
+
+</body>
+</html>

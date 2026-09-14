@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jarvis Research</title>
+  <link rel="stylesheet" href="research_overlay.css" />
+</head>
+<body>
+  <div id="glass-panel" class="glass-panel">
+    <span class="edge-line"></span>
+    <div class="floor-reflect"></div>
+
+    <!-- Header (draggable) -->
+    <div class="r-header">
+      <div class="r-brand">
+        <span class="r-dot"></span>
+        <span class="r-title" id="r-title">Research</span>
+      </div>
+      <div class="r-tools">
+        <button class="win-btn min" id="r-min" title="Minimize">&#8211;</button>
+        <button class="win-btn close" id="r-close" title="Close">&times;</button>
+      </div>
+    </div>
+
+    <!-- Query chip -->
+    <div class="r-query" id="r-query">…</div>
+
+    <!-- Live progress + incremental evidence (F28) — shown while a deep
+         research run is still working; hidden once the report renders. -->
+    <div class="r-live hidden" id="r-live">
+      <div class="r-live-msg" id="r-live-msg">Working…</div>
+      <div class="r-live-head">Sources so far</div>
+      <div id="r-live-evidence" class="r-live-evidence"></div>
+    </div>
+
+    <!-- Body -->
+    <div class="r-body" id="r-body">
+      <p class="r-placeholder">Waiting for the research report…</p>
+    </div>
+
+    <!-- Related videos -->
+    <div class="r-videos hidden" id="r-videos">
+      <div class="r-video-head">▶ Related YouTube videos</div>
+      <div id="r-video-list" class="r-video-list"></div>
+    </div>
+
+    <!-- Live self-diagnostic (copy this when reporting issues) -->
+    <div class="r-status" id="r-status">starting…</div>
+  </div>
+
+  <script src="research_overlay_renderer.js"></script>
+</body>
+</html>

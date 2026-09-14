@@ -1,0 +1,792 @@
+"""Echo-cancelled full-duplex listening reference path (F33).
+
+The audit asks that assistant playback be fed into WebRTC AEC3 and that
+onset/VAD detection run on the *echo-cancelled* microphone signal, instead
+of treating Jarvis's own voice as a user interruption. The AEC tuning
+itself is marked [ASSUMPTION] - real echo suppression requires recordings
+from the actual speaker/headset setup. What this module delivers is the
+*missing reference path*: rendered PCM flows from the audio actor into a
+monotonic, timestamped reference buffer, and the microphone window is
+aligned against it on a SHARED TIMELINE; the resulting (mic, reference)
+pair is handed to an AEC implementation.
+
+F33 corrections in this module:
+
+* **Continuous, stateful resampling.** The old conversion used an integer
+  stride (``int(round(16000/44100)) == 0`` -> 1), so 44.1 kHz playback was
+  handed to the AEC as if it were 16 kHz - an effective ~14.7 kHz reference
+  with periodic discontinuities. ``StatefulResampler`` interpolates with a
+  fractional phase and a carried-over sample, so chunk boundaries do not
+  break the signal and arbitrary chunk sizes are safe.
+* **Timestamp alignment, not "newest suffix".** Every reference chunk is
+  stored with the monotonic time its last sample was rendered. A mic window
+  is matched to the reference span that OVERLAPS it in time.
+* **Once-only frame processing.** ``cancelled_mic_window(..., frame_id=...)``
+  processes each capture frame exactly once, so the listener's overlapping
+  VAD windows cannot re-feed the AEC or double-count statistics.
+* **Explicit degraded state.** ``AecSignalPath.state()`` reports whether
+  cancellation is real, no-op, or cross-process, and why.
+
+When ``py-webrtc-aec3`` is installed and ``JARVIS_AEC_ENABLED != 0`` the
+streaming AEC3 processor is used. Otherwise the pair is still produced and
+a loud no-op fallback applies, so the wiring exists and instrumentation
+works before a real AEC model is added.
+"""
+
+import base64
+import json
+import math
+import threading
+import time
+from collections import deque, namedtuple
+from urllib.request import Request, urlopen
+
+from backend.config import AEC_ENABLED
+
+try:  # pragma: no cover - config always provides these, but stay importable
+    from backend.config import AEC_REMOTE_ENABLED, AEC_REMOTE_TIMEOUT
+except Exception:  # pragma: no cover
+    AEC_REMOTE_ENABLED = True
+    AEC_REMOTE_TIMEOUT = 0.35
+
+AEC_SAMPLE_RATE = 16000
+AEC_SAMPLE_WIDTH = 2
+REFERENCE_MAX_SECONDS = 30
+#: A mic window is only cancelled against reference PCM rendered within this
+#: many seconds of it (a stale reference means "playback did not overlap").
+REFERENCE_MAX_DRIFT_SECONDS = 2.0
+
+
+class CaptureFrame(namedtuple("CaptureFrame",
+                              "pcm had_reference suppressed sample_rate")):
+    """One analysed capture frame (F33).
+
+    *pcm* is what the mic contributed after cancellation, *had_reference*
+    says playback overlapped the frame, and *suppressed* says the frame was
+    recognised as the assistant's own playback (so it must never be committed
+    as user speech).
+    """
+
+    __slots__ = ()
+
+    def __bool__(self):
+        return bool(self.pcm)
+
+
+def _import_webrtcaec3():
+    """Guarded import - returns the webrtcaec3 module or None."""
+    try:
+        import webrtcaec3
+
+        return webrtcaec3
+    except Exception:
+        return None
+
+
+class StatefulResampler:
+    """Continuous sample-rate conversion for a chunked PCM stream.
+
+    Linear interpolation with a global read position and a two-frame tail
+    that CARRIES OVER between calls, so a stream split at an arbitrary byte
+    boundary resamples to exactly the same signal as the whole stream
+    resampled at once (no stride aliasing, no boundary clicks).
+    """
+
+    def __init__(self, source_rate, target_rate=AEC_SAMPLE_RATE,
+                 channels=1, sample_width=2):
+        self.source_rate = int(source_rate or target_rate)
+        self.target_rate = int(target_rate or source_rate)
+        self.channels = max(1, int(channels or 1))
+        self.sample_width = int(sample_width or 2)
+        self._step = float(self.source_rate) / float(self.target_rate)
+        # Global input frame index of the first frame of the next chunk, and
+        # the position (in the same global frame space) of the next output
+        # sample. Both survive across calls, so the output is EXACTLY the
+        # whole-stream resample for any chunk split.
+        self._input_frames = 0   # frames consumed so far
+        self._next_pos = 0.0     # global input position of the next output
+        self._tail = None        # last <=2 input frames of the previous chunk
+        self._carry = b""        # undecoded partial frame across chunks
+        self._lock = threading.Lock()
+
+    @property
+    def passthrough(self):
+        return self.source_rate == self.target_rate and self.channels == 1
+
+    def reset(self):
+        with self._lock:
+            self._input_frames = 0
+            self._next_pos = 0.0
+            self._tail = None
+            self._carry = b""
+
+    def resample(self, pcm_bytes):
+        """Return *pcm_bytes* converted to the target rate (mono s16le)."""
+        if not pcm_bytes:
+            return b""
+        frame_bytes = self.sample_width * self.channels
+        with self._lock:
+            data = self._carry + bytes(pcm_bytes)
+            usable = (len(data) // frame_bytes) * frame_bytes
+            self._carry = data[usable:]
+            data = data[:usable]
+            if not data:
+                return b""
+            import numpy as np
+
+            if self.sample_width == 2:
+                arr = np.frombuffer(data, dtype="<i2").astype(np.float32)
+            else:
+                arr = np.frombuffer(data, dtype="<i1").astype(np.float32)
+            if self.channels > 1:
+                arr = arr.reshape((-1, self.channels)).mean(axis=1)
+            frames = arr
+            n = int(frames.size)
+            g0 = self._input_frames
+            g_last = g0 + n - 1
+
+            if self.passthrough:
+                self._input_frames = g0 + n
+                self._next_pos = float(self._input_frames)
+                out = frames.astype(np.int16)
+                return out.tobytes()
+
+            tail = self._tail
+            if tail is None or tail.size == 0:
+                source = frames
+                source_g0 = g0
+            else:
+                source = np.concatenate((tail, frames))
+                source_g0 = g0 - int(tail.size)
+
+            # Emit every output sample whose interpolation support
+            # (floor(pos), floor(pos)+1) is fully inside the data we have.
+            positions = []
+            pos = self._next_pos
+            while int(pos) + 1 <= g_last:
+                positions.append(pos)
+                pos += self._step
+            self._next_pos = pos
+            self._input_frames = g0 + n
+            # Keep the last two frames for the next chunk's interpolation.
+            if n >= 2:
+                self._tail = frames[-2:].copy()
+            else:
+                self._tail = (frames if tail is None
+                              else np.concatenate((tail, frames)))[-2:].copy()
+
+            if not positions:
+                return b""
+            index = np.array(positions, dtype=np.float64)
+            low = np.floor(index).astype(np.int64)
+            frac = (index - low).astype(np.float32)
+            low_idx = low - source_g0
+            high_idx = low_idx + 1
+            mixed = source[low_idx] * (1.0 - frac) + source[high_idx] * frac
+            return np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
+
+
+class EchoCanceller:
+    """Protocol: combine a mic PCM window with the aligned reference PCM."""
+
+    name = "base"
+
+    def cancel(self, mic_pcm, ref_pcm):
+        raise NotImplementedError
+
+
+class NoOpEchoCanceller(EchoCanceller):
+    """Identity fallback: returns the mic signal untouched.
+
+    This is the [ASSUMPTION] boundary - the reference path is proven, but
+    measured acoustic performance is a hardware question. It is reported as
+    a DEGRADED state (see ``AecSignalPath.state``), never as cancellation.
+    """
+
+    name = "noop"
+    degraded = True
+
+    def cancel(self, mic_pcm, ref_pcm):
+        if ref_pcm:
+            self.last_reference_seen = time.monotonic()
+        return mic_pcm
+
+
+class WebRtcAec3Canceller(EchoCanceller):
+    """Streaming AEC3 via py-webrtc-aec3 when that package is present."""
+
+    name = "webrtcaec3"
+    degraded = False
+
+    def __init__(self, sample_rate=AEC_SAMPLE_RATE):
+        webrtcaec3 = _import_webrtcaec3()
+        if webrtcaec3 is None:
+            raise RuntimeError("py-webrtcaec3 is not installed")
+        self._aec = webrtcaec3.StreamingAec3(
+            sample_rate=sample_rate,
+            frame_length=10,  # ms
+            sample_format="S16",
+        )
+
+    def cancel(self, mic_pcm, ref_pcm):
+        # Feed the reference first so the model has learned recent playback,
+        # then cancel the mic window with it.
+        if ref_pcm:
+            self._aec.feed_reference_pcm(ref_pcm)
+        return self._aec.run(mic_pcm)
+
+
+class ReferenceEchoGate:
+    """Decide whether a mic window IS our own playback (degraded path).
+
+    When no real AEC model is installed the mic passes through unfiltered, and
+    no downstream VAD can be trusted to tell the assistant's own voice from
+    the user's: WebRTC VAD adapts to what it heard before, so it happily calls
+    a loud playback window "speech". This gate compares the window against the
+    time-aligned reference with a single-tap least-squares fit:
+
+      * ``gain``         best-fit playback scale;
+      * ``suppression``  dB of window energy removed by subtracting gain*ref;
+      * ``correlation``  |<mic, ref>| / sqrt(E_mic * E_ref).
+
+    A window that is (almost) entirely playback has correlation near 1 and a
+    large suppression; genuine double-talk does not. The residual is what the
+    user actually said, so callers can keep analysing it.
+    """
+
+    name = "echo-gate"
+
+    def __init__(self, min_correlation=0.55, min_suppression_db=8.0,
+                 residual_floor=8.0):
+        self.min_correlation = float(min_correlation)
+        self.min_suppression_db = float(min_suppression_db)
+        self.residual_floor = float(residual_floor)
+
+    def analyse(self, mic_pcm, ref_pcm):
+        """Return ``(is_echo, residual_pcm, metrics)``."""
+        metrics = {"correlation": 0.0, "suppression_db": 0.0, "is_echo": False}
+        if not mic_pcm or not ref_pcm:
+            return False, mic_pcm, metrics
+        import numpy as np
+
+        def as_float(data):
+            usable = (len(data) // 2) * 2
+            return np.frombuffer(data[:usable], dtype="<i2").astype(np.float64)
+
+        mic = as_float(mic_pcm)
+        ref = as_float(ref_pcm)
+        if mic.size == 0 or ref.size == 0:
+            return False, mic_pcm, metrics
+        # Align lengths: the reference span is asked for the window's length,
+        # but a partial span is padded so the fit stays comparable.
+        if ref.size < mic.size:
+            ref = np.concatenate((np.zeros(mic.size - ref.size), ref))
+        elif ref.size > mic.size:
+            ref = ref[ref.size - mic.size:]
+
+        mic_energy = float(np.dot(mic, mic))
+        ref_energy = float(np.dot(ref, ref))
+        if mic_energy <= 0.0 or ref_energy <= 0.0:
+            return False, mic_pcm, metrics
+        cross = float(np.dot(mic, ref))
+        correlation = abs(cross) / math.sqrt(mic_energy * ref_energy)
+        gain = cross / ref_energy
+        residual = mic - gain * ref
+        residual_energy = float(np.dot(residual, residual))
+        if residual_energy <= 0.0:
+            suppression = 120.0
+        else:
+            suppression = 10.0 * math.log10(mic_energy / residual_energy)
+        is_echo = (correlation >= self.min_correlation and
+                   suppression >= self.min_suppression_db)
+        metrics.update({"correlation": correlation,
+                        "suppression_db": suppression,
+                        "gain": gain,
+                        "is_echo": is_echo})
+        if not is_echo:
+            return False, mic_pcm, metrics
+        return True, np.clip(residual, -32768, 32767).astype(np.int16).tobytes(), metrics
+
+
+def build_canceller():
+    """Select the best AEC implementation available at runtime."""
+    if AEC_ENABLED and _import_webrtcaec3() is not None:
+        try:
+            return WebRtcAec3Canceller()
+        except Exception as exc:
+            print(f"[AEC] webrtcaec3 init failed ({exc}) - no-op path")
+    return NoOpEchoCanceller()
+
+
+class RemoteAecTransport:
+    """Fetch the AEC reference from the process that renders playback.
+
+    F33: the reference buffer is process-local, but the API process voices
+    replies while the voice process owns the microphone, so a listener-side
+    buffer would always be empty (``had_reference`` False forever). This is
+    the missing PCM transport: the voice side asks the API for the rendered
+    span that overlaps its mic window, together with the age of that span
+    measured on the API's own clock - which is what establishes the shared
+    timeline without comparing unrelated monotonic clocks.
+
+    Never raises and never blocks longer than ``AEC_REMOTE_TIMEOUT``; a
+    failure simply means "no reference", which the caller reports as
+    ``had_reference=False`` (unfiltered semantics, explicitly degraded).
+    """
+
+    def __init__(self, base_url=None, timeout=None):
+        if base_url is None:
+            try:
+                from backend.config import BACKEND_PORT
+                base_url = f"http://127.0.0.1:{BACKEND_PORT}"
+            except Exception:  # pragma: no cover
+                base_url = "http://127.0.0.1:9999"
+        self.base_url = base_url.rstrip("/")
+        self.timeout = float(timeout or AEC_REMOTE_TIMEOUT)
+        self.stats = {"fetches": 0, "hits": 0, "errors": 0,
+                      "last_age_seconds": None, "last_error": None}
+
+    def fetch_reference(self, duration_seconds, mic_t_end=None):
+        """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``."""
+        self.stats["fetches"] += 1
+        url = (f"{self.base_url}/aec/reference"
+               f"?seconds={max(0.0, float(duration_seconds or 0.0)):.3f}")
+        try:
+            request = Request(url, method="GET")
+            with urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8") or "{}")
+        except Exception as exc:
+            self.stats["errors"] += 1
+            self.stats["last_error"] = str(exc)
+            return b"", None
+        pcm = payload.get("pcm_b64") or ""
+        age = payload.get("age_seconds")
+        if not pcm:
+            return b"", None
+        try:
+            data = base64.b64decode(pcm)
+        except Exception as exc:
+            self.stats["errors"] += 1
+            self.stats["last_error"] = str(exc)
+            return b"", None
+        self.stats["hits"] += 1
+        self.stats["last_age_seconds"] = age
+        return data, (None if age is None else float(age))
+
+    def state(self):
+        return {"url": self.base_url, "timeout": self.timeout,
+                "stats": dict(self.stats)}
+
+
+class ReferencePcmBuffer:
+    """Monotonic, timestamped ring of rendered playback PCM (16k mono s16).
+
+    The audio actor (or fish_voice) feeds every chunk that actually reached
+    the output device. Each chunk carries the monotonic time of its LAST
+    sample, so a mic window can be aligned by TIME instead of by "whatever
+    was rendered most recently" (F33).
+    """
+
+    def __init__(self, max_seconds=REFERENCE_MAX_SECONDS,
+                 sample_rate=AEC_SAMPLE_RATE, sample_width=AEC_SAMPLE_WIDTH):
+        self.sample_rate = int(sample_rate)
+        self.sample_width = int(sample_width)
+        self._max_bytes = int(max_seconds * self.sample_rate * self.sample_width)
+        self._lock = threading.Lock()
+        #: deque of (t_end, pcm) oldest first.
+        self._chunks = deque()
+        self._resampler = None
+        self._resampler_rate = None
+        self._channels = 1
+        self._total_feeds = 0
+        self._last_feed_ts = 0.0
+        self._last_t_end = 0.0
+        self._resample_failures = 0
+
+    # ── feeding ────────────────────────────────────────────────────────
+    def feed(self, pcm_bytes, sample_rate=None, sample_width=None, t_end=None,
+             channels=None):
+        """Store a rendered-PCM chunk; returns the stored (16k) byte count.
+
+        Resampling is continuous ACROSS calls (``StatefulResampler``), so a
+        producer that hands over arbitrary chunk sizes still yields one
+        uninterrupted reference timeline. *channels* describes the incoming
+        format (device output is often 48 kHz stereo); the reference is always
+        stored as 16 kHz mono.
+        """
+        if not pcm_bytes:
+            return 0
+        if channels:
+            self.set_channels(channels)
+        resampled = self._resample_to_16k(pcm_bytes, sample_rate, sample_width)
+        if not resampled:
+            return 0
+        now = time.monotonic() if t_end is None else float(t_end)
+        with self._lock:
+            self._chunks.append((now, resampled))
+            self._total_feeds += 1
+            self._last_feed_ts = time.monotonic()
+            self._last_t_end = now
+            while len(self._chunks) > 1:
+                total = sum(len(c) for _, c in self._chunks)
+                if total <= self._max_bytes:
+                    break
+                self._chunks.popleft()
+        return len(resampled)
+
+    def _resample_to_16k(self, pcm_bytes, sample_rate, sample_width):
+        sr = int(sample_rate or self.sample_rate)
+        sw = int(sample_width or self.sample_width)
+        channels = getattr(self, "_channels", 1)
+        try:
+            with self._lock:
+                if (self._resampler is None or self._resampler_rate != (sr, sw,
+                                                                        channels)):
+                    self._resampler = StatefulResampler(
+                        sr, self.sample_rate, channels=channels,
+                        sample_width=sw)
+                    self._resampler_rate = (sr, sw, channels)
+                resampler = self._resampler
+            return resampler.resample(pcm_bytes)
+        except Exception as exc:  # pragma: no cover - defensive
+            with self._lock:
+                self._resample_failures += 1
+            print(f"[AEC] reference resample failed ({exc})")
+            return b""
+
+    def set_channels(self, channels):
+        """Tell the buffer how many channels the producer's PCM carries."""
+        with self._lock:
+            if int(channels) != self._channels:
+                self._channels = max(1, int(channels))
+                self._resampler = None
+                self._resampler_rate = None
+
+    # ── alignment ──────────────────────────────────────────────────────
+    def aligned_reference(self, duration_bytes, mic_t_end=None,
+                          max_drift_seconds=REFERENCE_MAX_DRIFT_SECONDS):
+        """The reference span that OVERLAPS the mic window, or ``b""``.
+
+        *mic_t_end* is the monotonic time of the mic window's last sample
+        (the listener timestamps each captured frame). The span returned ends
+        at that point and is *duration_bytes* long, so a window captured while
+        the assistant spoke is cancelled against exactly what was playing.
+        Without *mic_t_end* the window is assumed to end NOW (a live capture),
+        so a reference that stopped playing long ago reports "no reference"
+        rather than being reused as if it were current.
+        """
+        duration_bytes = max(0, int(duration_bytes or 0))
+        with self._lock:
+            if not self._chunks:
+                return b""
+            newest_t_end = self._chunks[-1][0]
+            chunks = list(self._chunks)
+        if mic_t_end is None:
+            mic_t_end = time.monotonic()
+        if abs(mic_t_end - newest_t_end) > max_drift_seconds:
+            # Playback did not overlap this window (or the clock is skewed).
+            return b""
+        # Walk backwards from the window end, keeping chunks whose span
+        # overlaps [mic_t_end - duration, mic_t_end].
+        bytes_per_second = float(self.sample_rate * self.sample_width)
+        window_start = mic_t_end - (duration_bytes / bytes_per_second)
+        kept = []
+        for t_end, chunk in reversed(chunks):
+            span = len(chunk) / bytes_per_second
+            t_start = t_end - span
+            if t_end <= window_start:
+                break
+            if t_start >= mic_t_end:
+                continue
+            kept.append(chunk)
+        joined = b"".join(reversed(kept))
+        if not joined:
+            return b""
+        if len(joined) <= duration_bytes:
+            return joined
+        return joined[len(joined) - duration_bytes:]
+
+    def age_seconds(self):
+        with self._lock:
+            if not self._chunks:
+                return None
+            return max(0.0, time.monotonic() - self._chunks[-1][0])
+
+    def stats(self):
+        with self._lock:
+            return {
+                "chunks": len(self._chunks),
+                "bytes": sum(len(c) for _, c in self._chunks),
+                "feeds": self._total_feeds,
+                "last_feed_ts": self._last_feed_ts,
+                "last_t_end": self._last_t_end,
+                "resample_failures": self._resample_failures,
+                "age_seconds": (max(0.0, time.monotonic() - self._chunks[-1][0])
+                                if self._chunks else None),
+            }
+
+    def __len__(self):
+        with self._lock:
+            return sum(len(c) for _, c in self._chunks)
+
+
+class AecSignalPath:
+    """Ties the reference buffer and the canceller together for the
+    listener: rendered PCM is fed by the audio layer; the mic capture
+    asks for a cancelled window before VAD/onset analysis.
+
+    F33: every capture frame is processed ONCE (``frame_id``), the mic window
+    is aligned on the shared timeline (``mic_t_end``), and the whole path
+    reports an explicit state instead of silently pretending to cancel.
+    """
+
+    #: Frames kept for the once-only cache (a few seconds of VAD windows).
+    FRAME_CACHE_LIMIT = 512
+
+    def __init__(self, canceller=None, reference_buffer=None, process=None,
+                 transport="auto", echo_gate=None):
+        self.canceller = canceller or build_canceller()
+        self.reference = reference_buffer or ReferencePcmBuffer()
+        self.process = process or "local"
+        if transport == "auto":
+            self.transport = (RemoteAecTransport()
+                              if (AEC_ENABLED and AEC_REMOTE_ENABLED) else None)
+        else:
+            self.transport = transport
+        #: Used only when the canceller is a no-op (no AEC model installed):
+        #: without it the "filtered" mic is the raw mic, and a loud playback
+        #: window would be captured as user speech.
+        self.echo_gate = (echo_gate if echo_gate is not None
+                          else ReferenceEchoGate())
+        self.stats = {
+            "cancelled_analyses": 0,
+            "had_reference": 0,
+            "replayed_frames": 0,
+            "frames_processed": 0,
+            "echo_suppressed": 0,
+            "reference_sources": {"local": 0, "remote": 0, "none": 0},
+        }
+        self._frame_lock = threading.Lock()
+        self._frame_cache = {}
+        self._frame_order = deque()
+        self._last_frame_id = None
+        #: Stateful 16k conversion for the MIC side too - the canceller is a
+        #: 16 kHz model, and the mic must not be resampled with a stride.
+        self._mic_resampler = None
+        self._mic_rate = None
+        self.mic_sample_rate = AEC_SAMPLE_RATE
+
+    # ── reference side ─────────────────────────────────────────────────
+    def feed_reference(self, pcm_bytes, sample_rate=None, sample_width=None,
+                       t_end=None, channels=None):
+        return self.reference.feed(pcm_bytes, sample_rate, sample_width, t_end,
+                                   channels=channels)
+
+    # ── mic side ───────────────────────────────────────────────────────
+    def _mic_to_aec_rate(self, mic_pcm, sample_rate=None, sample_width=None):
+        """Return (16k mono s16 pcm, rate_used) for a captured frame."""
+        rate = int(sample_rate or AEC_SAMPLE_RATE)
+        width = int(sample_width or AEC_SAMPLE_WIDTH)
+        if rate == AEC_SAMPLE_RATE and width == AEC_SAMPLE_WIDTH:
+            return mic_pcm, AEC_SAMPLE_RATE
+        try:
+            with self._frame_lock:
+                if self._mic_resampler is None or self._mic_rate != (rate, width):
+                    self._mic_resampler = StatefulResampler(
+                        rate, AEC_SAMPLE_RATE, channels=1, sample_width=width)
+                    self._mic_rate = (rate, width)
+                resampler = self._mic_resampler
+            return resampler.resample(mic_pcm), AEC_SAMPLE_RATE
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[AEC] mic resample failed ({exc})")
+            return mic_pcm, rate
+
+    def cancelled_mic_window(self, mic_pcm, duration_bytes=None,
+                             mic_t_end=None, frame_id=None,
+                             sample_rate=None, sample_width=None,
+                             duration_seconds=None):
+        """Return (filtered_pcm, had_reference) for a captured mic window.
+
+        *had_reference* False means there is no overlapping playback to
+        cancel (either the reference path is unpopulated or playback did not
+        overlap this window) - the caller keeps its existing VAD semantics
+        and must NOT treat this as "cancelled".
+
+        *frame_id* makes processing once-only: the SAME capture frame asked
+        for twice (the listener's VAD window slides over frames it already
+        analysed) returns the cached result and is not fed to the AEC again.
+
+        *mic_t_end* is the monotonic time of the window's last sample, so the
+        reference span is chosen by TIME overlap. *seconds* (or
+        *duration_seconds*) is the window length measured on the shared
+        timeline; *duration_bytes* remains accepted for 16k callers.
+
+        ``cancelled_capture_frame`` is the richer variant: it also reports
+        whether the window was identified as our own playback.
+        """
+        pcm, had_reference, _suppressed, _rate = self.cancelled_capture_frame(
+            mic_pcm, duration_bytes=duration_bytes, mic_t_end=mic_t_end,
+            frame_id=frame_id, sample_rate=sample_rate,
+            sample_width=sample_width, duration_seconds=duration_seconds)
+        return pcm, had_reference
+
+    def cancelled_capture_frame(self, mic_pcm, duration_bytes=None,
+                                mic_t_end=None, frame_id=None,
+                                sample_rate=None, sample_width=None,
+                                duration_seconds=None):
+        """Return ``CaptureFrame(pcm, had_reference, suppressed, sample_rate)``.
+
+        *suppressed* True means this window was recognised as the assistant's
+        own playback (see ``ReferenceEchoGate``) and *pcm* is the residual the
+        user actually contributed - which is near-silence for assistant-only
+        audio. Callers must not let a suppressed frame become user speech.
+        """
+        if frame_id is not None:
+            with self._frame_lock:
+                cached = self._frame_cache.get(frame_id)
+            if cached is not None:
+                with self._frame_lock:
+                    self.stats["replayed_frames"] += 1
+                return cached
+        pcm, had_reference, suppressed = self._cancel_once(
+            mic_pcm, duration_bytes, mic_t_end, sample_rate, sample_width,
+            duration_seconds)
+        result = CaptureFrame(pcm, had_reference, suppressed, AEC_SAMPLE_RATE)
+        if frame_id is not None:
+            with self._frame_lock:
+                self._frame_cache[frame_id] = result
+                self._frame_order.append(frame_id)
+                while len(self._frame_order) > self.FRAME_CACHE_LIMIT:
+                    self._frame_cache.pop(self._frame_order.popleft(), None)
+                self._last_frame_id = frame_id
+                self.stats["frames_processed"] += 1
+        return result
+
+    def _cancel_once(self, mic_pcm, duration_bytes, mic_t_end, sample_rate=None,
+                     sample_width=None, duration_seconds=None):
+        self.stats["cancelled_analyses"] += 1
+        mic_16k, rate = self._mic_to_aec_rate(mic_pcm, sample_rate, sample_width)
+        if duration_seconds is None:
+            if duration_bytes is None:
+                duration_seconds = (len(mic_16k) / float(
+                    AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)) if mic_16k else 0.0
+            else:
+                duration_seconds = duration_bytes / float(
+                    AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
+        want = int(duration_seconds * AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
+        ref_pcm = self.reference.aligned_reference(want, mic_t_end=mic_t_end)
+        source = "local" if ref_pcm else "none"
+        local_age = self.reference.age_seconds() if ref_pcm else None
+        # The API process voices replies while this process owns the mic, so
+        # when nothing was rendered locally ask the renderer for the span
+        # that overlaps this window (and how old it is on ITS clock).
+        if self.transport is not None and (not ref_pcm or
+                                           (local_age or 0.0) > 0.25):
+            remote, remote_age = self.transport.fetch_reference(
+                duration_seconds, mic_t_end=mic_t_end)
+            if remote and (remote_age is None or
+                           remote_age <= REFERENCE_MAX_DRIFT_SECONDS):
+                fresher = (not ref_pcm or remote_age is None or
+                           local_age is None or remote_age < local_age)
+                if fresher:
+                    ref_pcm = remote
+                    source = "remote"
+        had_reference = bool(ref_pcm)
+        if had_reference:
+            self.stats["had_reference"] += 1
+        sources = self.stats.setdefault("reference_sources",
+                                        {"local": 0, "remote": 0, "none": 0})
+        sources[source] = sources.get(source, 0) + 1
+        suppressed = False
+        if had_reference and getattr(self.canceller, "degraded", False):
+            # No real AEC: the canceller returns the mic untouched, so decide
+            # explicitly whether this window IS the playback echo. If it is,
+            # hand back the residual (near silence for assistant-only audio)
+            # and mark the frame so no downstream VAD can commit it.
+            suppressed, residual, _metrics = self.echo_gate.analyse(mic_16k,
+                                                                    ref_pcm)
+            if suppressed:
+                self.stats["echo_suppressed"] += 1
+                return residual, True, True
+            filtered = self.canceller.cancel(mic_16k, ref_pcm)
+            return filtered, True, False
+        filtered = self.canceller.cancel(mic_16k, ref_pcm)
+        return filtered, had_reference, suppressed
+
+    # ── observability ──────────────────────────────────────────────────
+    def state(self):
+        """Explicit AEC state — never a silent no-op.
+
+        ``mode`` is ``webrtcaec3`` when real cancellation is active,
+        ``noop`` when the reference path exists but the model does not, and
+        ``off`` when AEC is disabled by config.
+        """
+        mode = "off" if not AEC_ENABLED else getattr(self.canceller, "name", "noop")
+        degraded = bool(getattr(self.canceller, "degraded", True))
+        reason = None
+        if not AEC_ENABLED:
+            reason = "AEC disabled by configuration"
+        elif degraded:
+            reason = ("no AEC implementation installed - the reference path is "
+                      "wired but the mic passes through unfiltered")
+        age = self.reference.age_seconds()
+        if age is not None and age > REFERENCE_MAX_DRIFT_SECONDS:
+            reason = (reason + "; " if reason else "") + \
+                "reference is stale (%.1fs old)" % age
+        snapshot = {
+            "mode": mode,
+            "degraded": degraded,
+            "reason": reason,
+            "process": self.process,
+            "reference_age_seconds": age,
+            "mic_sample_rate": self.mic_sample_rate,
+            "reference": self.reference.stats(),
+            "transport": (self.transport.state()
+                          if self.transport is not None else None),
+            "counters": dict(self.stats),
+        }
+        return snapshot
+
+    # ── rendering side (the process that plays TTS) ────────────────────
+    def reference_span(self, duration_seconds, mic_t_end=None):
+        """Return ``(pcm, age_seconds)`` for the /aec/reference endpoint."""
+        want = int(max(0.0, float(duration_seconds or 0.0)) *
+                   AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
+        pcm = self.reference.aligned_reference(want, mic_t_end=mic_t_end)
+        if not pcm:
+            return b"", None
+        return pcm, self.reference.age_seconds()
+
+
+# Module-level path the listener uses; the audio actor feeds it so the
+# mic side and the playback side never need to meet explicitly.
+signal_path = AecSignalPath()
+
+
+def feed_reference(pcm_bytes, sample_rate=None, sample_width=None, t_end=None,
+                   channels=None):
+    return signal_path.feed_reference(pcm_bytes, sample_rate, sample_width,
+                                      t_end=t_end, channels=channels)
+
+
+def cancelled_mic_window(mic_pcm, duration_bytes=None, mic_t_end=None,
+                         frame_id=None, sample_rate=None, sample_width=None,
+                         duration_seconds=None):
+    return signal_path.cancelled_mic_window(
+        mic_pcm, duration_bytes, mic_t_end=mic_t_end, frame_id=frame_id,
+        sample_rate=sample_rate, sample_width=sample_width,
+        duration_seconds=duration_seconds)
+
+
+def cancelled_capture_frame(mic_pcm, duration_bytes=None, mic_t_end=None,
+                            frame_id=None, sample_rate=None, sample_width=None,
+                            duration_seconds=None):
+    """Richer sibling of ``cancelled_mic_window``: returns a CaptureFrame."""
+    return signal_path.cancelled_capture_frame(
+        mic_pcm, duration_bytes, mic_t_end=mic_t_end, frame_id=frame_id,
+        sample_rate=sample_rate, sample_width=sample_width,
+        duration_seconds=duration_seconds)
+
+
+def aec_state():
+    return signal_path.state()

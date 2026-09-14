@@ -1,0 +1,31 @@
+{
+  "name": "jarvis-editor-bridge",
+  "displayName": "Jarvis Editor Bridge",
+  "description": "Localhost bridge that exposes editor state and commands to Jarvis.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:jarvisBridge.start",
+    "onCommand:jarvisBridge.stop"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jarvisBridge.start",
+        "title": "Jarvis Bridge: Start"
+      },
+      {
+        "command": "jarvisBridge.stop",
+        "title": "Jarvis Bridge: Stop"
+      }
+    ]
+  }
+}

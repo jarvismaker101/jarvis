@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none';">
+  <title>JARVIS Capsule</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="capsule.css">
+</head>
+<body>
+  <div class="capsule">
+    <div class="capsule-title">
+      <span class="capsule-label">JARVIS</span>
+      <span class="capsule-title-actions">
+        <button id="capsule-task-stop" class="capsule-task-stop" style="display: none;" title="Stop the running task">STOP TASK</button>
+        <button id="capsule-close" class="capsule-close" title="Close">✕</button>
+      </span>
+    </div>
+    <div id="capsule-log" class="capsule-log"></div>
+    <div class="capsule-input-row">
+      <input id="capsule-input" class="capsule-input" placeholder="Type a message..." autocomplete="off" spellcheck="false" />
+      <button id="capsule-send" class="capsule-send">SEND</button>
+    </div>
+  </div>
+  <script src="capsule_renderer.js"></script>
+</body>
+</html>

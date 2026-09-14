@@ -1,0 +1,22 @@
+node_modules/
+dist/
+vendor/
+*.generated.py
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+backend/venv1/
+**/venv/
+**/venv1/
+**/.venv/
+
+# Git and editor noise
+.git/
+.DS_Store
+Thumbs.db

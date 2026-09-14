@@ -1,0 +1,489 @@
+/* =========================================================
+   Jarvis Screen Q&A — Floating Glass Overlay
+   ========================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: transparent;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+
+/* ── Container ─────────────────────────────────────── */
+.overlay-container {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 420px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-end;
+  padding: 40px 28px;
+  gap: 16px;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(30px);
+  transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Left-side container for image overlay */
+.overlay-container-left {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 400px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 40px 28px;
+  gap: 16px;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-30px);
+  transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.overlay-container.visible,
+.overlay-container-left.visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.overlay-container.dismissing {
+  opacity: 0;
+  transform: translateX(40px) scale(0.97);
+  transition: opacity 0.35s ease-in,
+              transform 0.35s ease-in;
+}
+
+.overlay-container-left.dismissing {
+  opacity: 0;
+  transform: translateX(-40px) scale(0.97);
+  transition: opacity 0.35s ease-in,
+              transform 0.35s ease-in;
+}
+
+/* ── Shared card base ──────────────────────────────── */
+.glass-card {
+  pointer-events: auto;
+  cursor: pointer;
+  width: 100%;
+  border-radius: 18px;
+  padding: 22px 24px;
+  /* Glassmorphism */
+  background: rgba(30, 30, 40, 0.72);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(255, 255, 255, 0.06) inset,
+    0 1px 0 rgba(255, 255, 255, 0.08) inset;
+  color: #f0f0f5;
+  position: relative;
+  overflow: hidden;
+  /* Staggered entrance */
+  opacity: 0;
+  transform: translateY(18px);
+  animation: cardSlideIn 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.glass-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.2) 30%,
+    rgba(255, 255, 255, 0.3) 50%,
+    rgba(255, 255, 255, 0.2) 70%,
+    transparent 100%
+  );
+}
+
+.glass-card:hover {
+  background: rgba(35, 35, 48, 0.78);
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow:
+    0 12px 40px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
+    0 1px 0 rgba(255, 255, 255, 0.1) inset;
+  transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
+}
+
+/* ── Region focus badge (highlighted-area questions) ── */
+.region-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: #d9e7ff;
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(99, 102, 241, 0.22));
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.18);
+  animation: cardSlideIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.35s forwards;
+  opacity: 0;
+}
+
+.region-badge.hidden {
+  display: none;
+}
+
+/* ── TIP card ──────────────────────────────────────── */
+.tip-card {
+  animation-delay: 0.05s;
+}
+
+.tip-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.tip-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  box-shadow: 0 2px 12px rgba(251, 191, 36, 0.3);
+  flex-shrink: 0;
+}
+
+.tip-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.tip-text {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.55;
+  color: #f0f0f5;
+  letter-spacing: -0.01em;
+}
+
+/* ── EXPLORE links card ────────────────────────────── */
+.links-card {
+  animation-delay: 0.12s;
+  padding: 18px 22px;
+}
+
+.links-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.links-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.3), rgba(99, 102, 241, 0.3));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+}
+
+.links-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.links-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.link-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #d4d4e8;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-decoration: none;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.link-pill:hover {
+  background: rgba(99, 102, 241, 0.2);
+  border-color: rgba(99, 102, 241, 0.4);
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+}
+
+.link-pill-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.link-pill-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── EVIDENCE section ──────────────────────────────── */
+.evidence-card {
+  animation-delay: 0.22s;
+  padding: 18px 22px;
+}
+
+.evidence-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.evidence-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+
+.evidence-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.evidence-items {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.evidence-items::-webkit-scrollbar {
+  display: none;
+}
+
+.evidence-item {
+  flex: 0 0 auto;
+  min-width: 130px;
+  max-width: 160px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 12px 14px;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.evidence-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.evidence-source {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.4);
+  margin-bottom: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.evidence-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e8e8f0;
+  margin-bottom: 4px;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.evidence-snippet {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── IMAGE card (left overlay) ─────────────────────── */
+.image-card {
+  padding: 0;
+  overflow: hidden;
+  cursor: default;
+}
+
+.image-card img {
+  width: 100%;
+  height: auto;
+  max-height: 260px;
+  object-fit: cover;
+  display: block;
+  border-radius: 18px 18px 0 0;
+}
+
+.image-card-body {
+  padding: 16px 20px 18px;
+}
+
+.image-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #f0f0f5;
+  margin-bottom: 4px;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.image-card-caption {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.45);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.image-card-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.35);
+  margin-bottom: 6px;
+}
+
+/* ── Progress bar (auto-dismiss timer) ─────────────── */
+.dismiss-progress {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, rgba(251, 191, 36, 0.6), rgba(245, 158, 11, 0.3));
+  border-radius: 0 0 18px 18px;
+  width: 100%;
+  transform-origin: left;
+  animation: progressShrink var(--dismiss-duration, 12s) linear forwards;
+}
+
+/* ── Keyframes ─────────────────────────────────────── */
+@keyframes cardSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes progressShrink {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* ── Subtle ambient glow behind card ───────────────── */
+.glass-card::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 18px;
+  background: linear-gradient(
+    135deg,
+    rgba(251, 191, 36, 0.04) 0%,
+    transparent 40%,
+    transparent 60%,
+    rgba(99, 102, 241, 0.04) 100%
+  );
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* ── No evidence / links state ─────────────────────── */
+.evidence-card.hidden,
+.links-card.hidden {
+  display: none;
+}
+
+/* ── Responsive tweaks for smaller screens ─────────── */
+@media (max-width: 500px) {
+  .overlay-container {
+    width: 100vw;
+    padding: 20px 16px;
+  }
+  .overlay-container-left {
+    width: 100vw;
+    padding: 20px 16px;
+  }
+  .evidence-item {
+    min-width: 110px;
+    max-width: 140px;
+  }
+}

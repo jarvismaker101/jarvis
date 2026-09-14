@@ -1,0 +1,966 @@
+import io
+import math
+import os
+import shutil
+import tempfile
+import threading
+import time
+import traceback
+
+import requests
+from pydub import AudioSegment
+from pydub.playback import play
+
+from backend.config import FISH_API_KEY, FISH_MODEL, FISH_REFERENCE_ID, FISH_VOLUME_BOOST_DB
+# F32: one playback owner + identity-keyed audio; F33: every chunk that
+# actually reaches the device feeds the AEC reference path.
+from backend.services.audio_actor import (
+    actor_abort,
+    actor_begin,
+    actor_end,
+    actor_feed,
+    actor_is_current,
+    actor_play,
+    audio_cache_key,
+    make_sounddevice_factory,
+)
+from backend.services.echo_cancel import (
+    feed_reference as _aec_feed_reference,
+)
+
+
+def _resolve_tts_model():
+    """TTS model id per call: registry tts_model else env default FISH_MODEL.
+
+    Registry read is per-call with safe degradation to the env constant.
+    Provider field is ignored for the Fish HTTP call (always Fish Audio).
+    """
+    try:
+        from backend.services import model_registry
+        sel = model_registry.get_model_for_role("tts")
+        m = str(sel.get("model") or "").strip()
+        if m:
+            return m
+    except Exception:
+        pass
+    return FISH_MODEL
+
+try:
+    import av
+except Exception:
+    av = None
+
+try:
+    from pydub.playback import _play_with_simpleaudio
+except Exception:
+    _play_with_simpleaudio = None
+
+for _bin, _pref in (("ffmpeg", "converter"), ("ffprobe", "ffprobe")):
+    _found = shutil.which(_bin)
+    if _found:
+        setattr(AudioSegment, _pref, _found)
+
+
+TTS_URL = "https://api.fish.audio/v1/tts"
+
+# Reused across every request — skips the TCP + TLS handshake that a fresh
+# `requests.post` pays on each TTS call (~100-300ms on Windows).
+_session = requests.Session()
+
+# Shared decoded-audio cache. Playback fetches through here so a prefetch
+# thread can synthesise the next chunk while the current one plays.
+_audio_cache = {}
+_in_flight = {}
+_cache_lock = threading.Lock()
+_CACHE_MAX = 32
+
+_playback_lock = threading.Lock()
+_current_playback = None
+
+
+def _pcm_cache_key(text):
+    """[F32] Cache identity = TTS model + reference + format + text.
+
+    The same sentence spoken by two references (or two models) must never
+    share a cache slot — pre-G10 the PCM cache was keyed by text only.
+    """
+    return audio_cache_key(
+        _resolve_tts_model(), FISH_REFERENCE_ID, "pcm", str(text or ""))
+
+
+def _looks_like_mp3(content):
+    if content[:3] == b"ID3":
+        return True
+    return len(content) >= 2 and content[0] == 0xFF and (content[1] & 0xE0) == 0xE0
+
+
+def _decode_audio(content):
+    """Decode MP3 bytes via bundled PyAV first (robust), falling back to pydub+system ffmpeg."""
+    if av is not None:
+        try:
+            container = av.open(io.BytesIO(content), mode="r", format="mp3")
+            try:
+                audio_stream = None
+                for stream in container.streams:
+                    if stream.type == "audio":
+                        audio_stream = stream
+                        break
+                if audio_stream is None:
+                    raise ValueError("no audio stream")
+
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=44100)
+                chunks = []
+                for frame in container.decode(audio_stream):
+                    for resampled in resampler.resample(frame):
+                        chunks.append(resampled.to_ndarray())
+
+                if not chunks:
+                    raise ValueError("no decoded audio")
+
+                import numpy as np
+
+                data = np.concatenate(chunks, axis=1)
+                raw = data.tobytes()
+                return AudioSegment(
+                    data=raw,
+                    sample_width=2,
+                    frame_rate=44100,
+                    channels=1,
+                )
+            finally:
+                container.close()
+        except Exception as exc:
+            print("[FISH] PyAV decode failed, falling back to ffmpeg:", exc)
+    return None
+
+
+def _boost_volume(audio):
+    if FISH_VOLUME_BOOST_DB <= 0:
+        return audio
+
+    peak = audio.max
+    amp = audio.max_possible_amplitude
+    if peak > 0 and amp > 0:
+        gain_db = min(FISH_VOLUME_BOOST_DB, 20 * math.log10(0.9 * amp / peak))
+    else:
+        gain_db = FISH_VOLUME_BOOST_DB
+
+    return audio.apply_gain(gain_db) if gain_db > 0 else audio
+
+
+def _request_audio(text):
+    tts_model = _resolve_tts_model()
+    headers = {
+        "Authorization": f"Bearer {FISH_API_KEY}",
+        "Content-Type": "application/json",
+        "model": tts_model,
+    }
+    payload = {
+        "text": text,
+        "model": tts_model,
+        "format": "mp3",
+    }
+    if FISH_REFERENCE_ID:
+        payload["reference_id"] = FISH_REFERENCE_ID
+
+    response = _session.post(TTS_URL, json=payload, headers=headers, timeout=(5.05, 90))
+    if response.status_code != 200:
+        print("[FISH] Error:", response.status_code, response.text[:300])
+        return None
+    if not response.content or not _looks_like_mp3(response.content):
+        print("[FISH] Response was not audio:", response.headers.get("Content-Type"), "len", len(response.content), repr(response.content[:60]))
+        return None
+    return response.content
+
+
+def _request_audio_playable(text):
+    """Fetch MP3 bytes, decode to a mono/44.1kHz AudioSegment and boost volume.
+
+    Returns None on any failure (already has one retry like the old code).
+    """
+    content = _request_audio(text)
+    if content is None:
+        print("[FISH] Retrying once...")
+        content = _request_audio(text)
+    if content is None:
+        return None
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as file:
+        file.write(content)
+        path = file.name
+    try:
+        audio = _decode_audio(content)
+        if audio is None:
+            audio = AudioSegment.from_file(path, format="mp3")
+        return _boost_volume(audio)
+    except Exception:
+        print("[FISH] Decode failed:")
+        traceback.print_exc()
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _fetch_audio(text):
+    """Fetch + decode + boost, shared between prefetch and playback threads.
+
+    Cached by IDENTITY (model + reference + format + text) and deduplicated,
+    so a prefetching thread and the playback thread never issue a duplicate
+    TTS request for the same sentence. If the fetch fails, the failure is
+    cached too — the playback thread then falls through to the local-TTS
+    ladder immediately instead of re-waiting on the network timeout.
+    """
+    # [F32] Identity-consistent caching: the decoded form is keyed by
+    # model + reference + 'mp3' + text, the same identity rule the PCM
+    # path uses. Two references (or two models) never share decoded audio.
+    ck = audio_cache_key(
+        _resolve_tts_model(), FISH_REFERENCE_ID, "mp3", str(text or ""))
+    while True:
+        with _cache_lock:
+            if ck in _audio_cache:
+                return _audio_cache[ck]
+            done = _in_flight.get(ck)
+            if done is None:
+                done = threading.Event()
+                _in_flight[ck] = done
+                break
+        if not done.wait(timeout=60):
+            # The other thread stalled long enough — take the fetch over.
+            # (F32: this used to pop the undefined name `ck`... which was
+            # the same key it should have used all along.)
+            with _cache_lock:
+                _in_flight.pop(ck, None)
+                continue
+        with _cache_lock:
+            return _audio_cache.get(ck)
+
+    try:
+        audio = _request_audio_playable(text)
+        with _cache_lock:
+            _audio_cache[ck] = audio
+            if len(_audio_cache) > _CACHE_MAX:
+                _audio_cache.pop(next(iter(_audio_cache)))
+        return audio
+    finally:
+        with _cache_lock:
+            _in_flight.pop(ck, None)
+        done.set()
+
+
+def _boost_pcm_chunk(chunk_bytes):
+    """Apply FISH_VOLUME_BOOST_DB to a PCM s16le chunk (mono, 44100)."""
+    if FISH_VOLUME_BOOST_DB <= 0 or not chunk_bytes:
+        return chunk_bytes
+    try:
+        import numpy as np
+
+        arr = np.frombuffer(chunk_bytes, dtype=np.int16)
+        if arr.size == 0:
+            return chunk_bytes
+        peak = int(np.max(np.abs(arr)))
+        if peak == 0:
+            return chunk_bytes
+        amp = 32767
+        gain_db = min(FISH_VOLUME_BOOST_DB, 20 * math.log10(0.9 * amp / peak)) if peak > 0 else FISH_VOLUME_BOOST_DB
+        if gain_db <= 0:
+            return chunk_bytes
+        linear = 10 ** (gain_db / 20.0)
+        boosted = np.clip(arr.astype(np.float32) * linear, -32768, 32767).astype(np.int16)
+        return boosted.tobytes()
+    except Exception:
+        return chunk_bytes
+
+
+def _aec_chunk_for(rate, channels):
+    """Build the AEC reference hook for a playback format.
+
+    [F32/F33] Every chunk that reaches the DEVICE feeds the reference path,
+    tagged with the format it was rendered in, so the listener-side alignment
+    measures real time instead of assuming a rate.
+    """
+    def _hook(chunk):
+        try:
+            _aec_feed_reference(chunk, rate, 2, channels=channels)
+        except Exception:
+            pass
+
+    return _hook
+
+
+def _aec_chunk(chunk):
+    """F32/F33: every chunk that reaches the DEVICE feeds the AEC reference."""
+    try:
+        _aec_feed_reference(chunk, 44100, 2, channels=1)
+    except Exception:
+        pass
+
+
+def _stream_key(ck):
+    return ck if ck is not None else "pcm"
+
+
+def _player_thread(key, done, written, on_chunk=None, stream_factory=None):
+    """Run the actor's play loop on its own thread (the single owner)."""
+    chunk_hook = on_chunk or _aec_chunk
+
+    def _loop():
+        try:
+            written["bytes"] = actor_play(on_chunk=chunk_hook,
+                                          stream_factory=stream_factory)
+        except Exception as exc:  # pragma: no cover - hardware path
+            written["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_loop, name="audio-actor-play", daemon=True)
+    thread.start()
+    return thread
+
+
+def _drain_seconds(byte_count, rate=44100, channels=1):
+    """A bounded wait for draining *byte_count* bytes of s16 PCM.
+
+    Audio duration plus a margin, with a small floor: this is only a worst-case
+    guard, because the actor ends the wait as soon as the utterance is marked
+    complete or aborted.
+    """
+    return max(5.0, (byte_count / float(rate * channels * 2)) + 5.0)
+
+
+def _play_pcm_through_actor(pcm_bytes, handle, ck=None, stream_factory=None,
+                            rate=44100, channels=1):
+    """F32: play fully-synthesised PCM through the ONE owner.
+
+    The producer only SUBMITS chunks; ``AudioActor.play`` writes them and
+    accounts the consumed frames. Returns True when the audio was played (or
+    the user stopped it), False when the ring could not keep up and audio
+    would have been lost — or when the output device refused to open.
+    """
+    if not pcm_bytes:
+        return False
+    key = _stream_key(ck)
+    generation = actor_begin(key)
+    done = threading.Event()
+    written = {}
+    _player_thread(key, done, written,
+                   on_chunk=_aec_chunk_for(rate, channels),
+                   stream_factory=stream_factory)
+    failed = False
+    try:
+        chunk_size = 4096
+        for index in range(0, len(pcm_bytes), chunk_size):
+            if handle is not None and handle.stopped:
+                actor_abort()
+                break
+            if written.get("error") is not None:
+                # The device refused to open (or died): stop feeding at once
+                # instead of filling the ring behind a dead consumer.
+                actor_abort()
+                failed = True
+                break
+            chunk = pcm_bytes[index:index + chunk_size]
+            if not chunk:
+                continue
+            if not actor_feed(key, generation, chunk):
+                if not actor_is_current(key, generation):
+                    break  # a newer utterance or a stop took over
+                # Backpressure timed out: report honestly instead of
+                # pretending the whole sentence was spoken.
+                actor_abort()
+                failed = True
+                break
+        else:
+            actor_end(key, generation)
+    finally:
+        if not failed and actor_is_current(key, generation):
+            actor_end(key, generation)
+    done.wait(timeout=_drain_seconds(len(pcm_bytes), rate, channels))
+    if written.get("error") is not None:
+        raise written["error"]
+    return not failed
+
+
+def _replay_cached_pcm(cached_bytes, ck=None):
+    """Replay cached PCM (44100 mono s16) through the one playback owner."""
+    if not cached_bytes:
+        return False
+    handle = _register_sounddevice_playback()
+    try:
+        if handle.stopped:
+            return True
+        return _play_pcm_through_actor(bytes(cached_bytes), handle, ck=ck)
+    finally:
+        _clear_sounddevice_playback(handle)
+
+
+def _pcm_chunks_from_response(response):
+    """Yield aligned, boosted PCM chunks from a streaming TTS response.
+
+    FIX1: odd-byte splits across HTTP chunks are stitched back together so no
+    sample is ever half-written to the device.
+    """
+    residual = b""
+    for chunk in response.iter_content(chunk_size=4096):
+        if not chunk:
+            continue
+        chunk = residual + chunk
+        aligned_len = (len(chunk) // 2) * 2
+        if aligned_len < len(chunk):
+            residual = chunk[aligned_len:]
+            chunk = chunk[:aligned_len]
+        else:
+            residual = b""
+        if not chunk:
+            continue
+        boosted = _boost_pcm_chunk(chunk)
+        if boosted:
+            yield boosted
+    if residual:
+        # Flush the final odd byte padded to a full sample: never drop audio.
+        boosted = _boost_pcm_chunk(residual + b"\x00")
+        if boosted:
+            yield boosted
+
+
+def _do_pcm_stream(text, play=True):
+    """Core streaming: fetch PCM chunks, optionally play, always cache full.
+
+    F32: there is exactly ONE playback owner — ``AudioActor``. This function
+    no longer creates or writes an ``OutputStream`` of its own; it submits
+    immutable generation-tagged chunks and the actor's play loop writes them
+    (and accounts the frames it consumed).
+
+    Cancellation is registered BEFORE any cache/in-flight wait, so a stop that
+    arrives during a prefetch wait still aborts this playback instead of
+    registering a handle only after it was already cancelled.
+    """
+    if not FISH_API_KEY or not text or not text.strip():
+        return False
+    # [F32] Identity-keyed cache/in-flight (model + reference + format + text).
+    ck = _pcm_cache_key(text)
+    key = _stream_key(ck)
+
+    cached = None
+    with _cache_lock:
+        entry = _audio_cache.get(ck)
+        if isinstance(entry, (bytes, bytearray)) and entry:
+            cached = bytes(entry)
+
+    # [F32] Early cancellation registration: the stoppable handle exists
+    # before the first wait, so a stop during prefetch/read/write is honoured.
+    handle = _register_sounddevice_playback() if play else None
+    if handle is not None and handle.stopped:
+        _clear_sounddevice_playback(handle)
+        return True
+
+    is_owner = False
+    generation = None
+    try:
+        if not play:
+            if cached is not None:
+                return True
+        elif cached is not None:
+            return _play_pcm_through_actor(cached, handle, ck=ck)
+
+        # ── in-flight deduplication, keyed by the identity key ──
+        wait_evt = None
+        with _cache_lock:
+            evt = _in_flight.get(ck)
+            if evt is not None:
+                wait_evt = evt
+            else:
+                wait_evt = threading.Event()
+                _in_flight[ck] = wait_evt
+                is_owner = True
+        if not is_owner:
+            # Wait for the owner, then play the shared result rather than
+            # silently dropping the sentence.
+            if not wait_evt.wait(timeout=60):
+                return False
+            with _cache_lock:
+                entry = _audio_cache.get(ck)
+                cached = bytes(entry) if isinstance(entry, (bytes, bytearray)) and entry else None
+            if cached is None:
+                return False
+            if not play:
+                return True
+            return _play_pcm_through_actor(cached, handle, ck=ck)
+
+        tts_model = _resolve_tts_model()
+        headers = {
+            "Authorization": f"Bearer {FISH_API_KEY}",
+            "Content-Type": "application/json",
+            "model": tts_model,
+        }
+        payload = {
+            "text": text,
+            "model": tts_model,
+            "format": "pcm",
+            "latency": "balanced",
+            "sample_rate": 44100,
+        }
+        if FISH_REFERENCE_ID:
+            payload["reference_id"] = FISH_REFERENCE_ID
+
+        response = _session.post(TTS_URL, json=payload, headers=headers,
+                                 timeout=(5.05, 90), stream=True)
+        try:
+            if response.status_code != 200:
+                return False
+            if not play:
+                # Prefetch: drain into the cache without touching the device.
+                full = bytearray()
+                for chunk in _pcm_chunks_from_response(response):
+                    full.extend(chunk)
+                if not full:
+                    return False
+                _cache_pcm(ck, bytes(full))
+                return True
+
+            # [F32] ONE owner: the actor plays while this thread only feeds.
+            generation = actor_begin(key)
+            done = threading.Event()
+            written = {}
+            _player_thread(key, done, written)
+            full = bytearray()
+            failed = False
+            read_error = None
+            try:
+                for chunk in _pcm_chunks_from_response(response):
+                    if handle is not None and handle.stopped:
+                        actor_abort()
+                        break
+                    full.extend(chunk)
+                    if not actor_feed(key, generation, chunk):
+                        if not actor_is_current(key, generation):
+                            break
+                        actor_abort()
+                        failed = True
+                        break
+                else:
+                    actor_end(key, generation)
+            except BaseException as exc:
+                # A read/network error mid-utterance: the chunks already fed
+                # ARE played (never replay the sentence from the start), then
+                # the error surfaces for the caller to decide about fallback.
+                read_error = exc
+            finally:
+                if not failed and actor_is_current(key, generation):
+                    actor_end(key, generation)
+                done.wait(timeout=_drain_seconds(len(full)))
+            if written.get("error") is not None:
+                raise written["error"]
+            if read_error is not None:
+                raise read_error
+            if written.get("error") is not None:
+                raise written["error"]
+            if not full:
+                return False
+            if failed:
+                return False
+            _cache_pcm(ck, bytes(full))
+            return True
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        # FIX3/F32: audio already reached the device — never report failure
+        # (and never fall back and replay the sentence from the beginning).
+        # `generation` is only set once THIS call opened its own utterance, so
+        # a stale cursor from an earlier sentence cannot be mistaken for it.
+        if play and generation is not None and _actor_heard_audio():
+            print(f"[FISH] pcm stream error after partial playback: {exc}")
+            return True
+        print(f"[FISH] pcm stream error: {exc}")
+        traceback.print_exc()
+        return False
+    finally:
+        if handle is not None:
+            _clear_sounddevice_playback(handle)
+        with _cache_lock:
+            if is_owner:
+                # [F32] the in-flight entry is keyed by the IDENTITY key; the
+                # old code popped by text and leaked the entry forever.
+                evt2 = _in_flight.pop(ck, None)
+            else:
+                evt2 = None
+        if evt2 is not None:
+            evt2.set()
+
+
+def _actor_heard_audio():
+    """True when the playback owner actually wrote audio to the device.
+
+    [F32] consumed-frame accounting is the only trustworthy answer to "did the
+    user already hear part of this?" — the old code guessed from a local
+    ``wrote_any`` flag that counted PRODUCED chunks, not played ones.
+    """
+    try:
+        from backend.services import audio_actor
+        return audio_actor.get_actor().spoke_bytes() > 0
+    except Exception:
+        return False
+
+
+def _cache_pcm(ck, pcm_bytes):
+    """Store utterance PCM under its identity key with bounded eviction."""
+    with _cache_lock:
+        _audio_cache[ck] = bytes(pcm_bytes)
+        while len(_audio_cache) > _CACHE_MAX:
+            oldest = next(iter(_audio_cache))
+            if oldest == ck:
+                break
+            _audio_cache.pop(oldest, None)
+
+
+def prefetch_fish_audio(text):
+    """Synthesise *text* in the background so playback never waits on TTS.
+
+    The decoded audio lands in the shared cache; when the playback loop
+    reaches this sentence, `speak_fish_audio` finds it ready and starts
+    instantly. Surfaces as no-op if Fish is unavailable.
+    Uses streaming PCM path (collect-to-cache, no playback) with fallback to legacy.
+    """
+    if not FISH_API_KEY or not text or not text.strip():
+        return
+
+    def _prefetch():
+        # Try streaming collect-to-cache first
+        if _do_pcm_stream(text, play=False):
+            return
+        # Fallback to legacy MP3 — FIX5: cache raw PCM bytes so _do_pcm_stream
+        # can replay it. [F32] stored under the IDENTITY key, the same slot the
+        # play path looks in (it used the bare text before, so the replay never
+        # found the prefetched bytes and re-synthesised the sentence).
+        audio = _fetch_audio(text)
+        if audio is not None:
+            try:
+                pcm_bytes = audio.set_frame_rate(44100).set_channels(1).raw_data
+                pcm_bytes = bytes(pcm_bytes)
+                ck = _pcm_cache_key(text)
+                with _cache_lock:
+                    cached = _audio_cache.get(ck)
+                    already = isinstance(cached, (bytes, bytearray))
+                if not already:
+                    # _cache_pcm takes the cache lock itself: never call it
+                    # while already holding that (non-reentrant) lock.
+                    _cache_pcm(ck, pcm_bytes)
+            except Exception:
+                pass
+
+    threading.Thread(target=_prefetch, daemon=True).start()
+
+
+def warm_up_fish_tts():
+    """Prime the Fish model and HTTP session so the first real reply is fast.
+
+    The first TTS request of a run pays noticeably slower synthesis. Calling
+    this at boot (in a background thread) makes that warm-up happen early;
+    the tiny warm-up audio is merely cached, never played.
+    """
+    try:
+        _fetch_audio("Warm up, sir.")
+    except Exception:
+        pass
+
+
+TTS_OUTPUT_DEVICE_ENV = "JARVIS_TTS_OUTPUT_DEVICE"
+
+# Cached device resolution — queried once per process, not per chunk
+_cached_device = None
+_cached_device_valid = False
+_cached_device_lock = threading.Lock()
+
+
+def _get_cached_device():
+    global _cached_device, _cached_device_valid
+    with _cached_device_lock:
+        if _cached_device_valid:
+            return _cached_device
+        dev = _resolve_output_device()
+        _cached_device = dev
+        _cached_device_valid = True
+        return dev
+
+
+def _clear_device_cache():
+    global _cached_device, _cached_device_valid
+    with _cached_device_lock:
+        _cached_device_valid = False
+        _cached_device = None
+
+
+def _resolve_output_device():
+    """Resolve the TTS render device from JARVIS_TTS_OUTPUT_DEVICE.
+
+    * unset / empty / default|system|auto  -> None (Windows default output)
+    * numeric                              -> that exact sounddevice index,
+                                              validated as an output device
+    * anything else                        -> case-insensitive substring match
+                                              against output-device names;
+                                              clean 48k stereo endpoints score
+                                              highest among matches
+
+    Never raises and never pins broken hardware: when nothing usable matches
+    we log loudly and fall back to the system default. The previous version
+    hard-pinned any endpoint whose name contained "oneplus", which routed
+    every reply into a possibly-silent Bluetooth profile with no way out —
+    explicit routing is now opt-in via the env var.
+    """
+    wanted = (os.getenv(TTS_OUTPUT_DEVICE_ENV) or "").strip()
+    if not wanted or wanted.lower() in ("default", "system", "auto"):
+        return None
+
+    try:
+        import sounddevice as sd
+
+        devs = sd.query_devices()
+    except Exception as e:
+        print(f"[FISH] device resolution failed ({e}) - using system default")
+        return None
+
+    if wanted.isdigit():
+        idx = int(wanted)
+        if 0 <= idx < len(devs) and devs[idx].get("max_output_channels", 0) >= 1:
+            d = devs[idx]
+            print(
+                f"[FISH] output device pinned by index: idx={idx} "
+                f"'{d.get('name')}' ch={d.get('max_output_channels')} "
+                f"sr={d.get('default_samplerate')}"
+            )
+            return idx
+        print(
+            f"[FISH] {TTS_OUTPUT_DEVICE_ENV}={wanted} is not an output-capable "
+            "sounddevice index - using system default"
+        )
+        return None
+
+    needle = wanted.lower()
+    candidates = []
+    for i, d in enumerate(devs):
+        ch = d.get("max_output_channels", 0)
+        if ch < 2:
+            continue
+        name = d.get("name", "")
+        if needle not in name.lower():
+            continue
+        sr = int(d.get("default_samplerate") or 0)
+        score = 0
+        if sr == 48000 and ch == 2:
+            score = 3
+        elif sr == 48000:
+            score = 2
+        elif ch == 2:
+            score = 1
+        candidates.append((score, i, name))
+    if not candidates:
+        print(
+            f"[FISH] no output device name containing '{wanted}' - "
+            "using system default"
+        )
+        return None
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    _, idx, name = candidates[0]
+    print(f"[FISH] output device matched by name '{wanted}': idx={idx} '{name}'")
+    return idx
+
+
+class _SoundDevicePlayback:
+    """Stoppable handle so stop_speaking()/stop_fish_audio() can cut playback.
+
+    [F32] "Stop" means aborting THIS utterance through the one playback owner:
+    the actor stops and discards its own stream and ring. It deliberately does
+    NOT call ``sd.stop()``, which kills every PortAudio stream in the process
+    (earcons, other engines) and is therefore not a reliable single-utterance
+    abort.
+    """
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+        try:
+            actor_abort()
+        except Exception:
+            pass
+
+
+def _register_sounddevice_playback():
+    global _current_playback
+
+    handle = _SoundDevicePlayback()
+    with _playback_lock:
+        _current_playback = handle
+    return handle
+
+
+def _clear_sounddevice_playback(handle):
+    global _current_playback
+
+    with _playback_lock:
+        if _current_playback is handle:
+            _current_playback = None
+
+
+def _play_via_sounddevice(audio):
+    """Play AudioSegment via sounddevice, resampled to 48k stereo.
+
+    Route selection (first attempt wins):
+      1. JARVIS_TTS_OUTPUT_DEVICE when set (index or name-substring pin)
+      2. Windows default render device
+
+    WASAPI output devices on Windows (OnePlus/Realtek) reject 44.1kHz, so we
+    upsample to 48kHz stereo first. If a pinned endpoint cannot be opened we
+    retry once on the system default before giving up and letting the caller
+    fall through to simpleaudio/ffplay.
+
+    Near-silent decoded audio is rejected outright so a dead Fish response
+    falls through to the next engine instead of wasting playback time.
+
+    Bluetooth note: keeping a headset mic open can flip buds into the
+    Hands-Free profile where the A2DP sink renders nothing audible even
+    though the mixer consumes the stream. If logs say "playback done" but
+    you hear silence, switch JARVIS_MIC_NAME off the headset or pin
+    JARVIS_TTS_OUTPUT_DEVICE to speakers (see check_tts_devices script).
+    """
+    # Register BEFORE anything else (even the lazy imports): a stop arriving
+    # during setup must short-circuit instead of racing past an unregistered
+    # handle. Exactly one handle per call; `finally` always unregisters it.
+    handle = _register_sounddevice_playback()
+    try:
+        if handle.stopped:
+            print("[FISH] sounddevice playback interrupted")
+            return True
+
+        peak = audio.max
+        if peak < 40:
+            print(f"[FISH] decoded audio near-silent (peak={peak}) - skipping playback")
+            return False
+
+        dev_index = _get_cached_device()
+
+        target = audio.set_frame_rate(48000)
+        if target.channels == 1:
+            target = target.set_channels(2)
+        # F32: raw s16le bytes for the ONE playback owner — no local stream
+        # and no sd.play() (which drives a global stream nobody owns).
+        pcm = target.raw_data
+
+        attempts = [dev_index, None] if dev_index is not None else [None]
+
+        for attempt in attempts:
+            if handle.stopped:
+                print("[FISH] sounddevice playback interrupted")
+                return True
+            label = f"idx={attempt}" if attempt is not None else "system default"
+            try:
+                print(f"[FISH] sounddevice playing {len(audio)}ms to {label}")
+                ok = _play_pcm_through_actor(
+                    pcm, handle, ck=("decoded", 48000, 2),
+                    stream_factory=make_sounddevice_factory(
+                        device=attempt, samplerate=48000, channels=2),
+                    rate=48000, channels=2)
+            except Exception as exc:
+                print(f"[FISH] could not open {label}: {exc}")
+                if attempt is not None and attempt == dev_index:
+                    _clear_device_cache()
+                continue
+            if handle.stopped:
+                print("[FISH] sounddevice playback interrupted")
+            else:
+                print("[FISH] sounddevice 48k playback done")
+            return ok
+
+        return False
+    except Exception as e:
+        print(f"[FISH] sounddevice error: {e}")
+        traceback.print_exc()
+        return False
+    finally:
+        _clear_sounddevice_playback(handle)
+
+
+def speak_fish_audio(text, before_playback=None):
+    global _current_playback
+
+    try:
+        if not FISH_API_KEY:
+            print("[FISH] Missing FISH_API_KEY")
+            return False
+
+        # Streaming PCM path: incremental playback starts at first chunk (~1s earlier),
+        # no decode, no temp files. Falls back to whole-MP3 on failure.
+        try:
+            if _do_pcm_stream(text, play=True):
+                return True
+        except Exception as exc:
+            print(f"[FISH] pcm stream failed, falling back: {exc}")
+
+        audio = _fetch_audio(text)
+        if audio is None:
+            return False
+
+        if callable(before_playback):
+            before_playback()
+
+        # 1) sounddevice (48k stereo to default device — confirmed audible on OnePlus earbuds)
+        if _play_via_sounddevice(audio):
+            return True
+
+        # 2) simpleaudio (WASAPI) fallback — note: rejects 44.1kHz, so it is NOT preferred
+        if _play_with_simpleaudio:
+            try:
+                print(f"[FISH] simpleaudio playing {len(audio)}ms to default device")
+                playback = _play_with_simpleaudio(audio)
+                with _playback_lock:
+                    _current_playback = playback
+                while playback.is_playing():
+                    time.sleep(0.05)
+                with _playback_lock:
+                    if _current_playback is playback:
+                        _current_playback = None
+                print("[FISH] simpleaudio done")
+                return True
+            except Exception as e:
+                print(f"[FISH] simpleaudio failed: {e}")
+
+        # 3) pydub ffplay fallback
+        print(f"[FISH] falling back to pydub ffplay {len(audio)}ms")
+        play(audio)
+        print("[FISH] ffplay done")
+
+        return True
+    except Exception:
+        print("[FISH] Exception:")
+        traceback.print_exc()
+        return False
+
+
+def stop_fish_audio():
+    global _current_playback
+    # [F32] abort the single playback owner: stops THIS stream, drops its
+    # ring and discards stale-generation PCM (never sd.stop() for everyone).
+    actor_abort()
+    with _playback_lock:
+        playback = _current_playback
+
+    if playback:
+        try:
+            playback.stop()
+        except Exception:
+            pass
+
+    # Drop the handle so already-buffered PCM is never resumed and a fresh
+    # speak() starts clean. The exiting playback thread's finally only
+    # clears its OWN handle (safe against a concurrent new registration:
+    # compare-and-clear under the lock never wipes a newer handle).
+    with _playback_lock:
+        if playback is not None and _current_playback is playback:
+            _current_playback = None
+            # [F32] pop the identity key in the owner finally.

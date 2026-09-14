@@ -1,0 +1,1278 @@
+import random
+import datetime
+import subprocess
+import time
+import threading
+import queue
+import os
+import re
+import glob
+import json
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+from backend import config as _config  # noqa: F401 - loads .env before service imports
+from backend.config import BACKEND_PORT
+from backend import listener_state
+from backend.services.listener import listen, _close_microphone_source
+from backend.services import local_auth
+from backend.services.fish_voice import warm_up_fish_tts
+from backend.services.voice import (
+    StreamSpeaker,
+    get_active_stream,
+    set_active_stream,
+    speak,
+    stop_speaking,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# G11 / F50 — the voice process is an I/O WORKER, not a second brain.
+#
+# Every utterance is submitted to the ONE backend task runtime over the
+# authenticated local HTTP contract; the backend owns conversation events,
+# approvals, task checkpoints, model decisions and job cancellation. This
+# process only captures audio, transcribes, submits, and speaks — and it
+# PUBLISHES its real listening state to the backend (POST /voice-state/publish)
+# instead of letting the UI read this process's empty listener_state copy.
+# Deliberately NO import of backend.core.brain: importing it here would give
+# the voice process a second, never-authoritative copy of the intelligence
+# state (the exact module-copy bug the audit flagged).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _local_token():
+    """Per-launch local command token injected by the supervisor."""
+    return os.getenv("JARVIS_LOCAL_TOKEN", "")
+
+
+def _backend_headers():
+    """The ONE authenticated header set for backend calls (F51).
+
+    Delegates to ``local_auth.auth_headers`` so the header name/shape lives
+    in exactly one place; auth now FAILS CLOSED outside explicit dev mode, so
+    every non-public backend call from this worker must carry it.
+    """
+    return local_auth.auth_headers()
+
+
+def _post_backend(path, payload, timeout=2.5):
+    """POST a control command to the backend; returns (ok, reply)."""
+    try:
+        request = Request(
+            f"http://127.0.0.1:{BACKEND_PORT}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers=_backend_headers(),
+        )
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        try:
+            return True, json.loads(body)
+        except Exception:
+            return True, {}
+    except Exception as exc:
+        print(f"[VOICE→BACKEND] {path} failed: {exc}")
+        return False, None
+
+
+def _get_backend(path, timeout=1.0):
+    """GET a backend endpoint, authenticated (F51).
+
+    Non-public reads are behind the launch token now: the task-mute poll
+    (``/ui-state``) silently returned None without it, which made
+    ``backend_task_running`` permanently False.
+    """
+    try:
+        request = Request(
+            f"http://127.0.0.1:{BACKEND_PORT}{path}",
+            method="GET",
+            headers=_backend_headers(),
+        )
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+# ── Published task state (replaces the dead module-copy flag) ───────────────
+_TASK_STATE_POLL_S = 1.0
+_task_running_last_known = False
+_task_running_checked_at = 0.0
+
+
+def backend_task_running():
+    """Is a browser/task job running — as the BACKEND reports it?
+
+    The voice process must never read a module copy of this flag: the task
+    runs in the backend process. Polled (1s TTL) from the authoritative
+    /ui-state; on request failure the last known value is kept.
+    """
+    global _task_running_last_known, _task_running_checked_at
+    now = time.monotonic()
+    if now - _task_running_checked_at >= _TASK_STATE_POLL_S:
+        _task_running_checked_at = now
+        data = _get_backend("/ui-state")
+        if isinstance(data, dict) and "task_running" in data:
+            _task_running_last_known = bool(data.get("task_running"))
+    return _task_running_last_known
+
+
+# ── Voice-state publisher (F50: publish, don't expose a module copy) ────────
+_voice_state_seq = 0
+
+
+def _publish_voice_state_loop():
+    """Publish this worker's real listening state to the backend every ~1s."""
+    global _voice_state_seq
+    while True:
+        try:
+            snapshot = listener_state.get_voice_state()
+            _voice_state_seq += 1
+            snapshot["state_seq"] = _voice_state_seq
+            snapshot["publisher_pid"] = os.getpid()
+            _post_backend("/voice-state/publish", snapshot, timeout=1.0)
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+# ── Backend submission (F50: the utterance goes to the ONE runtime) ─────────
+def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
+                 timeout=600):
+    """Submit one utterance to the backend task runtime; return the reply.
+
+    Prefers the SSE /ask/stream contract (F23/F26): deltas are fed to
+    ``stream_sink`` (the voice speaker) exactly like the old in-process
+    ``process_message(stream_reply=...)`` did, and the terminal frame
+    carries the authoritative reply. ``speak=False`` keeps the backend
+    silent — playback ownership stays with this I/O worker.
+
+    F23: the worker carries a cursor (``last_event_id``) and resumes from it
+    when a stream drops, so a reconnect restores the rest of the reply WITHOUT
+    replaying deltas it already spoke — the old code always re-attached from
+    the beginning, so every network hiccup repeated the answer out loud.
+    ``replace``/snapshot frames are honoured: only text that EXTENDS what has
+    already been spoken is fed to the sink (audio that has been played cannot
+    be un-played), and ``replace_sink`` is told about the authoritative text
+    when the caller can re-render it.
+    """
+    payload = {
+        "message": text,
+        "request_id": request_id,
+        "speak": False,
+        "origin": "voice",
+    }
+    headers = _backend_headers()
+
+    def _attempt_stream():
+        """One stream attempt starting at the current cursor.
+
+        Returns ``(reply, finished, cursor)``: *finished* True means the
+        terminal frame was reached (or the request failed permanently).
+        """
+        cursor_local = payload.get("last_event_id", -1)
+        spoken_local = payload.get("_spoken", "")
+        request = Request(
+            f"http://127.0.0.1:{BACKEND_PORT}/ask/stream",
+            data=json.dumps({
+                "message": text,
+                "request_id": request_id,
+                "speak": False,
+                "origin": "voice",
+                "last_event_id": cursor_local,
+            }).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        terminal_reply = ""
+        with urlopen(request, timeout=timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    frame = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                ftype = frame.get("type")
+                seq = frame.get("seq")
+                if isinstance(seq, int) and seq > cursor_local:
+                    cursor_local = seq
+                # F31: only FINAL-answer frames are spoken or counted as
+                # spoken. A reasoning/thinking frame (explicit ``channel``, or
+                # a legacy ``thought``/``reasoning`` flag) is preserved by the
+                # transport but must never reach TTS or the spoken history.
+                channel = frame.get("channel")
+                if channel is None and (frame.get("thought")
+                                        or frame.get("reasoning")):
+                    channel = "reasoning"
+                if ftype == "delta":
+                    if channel not in (None, "final"):
+                        continue
+                    text_delta = frame.get("text") or ""
+                    if text_delta:
+                        spoken_local += text_delta
+                        if stream_sink is not None:
+                            try:
+                                stream_sink(text_delta)
+                            except Exception:
+                                pass
+                elif ftype == "reasoning":
+                    # A dedicated reasoning frame: never spoken.
+                    continue
+                elif ftype == "replace":
+                    if channel not in (None, "final"):
+                        continue
+                    full = frame.get("text") or ""
+                    if replace_sink is not None:
+                        try:
+                            replace_sink(full)
+                        except Exception:
+                            pass
+                    elif stream_sink is not None and full.startswith(spoken_local):
+                        # A pure extension: speak only the new tail. Anything
+                        # else would repeat audio the user already heard.
+                        tail = full[len(spoken_local):]
+                        if tail:
+                            try:
+                                stream_sink(tail)
+                            except Exception:
+                                pass
+                    spoken_local = full or spoken_local
+                elif ftype == "completed":
+                    terminal_reply = frame.get("reply") or terminal_reply
+                    return terminal_reply, True, cursor_local, spoken_local
+                elif ftype == "interrupted":
+                    return frame.get("reply") or terminal_reply, True, \
+                        cursor_local, spoken_local
+                elif ftype == "error":
+                    return ("Error: %s" % (frame.get("error") or "unknown error"),
+                            True, cursor_local, spoken_local)
+        # The stream ended without a terminal frame: a dropped connection.
+        return terminal_reply, False, cursor_local, spoken_local
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            reply, finished, cursor, spoken = _attempt_stream()
+        except Exception as exc:
+            last_error = exc
+            print("[VOICE→BACKEND] stream submit failed: %s" % exc)
+            if attempt == 0:
+                # Nothing has been spoken yet: this is a plain connection
+                # failure, so fall through to the non-stream endpoint.
+                break
+            time.sleep(0.2)
+            payload["last_event_id"] = payload.get("last_event_id", -1)
+            continue
+        payload["last_event_id"] = cursor
+        payload["_spoken"] = spoken
+        if finished:
+            return reply or None
+        # Reconnect from the cursor: the resumed stream skips everything the
+        # speaker already heard.
+        time.sleep(0.2)
+
+    # Non-stream fallback: same runtime, one JSON round-trip.
+    try:
+        request = Request(
+            f"http://127.0.0.1:{BACKEND_PORT}/ask",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        return data.get("reply") or None
+    except Exception as exc2:
+        print("[VOICE→BACKEND] ask fallback failed: %s" % exc2)
+        return None
+
+BOOT_RESPONSES = [
+    "Good to see you back, sir. What's on your mind today?",
+    "I'm here, sir. How can I assist you?",
+    "At your service. What would you like to do?",
+    "Ready when you are. Tell me your command.",
+    "Welcome back, sir. What are we working on today?",
+    "Always listening. Go ahead.",
+    "Nice to have you back. What's the plan?"
+]
+
+DESKTOP = Path(os.getenv("JARVIS_DESKTOP_PATH", str(Path.home() / "Desktop")))
+
+command_queue = queue.Queue()
+
+# ─────────────────────────────────────────
+# STOP TALKING — English + Hindi variants
+# ─────────────────────────────────────────
+STOP_TALKING_EN = [
+    "stop speaking", "stop talking", "stop voice",
+    "be quiet", "shut up", "silence"
+]
+
+STOP_TALKING_HI = [
+    # chup = quiet/silent
+    "chup ho jao", "chup ho ja", "chup raho",
+    "chup ho", "chup kar", "chup karo",
+    # band = stop/close (for voice only, not shutdown)
+    "bolna band karo", "bolna band karo",
+    "bol mat", "bas karo",
+    # mishears
+    "cup ho jao", "choop", "chup jao",
+    "cheap ho", "cheap raho",
+]
+
+# ─────────────────────────────────────────
+# SHUTDOWN — English + Hindi variants
+# ─────────────────────────────────────────
+SHUTDOWN_EN = [
+    ("jarvis", "stop listening"),
+    ("jarvis", "shutdown"),
+    ("jarvis", "shut down"),
+    ("jarvis", "stop", "listening"),
+]
+
+SHUTDOWN_HI_PHRASES = [
+    # band ho = shut down
+    "band ho jao", "band ho ja", "band ho",
+    "band karo", "band kar do", "bandh karo",
+    "sab band", "chalo band",
+    # bund = mishear of band
+    "bund ho", "bund karo",
+    # sunna band karo = stop listening
+    "sunna band", "sunna band karo",
+    "mat suno", "sun mat",
+]
+
+JARVIS_VARIANTS = [
+    "jarvis", "jervis", "jarvish", "harvey",
+    "jarvas", "jarbus", "garvis", "jarwis",
+]
+
+# ─────────────────────────────────────────
+# CONTINUE VARIANTS
+# ─────────────────────────────────────────
+CONTINUE_PHRASES = [
+    "continue", "carry on", "go on", "keep going",
+    "aage bolo", "aage boliye", "jaari rakho",
+    "bolo aage", "continue karo",
+]
+
+# F35 — one exact, target-aware multilingual grammar -------------------------
+# Every control below is matched as a WHOLE normalized token sequence (never a
+# substring) and routed to exactly ONE owner. The old code mixed grammars:
+# Hindi shutdown was substring-based ("music band karo" matched "band karo"),
+# negation was handled only for the research phrases, "don't continue" still
+# resumed, pause had no handler at all, speech stop depended on this process's
+# own speaking flag, and shutdown called an UNAUTHENTICATED warm-stop.
+#
+# Targets:
+#   speech   -> the active narration/TTS (backend /speak/*)
+#   task     -> the running job                (backend /task/stop)
+#   approval -> the armed consent gate         (backend /approvals/reset)
+#   pause    -> narration, but resumable       (backend /speak/pause)
+#   continue -> resume the paused narration    (backend /speak/resume)
+#   sleep    -> warm sleep, UI down, backend warm (watcher /stop, authed)
+#   shutdown -> full shutdown of the whole stack  (watcher /shutdown, authed)
+SPEECH_STOP_EN = (
+    "stop speaking", "stop the speaking", "stop talking", "stop the talking",
+    "stop voice", "stop your voice", "stop the voice", "be quiet", "shut up",
+    "silence", "quiet", "stop the speech", "stop speech", "enough talking",
+)
+
+SPEECH_STOP_HI = (
+    "chup ho jao", "chup ho ja", "chup raho", "chup ho", "chup kar",
+    "chup karo", "bolna band karo", "bolna band", "bolna chup", "bol mat",
+    "bas karo", "bas", "awaz band karo", "awaaz band karo",
+    # mishears of the same command
+    "cup ho jao", "choop", "chup jao", "cheap ho", "cheap raho",
+)
+
+TASK_STOP_EN = (
+    "stop task", "stop the task", "stop this task", "cancel task",
+    "cancel the task", "abort task", "abort the task", "kill task",
+    "kill the task", "stop it", "stop doing that", "stop working on it",
+)
+
+TASK_STOP_HI = (
+    "kaam band karo", "kaam rok do", "kaam roko", "task band karo",
+    "task rok do", "task cancel karo", "kaam cancel karo", "kaam band",
+)
+
+APPROVAL_CANCEL_EN = (
+    "cancel approval", "cancel the approval", "cancel that", "cancel that action",
+    "cancel screen action", "cancel the screen action", "don't do that",
+    "dont do that", "do not do that", "no don't do it", "cancel the action",
+)
+
+APPROVAL_CANCEL_HI = (
+    "approval cancel karo", "manzoori cancel karo", "manjuri cancel karo",
+    "wo mat karo", "ye mat karo", "aisa mat karo",
+)
+
+PAUSE_EN = (
+    "pause", "pause it", "pause that", "pause the speech", "pause speaking",
+    "hold on", "hold that", "wait", "wait a moment", "give me a moment",
+)
+
+PAUSE_HI = (
+    "ruk jao", "ruko", "ruko zara", "pause karo", "thoda ruko", "ek minute",
+    "ek second", "ruk", "zara ruko",
+)
+
+CONTINUE_HI = (
+    "aage bolo", "aage boliye", "jaari rakho", "bolo aage", "continue karo",
+    "aage chalo", "wapas bolo",
+)
+
+SLEEP_EN = (
+    "sleep", "go to sleep", "sleep mode", "warm sleep", "standby",
+    "go to standby", "take a rest",
+)
+
+SLEEP_HI = (
+    "so jao", "sone jao", "aaram karo", "sleep karo", "so ja",
+)
+
+SHUTDOWN_EN_PHRASES = (
+    "stop listening", "shutdown", "shut down", "shut it down", "power off",
+    "turn off", "turn yourself off", "exit jarvis", "close jarvis", "quit jarvis",
+)
+
+SHUTDOWN_HI_EXACT = (
+    "band ho jao", "band ho ja", "band ho", "band karo", "band kar do",
+    "bandh karo", "bandh kar do", "sab band karo", "sab band", "chalo band",
+    "bund ho", "bund karo", "sunna band karo", "sunna band", "mat suno",
+    "sun mat", "sunna band kar do",
+)
+
+#: Negation anywhere in the phrase, or in the run-up to it, cancels the match
+#: ("don't stop the research", "mat band karo", "band mat karo"). Both
+#: apostrophe forms normalize to the same token because normalize strips them.
+NEGATION_TOKENS = frozenset((
+    "dont", "not", "never", "mat", "nahi", "nahin", "nako", "without",
+))
+NEGATION_WINDOW = 3
+
+#: Trailing politeness/adverbs that do not change a control's meaning.
+COMMAND_TAIL_TOKENS = frozenset((
+    "now", "please", "sir", "maam", "madam", "yaar", "yarr", "zara", "ab",
+    "abhi", "quickly", "immediately", "fast", "jaldi", "thoda", "just",
+))
+
+#: Classification precedence: the NON-shutdown controls win, so a phrase like
+#: "bolna band karo" (stop talking) or "kaam band karo" (stop the task) can
+#: never be read as shutdown just because it contains "band karo".
+CONTROL_GRAMMAR = (
+    ("speech_stop", (SPEECH_STOP_EN, SPEECH_STOP_HI)),
+    ("task_stop", (TASK_STOP_EN, TASK_STOP_HI)),
+    ("approval_cancel", (APPROVAL_CANCEL_EN, APPROVAL_CANCEL_HI)),
+    ("pause", (PAUSE_EN, PAUSE_HI)),
+    ("continue", (tuple(CONTINUE_PHRASES), CONTINUE_HI)),
+    ("sleep", (SLEEP_EN, SLEEP_HI)),
+    ("shutdown", (SHUTDOWN_EN_PHRASES, SHUTDOWN_HI_EXACT)),
+)
+
+
+#: Articles carry no meaning in a control phrase ("stop the task" == "stop task").
+ARTICLE_TOKENS = frozenset(("the", "a", "an"))
+
+#: Tokens that may remain in the utterance around a matched control phrase
+#: without making it a different command.
+CONTROL_NEUTRAL_TOKENS = frozenset((
+    "the", "a", "an", "it", "that", "this", "my", "your", "please", "now",
+    "jarvis",
+))
+
+
+def normalize_control_text(text):
+    """Normalize an utterance for the control grammar.
+
+    Apostrophes are removed (both ``'`` and ``’``) so "don't" and "dont" are
+    the same token, the Jarvis name and other fillers are dropped, articles
+    are dropped, and trailing politeness/adverbs are ignored.
+    """
+    cleaned = (text or "").lower().replace("\u2019", "").replace("'", "")
+    words = [word for word in re.findall(r"[a-z0-9]+", cleaned)
+             if word not in JARVIS_VARIANTS]
+    filler = {"please", "sir", "hey", "ok", "okay", "oh"}
+    while words and words[0] in filler:
+        words.pop(0)
+    while words and (words[-1] in filler or words[-1] in COMMAND_TAIL_TOKENS):
+        words.pop()
+    return [word for word in words if word not in ARTICLE_TOKENS]
+
+
+def _phrase_tokens(phrase):
+    return [word for word in re.findall(r"[a-z0-9]+", phrase)
+            if word not in JARVIS_VARIANTS and word not in ARTICLE_TOKENS]
+
+
+def _negated(tokens, start, length):
+    """Is the phrase at *start* negated by the words right before it?
+
+    Only the run-up is inspected: a negator INSIDE the matched run is part of
+    the phrase's own vocabulary ("don't do that" is an approval cancel, not a
+    negated cancel), while a negator before it turns the phrase into its
+    opposite ("don't stop the research", "mat band karo").
+    """
+    return any(token in NEGATION_TOKENS
+               for token in tokens[max(0, start - NEGATION_WINDOW):start])
+
+
+def _match_tokens(tokens, phrases):
+    """Whole-utterance match, negation-aware and target-aware.
+
+    The phrase must appear as a contiguous token run AND everything else in
+    the utterance must be neutral (a particle, not another target word): this
+    is what stops "music band karo" from reading as "shut down" and
+    "don't stop the research" from reading as a stop request.
+    """
+    for phrase in phrases:
+        wanted = _phrase_tokens(phrase)
+        if not wanted or len(wanted) > len(tokens):
+            continue
+        for start in range(0, len(tokens) - len(wanted) + 1):
+            if tokens[start:start + len(wanted)] != wanted:
+                continue
+            if _negated(tokens, start, len(wanted)):
+                continue
+            rest = tokens[:start] + tokens[start + len(wanted):]
+            if all(token in NEGATION_TOKENS or token in COMMAND_TAIL_TOKENS
+                   or token in CONTROL_NEUTRAL_TOKENS for token in rest):
+                return phrase
+    return None
+
+
+def classify_control(text):
+    """Classify an utterance as exactly one control command (or None).
+
+    This is the ONE grammar the voice runtime consults before any mute: an
+    exact, target-aware, negation-aware multilingual match. Returns one of
+    ``speech_stop``, ``task_stop``, ``approval_cancel``, ``pause``,
+    ``continue``, ``sleep``, ``shutdown`` or ``None``.
+    """
+    tokens = normalize_control_text(text)
+    if not tokens:
+        return None
+    for name, phrase_groups in CONTROL_GRAMMAR:
+        for phrases in phrase_groups:
+            if _match_tokens(tokens, phrases):
+                return name
+    return None
+
+
+def control_owner(command):
+    """Which runtime owns *command* — the audit's target-aware routing."""
+    return {
+        "speech_stop": "speech",
+        "pause": "speech",
+        "continue": "speech",
+        "task_stop": "task",
+        "approval_cancel": "approval",
+        "stop_research": "task",
+        "sleep": "supervisor",
+        "shutdown": "supervisor",
+    }.get(command)
+
+# ─────────────────────────────────────────
+# NORMAL SETUP VARIANTS
+# ─────────────────────────────────────────
+SETUP_PHRASES = [
+    "normal setup", "put my setup", "my normal setup",
+    "mera setup", "setup chalu karo", "setup kholo",
+]
+
+#: Verbs a setup request may carry beside the phrase vocabulary ("put my
+#: normal setup", "mera setup karo"). Stripped ONLY when the utterance does
+#: not already match a setup phrase, and never added to the shared
+#: neutral-token sets the F35 grammar depends on.
+SETUP_VERB_TOKENS = frozenset((
+    "put", "set", "lagao", "chalao", "karo", "kar", "kro", "kardo", "chalu",
+    "kholo", "launch", "open", "start", "activate", "run",
+))
+
+
+# ─────────────────────────────────────────
+# MATCHING FUNCTIONS
+# ─────────────────────────────────────────
+def normalize_spoken_command(text):
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    filler_words = {"jarvis", "jervis", "jarvish", "please", "sir", "hey", "ok", "okay"}
+
+    while words and words[0] in filler_words:
+        words.pop(0)
+    while words and words[-1] in filler_words:
+        words.pop()
+
+    return " ".join(words)
+
+
+def is_stop_talking(text):
+    return classify_control(text) == "speech_stop"
+
+
+def is_pause(text):
+    return classify_control(text) == "pause"
+
+
+def is_sleep(text):
+    return classify_control(text) == "sleep"
+
+
+#: Kept as frozensets because other modules/tests import them by name; the
+#: authoritative grammar is CONTROL_GRAMMAR above (one matcher, one order).
+STOP_TASK_EN = frozenset(TASK_STOP_EN)
+CANCEL_APPROVAL_EN = frozenset(APPROVAL_CANCEL_EN)
+
+
+def is_stop_task(text):
+    return classify_control(text) == "task_stop"
+
+
+def is_cancel_approval(text):
+    return classify_control(text) == "approval_cancel"
+
+
+def _deliver_stop_task():
+    """Deliver 'stop task' to the BACKEND (the one runtime that owns jobs).
+
+    G11 / F50 — the old version called browser_agent/research/jobs module
+    copies INSIDE the voice process, which never own the running task: the
+    stop was a silent no-op against the real backend job. The authoritative
+    kill switch is POST /task/stop (authed), which stops the browser agent,
+    the research flow, interrupts live registered requests and cuts TTS.
+    """
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+    ok, _ = _post_backend("/task/stop", {})
+    print("🛑 Stop task delivered to backend: %s" % ("ok" if ok else "FAILED"))
+
+
+def _deliver_cancel_approval():
+    """Deliver 'cancel approval' to the consent gate on the backend.
+
+    G11 / F50 — the pending approval lives in the backend process; the voice
+    process's module copy is empty, so cancelling locally was a no-op.
+    POST /approvals/reset drops the pending plan (and the pending screen
+    preview) authoritatively.
+    """
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+    ok, reply = _post_backend("/approvals/reset", {})
+    dropped = bool(isinstance(reply, dict) and reply.get("dropped"))
+    print("🛑 Cancel approval delivered (%s): %s"
+          % ("ok" if ok else "FAILED", "dropped pending plan" if dropped else "nothing pending"))
+
+
+# ── Explicit websearch stop ("stop the research") ──
+# F35: matched with the SAME normalization + negation rules as every other
+# control (both apostrophe forms, a negation anywhere in the phrase or its
+# run-up), so "don't stop the research" is never a stop request.
+STOP_RESEARCH_PHRASES = (
+    "stop the research", "stop the search", "stop researching",
+    "stop the deepsearch", "stop deepsearch", "stop research", "stop search",
+)
+
+
+def is_stop_research(text):
+    tokens = normalize_control_text(text)
+    if not tokens:
+        return False
+    return bool(_match_tokens(tokens, STOP_RESEARCH_PHRASES))
+
+
+def _deliver_stop_research():
+    """Stop BOTH narration and the task — on the backend (F50).
+
+    Mirrors brain.handle_stop_research_request(from_voice=True): the voice
+    process cannot reach the backend's internals, so the control plane is
+    the authed HTTP contract: /task/stop (stops research + browser task +
+    live requests) and /speak/stop (cuts TTS + narration).
+    """
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+    _post_backend("/task/stop", {})
+    _post_backend("/speak/stop", {})
+    print("🛑 Stop research delivered to backend")
+
+# Control phrases that must NEVER classify as shutdown, with or without the
+# Jarvis name: they have their own handlers (stop speaking / pause / cancel)
+# or fall through to the normal command path. Checked BEFORE the shutdown
+# vocabulary so 'jarvis stop speaking' can never terminate the stack.
+_NON_SHUTDOWN_PHRASES = tuple(STOP_TALKING_EN) + tuple(STOP_TALKING_HI) + (
+    "stop task", "stop the task", "cancel approval", "pause",
+)
+
+# Exact English shutdown commands, derived from the SHUTDOWN_EN vocabulary
+# with the jarvis-name token removed (normalize_spoken_command strips it).
+_SHUTDOWN_EN_EXACT = frozenset(
+    " ".join(word for word in combo if word not in JARVIS_VARIANTS)
+    for combo in SHUTDOWN_EN
+)
+
+
+def is_shutdown(text):
+    """True ONLY for explicit shutdown phrases.
+
+    F35: one exact, token-based, negation-aware match for BOTH languages — no
+    substring matching, so "music band karo" is not shutdown and "bolna band
+    karo" (stop talking) is handled by the speech target first. Control
+    phrases with their own owner (speech/task/approval/pause/continue/sleep)
+    are classified before shutdown and therefore never terminate the stack.
+    """
+    return classify_control(text) == "shutdown"
+
+
+def is_continue(text):
+    """F35: exact and negation-aware — "don't continue" never resumes."""
+    return classify_control(text) == "continue"
+
+
+def is_normal_setup(text):
+    """True when the utterance asks for the normal setup (F50/F35).
+
+    The old ``any(phrase in t)`` substring test fired on any utterance that
+    merely CONTAINED a setup phrase — including "do not put my normal setup".
+    Setup now uses the same exact, negation-aware token grammar as every other
+    control, with two deliberate safeguards:
+
+      * a setup launch is a state-changing effect, so ANY negator in the
+        utterance refuses it (F16's fail-closed rule) rather than relying on
+        where the negator sits;
+      * an imperative verb ("put my normal setup", "mera setup karo") is
+        stripped and the match retried — instead of widening the shared
+        neutral-token sets, which the F35 grammar's negatives depend on.
+    """
+    tokens = normalize_control_text(text)
+    if not tokens:
+        return False
+    if any(token in NEGATION_TOKENS for token in tokens):
+        return False
+    if _match_tokens(tokens, SETUP_PHRASES):
+        return True
+    reduced = [token for token in tokens if token not in SETUP_VERB_TOKENS]
+    return bool(reduced) and bool(_match_tokens(reduced, SETUP_PHRASES))
+
+
+# ─────────────────────────────────────────
+# F35 — ONE delivery action per control owner
+# ─────────────────────────────────────────
+def _deliver_speech_stop():
+    """Stop the SPEECH owner — never gated on this process's own flag.
+
+    F35: the old path only honoured "stop speaking" while THIS process thought
+    it was speaking. The backend voices replies and narrates tasks, so its
+    local flag is False exactly when the user most needs the stop: the request
+    must always reach the backend's /speak/stop (authed).
+    """
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+    ok, _ = _post_backend("/speak/stop", {})
+    print("🛑 Speech stop delivered to backend: %s" % ("ok" if ok else "FAILED"))
+    return ok
+
+
+def _deliver_pause():
+    """Pause narration but KEEP the remainder resumable (F35).
+
+    Distinct from a stop: the backend remembers the unplayed text
+    (/speak/pause) so "continue" has a real target in the process that owns
+    the speech — the voice process's own listener_state copy never sees it.
+    """
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+    ok, reply = _post_backend("/speak/pause", {})
+    resumable = bool(isinstance(reply, dict) and reply.get("resumable"))
+    print("⏸️ Speech paused (%s): %s"
+          % ("ok" if ok else "FAILED",
+             "resumable" if resumable else "nothing to resume"))
+    return ok
+
+
+def _deliver_continue():
+    """Resume what a pause/interruption left unplayed, on the backend.
+
+    F35/F50: the backend owns playback, so /speak/resume is the ONLY place a
+    remainder can be resumed from. The old fallback played
+    ``listener_state.pop_remaining()`` from THIS process — a second playback
+    owner, which is exactly what the single-owner rule forbids.
+    """
+    ok, reply = _post_backend("/speak/resume", {})
+    resumed = bool(isinstance(reply, dict) and reply.get("resumed"))
+    print("▶️ Resume delivered to backend: %s"
+          % ("ok" if ok and resumed else "nothing to resume"))
+    return bool(ok and resumed)
+
+
+def _request_watcher(path, timeout=3.0):
+    """POST to the supervisor's control plane WITH the per-launch token.
+
+    F35: the old shutdown path sent an unauthenticated request to
+    ``/stop`` — which the watcher rejects with 401 (and which, even when it
+    came from a trusted caller, is WARM SLEEP: it leaves the backend running).
+    Both actions now carry the token the watcher injected into this process
+    and target the endpoint that matches what the user asked for.
+    """
+    port = os.getenv("JARVIS_WATCHER_CONTROL_PORT")
+    if not port:
+        return False, None
+    try:
+        request = Request(
+            f"http://127.0.0.1:{port}{path}",
+            data=b"{}",
+            method="POST",
+            headers=_backend_headers(),
+        )
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        try:
+            return True, json.loads(body)
+        except Exception:
+            return True, {}
+    except Exception as exc:
+        print(f"[VOICE→WATCHER] {path} failed: {exc}")
+        return False, None
+
+
+def _deliver_sleep():
+    """Warm sleep: UI + voice down, backend kept warm (F35/F52)."""
+    ok, reply = _request_watcher("/stop")
+    mode = (reply or {}).get("mode") if isinstance(reply, dict) else None
+    print("😴 Warm sleep requested: %s" % (mode or ("ok" if ok else "FAILED")))
+    return ok
+
+
+def _deliver_shutdown():
+    """FULL shutdown of the whole stack, authenticated (F35).
+
+    Target: watcher ``/shutdown`` (stops electron AND the warm backend AND the
+    daemons). If the supervisor is unreachable we fall back to killing the
+    tracked children ourselves instead of silently leaving half the stack up.
+    """
+    ok, reply = _request_watcher("/shutdown")
+    if ok:
+        mode = (reply or {}).get("mode") if isinstance(reply, dict) else None
+        print("🔴 Full shutdown requested: %s" % (mode or "ok"))
+        return True
+    print("🔴 Supervisor unreachable — shutting down tracked processes directly")
+    _taskkill_pid(os.getenv("JARVIS_BACKEND_PID"))
+    _taskkill_pid(os.getenv("JARVIS_ELECTRON_PID"))
+    _stop_backend_port_if_jarvis()
+    return False
+
+
+def dispatch_control(command):
+    """Route ONE classified control to exactly its owner (F35).
+
+    Returns True when the command was delivered. Every control has a single
+    target, so a stop can never take down unrelated work and a shutdown can
+    never be confused with "stop talking".
+    """
+    owner = control_owner(command)
+    if owner is None:
+        return False
+    if command == "speech_stop":
+        return _deliver_speech_stop()
+    if command == "pause":
+        return _deliver_pause()
+    if command == "continue":
+        return _deliver_continue()
+    if command == "task_stop":
+        return _deliver_stop_task()
+    if command == "approval_cancel":
+        return _deliver_cancel_approval()
+    if command == "stop_research":
+        return _deliver_stop_research()
+    if command == "sleep":
+        return _deliver_sleep()
+    if command == "shutdown":
+        return _deliver_shutdown()
+    return False
+
+
+# ─────────────────────────────────────────
+# SETUP COMMAND
+# ─────────────────────────────────────────
+def launch_normal_setup():
+    """Ask the BACKEND to launch the user's normal setup (F50).
+
+    A setup launch opens applications and mutates shared session state, so it
+    belongs to the process that owns intelligence state — this worker POSTs a
+    typed request to ``/voice-setup/launch`` and never calls ``os.startfile``
+    (or spawns anything) itself: one owner, one place to see what ran.
+
+    Returns True when the backend accepted the launch.
+    """
+    print("🖥️ Requesting normal setup from the backend...")
+    ok, reply = _post_backend("/voice-setup/launch", {"setup": "normal"})
+    if not ok:
+        print("❌ Normal setup request failed — the backend owns setup launches")
+        return False
+    launched = reply.get("launched") if isinstance(reply, dict) else None
+    if isinstance(launched, list) and launched:
+        print("✅ Normal setup launched by backend: %s" % ", ".join(
+            str(item) for item in launched))
+    else:
+        print("✅ Normal setup accepted by the backend")
+    return True
+
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+def get_time_based_greeting():
+    hour = datetime.datetime.now().hour
+    if hour < 12:
+        return "Good morning, sir."
+    elif hour < 18:
+        return "Good afternoon, sir."
+    else:
+        return "Good evening, sir."
+
+
+def _taskkill_pid(pid):
+    if not pid:
+        return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _pids_on_port(port):
+    pids = set()
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return pids
+
+    marker = f":{port}"
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if marker not in parts[1] or parts[-2].upper() != "LISTENING":
+            continue
+        try:
+            pids.add(int(parts[-1]))
+        except ValueError:
+            continue
+    return pids
+
+
+def _is_jarvis_backend():
+    try:
+        with urlopen(f"http://127.0.0.1:{BACKEND_PORT}/health", timeout=0.8) as response:
+            return b"jarvis-backend" in response.read()
+    except Exception:
+        return False
+
+
+def _stop_backend_port_if_jarvis():
+    if not _is_jarvis_backend():
+        return False
+    stopped = False
+    for pid in _pids_on_port(BACKEND_PORT):
+        stopped = _taskkill_pid(pid) or stopped
+    return stopped
+
+
+def _request_watcher_stop():
+    """Warm sleep (kept for callers that explicitly want it)."""
+    ok, _ = _request_watcher("/stop")
+    return ok
+
+
+def _terminate_self():
+    """Exit this voice worker once the stack has been asked to stop.
+
+    Separated so callers (and tests) can observe the shutdown request without
+    the process disappearing: the SIGTERM is the LAST step, after the
+    authenticated supervisor request.
+    """
+    try:
+        import signal
+
+        os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        os._exit(0)
+
+
+def shutdown_everything():
+    """Full shutdown: authenticated supervisor request, then this process.
+
+    F35: this used to fire an UNAUTHENTICATED warm-stop at the watcher and
+    call it done — the backend kept running. The full-shutdown request is
+    authenticated, and if the supervisor cannot be reached the tracked
+    children are killed directly before this process exits.
+    """
+    stop_speaking()
+    try:
+        speak("Goodbye sir. Shutting everything down.")
+        time.sleep(3)
+    except Exception:
+        pass
+
+    _deliver_shutdown()
+    time.sleep(1)
+    _terminate_self()
+
+
+# ─────────────────────────────────────────
+# THREAD 1 — LISTENER
+# ─────────────────────────────────────────
+# TEXT MODE FLAG — consumed over HTTP, never via module import.
+# This voice process is a SEPARATE OS process from the API (spawned by
+# the watcher): its imported copy of listener_state can never see the
+# API-side toggles, so the flag is polled from the backend
+# (GET /voice-mode) on a short cadence and cached. On request failure
+# the last known value is kept.
+_VOICE_FLAG_POLL_S = 1.0
+_voice_flag_last_known = True
+_voice_flag_checked_at = 0.0
+
+
+def _fetch_voice_flag():
+    """Current voice-input flag as seen by THIS process (HTTP-polled).
+
+    F51: ``/voice-mode`` is a private read (only ``/health`` is public), so
+    the poll authenticates with the launch token — an unauthenticated 401
+    looked identical to "no answer" and froze the voice-input switch at its
+    last known value.
+    """
+    global _voice_flag_last_known, _voice_flag_checked_at
+    now = time.monotonic()
+    if now - _voice_flag_checked_at < _VOICE_FLAG_POLL_S:
+        return _voice_flag_last_known
+    _voice_flag_checked_at = now
+    try:
+        request = Request(
+            f"http://127.0.0.1:{BACKEND_PORT}/voice-mode",
+            method="GET",
+            headers=_backend_headers(),
+        )
+        with urlopen(request, timeout=0.5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        _voice_flag_last_known = bool(data.get("voice_input_enabled", True))
+    except Exception:
+        pass  # keep the last known value on request failure
+    return _voice_flag_last_known
+
+
+def voice_input_enabled():
+    return _fetch_voice_flag()
+
+
+def listener_thread():
+    while True:
+        try:
+            if not voice_input_enabled():
+                try:
+                    _close_microphone_source()
+                except Exception:
+                    pass
+                time.sleep(0.25)
+                continue
+            text = listen()
+            if not text:
+                continue
+
+            print("👤:", text)
+
+            # ── F35: ONE exact control grammar runs BEFORE any mute. ──
+            # Every control is classified here (one match, one owner) and
+            # delivered while narration plays and while a long task runs:
+            # supervision can never be locked out by Jarvis's own speaking or
+            # working state, and a stop never depends on this process's own
+            # (never-authoritative) speaking flag.
+            control = classify_control(text)
+            if control == "shutdown":
+                print("🔴 Shutdown command received")
+                shutdown_everything()
+                break
+            if control in ("speech_stop", "task_stop", "approval_cancel",
+                           "pause", "continue", "sleep"):
+                print(f"🎛️ Control command: {control}")
+                dispatch_control(control)
+                continue
+            if is_stop_research(text):
+                print("🛑 Stop research command")
+                _deliver_stop_research()
+                continue
+
+            # While Jarvis is speaking, only the controls above get through.
+            if listener_state.is_speaking():
+                continue
+
+            # While an opencode task runs, only opencode speaks. The agent's
+            # narration is heard by the mic; queueing it here would echo it
+            # back as a Jarvis reply — drop it instead. The flag is the
+            # BACKEND's published task state (F50) — never a module copy.
+            if backend_task_running():
+                print("[TASK] backend task running — listener muted.")
+                continue
+
+            command_queue.put(text)
+
+        except Exception as e:
+            print(f"Listener thread error: {e}")
+            time.sleep(0.5)
+
+
+def _respond_to_utterance(text):
+    """Turn one queued voice utterance into a Jarvis reply — via the backend.
+
+    G11 / F50: this process no longer executes its own ``process_message``
+    copy. The utterance is submitted to the ONE backend task runtime
+    (authenticated /ask/stream, ``speak=False``); streamed deltas feed the
+    same StreamSpeaker the in-process path used, and the terminal frame's
+    reply is authoritative. While a backend task runs, ONLY the task
+    speaks — the utterance is dropped so a pre-queued one can never produce
+    Jarvis speech mid-task.
+    """
+    if backend_task_running():
+        print("[TASK] backend task running — voice reply suppressed.")
+        return
+    listener_state.set_thinking(True)
+    previous = get_active_stream()
+    if previous is not None:
+        previous.close()
+    speaker = StreamSpeaker()
+    set_active_stream(speaker)
+    try:
+        response = _ask_backend(
+            text,
+            request_id="voice-%s-%s" % (int(time.time() * 1000), os.getpid()),
+            stream_sink=speaker.feed,
+        )
+    finally:
+        listener_state.set_thinking(False)
+    print("🤖:", response)
+
+    if not response:
+        # The one runtime was unreachable — never leave the user in silence.
+        speaker.close()
+        set_active_stream(None)
+        speak("I couldn't reach the backend, sir.")
+        return
+
+    if speaker.spoken_any:
+        # The reply was voiced sentence-by-sentence as it streamed;
+        # flush the remainder and let the worker take announcements.
+        speaker.finish()
+    else:
+        # Task/tool/screen branches return a full reply without
+        # streaming — speak it the normal way.
+        speaker.close()
+        set_active_stream(None)
+        speak(response)
+
+
+# ─────────────────────────────────────────
+# THREAD 2 — BRAIN
+# ─────────────────────────────────────────
+def brain_thread():
+    while True:
+        try:
+            text = command_queue.get(timeout=1)
+
+            # ── F35: the SAME one grammar, so a queued utterance is handled
+            # exactly like a live one (a control can never be re-interpreted
+            # as a chat message after it was classified). ──
+            control = classify_control(text)
+            if control == "shutdown":
+                print("🔴 Shutdown command received")
+                shutdown_everything()
+                break
+            if control == "continue":
+                _deliver_continue()
+                continue
+            if control == "pause":
+                _deliver_pause()
+                continue
+            if control in ("speech_stop", "task_stop", "approval_cancel",
+                           "sleep"):
+                print(f"🎛️ Control command: {control}")
+                dispatch_control(control)
+                continue
+
+            # While a backend task runs, only the task speaks — drop
+            # anything queued before the mute took effect. (Shutdown stays
+            # available as a deliberate kill switch.)
+            if backend_task_running():
+                print("[TASK] backend task running — utterance dropped.")
+                continue
+
+            # ── NORMAL SETUP ──
+            if is_normal_setup(text):
+                speak("Opening your normal setup, sir.")
+                threading.Thread(target=launch_normal_setup, daemon=True).start()
+                continue
+
+            # ── PROCESS ──
+            _respond_to_utterance(text)
+
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Brain thread error: {e}")
+            time.sleep(0.5)
+
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+def start_voice_mode():
+    greeting = get_time_based_greeting()
+    reply    = f"{greeting} {random.choice(BOOT_RESPONSES)}"
+    print("🟢 Jarvis Active")
+    print("🤖:", reply)
+
+    # Warm the Fish TTS model + connection in the background so the first
+    # real reply isn't slowed by a cold synthesis request.
+    threading.Thread(target=warm_up_fish_tts, daemon=True).start()
+
+    speak(reply)
+
+    # G11 / F50 — publish this worker's real listening state to the backend
+    # so /voice-state and /ui-state show the TRUTH instead of the backend's
+    # empty listener_state module copy.
+    threading.Thread(target=_publish_voice_state_loop, daemon=True).start()
+
+    # Async replies (task completions, screen Q&A) are SPOKEN BY THE BACKEND
+    # process where those jobs actually run — the old in-process callback
+    # registrations here were dead code against module copies that never run
+    # anything (F50 removes exactly that pattern).
+
+    t_listener = threading.Thread(target=listener_thread, daemon=True)
+    t_listener.start()
+
+    try:
+        brain_thread()
+    except KeyboardInterrupt:
+        print("\n🔴 Stopped manually")
+        stop_speaking()
+
+
+if __name__ == "__main__":
+    start_voice_mode()

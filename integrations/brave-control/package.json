@@ -1,0 +1,15 @@
+{
+  "name": "brave-control-mcp",
+  "version": "1.0.0",
+  "description": "MCP server that drives a real Brave browser to chat with AI sites and extract generated code",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright-core": "^1.49.0",
+    "zod": "^4.4.3"
+  }
+}

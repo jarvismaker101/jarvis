@@ -1,0 +1,195 @@
+/* JARVIS capsule - compact glass panel matching HUD aesthetic */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: "Space Grotesk", sans-serif;
+}
+
+.capsule {
+  width: 360px;
+  height: 150px;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, rgba(14,20,36,0.88), rgba(10,16,30,0.92));
+  border: 1px solid rgba(0,229,255,0.22);
+  border-radius: 12px;
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,229,255,0.08) inset, 0 0 18px rgba(0,229,255,0.12);
+  overflow: hidden;
+}
+
+.capsule-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px 5px;
+  border-bottom: 1px solid rgba(0,229,255,0.10);
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+}
+
+.capsule-label {
+  font-family: Orbitron, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #eaf6ff;
+  text-shadow: 0 0 10px rgba(0,229,255,0.45);
+}
+
+.capsule-close {
+  -webkit-app-region: no-drag;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: linear-gradient(180deg, rgba(255,59,92,0.14), rgba(255,59,92,0.08));
+  color: #ff3b5c;
+  border: 1px solid rgba(255,59,92,0.34);
+  transition: all 0.2s ease;
+}
+
+.capsule-close:hover {
+  background: rgba(255,59,92,0.22);
+  box-shadow: 0 0 10px rgba(255,59,92,0.2);
+}
+
+.capsule-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.capsule-task-stop {
+  -webkit-app-region: no-drag;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: linear-gradient(180deg, rgba(255,59,92,0.88), rgba(214,38,80,0.92));
+  color: #fff;
+  border: 1px solid rgba(255,59,92,0.55);
+  box-shadow: 0 0 12px rgba(255,59,92,0.35);
+  transition: all 0.2s ease;
+  animation: capsule-stop-pulse 1.6s ease-in-out infinite;
+}
+
+.capsule-task-stop:hover { box-shadow: 0 0 16px rgba(255,59,92,0.6); }
+.capsule-task-stop:active { transform: scale(0.97); }
+.capsule-task-stop:disabled { opacity: 0.55; cursor: not-allowed; animation: none; transform: none; }
+
+@keyframes capsule-stop-pulse {
+  0%, 100% { box-shadow: 0 0 10px rgba(255,59,92,0.3); }
+  50% { box-shadow: 0 0 18px rgba(255,59,92,0.55); }
+}
+
+.capsule-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  min-height: 0;
+}
+
+.capsule-log::-webkit-scrollbar { width: 4px; }
+.capsule-log::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.24); border-radius: 999px; }
+
+.capsule-msg {
+  max-width: 86%;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  border: 1px solid rgba(255,255,255,0.06);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.capsule-msg.user {
+  align-self: flex-end;
+  background: linear-gradient(180deg, rgba(0,196,220,0.14), rgba(0,168,200,0.08));
+  border-color: rgba(0,229,255,0.18);
+  text-align: right;
+  color: #dff1ff;
+}
+
+.capsule-msg.bot {
+  align-self: flex-start;
+  background: linear-gradient(180deg, rgba(22,30,52,0.72), rgba(14,22,42,0.62));
+  border-left: 2px solid #00e5ff;
+  color: #dff1ff;
+}
+
+.capsule-msg.error {
+  align-self: flex-start;
+  background: rgba(255,59,92,0.10);
+  border-color: rgba(255,59,92,0.24);
+  color: #ffb3c0;
+}
+
+.capsule-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  flex-shrink: 0;
+  border-top: 1px solid rgba(0,229,255,0.08);
+  background: linear-gradient(180deg, rgba(7,12,24,0.72), rgba(5,9,20,0.88));
+}
+
+.capsule-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(0,229,255,0.16);
+  background: rgba(255,255,255,0.05);
+  color: #dff1ff;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 11px;
+  outline: none;
+  -webkit-app-region: no-drag;
+}
+
+.capsule-input::placeholder { color: #3a5168; font-style: italic; }
+.capsule-input:focus { border-color: rgba(0,229,255,0.36); box-shadow: 0 0 0 2px rgba(0,229,255,0.10); }
+.capsule-input:disabled { opacity: 0.5; }
+
+.capsule-send {
+  -webkit-app-region: no-drag;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: linear-gradient(135deg, #00e5ff 0%, #7c5cff 100%);
+  color: #021019;
+  border: none;
+  box-shadow: 0 4px 14px rgba(0,229,255,0.22);
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+.capsule-send:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,229,255,0.3); }
+.capsule-send:active { transform: scale(0.97); }
+.capsule-send:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
