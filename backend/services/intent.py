@@ -12,8 +12,9 @@ Hinglish — and routes it to exactly one handler:
                 (headed, so captchas are solvable) with a summarized report
     task     -> opencode agent (file/folder ops, code, shell, automation…)
 
-Gemini (Flash Lite) classifies first; if it is unavailable, Qwen on Groq is
-the single fallback. Any hard failure just routes to chat rather than stalling.
+Gemini (Flash Lite) classifies first; if it is unavailable, the same Lite
+model over OpenRouter is tried next, then Qwen on Groq. Any hard failure just
+routes to chat rather than stalling.
 """
 
 import json
@@ -22,7 +23,7 @@ import os
 import re
 import time
 
-from backend.config import GEMINI_API_KEY, GROQ_API_KEY
+from backend.config import GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
 from backend.services.gemini_client import ask_gemini_chat
 from backend.services.grok_client import _strip_think_blocks, ask_grok
 
@@ -189,16 +190,51 @@ def _budget_timeout(remaining):
     return (connect, read)
 
 
+def _classify_with_openrouter(message, timeout=(2, 2.5)):
+    """Ask the Lite brain model over OpenRouter. Returns raw JSON text or "".
+
+    First hop since the 2026-09-23 incident: the Cloudflare-fronted openrouter
+    endpoint answers in ~1.4s even while the direct Gemini API degrades to
+    7-45s+ behind a VPN relay — so the router keeps routing within its budget
+    instead of silently landing every message on the chat fallback.
+    """
+    if not OPENROUTER_API_KEY:
+        return ""
+    from backend.services.openai_compat_client import ask_openai_compat
+    response = ask_openai_compat(
+        [
+            {
+                "role": "system",
+                "content": "Return strict JSON only. No markdown, no extra text.",
+            },
+            {
+                "role": "user",
+                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
+            },
+        ],
+        model=os.getenv(
+            "INTENT_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"),
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        temperature=0.0,
+        max_tokens=500,
+        timeout=timeout,
+    )
+    if not response or not response.get("choices"):
+        return ""
+    return response["choices"][0].get("message", {}).get("content", "")
+
+
 def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
     """Route *message* to chat/tool/screen/region/task.
 
-    Every message is classified — no keyword pre-check — using Gemini 3.5
-    Flash Lite first, with Qwen on Groq as the single fallback. Any remaining
-    failure just lands on chat.
+    Every message is classified — no keyword pre-check — fastest cloud
+    classifier first (the Lite brain model over OpenRouter), then Gemini
+    direct, then Qwen on Groq. Any remaining failure just lands on chat.
 
     A single monotonic deadline (timeout_ms) spans the whole classification:
-    the primary and the fallback share the remaining budget, so fast-fail
-    never exceeds the advertised window.
+    primary and fallbacks share the remaining budget, so fast-fail never
+    exceeds the advertised window.
     """
     fallback = {
         "intent": "chat",
@@ -211,7 +247,20 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
 
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
 
-    # 1) Cloud classifier (primary: Gemini 3.5 Flash Lite).
+    # 1) Fastest hop first (2026-09-23): OpenRouter stays ~1.4s even when the
+    #    direct Gemini API degrades behind a VPN relay, so routing survives.
+    timeout = _budget_timeout(deadline - time.monotonic())
+    if timeout:
+        try:
+            content = _classify_with_openrouter(message, timeout=timeout)
+            result = _parse_intent_json(content, message)
+            if result["intent"] != "chat" or content:
+                # Even a chat verdict from the model is a deliberate answer.
+                return result
+        except Exception as exc:
+            logging.warning("[INTENT] OpenRouter classifier unavailable: %s", exc)
+
+    # 2) Cloud classifier (Gemini 3.5 Flash Lite direct).
     timeout = _budget_timeout(deadline - time.monotonic())
     if timeout:
         try:
@@ -223,7 +272,7 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
         except Exception as exc:
             logging.warning("[INTENT] Gemini classifier unavailable: %s", exc)
 
-    # 2) Single fallback: Qwen 3.6 27B on Groq — only with budget left.
+    # 3) Single fallback: Qwen 3.6 27B on Groq — only with budget left.
     timeout = _budget_timeout(deadline - time.monotonic())
     if timeout:
         try:

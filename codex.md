@@ -156,3 +156,14 @@ This file is a lightweight running log for future Codex conversations. It should
 
 - Append a dated bullet under `Recent Changes` after each substantive Codex edit.
 - Update `Current Baseline` whenever behavior or architecture meaningfully changes.
+
+## 2026-09-23 - Chat outage root-caused: direct Gemini API unusable behind Proton VPN; chat/vision/browser_tool + intent rerouted via OpenRouter
+
+- Symptom: every query returned "I'm having trouble connecting. Please try again."
+- Root cause chain: Proton VPN (ProTUN tunnel, post-PC-reset install) active -> direct generativelanguage.googleapis.com calls degraded to 7-45s+ (frequent >45s read timeouts) -> brain chat chain exhausted attempts -> fallback leg is the suspended Fireworks account -> {} -> generic message. Groq now 403s ("check your network") from the VPN exit IP. OpenRouter (Cloudflare-fronted) measures ~1.4s through the same tunnel.
+- Fix (no key ever left .env):
+  - model_registry: chat role allowlist += openrouter; get_provider_credentials now returns canonical OpenAI-compatible base URLs for openrouter/groq (_ENV_PROVIDER_BASE_URLS; fireworks deliberately stays None - pinned contract).
+  - data/jarvis_settings.json (backup .bak-before-openrouter-switch): chat/vision/browser_tool -> openrouter/google/gemini-2.5-flash-lite.
+  - intent.py: classifier chain reordered OpenRouter -> Gemini -> Groq (OpenRouter stays fast behind the VPN so routing no longer collapses to "chat" verdicts); ask_openai_compat gained an optional timeout param for the classifier's tight budget slice.
+- Verified: non-stream chat 1.41s, stream 0.61-0.65s, full process_message turn 1.80s with a real reply; classify 0.6-1.6s with correct verdicts (fresh-price question routes research). Regression 183 passed; 2 pre-existing failures (test_verification_uses_fireworks / test_verification_uses_groq - fail identically on stashed pre-edit code).
+- Operator note: the direct-Gemini degradation is caused by the Proton VPN relay. Turning it off (or excluding python.exe/electron.exe via Proton split tunneling on Plus plans) restores the direct Gemini path; the OpenRouter selection then simply remains a fast alternative.

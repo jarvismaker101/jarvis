@@ -150,7 +150,7 @@ def _headers(api_key):
 
 def ask_openai_compat(
     messages, model, base_url, api_key, temperature=0.7, max_tokens=None,
-    tools=None, tool_choice=None, reasoning_effort=None,
+    tools=None, tool_choice=None, reasoning_effort=None, timeout=None,
 ):
     """Non-stream chat completion; {} on any failure (fireworks pattern).
 
@@ -161,6 +161,9 @@ def ask_openai_compat(
     *reasoning_effort* (F49): sent only when the caller's validated model
     snapshot says the model takes it — a model that runs its own default
     reasoning must never receive the field.
+
+    *timeout*: optional (connect, read) override — latency-critical callers
+    (the intent classifier) pass a tight slice of their own deadline.
     """
     data = {
         "model": model,
@@ -180,7 +183,7 @@ def ask_openai_compat(
             _chat_url(base_url),
             headers=_headers(api_key),
             json=data,
-            timeout=(5.05, 60),
+            timeout=timeout or (5.05, 60),
         )
     except Exception as exc:
         print("[OPENAI-COMPAT] Request error:", exc)

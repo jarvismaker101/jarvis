@@ -65,7 +65,12 @@ ENV_PROVIDERS = {
 # Per-role allowlist (env providers). Custom providers are allowed only
 # for chat and browser_tool (openai_compatible chat completions).
 _ROLE_ALLOWED_ENV = {
-    "chat": {"gemini", "fireworks"},
+    # openrouter: same Gemini-family models over Cloudflare-fronted endpoints.
+    # Added for chat after the 2026-09-23 incident: the direct Gemini API was
+    # returning 7-45s+ (often >45s read timeouts) through the user's VPN relay
+    # while openrouter answered the same model in ~1.4s, and the chat chain's
+    # other leg (fireworks) is suspended. vision/browser_tool already allowed it.
+    "chat": {"gemini", "fireworks", "openrouter"},
     # Two interchangeable voice engines: Fish (metered, high quality) and
     # Google Translate TTS (free, key-less) as the zero-cost fallback.
     "tts": {"fish", "gtts"},
@@ -948,15 +953,34 @@ def set_default_chat_model(provider, model):
     return set_model_for_role("chat", provider, model)
 
 
+#: Canonical OpenAI-compatible chat endpoints for env providers that have
+#: one AND whose calls ride the generic openai-compat dispatch (openrouter,
+#: groq). The dedicated clients know their URLs privately; exposing them here
+#: lets the brain chat / browser tool carry an env-provider selection too —
+#: without moving the key out of .env into a custom provider record. Fireworks
+#: keeps base_url=None deliberately: it has its own full client and its tests
+#: pin that contract. [added 2026-09-23: chat via openrouter after the direct
+#: Gemini API became unusably slow behind the user's VPN relay]
+_ENV_PROVIDER_BASE_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+}
+
+
 def get_provider_credentials(provider_id):
-    """(api_key, base_url) for a provider; env providers have no base_url.
+    """(api_key, base_url) for a provider; env providers return their
+    canonical OpenAI-compatible base URL when they have one (see
+    _ENV_PROVIDER_BASE_URLS), else None.
 
     Returns (None, None) for unknown providers. F49: resolved from a single
     locked settings read (see _credentials_from) so callers that ALSO use a
     config snapshot cannot observe two different configuration states.
     """
     with _lock:
-        return _credentials_from(provider_id, _load_unlocked())
+        api_key, base_url = _credentials_from(provider_id, _load_unlocked())
+    if base_url is None and provider_id in _ENV_PROVIDER_BASE_URLS:
+        base_url = _ENV_PROVIDER_BASE_URLS[provider_id]
+    return api_key, base_url
 
 
 def list_providers():
