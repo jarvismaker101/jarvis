@@ -840,10 +840,13 @@ class IntentDeadlineTests(unittest.TestCase):
 
     def test_remaining_budget_passed_as_timeout(self):
         from backend.services import intent as _int
-        with patch.object(_int, "_classify_with_gemini",
+        with patch.object(_int, "_classify_with_openrouter",
+                          return_value="") as orr, \
+             patch.object(_int, "_classify_with_gemini",
                           return_value='{"intent":"chat"}') as gem, \
              patch.object(_int, "_classify_with_groq", return_value=""):
             _int.classify_intent("hello", timeout_ms=3500)
+        orr.assert_called_once()
         gem.assert_called_once()
         timeout = gem.call_args.kwargs.get("timeout")
         self.assertIsNotNone(timeout)
@@ -853,21 +856,25 @@ class IntentDeadlineTests(unittest.TestCase):
         self.assertGreater(read, 0)
 
     def test_exhausted_budget_skips_fallback(self):
-        """When the primary eats the whole budget the Groq fallback is
+        """When the primary eats the whole budget the remaining hops are
         skipped — fast-fail preserved with a real total deadline."""
         from backend.services import intent as _int
 
-        # Monotonic reads: deadline anchor, primary budget, fallback budget.
-        # The third read is past the deadline, so Groq never runs.
-        ticks = iter([100.0, 100.0, 109.9])
+        # Monotonic reads: deadline anchor, then one budget slice per hop
+        # (openrouter, gemini, groq). The second read is past the deadline, so
+        # gemini and groq never run.
+        ticks = iter([100.0, 100.0, 109.9, 109.9])
         with patch.object(_int.time, "monotonic",
                           side_effect=lambda: next(ticks)), \
+             patch.object(_int, "_classify_with_openrouter",
+                          return_value="") as orr, \
              patch.object(_int, "_classify_with_gemini",
                           return_value="") as gem, \
              patch.object(_int, "_classify_with_groq",
                           return_value='{"intent":"tool"}') as groq:
             result = _int.classify_intent("hello", timeout_ms=3500)
-        gem.assert_called_once()
+        orr.assert_called_once()
+        gem.assert_not_called()
         groq.assert_not_called()
         self.assertEqual(result["intent"], "chat")
 

@@ -123,8 +123,12 @@ def provider_available(provider):
         from backend.services import model_registry
         if pid not in {_normalize(p) for p in (model_registry.ENV_PROVIDERS or {})}:
             return False
-        key, base_url = model_registry.get_provider_credentials(pid)
-        return bool(key) or bool(base_url)
+        key, _base_url = model_registry.get_provider_credentials(pid)
+        # Configured means "has a usable key" - a base URL alone must not make
+        # a keyless provider look ready (env base URLs are canonical constants
+        # now, so an or-condition here would dispatch an unconfigured
+        # provider). Custom providers always store their key WITH the URL.
+        return bool(key)
     except Exception:
         return False
 
