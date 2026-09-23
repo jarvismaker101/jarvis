@@ -167,3 +167,8 @@ This file is a lightweight running log for future Codex conversations. It should
   - intent.py: classifier chain reordered OpenRouter -> Gemini -> Groq (OpenRouter stays fast behind the VPN so routing no longer collapses to "chat" verdicts); ask_openai_compat gained an optional timeout param for the classifier's tight budget slice.
 - Verified: non-stream chat 1.41s, stream 0.61-0.65s, full process_message turn 1.80s with a real reply; classify 0.6-1.6s with correct verdicts (fresh-price question routes research). Regression 183 passed; 2 pre-existing failures (test_verification_uses_fireworks / test_verification_uses_groq - fail identically on stashed pre-edit code).
 - Operator note: the direct-Gemini degradation is caused by the Proton VPN relay. Turning it off (or excluding python.exe/electron.exe via Proton split tunneling on Plus plans) restores the direct Gemini path; the OpenRouter selection then simply remains a fast alternative.
+
+## 2026-09-23 - CODE_REVIEW_REPORT C1: prompt-injection hardening for the screen planner
+
+- screen_control.py: screen-derived text (OCR, UIA names, window title, history) is now UNTRUSTED DATA: spoof-proof <<<SCREEN_TEXT_UNTRUSTED>>> delimiters (marker spoofing neutralized first), role-prefix + control-phrase stripping (_sanitize_screen_fragment), and a static never-instructions header that also pins step targets to element ids/coordinates and type payloads to the User command. Single choke point (_build_tree_prompt) covers _build_vision_prompt merges.
+- Tests: backend/tests/test_c1_prompt_injection.py (10 cases: marker spoof, role prefix, control phrases, innocent pass-through, block wrapping, prompt integration). Full screen suite: 149 passed.
