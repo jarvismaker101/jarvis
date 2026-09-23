@@ -1,0 +1,80 @@
+@contextlib.contextmanager
+def _effect_boundary(gate):
+    """Enter the authoritative effect boundary for ONE screen effect.
+
+    *gate* is a zero-argument callable returning a context manager (in
+    practice ``lambda: screen_state.effect_gate(stamp)``). It is entered
+    immediately before the effect, so the revocation check and the effect
+    itself are serialized — a disable cannot land between them.
+
+    Any failure to establish authorization fails closed: an unevaluatable
+    check must never authorise a keypress or a click.
+    """
+    if gate is None:
+        yield
+        return
+    try:
+        boundary = gate()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ScreenRevoked(
+            "Screen control authorization could not be verified (%s). I "
+            "stopped that action, sir." % (exc,)
+        )
+    try:
+        with boundary:
+            yield
+    except ScreenRevoked:
+        raise
+    except PermissionError as exc:
+        raise ScreenRevoked(
+            "Screen control was revoked before this action ran (%s). I stopped "
+            "the rest of it, sir." % (exc,)
+        )
+
+
+def execute_steps(steps, target_hwnd=None, gate=None):
+    _ensure_dpi_awareness()
+    # F19: the control generation is enforced immediately before the first
+    # effect (focus acquisition itself is an effect) and again before every
+    # individual step, so disabling screen control mid-plan stops the
+    # remainder instead of letting an already-started plan run to completion.
+    # If we know which window we planned against, bring it to front first.
+    # F42: focus failure STOPS the plan — a click aimed at a window that never
+    # reached the foreground would land on whoever did.
+    if target_hwnd:
+        with _effect_boundary(gate):
+            try:
+                if user32.IsIconic(target_hwnd):
+                    user32.ShowWindow(target_hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(target_hwnd)
+                if not _wait_for_foreground(target_hwnd):
+                    raise RuntimeError(
+                        "The target window did not come to the foreground, sir. "
+                        "Please ask me again so I can re-plan."
+                    )
+            except RuntimeError:
+                raise
+            except ScreenRevoked:
+                raise
+            except Exception as exc:
+                # F42: still treat it as a stop — never continue into a different
+                # window's geometry with translated/stale coordinates.
+                raise RuntimeError(
+                    "I could not bring the target window forward (%s), sir. "
+                    "Please bring it up and ask again." % exc
+                )
+    else:
+        with _effect_boundary(gate):
+            pass
+
+    for step in steps:
+        action = (step.get("action") or "").lower()
+
+        ui_uid = step.get("ui_uid")
+        if ui_uid:
+            revoked = None
+            try:
+                from backend.services.screen_ui_elements import invoke_element
+                # F19: the UIA revalidation + invoke is itself an effect and
+                # runs inside the boundary, so revocation cannot land between
+                # the check and the invoke.

@@ -1,0 +1,213 @@
+    if not normalized or _needs_desktop_capture(command_text):
+        return False
+
+    if any(term in normalized for term in ("window", "app", "application", "dialog", "popup", "title bar")):
+        return True
+
+    if re.search(r"\b(its|this|that)\b", normalized) and any(
+        term in normalized
+        for term in ("search bar", "search box", "button", "field", "textbox", "text box", "tab", "icon")
+    ):
+        return True
+
+    if capture and _command_references_window_title(command_text, capture.get("window_title", "")):
+        return True
+
+    return False
+
+
+def _extract_box_center(raw_step):
+    for key in ("box", "bbox", "bounds"):
+        box = raw_step.get(key)
+        if not isinstance(box, dict):
+            continue
+
+        left = _coerce_int(box.get("left", box.get("x", box.get("x1"))), None)
+        top = _coerce_int(box.get("top", box.get("y", box.get("y1"))), None)
+        right = _coerce_int(box.get("right", box.get("x2")), None)
+        bottom = _coerce_int(box.get("bottom", box.get("y2")), None)
+
+        if right is None and left is not None:
+            width = _coerce_int(box.get("width"), None)
+            if width is not None:
+                right = left + width
+
+        if bottom is None and top is not None:
+            height = _coerce_int(box.get("height"), None)
+            if height is not None:
+                bottom = top + height
+
+        if None in (left, top, right, bottom):
+            continue
+        if right <= left or bottom <= top:
+            continue
+
+        return (
+            int(round((left + right) / 2.0)),
+            int(round((top + bottom) / 2.0)),
+        )
+
+    # Also support bbox returned directly as top-level keys (e.g. {"x":10,"y":20,"width":100,"height":50}
+    # or {"left":10,"top":20,"right":110,"bottom":70}) without wrapper - plain x/y remains fallback
+    if isinstance(raw_step, dict) and any(k in raw_step for k in ("width", "height", "right", "bottom", "x2", "y2")):
+        left = _coerce_int(raw_step.get("left", raw_step.get("x", raw_step.get("x1"))), None)
+        top = _coerce_int(raw_step.get("top", raw_step.get("y", raw_step.get("y1"))), None)
+        right = _coerce_int(raw_step.get("right", raw_step.get("x2")), None)
+        bottom = _coerce_int(raw_step.get("bottom", raw_step.get("y2")), None)
+        if right is None and left is not None:
+            width = _coerce_int(raw_step.get("width"), None)
+            if width is not None:
+                right = left + width
+        if bottom is None and top is not None:
+            height = _coerce_int(raw_step.get("height"), None)
+            if height is not None:
+                bottom = top + height
+        if None not in (left, top, right, bottom) and right > left and bottom > top:
+            return (
+                int(round((left + right) / 2.0)),
+                int(round((top + bottom) / 2.0)),
+            )
+
+    return None
+
+
+def _vision_to_screen_point(capture, x, y):
+    x_scale = capture["capture_width"] / float(capture["vision_width"])
+    y_scale = capture["capture_height"] / float(capture["vision_height"])
+    screen_x = capture["origin_left"] + int(round(x * x_scale))
+    screen_y = capture["origin_top"] + int(round(y * y_scale))
+    # P1-B: post-scale clamp to capture bounds (vision clamp then scale can overshoot by 1px)
+    max_x = capture["origin_left"] + capture["capture_width"] - 1
+    max_y = capture["origin_top"] + capture["capture_height"] - 1
+    screen_x = max(capture["origin_left"], min(screen_x, max_x))
+    screen_y = max(capture["origin_top"], min(screen_y, max_y))
+    return screen_x, screen_y
+
+
+def _build_element_point(x, y, space="vision", bounds=None, source="", label="", uid="", runtime_id=""):
+    point = {
+        "x": _coerce_int(x, None),
+        "y": _coerce_int(y, None),
+        # F43: canonical space token — never a loose spelling that a later
+        # comparison (`space == "screen"`) could miss.
+        "space": screen_geometry.normalize_space(space, screen_geometry.COORD_VISION_PIXELS),
+    }
+    if bounds:
+        point["bounds"] = dict(bounds)
+    if source:
+        point["source"] = source
+    if label:
+        point["label"] = label
+    if uid:
+        point["uid"] = uid
+    if runtime_id:
+        # F42: the semantic runtime identity travels with the element point so
+        # the executor can re-resolve the control through a FRESH UIA walk.
+        point["runtime_id"] = runtime_id
+    return point
+
+
+def _build_screen_snapshot(capture):
+    snapshot = {
+        "raw_ui": [],
+        "ui_elements": [],
+        "ui_space": screen_geometry.COORD_SCREEN_PIXELS,
+        "ocr_regions": [],
+        "ocr_merged": [],
+        # F43: the observation this snapshot came from, and the window it
+        # describes. Consumers can compare this epoch with the capture's to
+        # refuse mixing a tree with a different frame.
+        "capture_epoch": capture.get("capture_epoch"),
+        "ui_hwnd": capture.get("ui_hwnd") or capture.get("hwnd"),
+    }
+
+    if screen_ui_elements.is_available():
+        try:
+            # F43: walk the window the CAPTURE came from — not "whatever is
+            # foreground now". When Jarvis's overlay owns the foreground the
+            # screenshot is of the recorded user target, and a foreground walk
+            # would feed the planner a tree describing a completely different
+            # window than the pixels it is looking at.
+            raw_ui = screen_ui_elements.get_foreground_window_elements(
+                hwnd=capture.get("ui_hwnd") or capture.get("hwnd")
+            )
+            snapshot["raw_ui"] = raw_ui
+            if all(
+                key in capture
+                for key in ("capture_width", "capture_height", "vision_width", "vision_height")
+            ):
+                snapshot["ui_elements"] = screen_ui_elements.to_vision_coords(raw_ui, capture)
+                snapshot["ui_space"] = screen_geometry.COORD_VISION_PIXELS
+            else:
+                snapshot["ui_elements"] = raw_ui
+                snapshot["ui_space"] = screen_geometry.COORD_SCREEN_PIXELS
+        except Exception as exc:
+            logging.warning("UI Automation snapshot failed: %s", exc)
+
+    raw_image = capture.get("raw_vision_image")
+    if raw_image and screen_ocr.is_available():
+        try:
+            regions = screen_ocr.extract_text_regions(raw_image)
+            snapshot["ocr_regions"] = regions
+            snapshot["ocr_merged"] = screen_ocr._merge_nearby_words(regions)
+        except Exception as exc:
+            logging.warning("OCR snapshot failed: %s", exc)
+
+    return snapshot
+
+
+def _resolve_element_point(element_ref):
+    if isinstance(element_ref, dict):
+        x = _coerce_int(element_ref.get("x"), None)
+        y = _coerce_int(element_ref.get("y"), None)
+        if x is None or y is None:
+            return None
+        return {
+            "x": x,
+            "y": y,
+            # F43: canonical token, so a later comparison against the screen
+            # space cannot miss an alias spelling.
+            "space": screen_geometry.normalize_space(
+                element_ref.get("space"), screen_geometry.COORD_VISION_PIXELS),
+            "uid": element_ref.get("uid", ""),
+            "runtime_id": element_ref.get("runtime_id", ""),
+        }
+
+    if isinstance(element_ref, (list, tuple)) and len(element_ref) >= 2:
+        x = _coerce_int(element_ref[0], None)
+        y = _coerce_int(element_ref[1], None)
+        if x is None or y is None:
+            return None
+        return {"x": x, "y": y, "space": screen_geometry.COORD_VISION_PIXELS,
+                "uid": "", "runtime_id": ""}
+
+    return None
+
+
+def _resolve_observation_depth(elements, by_uid):
+    """F44: effective depth from explicit parent links, not a raw integer.
+
+    A depth value recorded during the walk can skip a level when the walk was
+    truncated (``max_elements``) or when a degenerate container was dropped.
+    Trusting it then misparents children. Deriving depth from the emitted
+    ``parent_uid`` chain keeps parent/child relationships exact; the recorded
+    depth is the fallback for element dicts that carry no parent information.
+    """
+    depths = {}
+    for el in elements:
+        uid = el.get("uid")
+        if not uid or el.get("parent_uid") is None:
+            continue
+        hops = 0
+        parent = el.get("parent_uid")
+        seen = set()
+        while parent and parent in by_uid and hops < 64:
+            if parent in seen:
+                break  # defensive: never loop on a corrupt chain
+            seen.add(parent)
+            hops += 1
+            parent = by_uid[parent].get("parent_uid")
+        depths[uid] = hops
+    return depths
+
+

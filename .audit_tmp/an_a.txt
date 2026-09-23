@@ -1,0 +1,57 @@
+def _screen_vision_schema(result):
+    """F37 schema validation: nonempty is NOT success — JSON is.
+
+    The old check (``_extract_result_content(result) is not None``) accepted
+    any nonempty text, so a malformed first response ended the cascade. A
+    response only counts as usable when it contains a JSON object.
+    """
+    content = _extract_result_content(result)
+    if content is None:
+        return False, "no assistant content"
+    parsed = _extract_json(content)
+    if not isinstance(parsed, dict) or not parsed:
+        return False, "content was not a JSON object"
+    return True, ""
+
+
+def _ask_screen_vision_cascade(prompt, image_data_url, max_completion_tokens=800,
+                               attempts_out=None):
+    """Vision for screen Q&A through the ONE eligible-provider cascade (F37).
+
+    The registry-selected (provider, model) is attempted first when it is
+    eligible; the remaining ELIGIBLE configured providers follow, each at most
+    once, bounded by the cascade's attempt cap. A provider with no credential
+    is never dispatched (no unrelated key is required), adapter exceptions and
+    schema-invalid output advance to the next provider, and *attempts_out*
+    (optional dict) receives the actual-attempt record.
+    """
+    result, report = vision_cascade.ask_vision_with_fallback(
+        prompt,
+        image_data_url,
+        dispatchers=_vision_dispatchers(),
+        validate=_screen_vision_schema,
+        selected=_resolve_vision_model(),
+        max_completion_tokens=max_completion_tokens,
+        response_format={"type": "json_object"},
+        attempts_out=attempts_out,
+    )
+    if report.get("usable"):
+        logging.info("[SCREEN-QA] Vision response from %s (%s)",
+                     report.get("provider"), report.get("model") or "default")
+        return result
+    logging.warning("[SCREEN-QA] %s", report.get("unavailable_reason"))
+    return result if result is not None else {}
+
+
+def analyze_screen(question: str) -> dict:
+    """Capture the screen and ask Gemini Vision about it.
+
+    Returns a dict with keys:
+    - ``tip`` (str) — main answer
+    - ``evidence`` (list[dict]) — supporting details, each tagged with a
+      ``provenance`` (``observed`` / ``inferred`` / ``externally_checked``)
+      so the answer never blurs what was seen into what was assumed (F48)
+    - ``topic`` (str) — main subject for image/link generation
+    - ``grounding_links`` (list[dict]) — source URLs, when the provider
+      actually returns any (search grounding is OFF, so usually empty)
+    - ``show_images`` (bool) — whether related images are worth fetching

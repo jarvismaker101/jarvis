@@ -1,0 +1,500 @@
+        r"\b(click|type|enter|write|press|hotkey|scroll|hover|move|select|focus)\b",
+        text,
+    )
+    if not match:
+        return text.replace(" ", "_")
+
+    verb = match.group(1)
+    if verb in {"select", "focus"}:
+        return "click"
+    if verb in {"enter", "write"}:
+        return "type"
+    return verb
+
+
+def _step_point_to_screen(space, x, y, capture):
+    """Convert ONE raw planner point (declared *space*) to screen pixels.
+
+    F43 — every provider point is converted exactly once, by its named
+    coordinate space, instead of assuming the 0..1000 frame. Returns
+    (screen_x, screen_y), or None when that space cannot be expressed against
+    this capture (e.g. window-relative coordinates for a desktop capture).
+    """
+    if x is None or y is None:
+        return None
+    x = int(x)
+    y = int(y)
+
+    if space == screen_geometry.COORD_SCREEN_PIXELS:
+        return x, y
+
+    if space == screen_geometry.COORD_WINDOW_PIXELS:
+        if capture.get("capture_mode") != "active_window":
+            return None
+        if any(k not in capture for k in ("origin_left", "origin_top")):
+            return None
+        return int(capture["origin_left"]) + x, int(capture["origin_top"]) + y
+
+    if space == screen_geometry.COORD_VISION_PIXELS:
+        return _vision_to_screen_point(capture, x, y)
+
+    # normalized 0..1000 — clamp to the vision frame, then scale once (P1-B).
+    vw = max(1, int(capture.get("vision_width") or 1000))
+    vh = max(1, int(capture.get("vision_height") or 1000))
+    vx = min(max(int(round(x * vw / 1000.0)), 0), vw - 1)
+    vy = min(max(int(round(y * vh / 1000.0)), 0), vh - 1)
+    return _vision_to_screen_point(capture, vx, vy)
+
+
+def _mark_step_sensitive(step_payload, raw_step, element_id_map=None):
+    """F21: flag a typed step whose target is a sensitive field.
+
+    The flag is what the redacted egress boundary keys on — without it, a step
+    that types a password is indistinguishable from one that types a city name
+    because both store the value under the key ``text``.
+
+    Evidence only: an explicit marker from the planner, a sensitive word in the
+    step's own description/label, or the identity of the element the step
+    targets. A plain typed step is left unmarked so logs stay readable.
+    """
+    if raw_step.get("sensitive") is True or raw_step.get("secret") is True:
+        step_payload["sensitive"] = True
+        return True
+    if tool_policy.is_sensitive_field(
+            raw_step.get("description"), raw_step.get("label"),
+            raw_step.get("target"), raw_step.get("name"),
+            raw_step.get("placeholder")):
+        step_payload["sensitive"] = True
+        return True
+
+    lookup = element_id_map if isinstance(element_id_map, dict) else {}
+    keys = []
+    el_id = _coerce_int(raw_step.get("element_id"), None)
+    if el_id is not None:
+        keys.append(el_id)
+    for key in keys:
+        element = lookup.get(key)
+        if not isinstance(element, dict):
+            continue
+        if element.get("is_password") or tool_policy.is_sensitive_field(
+                element.get("name"), element.get("label"),
+                element.get("text"), element.get("placeholder"),
+                element.get("control_type"), element.get("automation_id"),
+                element.get("className")):
+            step_payload["sensitive"] = True
+            return True
+    return False
+
+
+def _normalize_vision_plan(plan, capture, element_id_map=None):
+    if not isinstance(plan, dict):
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "I couldn't parse the screen action plan.",
+            "steps": [],
+        }
+
+    normalized = {
+        "ok": bool(plan.get("ok")),
+        "confidence": _bounded_confidence(plan.get("confidence"), 0.0),
+        "summary": (plan.get("summary") or "").strip(),
+        "needs_confirmation": bool(plan.get("needs_confirmation")),
+        "reason": (plan.get("reason") or "").strip(),
+        "capture_mode": capture.get("capture_mode", ""),
+        "window_title": capture.get("window_title", ""),
+        "hwnd": capture.get("hwnd"),
+        "origin_left": capture.get("origin_left"),
+        "origin_top": capture.get("origin_top"),
+        "capture_width": capture.get("capture_width"),
+        "capture_height": capture.get("capture_height"),
+        "vision_width": capture.get("vision_width"),
+        "vision_height": capture.get("vision_height"),
+        # F43/F42: identity + coordinate contract travel with the plan so the
+        # executor can revalidate the target by HWND, process id and monitor.
+        "process_id": capture.get("process_id"),
+        "monitor_index": capture.get("monitor_index"),
+        "dpi_scale": capture.get("dpi_scale"),
+        "steps": [],
+    }
+
+    if not normalized["ok"]:
+        if not normalized["reason"]:
+            normalized["reason"] = "I couldn't find a confident screen action for that."
+        return normalized
+
+    def _reject(reason):
+        normalized["ok"] = False
+        normalized["reason"] = reason
+        normalized["steps"] = []
+        return normalized
+
+    # F45: validate the schema before trusting any of it.
+    raw_steps = plan.get("steps", [])
+    if not isinstance(raw_steps, list):
+        return _reject("The screen planner returned a malformed plan.")
+
+    raw_coord_click = False
+    plan_space, plan_space_declared = _declared_space(plan)
+    if plan_space_declared and plan_space is None:
+        return _reject(
+            "The screen planner returned coordinates in an unrecognised "
+            "coordinate space."
+        )
+    if plan_space is not None and plan_space not in _SUPPORTED_STEP_SPACES:
+        return _reject(
+            "The screen planner returned coordinates in an unsupported space."
+        )
+
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, dict):
+            return _reject("The screen planner returned a malformed step.")
+        raw_action = (raw_step.get("action") or "").strip().lower()
+        action = _normalize_action_name(raw_action)
+        if not action:
+            return _reject("The screen planner returned a step with no action.")
+
+        if action in {"click", "double_click", "right_click", "move", "hover"}:
+            x, y = None, None
+            point_space = screen_geometry.COORD_VISION_PIXELS
+
+            # 1. Primary: Set-of-Mark element_id
+            el_id = _coerce_int(raw_step.get("element_id"), None)
+            if el_id is not None:
+                if not element_id_map:
+                    # F45: an element id with no tree at all is invalid — the
+                    # image-only path must never silently degrade to a guessed
+                    # coordinate click on a hallucinated control.
+                    return _reject(
+                        "The screen planner referenced a control that is not in "
+                        "the current UI tree."
+                    )
+                if el_id not in element_id_map:
+                    logging.warning(
+                        "Screen plan referenced missing element_id=%s for action=%s",
+                        el_id, raw_action,
+                    )
+                    return _reject(
+                        "The local screen planner referenced a control that is "
+                        "not in the current UI tree."
+                    )
+                point = _resolve_element_point(element_id_map[el_id])
+                if point is not None:
+                    x = point["x"]
+                    y = point["y"]
+                    point_space = point["space"]
+            else:
+                # 2. Fallback: bounding box or direct x, y in the DECLARED space.
+                # F45: the space must be declared explicitly — a missing or
+                # unknown space is rejected instead of being guessed.
+                raw_coord_click = True
+                if _spaces_conflict(raw_step):
+                    return _reject(
+                        "The screen planner declared conflicting coordinate "
+                        "spaces for one step."
+                    )
+                step_space, step_declared = _declared_space(raw_step)
+                if not step_declared:
+                    step_space = plan_space
+                if step_space is None:
+                    return _reject(
+                        "The screen planner did not declare which coordinate "
+                        "space its coordinates use."
+                    )
+                if step_space not in _SUPPORTED_STEP_SPACES:
+                    return _reject(
+                        "The screen planner returned coordinates in an "
+                        "unsupported space."
+                    )
+
+                box_center = _extract_box_center(raw_step)
+                if box_center is not None:
+                    x, y = box_center
+                else:
+                    x = _coerce_int(raw_step.get("x"), None)
+                    y = _coerce_int(raw_step.get("y"), None)
+                if x is not None and y is not None:
+                    # F45: out-of-range points are rejected, not clamped into
+                    # an actionable pixel at the edge of the capture.
+                    if not _point_in_declared_space(step_space, x, y, capture):
+                        return _reject(
+                            "The screen planner returned a coordinate outside "
+                            "the captured screen area."
+                        )
+                    converted = _step_point_to_screen(step_space, x, y, capture)
+                    if converted is None:
+                        return _reject(
+                            "The screen planner returned window-relative "
+                            "coordinates but this capture is not a single window."
+                        )
+                    x, y = converted
+                    point_space = screen_geometry.COORD_SCREEN_PIXELS
+
+            if x is None or y is None:
+                continue
+
+            # P0: Do NOT snap pure-coordinate clicks - model coordinates are already
+            # screen-grounded. Previous snapping used smallest containing element
+            # which for browsers is the giant document root (0,0,1920,1216) and
+            # snapped every icon click to its center (960,608).
+            raw_ui_uid = raw_step.get("ui_uid", "")
+
+            if point_space == screen_geometry.COORD_SCREEN_PIXELS:
+                screen_x, screen_y = x, y
+            else:
+                x = min(max(x, 0), capture["vision_width"] - 1)
+                y = min(max(y, 0), capture["vision_height"] - 1)
+                screen_x, screen_y = _vision_to_screen_point(capture, x, y)
+
+            # P1-B: post-scale clamp (also covers screen-space case and 1px overshoot on far edge)
+            if all(k in capture for k in ("origin_left", "origin_top", "capture_width", "capture_height")):
+                max_x = capture["origin_left"] + capture["capture_width"] - 1
+                max_y = capture["origin_top"] + capture["capture_height"] - 1
+                screen_x = max(capture["origin_left"], min(screen_x, max_x))
+                screen_y = max(capture["origin_top"], min(screen_y, max_y))
+
+            # F43: emitted steps carry an explicit coordinate-space contract.
+            step_payload = {
+                "action": action,
+                "x": screen_x,
+                "y": screen_y,
+                "button": raw_step.get("button", "left"),
+                "clicks": raw_step.get("clicks", 1),
+                "space": screen_geometry.COORD_SCREEN_PIXELS,
+            }
+            # Bug #9: Carry element label into step for menu-open heuristic.
+            if el_id is not None and element_id_map and el_id in element_id_map:
+                el_ref = element_id_map[el_id]
+                step_payload["label"] = el_ref.get("label", "") if isinstance(el_ref, dict) else ""
+                resolved = _resolve_element_point(el_ref)
+                if resolved and resolved.get("uid"):
+                    step_payload["ui_uid"] = resolved["uid"]
+                if resolved and resolved.get("runtime_id"):
+                    step_payload["ui_runtime_id"] = resolved["runtime_id"]
+            elif raw_ui_uid:
+                step_payload["ui_uid"] = raw_ui_uid
+                if raw_step.get("ui_runtime_id"):
+                    step_payload["ui_runtime_id"] = raw_step["ui_runtime_id"]
+
+            normalized["steps"].append(step_payload)
+        elif action == "scroll":
+            direction = str(raw_step.get("direction", "down") or "down").strip().lower()
+            if direction not in {"up", "down", "left", "right"}:
+                return _reject("The screen planner returned an invalid scroll direction.")
+            normalized["steps"].append(
+                {
+                    "action": "scroll",
+                    "direction": direction,
+                    "amount": max(1, min(_coerce_int(raw_step.get("amount"), 600), 10000)),
+                }
+            )
+        elif action == "type":
+            text = raw_step.get("text", "")
+            if not isinstance(text, str):
+                # F45: a non-string payload would be coerced by the executor's
+                # typing layer into something the planner never produced.
+                return _reject("The screen planner returned a malformed typing step.")
+            step_payload = {"action": "type", "text": text}
+
+            el_id = _coerce_int(raw_step.get("element_id"), None)
+            if el_id is not None and element_id_map and el_id in element_id_map:
+                resolved = _resolve_element_point(element_id_map[el_id])
+                if resolved and resolved.get("uid"):
+                    step_payload["ui_uid"] = resolved["uid"]
+                if resolved and resolved.get("runtime_id"):
+                    step_payload["ui_runtime_id"] = resolved["runtime_id"]
+            elif el_id is not None and element_id_map:
+                logging.warning(
+                    "Screen plan referenced missing element_id=%s for type action",
+                    el_id,
+                )
+                return _reject(
+                    "The local screen planner referenced a text field that is "
+                    "not in the current UI tree."
+                )
+            elif raw_step.get("ui_uid"):
+                step_payload["ui_uid"] = raw_step["ui_uid"]
+                if raw_step.get("ui_runtime_id"):
+                    step_payload["ui_runtime_id"] = raw_step["ui_runtime_id"]
+
+            # F21: mark a typing step whose target is a sensitive field, so the
+            # redacted egress boundary knows the innocuous "text" key holds a
+            # credential. Evidence comes from the step itself or the element it
+            # names — never from a guess.
+            _mark_step_sensitive(step_payload, raw_step, element_id_map)
+
+            normalized["steps"].append(step_payload)
+        elif action in {"press", "hotkey"}:
+            keys = raw_step.get("keys", [])
+            if isinstance(keys, str):
+                keys = [keys]
+            if not isinstance(keys, list) or not keys:
+                return _reject("The screen planner returned a malformed key step.")
+            if any(not isinstance(key, str) or not key.strip() for key in keys):
+                return _reject("The screen planner returned a malformed key step.")
+            normalized["steps"].append(
+                {"action": action, "keys": [k.strip() for k in keys]}
+            )
+        else:
+            # F45: an unsupported action is not silently dropped — a plan whose
+            # steps cannot all be honoured must not run partially.
+            return _reject(
+                "The screen planner asked for an action I don't support."
+            )
+
+    # P1.4: Raw-coordinate / bbox clicks are less certain than resolved
+    # element_ids: force the confirmation gate when confidence is below the
+    # coordinate bar. Global thresholds (0.82 / 0.90 / 0.58) are untouched;
+    # element_id targets are never affected by this rule.
+    if raw_coord_click and normalized["ok"] and normalized["confidence"] < COORDINATE_CONFIRMATION_THRESHOLD:
+        normalized["needs_confirmation"] = True
+
+    if not normalized["steps"]:
+        normalized["ok"] = False
+        if not normalized["reason"]:
+            normalized["reason"] = "I couldn't produce any screen steps for that command."
+
+    return normalized
+
+
+def _build_tree_prompt(command_text, capture, ui_context="", image_only=False):
+    title = capture["window_title"] or "Unknown window"
+    history_context = screen_state.format_history_for_prompt()
+
+    if image_only:
+        coordinate_examples = (
+            'Example - user says "click the heart icon" (visible in the screenshot near grid x=660, y=550):\n'
+            '{"ok": true, "confidence": 0.90, "summary": "Clicking the heart icon, sir.", '
+            '"needs_confirmation": false, "coordinate_space": "normalized_1000", '
+            '"reason": "Image-only mode: located from the screenshot grid.", '
+            '"steps": [{"action": "click", "x": 660, "y": 550}]}\n\n'
+        )
+        return (
+            "You are an autonomous computer agent. You are driving the computer by looking at a screenshot.\n"
+            "Return only a JSON object with keys: ok, confidence, summary, needs_confirmation, reason, steps, coordinate_space.\n"
+            f"{coordinate_examples}"
+            f"Active window title: {title}\n"
+            f"{history_context}"
+            "IMAGE-ONLY MODE: UI Automation and OCR found no readable controls on this screen, so "
+            "the screenshot and its coordinate grid are your ONLY evidence. Absence from the "
+            "accessibility tree does NOT mean absence from the image — locate the target visually.\n"
+            "Allowed step actions: click, double_click, right_click, type, press, hotkey, scroll.\n"
+            "CRITICAL: You MUST use EXACTLY one of these allowed action verbs. Do NOT write descriptive actions.\n"
+            "Never use element_id in this mode — there is no UI tree. Return x, y (and any bounding "
+            "box) in NORMALIZED 0..1000 coordinates on each axis: 0 = left/top edge of the image, "
+            "1000 = right/bottom edge. Grid ticks are drawn every 10 percent with labels 100, 200, "
+            "... 900 in both axes. Prefer a bounding box ({x, y, width, height} or {left, top, "
+            "right, bottom}, same normalized scale) over a plain point when the target is larger "
+            "than a few pixels; we click the box center. Estimate coordinates from the screenshot "
+            "grid; never copy example numbers.\n"
+            "Set \"coordinate_space\" to \"normalized_1000\" in every reply so we can validate the "
+            "coordinate space you used.\n"
+            "If the target is ambiguous (several visually similar candidates), return ok:false with "
+            "a reason asking the user which region or element they mean instead of guessing.\n"
+            "For type steps include text. For press/hotkey steps include keys as a JSON array.\n"
+            "Set ok to false ONLY when the target is genuinely not visible or you cannot locate it precisely.\n"
+            "Set needs_confirmation true for risky actions like send, delete, submit, pay, buy, purchase, close, quit, or exit.\n"
+            f"User command: {command_text}"
+        )
+
+    few_shot_examples = (
+        'Example - user says "click the search bar":\n'
+        '{"ok": true, "confidence": 0.92, "summary": "Clicking the search bar, sir.", '
+        '"needs_confirmation": false, "reason": "", '
+        '"steps": [{"action": "click", "element_id": 14}]}\n\n'
+        'Example - user says "type hello world" (cursor already in a text field):\n'
+        '{"ok": true, "confidence": 0.95, "summary": "Typing that now, sir.", '
+        '"needs_confirmation": false, "reason": "", '
+        '"steps": [{"action": "type", "text": "hello world"}]}\n\n'
+        'Example - user says "type hello into the search box":\n'
+        '{"ok": true, "confidence": 0.94, "summary": "Typing into Search, sir.", '
+        '"needs_confirmation": false, "reason": "", '
+        '"steps": [{"action": "click", "element_id": 9}, {"action": "type", "text": "hello"}]}\n\n'
+        'Example - user says "click the heart icon" (icon not in the UI tree, visible in the screenshot at x=660, y=550):\n'
+        '{"ok": true, "confidence": 0.90, "summary": "Clicking the heart icon, sir.", '
+        '"needs_confirmation": false, "coordinate_space": "normalized_1000", '
+        '"reason": "Used screenshot coordinates because the icon was not in the UI tree.", '
+        '"steps": [{"action": "click", "x": 660, "y": 550}]}\n\n'
+        'Example - user says "click the search icon" (icon not in the UI tree, visible in the screenshot at x=922, y=83):\n'
+        '{"ok": true, "confidence": 0.89, "summary": "Clicking the search icon, sir.", '
+        '"needs_confirmation": false, "coordinate_space": "normalized_1000", '
+        '"reason": "Used screenshot coordinates because the icon was not in the UI tree.", '
+        '"steps": [{"action": "click", "x": 922, "y": 83}]}\n\n'
+    )
+
+    return (
+        "You are an autonomous computer agent. You are driving the computer by reading its active Accessibility Tree.\n"
+        "Return only a JSON object with keys: ok, confidence, summary, needs_confirmation, reason, steps, coordinate_space.\n"
+        f"{few_shot_examples}"
+        f"Active window title: {title}\n"
+        f"{history_context}"
+        "Below is the XML-like structure of the active window. Every element includes its role, bounds, center, and any known labels.\n"
+        "Bounds and centers are in capture-local vision pixels, not raw screen pixels.\n"
+        "Use the tree hierarchy and the metadata to disambiguate repeated labels.\n"
+        "--- UI TREE START ---\n"
+        f"{ui_context}\n"
+        "--- UI TREE END ---\n"
+        "Allowed step actions: click, double_click, right_click, type, press, hotkey, scroll.\n"
+        "CRITICAL: You MUST use EXACTLY one of these allowed action verbs. Do NOT write descriptive actions like 'Locate element' or 'Simulate click event'. Just write 'click'.\n"
+        "For click-like steps, PREFER to return the integer ID of the target element in the 'element_id' field when a listed ID matches the target. Only use element_id values that appear verbatim in the UI tree below.\n"
+        "If no listed ID matches but the target is clearly visible in the screenshot, PREFER returning a bounding box for the target. A plain x,y point tends to land on the corner of an icon instead of its center and cause misses - return a bounding box whenever the target is larger than a few pixels, and make x,y the CENTER of the target. Return the step with a bounding box when you can -- either {x, y, width, height} or {left, top, right, bottom} (as {\"x\":, \"y\":, \"width\":, \"height\":} or {\"left\":, \"top\":, \"right\":, \"bottom\":}) with all box coordinates in the same NORMALIZED 0..1000 scale as x,y and we will click its center; plain x and y remains an acceptable fallback if you cannot estimate the box. Return x, y, and any bounding box in NORMALIZED 0..1000 coordinates on each axis: 0 = left/top edge of the image, 1000 = right/bottom edge. Numbered boxes are element ids from the UI tree; grid ticks are drawn every 10 percent with labels 100, 200, ... 900 in both axes (normalized 0..1000). When several visually similar icons are on screen, prefer the one in the main content or feed area over sidebars and navigation panels. Estimate coordinates from the screenshot grid and boxes; never copy example numbers.\n"
+        "For type steps include text. For press/hotkey steps include keys as a JSON array.\n"
+        "If the user wants text entered into a visible field, include a click step on the field's ID before the type step.\n"
+        "Prefer UI Automation elements over OCR-only text when both describe the same target.\n"
+        "F45: any raw coordinate you return MUST be accompanied by \"coordinate_space\": "
+        "\"normalized_1000\". A reply containing coordinates without a declared coordinate space is "
+        "rejected, so always state it.\n"
+        "Set ok to false ONLY when the target is genuinely not visible or you cannot locate it precisely.\n"
+        "Set needs_confirmation true for risky actions like send, delete, submit, pay, buy, purchase, close, quit, or exit.\n"
+        f"User command: {command_text}"
+    )
+
+
+def _build_vision_prompt(command_text, capture, ocr_context="", ui_context="", image_only=False):
+    merged_context = "\n".join(
+        fragment.strip()
+        for fragment in (ui_context, ocr_context)
+        if fragment and fragment.strip()
+    )
+    return _build_tree_prompt(command_text, capture, ui_context=merged_context, image_only=image_only)
+
+
+def _extract_response_content(result):
+    """Pull the text content from a vision API response.
+
+    Some models (e.g. Nemotron) put the answer in a 'reasoning' field
+    instead of 'content'.  This helper checks both.
+    """
+    if not result or not result.get("choices"):
+        return None
+    msg = result["choices"][0].get("message", {})
+    content = msg.get("content") or ""
+    if content.strip():
+        return content
+    # Fallback: some reasoning models put the JSON inside 'reasoning'.
+    reasoning = msg.get("reasoning") or ""
+    if reasoning.strip():
+        return reasoning
+    return None
+
+
+def _resolve_vision_model():
+    """Vision model per call: registry vision_model else env default."""
+    try:
+        from backend.services import model_registry
+        sel = model_registry.get_model_for_role("vision")
+        prov = str(sel.get("provider") or "").strip()
+        mod = str(sel.get("model") or "").strip()
+        if prov and mod:
+            return {"provider": prov, "model": mod}
+    except Exception:
+        pass
+    try:
+        from backend.services.gemini_client import GEMINI_MODEL as _GM
+        return {"provider": "gemini", "model": _GM}
+    except Exception:
+        return {"provider": "gemini", "model": "gemini-3.5-flash-lite"}
+
+

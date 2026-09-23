@@ -1,0 +1,395 @@
+      * ``(None, True)``   — declared but unrecognised (caller must reject);
+      * ``(None, False)``  — nothing was declared (caller must not guess).
+    """
+    if not isinstance(source, dict):
+        return None, False
+    stated = source.get("coordinate_space")
+    if stated is None or str(stated).strip() == "":
+        stated = source.get("space")
+    if stated is None or str(stated).strip() == "":
+        return None, False
+    return screen_geometry.normalize_space(stated, default=None), True
+
+
+def _spaces_conflict(raw_step):
+    """F45: ``space`` and ``coordinate_space`` on one step must agree."""
+    if not isinstance(raw_step, dict):
+        return False
+    first = raw_step.get("coordinate_space")
+    second = raw_step.get("space")
+    if first is None or second is None:
+        return False
+    a = screen_geometry.normalize_space(first, default=None)
+    b = screen_geometry.normalize_space(second, default=None)
+    return a != b
+
+
+def _point_in_declared_space(space, x, y, capture):
+    """F45: a coordinate must lie inside the frame it claims to be in.
+
+    Out-of-range points used to be *clamped* into the capture, which turned a
+    malformed or hallucinated coordinate into a real click at the edge of the
+    screen. They are now rejected.
+    """
+    try:
+        fx, fy = float(x), float(y)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(fx) and math.isfinite(fy)):
+        return False
+
+    if space == screen_geometry.COORD_NORMALIZED_1000:
+        return 0 <= fx <= 1000 and 0 <= fy <= 1000
+
+    if space == screen_geometry.COORD_VISION_PIXELS:
+        vw = _coerce_int(capture.get("vision_width"), 0)
+        vh = _coerce_int(capture.get("vision_height"), 0)
+        if vw <= 0 or vh <= 0:
+            return False
+        return 0 <= fx <= vw - 1 and 0 <= fy <= vh - 1
+
+    if space == screen_geometry.COORD_WINDOW_PIXELS:
+        cw = _coerce_int(capture.get("capture_width"), 0)
+        ch = _coerce_int(capture.get("capture_height"), 0)
+        if cw <= 0 or ch <= 0:
+            return False
+        return 0 <= fx <= cw - 1 and 0 <= fy <= ch - 1
+
+    if space == screen_geometry.COORD_SCREEN_PIXELS:
+        ol = capture.get("origin_left")
+        ot = capture.get("origin_top")
+        cw = _coerce_int(capture.get("capture_width"), 0)
+        ch = _coerce_int(capture.get("capture_height"), 0)
+        if ol is None or ot is None or cw <= 0 or ch <= 0:
+            return False
+        return (int(ol) <= fx <= int(ol) + cw - 1
+                and int(ot) <= fy <= int(ot) + ch - 1)
+
+    return False
+
+
+def _command_references_window_title(command_text, title):
+    normalized_command = _normalize_text(command_text)
+    normalized_title = _normalize_text(title)
+    if not normalized_command or not normalized_title:
+        return False
+
+    if normalized_title in normalized_command:
+        return True
+
+    title_tokens = [token for token in re.findall(r"[a-z0-9]+", normalized_title) if len(token) >= 4]
+    if not title_tokens:
+        return False
+
+    shared = [
+        token
+        for token in title_tokens
+        if re.search(rf"\b{re.escape(token)}\b", normalized_command)
+    ]
+    required_matches = 1 if len(title_tokens) == 1 else min(2, len(title_tokens))
+    return len(shared) >= required_matches
+
+
+def _is_window_local_command(command_text, capture=None):
+    normalized = _normalize_text(command_text)
+    if not normalized or _needs_desktop_capture(command_text):
+        return False
+
+    if any(term in normalized for term in ("window", "app", "application", "dialog", "popup", "title bar")):
+        return True
+
+    if re.search(r"\b(its|this|that)\b", normalized) and any(
+        term in normalized
+        for term in ("search bar", "search box", "button", "field", "textbox", "text box", "tab", "icon")
+    ):
+        return True
+
+    if capture and _command_references_window_title(command_text, capture.get("window_title", "")):
+        return True
+
+    return False
+
+
+def _extract_box_center(raw_step):
+    for key in ("box", "bbox", "bounds"):
+        box = raw_step.get(key)
+        if not isinstance(box, dict):
+            continue
+
+        left = _coerce_int(box.get("left", box.get("x", box.get("x1"))), None)
+        top = _coerce_int(box.get("top", box.get("y", box.get("y1"))), None)
+        right = _coerce_int(box.get("right", box.get("x2")), None)
+        bottom = _coerce_int(box.get("bottom", box.get("y2")), None)
+
+        if right is None and left is not None:
+            width = _coerce_int(box.get("width"), None)
+            if width is not None:
+                right = left + width
+
+        if bottom is None and top is not None:
+            height = _coerce_int(box.get("height"), None)
+            if height is not None:
+                bottom = top + height
+
+        if None in (left, top, right, bottom):
+            continue
+        if right <= left or bottom <= top:
+            continue
+
+        return (
+            int(round((left + right) / 2.0)),
+            int(round((top + bottom) / 2.0)),
+        )
+
+    # Also support bbox returned directly as top-level keys (e.g. {"x":10,"y":20,"width":100,"height":50}
+    # or {"left":10,"top":20,"right":110,"bottom":70}) without wrapper - plain x/y remains fallback
+    if isinstance(raw_step, dict) and any(k in raw_step for k in ("width", "height", "right", "bottom", "x2", "y2")):
+        left = _coerce_int(raw_step.get("left", raw_step.get("x", raw_step.get("x1"))), None)
+        top = _coerce_int(raw_step.get("top", raw_step.get("y", raw_step.get("y1"))), None)
+        right = _coerce_int(raw_step.get("right", raw_step.get("x2")), None)
+        bottom = _coerce_int(raw_step.get("bottom", raw_step.get("y2")), None)
+        if right is None and left is not None:
+            width = _coerce_int(raw_step.get("width"), None)
+            if width is not None:
+                right = left + width
+        if bottom is None and top is not None:
+            height = _coerce_int(raw_step.get("height"), None)
+            if height is not None:
+                bottom = top + height
+        if None not in (left, top, right, bottom) and right > left and bottom > top:
+            return (
+                int(round((left + right) / 2.0)),
+                int(round((top + bottom) / 2.0)),
+            )
+
+    return None
+
+
+def _vision_to_screen_point(capture, x, y):
+    x_scale = capture["capture_width"] / float(capture["vision_width"])
+    y_scale = capture["capture_height"] / float(capture["vision_height"])
+    screen_x = capture["origin_left"] + int(round(x * x_scale))
+    screen_y = capture["origin_top"] + int(round(y * y_scale))
+    # P1-B: post-scale clamp to capture bounds (vision clamp then scale can overshoot by 1px)
+    max_x = capture["origin_left"] + capture["capture_width"] - 1
+    max_y = capture["origin_top"] + capture["capture_height"] - 1
+    screen_x = max(capture["origin_left"], min(screen_x, max_x))
+    screen_y = max(capture["origin_top"], min(screen_y, max_y))
+    return screen_x, screen_y
+
+
+def _build_element_point(x, y, space="vision", bounds=None, source="", label="", uid="", runtime_id=""):
+    point = {
+        "x": _coerce_int(x, None),
+        "y": _coerce_int(y, None),
+        # F43: canonical space token — never a loose spelling that a later
+        # comparison (`space == "screen"`) could miss.
+        "space": screen_geometry.normalize_space(space, screen_geometry.COORD_VISION_PIXELS),
+    }
+    if bounds:
+        point["bounds"] = dict(bounds)
+    if source:
+        point["source"] = source
+    if label:
+        point["label"] = label
+    if uid:
+        point["uid"] = uid
+    if runtime_id:
+        # F42: the semantic runtime identity travels with the element point so
+        # the executor can re-resolve the control through a FRESH UIA walk.
+        point["runtime_id"] = runtime_id
+    return point
+
+
+def _build_screen_snapshot(capture):
+    snapshot = {
+        "raw_ui": [],
+        "ui_elements": [],
+        "ui_space": screen_geometry.COORD_SCREEN_PIXELS,
+        "ocr_regions": [],
+        "ocr_merged": [],
+        # F43: the observation this snapshot came from, and the window it
+        # describes. Consumers can compare this epoch with the capture's to
+        # refuse mixing a tree with a different frame.
+        "capture_epoch": capture.get("capture_epoch"),
+        "ui_hwnd": capture.get("ui_hwnd") or capture.get("hwnd"),
+    }
+
+    if screen_ui_elements.is_available():
+        try:
+            # F43: walk the window the CAPTURE came from — not "whatever is
+            # foreground now". When Jarvis's overlay owns the foreground the
+            # screenshot is of the recorded user target, and a foreground walk
+            # would feed the planner a tree describing a completely different
+            # window than the pixels it is looking at.
+            raw_ui = screen_ui_elements.get_foreground_window_elements(
+                hwnd=capture.get("ui_hwnd") or capture.get("hwnd")
+            )
+            snapshot["raw_ui"] = raw_ui
+            if all(
+                key in capture
+                for key in ("capture_width", "capture_height", "vision_width", "vision_height")
+            ):
+                snapshot["ui_elements"] = screen_ui_elements.to_vision_coords(raw_ui, capture)
+                snapshot["ui_space"] = screen_geometry.COORD_VISION_PIXELS
+            else:
+                snapshot["ui_elements"] = raw_ui
+                snapshot["ui_space"] = screen_geometry.COORD_SCREEN_PIXELS
+        except Exception as exc:
+            logging.warning("UI Automation snapshot failed: %s", exc)
+
+    raw_image = capture.get("raw_vision_image")
+    if raw_image and screen_ocr.is_available():
+        try:
+            regions = screen_ocr.extract_text_regions(raw_image)
+            snapshot["ocr_regions"] = regions
+            snapshot["ocr_merged"] = screen_ocr._merge_nearby_words(regions)
+        except Exception as exc:
+            logging.warning("OCR snapshot failed: %s", exc)
+
+    return snapshot
+
+
+def _resolve_element_point(element_ref):
+    if isinstance(element_ref, dict):
+        x = _coerce_int(element_ref.get("x"), None)
+        y = _coerce_int(element_ref.get("y"), None)
+        if x is None or y is None:
+            return None
+        return {
+            "x": x,
+            "y": y,
+            # F43: canonical token, so a later comparison against the screen
+            # space cannot miss an alias spelling.
+            "space": screen_geometry.normalize_space(
+                element_ref.get("space"), screen_geometry.COORD_VISION_PIXELS),
+            "uid": element_ref.get("uid", ""),
+            "runtime_id": element_ref.get("runtime_id", ""),
+        }
+
+    if isinstance(element_ref, (list, tuple)) and len(element_ref) >= 2:
+        x = _coerce_int(element_ref[0], None)
+        y = _coerce_int(element_ref[1], None)
+        if x is None or y is None:
+            return None
+        return {"x": x, "y": y, "space": screen_geometry.COORD_VISION_PIXELS,
+                "uid": "", "runtime_id": ""}
+
+    return None
+
+
+def _resolve_observation_depth(elements, by_uid):
+    """F44: effective depth from explicit parent links, not a raw integer.
+
+    A depth value recorded during the walk can skip a level when the walk was
+    truncated (``max_elements``) or when a degenerate container was dropped.
+    Trusting it then misparents children. Deriving depth from the emitted
+    ``parent_uid`` chain keeps parent/child relationships exact; the recorded
+    depth is the fallback for element dicts that carry no parent information.
+    """
+    depths = {}
+    for el in elements:
+        uid = el.get("uid")
+        if not uid or el.get("parent_uid") is None:
+            continue
+        hops = 0
+        parent = el.get("parent_uid")
+        seen = set()
+        while parent and parent in by_uid and hops < 64:
+            if parent in seen:
+                break  # defensive: never loop on a corrupt chain
+            seen.add(parent)
+            hops += 1
+            parent = by_uid[parent].get("parent_uid")
+        depths[uid] = hops
+    return depths
+
+
+def _serialize_accessibility_elements(elements, start_id=1, space="vision"):
+    lines = []
+    element_id_map = {}
+    next_id = start_id
+    open_depths = []
+    total = len(elements)
+
+    # F43: the caller declares which frame these bounds live in. Defaulting to
+    # "vision" is only correct for the converted (to_vision_coords) path; the
+    # unconverted fallback is screen pixels and must say so. An unrecognised
+    # label is treated as screen pixels — the conservative choice, because
+    # claiming "vision" for raw pixels would convert them a second time.
+    declared_space = screen_geometry.normalize_space(
+        space, screen_geometry.COORD_SCREEN_PIXELS)
+    if declared_space not in (screen_geometry.COORD_SCREEN_PIXELS,
+                              screen_geometry.COORD_VISION_PIXELS):
+        declared_space = screen_geometry.COORD_SCREEN_PIXELS
+
+    by_uid = {}
+    for el in elements:
+        uid = el.get("uid")
+        if uid:
+            by_uid.setdefault(uid, el)
+    chain_depths = _resolve_observation_depth(elements, by_uid)
+
+    def _depth_of(index, el):
+        uid = el.get("uid")
+        if uid and uid in chain_depths:
+            return chain_depths[uid]
+        return max(0, _coerce_int(el.get("depth"), 0))
+
+    for index, el in enumerate(elements):
+        depth = _depth_of(index, el)
+        while open_depths and open_depths[-1] >= depth:
+            close_depth = open_depths.pop()
+            lines.append(f'{"  " * (close_depth + 2)}</element>')
+
+        left = _coerce_int(el.get("left"), 0)
+        top = _coerce_int(el.get("top"), 0)
+        right = _coerce_int(el.get("right"), 0)
+        bottom = _coerce_int(el.get("bottom"), 0)
+        cx = int(round((left + right) / 2.0))
+        cy = int(round((top + bottom) / 2.0))
+        control_type = (el.get("control_type") or "element").strip() or "element"
+        name = (el.get("name") or "").strip()
+        automation_id = (el.get("automation_id") or "").strip()
+        class_name = (el.get("class_name") or "").strip()
+        enabled = bool(el.get("enabled", True))
+
+        attrs = [
+            f'id="{next_id}"',
+            f'role="{_escape_xml_attr(control_type)}"',
+            f'enabled="{str(enabled).lower()}"',
+            f'bounds="{left},{top},{right},{bottom}"',
+            f'center="{cx},{cy}"',
+        ]
+        if name:
+            attrs.append(f'name="{_escape_xml_attr(name)}"')
+        if automation_id:
+            attrs.append(f'automation_id="{_escape_xml_attr(automation_id)}"')
+        if class_name:
+            attrs.append(f'class="{_escape_xml_attr(class_name)}"')
+        if el.get("placeholder"):
+            # F44: explicit structural container kept only for hierarchy.
+            attrs.append('structural="true"')
+
+        indent = "  " * (depth + 2)
+        next_depth = (
+            _depth_of(index + 1, elements[index + 1])
+            if index + 1 < total
+            else -1
+        )
+
+        element_id_map[next_id] = _build_element_point(
+            cx,
+            cy,
+            space=declared_space,
+            bounds={"left": left, "top": top, "right": right, "bottom": bottom},
+            source="ui",
+            label=name or control_type,
+            uid=el.get("uid", ""),
+            runtime_id=el.get("runtime_id", ""),
+        )
+
+        if next_depth > depth:
+            lines.append(f'{indent}<element {" ".join(attrs)}>')
+            open_depths.append(depth)
+        else:

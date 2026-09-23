@@ -1,0 +1,10 @@
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+API KEY FOUND: True
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+FIREWORKS API KEY FOUND: True
+[REPRO] asking: 'whats the current pricing for gpt 6 astra'
+
+==============================
+[USER]: whats the current pricing for gpt 6 astra
+[INTENT] research intent -> whats the current pricing for gpt 6 astra
+[REPRO] REPLY in 0.97s: 'Let me check that on Google, sir. Back in a moment with the short version.'

@@ -1,0 +1,650 @@
+    screen (100, 100)). Every candidate is converted into the screen frame
+    first, so a tie breaks on real distance; if the conversion is unavailable
+    the candidate keeps its own coordinates rather than being compared across
+    frames.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        cursor_x, cursor_y = pt.x, pt.y
+    except Exception:
+        return candidates[0]
+
+    def _screen_point(candidate):
+        x = candidate.get("cx", 0)
+        y = candidate.get("cy", 0)
+        if to_screen is None:
+            return x, y
+        try:
+            converted = to_screen(x, y, screen_geometry.normalize_space(
+                candidate.get("space"), screen_geometry.COORD_VISION_PIXELS))
+        except Exception:
+            return x, y
+        return converted if converted else (x, y)
+
+    def _distance(candidate):
+        x, y = _screen_point(candidate)
+        return abs(x - cursor_x) + abs(y - cursor_y)
+
+    return min(candidates, key=_distance)
+
+
+def _is_icon_target(target):
+    """P1.5: icon guard - true for icon-like targets that should not be
+    fuzzy-matched via low UI/OCR scores (a "Heart" caption vs the like button).
+
+    True when the noun explicitly names an icon/button, or when it is a bare
+    common icon glyph (heart, star, arrow, bell, camera, ...).
+    """
+    if not target:
+        return False
+    low = target.lower()
+    if re.search(r"\b(icon|button)\b", low):
+        return True
+    words = set(re.findall(r"[a-z0-9]+", low))
+    return bool(words & _ICON_NOUNS)
+
+
+def _try_local_match(command_text, capture, snapshot=None):
+    """Try to find the target element using OCR/UI data, no API call.
+
+    Returns a plan dict if a confident match is found, else None.
+    """
+    targeted_entry = _extract_targeted_text_entry(command_text)
+    target = targeted_entry["target"] if targeted_entry else _extract_action_target(command_text)
+    if not target or len(target) < 2:
+        return None
+
+    best_score = 0.0
+    best_x = 0
+    best_y = 0
+    best_label = ""
+    best_source = ""
+    best_space = screen_geometry.COORD_VISION_PIXELS
+    best_priority = -1
+    best_uid = ""
+    tied_candidates = []  # Bug #6: collect ties for disambiguation
+    # F29: a local fallback pick may only auto-execute when the target was
+    # identified uniquely. Duplicate labels, or a tie between materially
+    # different targets that cursor proximity would silently break, must not
+    # regain automatic execution — the screenshot path handles those.
+    ambiguous = False
+    snapshot = snapshot or _build_screen_snapshot(capture)
+
+    # -- Check UI Automation elements first (more reliable coordinates) --
+    for elem in snapshot.get("ui_elements", []):
+        name = elem.get("name", "")
+        ctype = elem.get("control_type", "")
+        if targeted_entry and ctype not in TEXT_ENTRY_CONTROL_TYPES:
+            continue
+        # F29: fail closed on actionability. A control that is not explicitly
+        # enabled must never be clicked just because it matched by text.
+        if elem.get("enabled") is not True:
+            continue
+        score = _score_ui_element_match(target, elem)
+        if score <= 0:
+            continue
+        priority = _control_priority(ctype, "ui")
+        if _is_better_match(score, priority, best_score, best_priority):
+            best_score = score
+            best_priority = priority
+            best_x = (elem["left"] + elem["right"]) // 2
+            best_y = (elem["top"] + elem["bottom"]) // 2
+            best_label = name or ctype
+            best_source = "ui"
+            best_space = snapshot.get("ui_space", screen_geometry.COORD_VISION_PIXELS)
+            best_uid = elem.get("uid", "")
+            tied_candidates = [{"cx": best_x, "cy": best_y, "label": best_label,
+                                "source": "ui", "space": best_space, "uid": best_uid}]
+        elif abs(score - best_score) <= 0.001 and priority >= best_priority:
+            tied_candidates.append({
+                "cx": (elem["left"] + elem["right"]) // 2,
+                "cy": (elem["top"] + elem["bottom"]) // 2,
+                "label": name or ctype, "source": "ui",
+                "space": snapshot.get("ui_space", screen_geometry.COORD_VISION_PIXELS),
+                "uid": elem.get("uid", ""),
+            })
+
+    if not targeted_entry:
+        # -- Check OCR regions --
+        for region in snapshot.get("ocr_merged", []):
+            text = region.get("text", "")
+            # F29: the OCR fallback is the weakest evidence, so it takes an
+            # extra class-preserving penalty. It can still match, but a
+            # different-text target cannot be promoted to automatic execution
+            # by the fallback route.
+            score = max(0.0, _score_text_match(target, text) - 0.02)
+            if score <= 0:
+                continue
+            priority = _control_priority("", "ocr")
+            if _is_better_match(score, priority, best_score, best_priority):
+                best_score = score
+                best_priority = priority
+                best_x = (region["left"] + region["right"]) // 2
+                best_y = (region["top"] + region["bottom"]) // 2
+                best_label = text
+                best_source = "ocr"
+                best_space = screen_geometry.COORD_VISION_PIXELS
+                best_uid = ""
+
+    # Need a strong match to skip the vision model entirely.
+    # P1.5 icon guard: icon-like targets need higher confidence from UI/OCR (not exact UIA name)
+    if (_is_icon_target(target) or _is_icon_target(command_text)) and best_source in ("ui", "ocr"):
+        if best_score < ICON_MATCH_THRESHOLD:
+            return None
+    else:
+        if best_score < 0.6:
+            return None
+
+    # Bug #6: Break ties by proximity to current cursor position.
+    # F44: both sides are put in the screen frame before the distance is
+    # computed, so the comparison is never across coordinate spaces.
+    if len(tied_candidates) > 1:
+        # F29: two candidates are the same target only when they are the SAME
+        # control (same observation uid). Repeated labels — the repeated Edit
+        # / Delete buttons of a list — and different fuzzy targets are
+        # ambiguous, and picking one by cursor proximity would silently choose
+        # between materially different actions.
+        uids = {(c.get("uid") or "") for c in tied_candidates}
+        labels = {(c.get("label") or "").strip().lower() for c in tied_candidates}
+        if "" in uids or len(uids) > 1 or len(labels) > 1:
+            ambiguous = True
+        else:
+            winner = _tiebreak_by_proximity(
+                tied_candidates,
+                capture=capture,
+                to_screen=lambda x, y, space: _step_point_to_screen(
+                    screen_geometry.normalize_space(space,
+                                                    screen_geometry.COORD_VISION_PIXELS),
+                    x, y, capture),
+            )
+            if winner:
+                best_x = winner["cx"]
+                best_y = winner["cy"]
+                best_label = winner["label"]
+                best_source = winner["source"]
+                best_space = winner["space"]
+                best_uid = winner["uid"]
+
+    if ambiguous:
+        # Defer to the screenshot planner instead of guessing: it sees the
+        # numbered boxes and can tell the two candidates apart, or decline.
+        logging.info(
+            "Local match for '%s' is ambiguous (%d tied candidates) — deferring "
+            "to the vision planner.", target, len(tied_candidates),
+        )
+        return None
+
+    if targeted_entry and best_source != "ui":
+        return None
+
+    logging.info(
+        "Local match: '%s' -> '%s' (score=%.2f) at (%d, %d)",
+        target, best_label, best_score, best_x, best_y,
+    )
+
+    if best_space == screen_geometry.COORD_VISION_PIXELS and all(
+        key in capture
+        for key in ("capture_width", "capture_height", "vision_width", "vision_height")
+    ):
+        best_x, best_y = _vision_to_screen_point(capture, best_x, best_y)
+
+    # F29: only an exact / semantically equivalent label identifies the target
+    # uniquely enough for the deterministic route to act without asking. A
+    # substring or fuzzy label ("Save As" for "Save", "Lock" for "block") is a
+    # candidate, not an identification, so it is held below the auto-execute
+    # threshold and the caller confirms it or tries the screenshot planner.
+    identified = _text_match_class(target, best_label) >= 3
+
+    if targeted_entry:
+        confidence = min(best_score, 0.95)
+        if not identified:
+            confidence = min(confidence, FAST_LOCAL_MATCH_CONFIDENCE - 0.01)
+        steps = [
+            {
+                "action": "click",
+                "x": best_x,
+                "y": best_y,
+                "description": f"Focus '{best_label}'",
+            },
+            {
+                "action": "type",
+                "text": targeted_entry["text"],
+            },
+        ]
+        if best_uid:
+            steps[0]["ui_uid"] = best_uid
+
+        return {
+            "ok": True,
+            "confidence": confidence,
+            "summary": f"Typing into '{best_label}', sir.",
+            "needs_confirmation": confidence < FAST_LOCAL_MATCH_CONFIDENCE,
+            "reason": "",
+            "capture_mode": capture.get("capture_mode", ""),
+            "window_title": capture.get("window_title", ""),
+            "hwnd": capture.get("hwnd"),
+            "steps": steps,
+            "source": "Local Match",
+        }
+
+    # Determine the action type from the command.
+    action = _extract_action_verb(command_text)
+    action_label = action.replace("_", " ").title()
+
+    confidence = min(best_score, 0.95)
+    if not identified:
+        confidence = min(confidence, FAST_LOCAL_MATCH_CONFIDENCE - 0.01)
+
+    step = {
+        "action": action,
+        "x": best_x,
+        "y": best_y,
+        "description": f"{action_label} on '{best_label}'",
+    }
+    if best_uid:
+        step["ui_uid"] = best_uid
+
+    return {
+        "ok": True,
+        "confidence": confidence,
+        "summary": f"{action_label}ing '{best_label}', sir.",
+        "needs_confirmation": confidence < FAST_LOCAL_MATCH_CONFIDENCE,
+        "reason": "",
+        "capture_mode": capture.get("capture_mode", ""),
+        "window_title": capture.get("window_title", ""),
+        "hwnd": capture.get("hwnd"),
+        "steps": [step],
+        "source": "Local Match",
+    }
+
+
+def _build_som_elements(element_id_map):
+    """Build a list of SoM overlay elements from the element_id_map."""
+    som_elements = []
+    for eid, point in element_id_map.items():
+        bounds = point.get("bounds") if isinstance(point, dict) else None
+        if not bounds:
+            continue
+        som_elements.append({
+            "id": eid,
+            "left": bounds.get("left", 0),
+            "top": bounds.get("top", 0),
+            "right": bounds.get("right", 0),
+            "bottom": bounds.get("bottom", 0),
+            "source": point.get("source", ""),
+        })
+    return som_elements
+
+
+def _resolve_uia_target_hwnd():
+    """The HWND the UIA-first fast path matches against (F29).
+
+    Prefers the real foreground window; if Jarvis's own overlay owns the
+    foreground, falls back to the last recorded non-Jarvis target (F43).
+    """
+    import ctypes
+
+    try:
+        fg = ctypes.windll.user32.GetForegroundWindow()
+        if fg and not is_own_window(fg):
+            return int(fg)
+    except Exception:
+        pass
+    target = last_foreground_target() or {}
+    hwnd = target.get("hwnd")
+    return int(hwnd) if hwnd else 0
+def _plan_with_tree(command_text):
+
+    # F29: the UIA semantic fast path runs BEFORE any image capture or OCR.
+    # Straightforward native controls are matched structurally and executed
+    # through their UID; only missing/ambiguous/icon targets reach the camera.
+    uia_first_plan = _try_uia_first(command_text)
+    if uia_first_plan is not None:
+        logging.info("UIA-first fast path matched (%s).", uia_first_plan.get("source"))
+        return uia_first_plan
+    from backend.services.screen_capture import annotate_capture
+
+    def _attempt_capture(capture_function):
+        try:
+            capture = capture_function()
+        except RuntimeError as exc:
+            return None, {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": str(exc),
+                "capture_mode": "",
+                "steps": [],
+            }
+
+        snapshot = _build_screen_snapshot(capture)
+        # F21: remove anything that provably holds a secret from the pixels
+        # BEFORE they are annotated, sent to the vision model or persisted.
+        # OCR/AIA detection runs on the vision image, so the rectangles and the
+        # image share one coordinate space.
+        try:
+            from backend.services import screen_capture as _screen_capture
+
+            redact_elements = None
+            if snapshot.get("ui_space") == screen_geometry.COORD_VISION_PIXELS:
+                redact_elements = snapshot.get("ui_elements") or None
+            blanked = _screen_capture.redact_capture(
+                capture,
+                words=(snapshot.get("ocr_regions")
+                       or snapshot.get("ocr_merged")),
+                elements=redact_elements,
+            )
+            if blanked:
+                logging.info(
+                    "F21: redacted %d sensitive region(s) from the screenshot.",
+                    blanked)
+        except Exception as exc:
+            logging.warning("Screenshot redaction failed: %s", exc)
+        best_plan = None
+        best_failure = None
+
+        # Fast path: use deterministic UIA/OCR matching before any model.
+        local_plan = _try_local_match(command_text, capture, snapshot)
+        if local_plan:
+            if best_plan is None or _plan_selection_score(local_plan, command_text) > _plan_selection_score(
+                best_plan, command_text
+            ):
+                best_plan = local_plan
+            if local_plan.get("confidence", 0.0) >= FAST_LOCAL_MATCH_CONFIDENCE:
+                logging.info("Fast local match - skipping AI planners.")
+                return local_plan, None
+
+        ui_tree, element_id_map = _gather_ui_tree(
+            capture, snapshot,
+            target_label=_extract_action_target(command_text),
+        )
+        if not element_id_map:
+            # UIA and OCR provided no targets — absence from the tree must
+            # not mean absence from the image. Send the screenshot (with its
+            # coordinate grid) to the vision planner in image-only mode.
+            logging.info("\n========== [VISION CASCADE CALL - IMAGE ONLY] ==========\n")
+            vision_plan = _request_vision_plan(
+                command_text, capture, ui_context="", element_id_map=None,
+                image_only=True,
+            )
+            if vision_plan.get("ok"):
+                logging.info(
+                    "[IMAGE-ONLY VISION PLAN]\n%s\n============================================\n",
+                    json.dumps(vision_plan, indent=2),
+                )
+                if best_plan is None or _plan_selection_score(vision_plan, command_text) > _plan_selection_score(
+                    best_plan, command_text
+                ):
+                    best_plan = vision_plan
+                return best_plan, None
+            if best_failure is None:
+                best_failure = vision_plan
+            return best_plan, best_failure
+
+        # Draw Set-of-Mark numbered bounding boxes on the screenshot
+        # so the vision model can visually identify elements by their ID.
+        som_elements = _build_som_elements(element_id_map)
+        if som_elements:
+            try:
+                annotate_capture(capture, som_elements)
+            except Exception as exc:
+                logging.warning("SoM annotation failed: %s", exc)
+
+        # ---- Vision cascade: Gemini Flash (primary) / Groq (fallback) ----
+        # The vision model actually sees the SoM-annotated screenshot,
+        # making it far more accurate than text-only Ollama at picking
+        # the correct element by its numbered bounding box.
+        logging.info("\n========== [VISION CASCADE CALL] ==========\n")
+        vision_plan = _request_vision_plan(
+            command_text, capture, ui_context=ui_tree, element_id_map=element_id_map,
+        )
+
+        if vision_plan.get("ok"):
+            logging.info("[VISION PLAN]\n%s\n============================================\n", json.dumps(vision_plan, indent=2))
+            if best_plan is None or _plan_selection_score(vision_plan, command_text) > _plan_selection_score(
+                best_plan, command_text
+            ):
+                best_plan = vision_plan
+            return best_plan, None
+
+        # TARGETED RETRY: icon-only target missing from UI tree -> ask for coordinates
+        if (
+            not vision_plan.get("ok")
+            and not vision_plan.get("steps")
+            and _is_missing_element_failure(vision_plan.get("reason", ""))
+        ):
+            retry_command = command_text + "\n\n" + _RETRY_INSTRUCTION
+            retry_plan = _request_vision_plan(
+                retry_command, capture, ui_context=ui_tree, element_id_map=element_id_map,
+            )
+            if retry_plan.get("ok"):
+                logging.info(
+                    "[VISION RETRY PLAN]\n%s\n============================================\n",
+                    json.dumps(retry_plan, indent=2),
+                )
+                if best_plan is None or _plan_selection_score(
+                    retry_plan, retry_command
+                ) > _plan_selection_score(best_plan, command_text):
+                    best_plan = retry_plan
+                return best_plan, None
+            # retry also failed - surface its failure
+            vision_plan = retry_plan
+
+        # Neither planner succeeded — return the best we have.
+        if best_plan is not None:
+            return best_plan, None
+
+        if best_failure is None:
+            best_failure = vision_plan
+
+        return best_plan, best_failure
+
+    needs_desktop = _needs_desktop_capture(command_text)
+    needs_whole_screen = _is_whole_screen_phrase(command_text)
+    needs_primary = needs_desktop or needs_whole_screen
+    first_capture = capture_primary_screen if needs_primary else capture_for_screen_control
+
+    best_plan, best_failure = _attempt_capture(first_capture)
+    if best_plan is not None:
+        return best_plan
+
+    if not needs_primary:
+        retry_plan, retry_failure = _attempt_capture(capture_primary_screen)
+        if retry_plan is not None:
+            return retry_plan
+        if retry_failure is not None:
+            return retry_failure
+
+    if best_failure is not None:
+        return best_failure
+
+    return {
+        "ok": False,
+        "confidence": 0.0,
+        "summary": "",
+        "needs_confirmation": False,
+        "reason": "I couldn't find a confident screen action for that.",
+        "capture_mode": "",
+        "steps": [],
+    }
+
+
+
+def _try_uia_first(command_text):
+    """F29 — run the UIA semantic fast path BEFORE any screenshot or OCR.
+
+    Queries the live accessibility tree for an ENABLED, UNAMBIGUOUS target
+    and builds a plan that executes through the control's UID (revalidated by
+    fresh UIA resolution at execution time, F42). No image is captured, no
+    OCR runs and no cloud vision is called.
+
+    Returns a plan in screen-pixel space, or None when the target is missing,
+    icon-like or ambiguous so ``_plan_with_tree`` falls through to the full
+    capture + OCR + vision pipeline.
+    """
+    if not screen_ui_elements.is_available():
+        return None
+
+    targeted_entry = _extract_targeted_text_entry(command_text)
+    target = (
+        targeted_entry["target"] if targeted_entry
+        else _extract_action_target(command_text)
+    )
+    if not target or len(target) < 2:
+        return None
+    # Icon-only targets are visually ambiguous: a UIA caption may name a
+    # sibling rather than the control itself, so they stay on the vision path.
+    if _is_icon_target(target):
+        return None
+
+    hwnd = _resolve_uia_target_hwnd()
+    if not hwnd:
+        return None
+    try:
+        raw_ui = screen_ui_elements.get_foreground_window_elements(hwnd=hwnd)
+    except Exception as exc:
+        logging.debug("UIA-first walk failed: %s", exc)
+        return None
+    if not raw_ui:
+        return None
+
+    scored = []
+    for elem in raw_ui:
+        ctype = elem.get("control_type", "")
+        if targeted_entry and ctype not in TEXT_ENTRY_CONTROL_TYPES:
+            continue
+        # F29: unknown enabled state is not evidence of actionability.
+        if elem.get("enabled") is not True:
+            continue
+        score = _score_ui_element_match(target, elem)
+        if score <= 0:
+            continue
+        scored.append((score, _control_priority(ctype, "ui"), elem))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    best_score, _best_prio, best_elem = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1.0
+
+    # Unambiguous: a strict winning margin. Two controls sharing the label
+    # (F44's repeated labels) make the fast path decline instead of guessing.
+    if (best_score - second_score) < UIA_FIRST_UNAMBIGUOUS_MARGIN:
+        return None
+    if best_score < UIA_FIRST_MIN_CONFIDENCE:
+        return None
+
+    left = _coerce_int(best_elem.get("left"), 0)
+    top = _coerce_int(best_elem.get("top"), 0)
+    right = _coerce_int(best_elem.get("right"), 0)
+    bottom = _coerce_int(best_elem.get("bottom"), 0)
+    cx = int(round((left + right) / 2.0))
+    cy = int(round((top + bottom) / 2.0))
+    label = (
+        (best_elem.get("name") or "").strip()
+        or (best_elem.get("control_type") or "element")
+    )
+    uid = best_elem.get("uid", "")
+    runtime_id = best_elem.get("runtime_id", "")
+
+    try:
+        bounds = get_window_bounds(hwnd)
+    except Exception:
+        bounds = None
+    if not bounds:
+        return None
+
+    confidence = min(best_score, 0.95)
+
+    if targeted_entry:
+        step = {
+            "action": "click",
+            "x": cx,
+            "y": cy,
+            "description": f"Focus '{label}'",
+            "space": screen_geometry.COORD_SCREEN_PIXELS,
+        }
+        if uid:
+            step["ui_uid"] = uid
+        if runtime_id:
+            step["ui_runtime_id"] = runtime_id
+        steps = [step, {"action": "type", "text": targeted_entry["text"]}]
+        # F21: a local match knows the target element, so a sensitive field can
+        # be marked here with real evidence (name/control type/automation id).
+        if best_elem.get("is_password") or tool_policy.is_sensitive_field(
+                label, best_elem.get("name"), best_elem.get("control_type"),
+                best_elem.get("automation_id"), best_elem.get("className")):
+            steps[1]["sensitive"] = True
+        summary = f"Typing into '{label}', sir."
+    else:
+        action = _extract_action_verb(command_text)
+        action_label = action.replace("_", " ").title()
+        step = {
+            "action": action,
+            "x": cx,
+            "y": cy,
+            "description": f"{action_label} on '{label}'",
+            "space": screen_geometry.COORD_SCREEN_PIXELS,
+        }
+        if uid:
+            step["ui_uid"] = uid
+        if runtime_id:
+            step["ui_runtime_id"] = runtime_id
+        steps = [step]
+        summary = f"{action_label}ing '{label}', sir."
+
+    return {
+        "ok": True,
+        "confidence": confidence,
+        "summary": summary,
+        "needs_confirmation": False,
+        "reason": "",
+        "capture_mode": "active_window",
+        "window_title": bounds.get("window_title", ""),
+        "hwnd": int(hwnd),
+        "process_id": bounds.get("process_id", 0),
+        "origin_left": bounds.get("left"),
+        "origin_top": bounds.get("top"),
+        "capture_width": bounds.get("width"),
+        "capture_height": bounds.get("height"),
+        "vision_width": bounds.get("width"),
+        "vision_height": bounds.get("height"),
+        "steps": steps,
+        "source": "UIA First",
+    }
+
+
+def _plan_with_vision(command_text):
+    """Backward-compatible alias for the old planner name."""
+    return _plan_with_tree(command_text)
+
+
+def _verify_action(steps_description):
+    """Backward-compatible wrapper for older callers."""
+    return _verify_action_with_steps(steps_description, steps=None)
+
+
+def _cloud_verification_enabled():
+    return os.getenv(CLOUD_VERIFY_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _typed_texts_from_steps(steps):
+    texts = []
+    for step in steps or []:
+        if step.get("action") != "type":
+            continue
+        text = str(step.get("text") or "").strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _verification_text_haystack(capture):

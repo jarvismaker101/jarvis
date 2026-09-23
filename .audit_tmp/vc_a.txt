@@ -1,0 +1,74 @@
+
+    *validate* maps a raw result to ``(usable, reason)``; a result that is not
+    usable ADVANCES the cascade instead of ending it (F37: malformed nonempty
+    output no longer counts as an answer).
+
+    Returns ``(result, report)``. *report* is the actual-attempt record::
+
+        {"usable": bool, "provider": str|None, "model": str|None,
+         "attempted": [provider, ...], "attempts": [{provider, model,
+         outcome, detail}], "unavailable_reason": str}
+
+    ``result`` is the serving provider's result when one served. When every
+    eligible provider advanced but at least one returned nonempty-but-invalid
+    output, the LAST such result is returned with ``report["usable"]`` False
+    and ``report["degraded"]`` True — the caller keeps its own last-resort
+    handling (e.g. using the raw text) while knowing it is not schema-valid.
+    """
+    candidates, skipped = provider_candidates(selected=selected,
+                                              availability=availability)
+    report = {
+        "usable": False,
+        "provider": None,
+        "model": None,
+        "attempted": [],
+        "attempts": [],
+        "degraded": False,
+        "unavailable_reason": "",
+    }
+    # Ineligible providers are recorded (so the report can say exactly why a
+    # provider was never called) but are NEVER dispatched — that is what keeps
+    # another provider's missing key from mattering at all.
+    for entry in skipped:
+        report["attempts"].append({
+            "provider": entry["provider"],
+            "model": None,
+            "outcome": OUTCOME_SKIPPED,
+            "detail": entry["reason"],
+        })
+
+    dispatched = 0
+    malformed_result = None
+    for candidate in candidates:
+        if dispatched >= max(1, int(max_attempts)):
+            report["attempts"].append({
+                "provider": candidate["provider"],
+                "model": candidate["model"],
+                "outcome": OUTCOME_SKIPPED,
+                "detail": "attempt budget exhausted",
+            })
+            continue
+        pid = candidate["provider"]
+        dispatcher = (dispatchers or {}).get(pid)
+        if dispatcher is None:
+            report["attempts"].append({
+                "provider": pid, "model": candidate["model"],
+                "outcome": OUTCOME_SKIPPED,
+                "detail": "no adapter is wired for this provider",
+            })
+            continue
+        dispatched += 1
+        report["attempted"].append(pid)
+        try:
+            result = dispatcher(
+                prompt,
+                image_data_url,
+                candidate["model"],
+                max_completion_tokens,
+                response_format,
+            )
+        except Exception as exc:  # noqa: BLE001 - an adapter error advances
+            logging.warning("[VISION] %s adapter error: %s", pid, exc)
+            report["attempts"].append({
+                "provider": pid, "model": candidate["model"],
+                "outcome": OUTCOME_ERROR, "detail": str(exc)[:200],

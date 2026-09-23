@@ -1,0 +1,98 @@
+    hwnd = _get_foreground_window()
+    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+
+
+def restore_foreground_window():
+    hwnd = _get_foreground_window()
+    user32.ShowWindow(hwnd, SW_RESTORE)
+
+
+def click(x, y, button="left", clicks=1):
+    _ensure_dpi_awareness()
+    move_mouse(x, y)
+    time.sleep(0.08)
+
+    if button == "right":
+        down_flag = MOUSEEVENTF_RIGHTDOWN
+        up_flag = MOUSEEVENTF_RIGHTUP
+    else:
+        down_flag = MOUSEEVENTF_LEFTDOWN
+        up_flag = MOUSEEVENTF_LEFTUP
+
+    for _ in range(max(1, int(clicks))):
+        inp_down = INPUT(type=INPUT_MOUSE)
+        inp_down._input.mi.dwFlags = down_flag
+        inp_up = INPUT(type=INPUT_MOUSE)
+        inp_up._input.mi.dwFlags = up_flag
+
+        user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT))
+        user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT))
+        time.sleep(0.08)
+
+
+def scroll(direction="down", amount=600):
+    _ensure_dpi_awareness()
+    delta = abs(int(amount))
+    if direction in {"left", "right"}:
+        if direction == "left":
+            delta *= -1
+        user32.mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, delta, 0)
+        return
+
+    if direction == "down":
+        delta *= -1
+    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+
+
+def type_text(text):
+    keyboard = _get_keyboard()
+    keyboard.write(text or "", delay=0.02)
+
+
+def press_keys(keys):
+    keyboard = _get_keyboard()
+    normalized = [_normalize_key_name(key) for key in keys if key]
+    if not normalized:
+        return
+
+    if len(normalized) == 1:
+        keyboard.press_and_release(normalized[0])
+        return
+
+    keyboard.press_and_release("+".join(normalized))
+
+
+def _wait_for_foreground(hwnd, timeout=1.0, poll=0.05):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(poll)
+    return False
+
+
+#: Actions whose effect lands wherever the keyboard focus currently is.
+_KEYBOARD_ACTIONS = {"type", "press", "hotkey", "scroll"}
+
+
+def _foreground_is(hwnd):
+    try:
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:
+        return False
+
+
+def _ensure_target_focus(target_hwnd, description):
+    """F42: keyboard effects must land in the window the plan targeted.
+
+    Focus can be stolen between steps (a dialog pops up, the user clicks
+    elsewhere). Typing then follows the *new* focus — the "later typing can
+    follow stolen focus" defect. Re-acquire the planned window once; if it
+    cannot be made foreground, stop rather than type into whatever has focus.
+    """
+    if not target_hwnd:
+        return
+    if _foreground_is(target_hwnd):
+        return
+    try:
+        if user32.IsIconic(target_hwnd):

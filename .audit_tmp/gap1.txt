@@ -1,0 +1,351 @@
+    cleaned = _strip_leading_fillers(text)
+    return " ".join(cleaned.lower().split())
+
+
+def _escape_xml_attr(value):
+    text = str(value or "")
+    return (
+        text.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _is_toggle_on(text):
+    return bool(_TOGGLE_ON_RE.search(_normalize_text(text)))
+
+
+def _is_toggle_off(text):
+    return bool(_TOGGLE_OFF_RE.search(_normalize_text(text)))
+
+
+#: Negation words that invalidate an *enable* request ("don't turn on screen
+#: controls", "never enable screen controls"). F19: a negated enable must
+#: never enable.
+_NEGATED_TOGGLE_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|does\s+not|never|no\s+longer|not|without|"
+    r"mat\s+karo|nahi|na)\b",
+    re.IGNORECASE,
+)
+
+
+def _exact_toggle_verdict(text):
+    """Resolve one utterance to an exact screen-control toggle intent.
+
+    Returns ``"on"``, ``"off"``, ``"negated_on"`` or ``None``.
+
+    F19: the patterns are anchored and mutually exclusive, so an off-phrase
+    can never match the on-pattern. Both matching at once (e.g. "turn them off
+    and on again") is ambiguous and resolves to ``None`` rather than guessing.
+    A negated enable resolves to ``"negated_on"`` — the caller leaves the
+    current state alone instead of enabling.
+    """
+    normalized = _normalize_text(text)
+    on = bool(_TOGGLE_ON_RE.search(normalized))
+    off = bool(_TOGGLE_OFF_RE.search(normalized))
+    if on == off:
+        return None
+    if on:
+        if _NEGATED_TOGGLE_RE.search(normalized):
+            return "negated_on"
+        return "on"
+    return "off"
+
+
+def _is_confirmation(text):
+    return bool(_CONFIRM_RE.search(_normalize_text(text)))
+
+
+def _is_cancel(text):
+    return bool(_CANCEL_RE.search(_normalize_text(text)))
+
+
+_SCREEN_CMD_HIGH_CONFIDENCE = re.compile(
+    r"^(?:can you |could you |would you |please )?"
+    r"(click|double.?click|right.?click|scroll|type into|press the|"
+    r"minimize|minimise|maximize|maximise|restore|hover over|"
+    r"move\s+(?:the\s+)?mouse)\b",
+    re.IGNORECASE,
+)
+
+_SCREEN_CMD_UI_NOUN = re.compile(
+    r"\b(button|link|search\s*bar|search\s*box|text\s*box|textbox|"
+    r"field|tab|icon|checkbox|dropdown|menu\s*item|toolbar)\b",
+    re.IGNORECASE,
+)
+
+_SCREEN_CMD_ACTION_RE = re.compile(
+    r"\b(click|type|open|close|select|focus|tap|press|hit|enter)\b",
+    re.IGNORECASE,
+)
+
+# PART A - screen phrase + action verb detection anywhere (regardless of toggle)
+_SCREEN_ACTION_VERBS_RE = re.compile(
+    r"\b(click|double\s*click|double-?click|press|tap|open|close|play|pause|scroll|type|drag)\b",
+    re.IGNORECASE,
+)
+
+_SCREEN_PHRASE_RE = re.compile(
+    r"\b(?:visible\s+(?:on|at)\s+(?:my\s+|the\s+)?screen|"
+    r"(?:on|at)\s+(?:my\s+|the\s+)?screen|"
+    r"(?:on|at)\s+(?:my\s+|the\s+)?desktop|"
+    r"anything\s+visible)\b",
+    re.IGNORECASE,
+)
+
+# P1.6 extra whole-screen phrases that must route to primary/desktop capture
+_WHOLE_SCREEN_EXTRA_RE = re.compile(
+    r"\b(?:on\s+screen|on\s+the\s+screen|on\s+my\s+desktop|on\s+the\s+desktop|visible\s+on\s+screen|anything\s+visible)\b",
+    re.IGNORECASE,
+)
+
+_INTERROGATIVE_PREFIX_RE = re.compile(r'^(what|which|how|where|who|why|when|whose)\b', re.IGNORECASE)
+
+_MISSING_ELEMENT_PATTERNS = [
+    "element id",
+    "element_id",
+    "not found in the ui tree",
+    "missing from the tree",
+    "no corresponding",
+    "accessibility tree",
+]
+
+_RETRY_INSTRUCTION = (
+    "IMPORTANT: the target may not be exposed in the accessibility tree. "
+    "Look at the screenshot itself and return click coordinates (x, y in vision pixels) "
+    "for the visible target instead of failing."
+)
+
+
+def _is_missing_element_failure(reason):
+    lower = (reason or "").lower()
+    return any(p in lower for p in _MISSING_ELEMENT_PATTERNS)
+
+
+def _looks_like_screen_command(text):
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    # PART A: anywhere action verb + screen phrase -> screen command regardless of toggle
+    if _SCREEN_ACTION_VERBS_RE.search(normalized) and _SCREEN_PHRASE_RE.search(normalized):
+        if not _INTERROGATIVE_PREFIX_RE.search(normalized):
+            return True
+    if _SCREEN_CMD_HIGH_CONFIDENCE.search(normalized):
+        return True
+    # Context-dependent: needs screen controls on AND both a UI noun + action verb
+    if screen_state.is_enabled():
+        has_ui_noun = bool(_SCREEN_CMD_UI_NOUN.search(normalized))
+        has_action = bool(_SCREEN_CMD_ACTION_RE.search(normalized))
+        return has_ui_noun and has_action
+    return False
+
+
+def _is_whole_screen_phrase(text):
+    """True when the command explicitly references the whole screen."""
+    normalized = _normalize_text(text)
+    return bool(_SCREEN_PHRASE_RE.search(normalized) or _WHOLE_SCREEN_EXTRA_RE.search(normalized))
+
+
+def _is_risky_command(text):
+    normalized = _normalize_text(text)
+    return any(term in normalized for term in RISKY_TERMS)
+
+
+def _needs_desktop_capture(command_text):
+    normalized = _normalize_text(command_text)
+    if any(term in normalized for term in DESKTOP_CAPTURE_TERMS):
+        return True
+    # P1.6 also treat explicit whole-screen phrases as needing desktop-wide (primary) capture
+    return bool(_WHOLE_SCREEN_EXTRA_RE.search(normalized))
+
+
+def _parse_scroll_command(command_text):
+    normalized = _normalize_text(command_text)
+    if "scroll" not in normalized:
+        return None
+
+    direction = None
+    for candidate in ("down", "up", "right", "left"):
+        if re.search(rf"\b{candidate}\b", normalized):
+            direction = candidate
+            break
+
+    if direction is None:
+        direction = "down"
+
+    amount = 600
+    if any(word in normalized for word in ("little", "slightly", "bit", "small")):
+        amount = 360
+    elif any(word in normalized for word in ("page", "lot", "more", "fast", "far")):
+        amount = 960
+
+    return {
+        "ok": True,
+        "confidence": 0.99,
+        "summary": f"Scrolling {direction}, sir.",
+        "needs_confirmation": False,
+        "reason": "",
+        "steps": [{"action": "scroll", "direction": direction, "amount": amount}],
+    }
+
+
+def _parse_windows_shell_command(command_text):
+    normalized = _normalize_text(command_text)
+
+    if (
+        ("start menu" in normalized or "start button" in normalized)
+        and any(word in normalized for word in ("click", "open", "show", "press"))
+    ):
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Opening Start, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "press", "keys": ["windows"]}],
+        }
+
+    if any(term in normalized for term in WINDOWS_SEARCH_COMMAND_TERMS) and any(
+        word in normalized for word in ("click", "open", "show", "focus", "select")
+    ):
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Opening Windows search, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "press", "keys": ["windows", "s"]}],
+        }
+
+    if (
+        ("search bar" in normalized or "search box" in normalized)
+        and any(term in normalized for term in ("taskbar", "start menu", "start button", "windows search"))
+        and any(word in normalized for word in ("click", "open", "show", "focus", "select"))
+    ):
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Opening Windows search, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "press", "keys": ["windows", "s"]}],
+        }
+
+    return None
+
+
+def _parse_window_command(command_text):
+    normalized = _normalize_text(command_text)
+
+    if any(word in normalized for word in ("minimize", "minimise")):
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Minimizing the active window, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "minimize_window"}],
+        }
+
+    if any(word in normalized for word in ("maximize", "maximise")):
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Maximizing the active window, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "maximize_window"}],
+        }
+
+    if "restore" in normalized:
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": "Restoring the active window, sir.",
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [{"action": "restore_window"}],
+        }
+
+    return None
+
+
+def _parse_key_sequence(raw_keys):
+    normalized = " ".join(raw_keys.lower().split())
+    for source, target in KEY_PHRASE_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+
+    normalized = normalized.replace(" plus ", "+")
+    normalized = normalized.replace(" and ", "+")
+    normalized = normalized.replace(",", "+")
+    normalized = normalized.replace("-", "+")
+    normalized = normalized.replace(" then ", " ")
+
+    pieces = [piece for piece in re.split(r"[+\s]+", normalized) if piece]
+    keys = []
+    for piece in pieces:
+        if piece in KEY_TOKEN_MAP:
+            keys.append(KEY_TOKEN_MAP[piece])
+        elif re.fullmatch(r"f\d{1,2}", piece):
+            keys.append(piece)
+        elif re.fullmatch(r"[a-z0-9]", piece):
+            keys.append(piece)
+
+    return keys
+
+
+def _parse_press_command(command_text):
+    cleaned = _strip_leading_fillers(command_text)
+    match = re.match(r"^(?:press|hit|tap)\s+(.+)$", cleaned, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    keys = _parse_key_sequence(match.group(1))
+    if not keys:
+        return None
+
+    key_words = ", ".join(keys)
+    return {
+        "ok": True,
+        "confidence": 0.98,
+        "summary": f"Pressing {key_words}, sir.",
+        "needs_confirmation": _is_risky_command(command_text),
+        "reason": "",
+        "steps": [{"action": "press", "keys": keys}],
+    }
+
+
+def _unquote_spoken_text(text):
+    cleaned = (text or "").strip()
+    if cleaned.startswith(("'", '"')) and cleaned.endswith(("'", '"')) and len(cleaned) >= 2:
+        cleaned = cleaned[1:-1]
+    return cleaned.strip()
+
+
+def _clean_action_target_text(text):
+    cleaned = (text or "").strip().lower()
+    for prefix in ("the ", "a ", "an "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    for suffix in (
+        " button",
+        " tab",
+        " icon",
+        " menu",
+        " bar",
+        " link",
+        " field",
+        " box",
+        " in front of me",
+        " in front of you",
+        " for me",
+        " please",
+    ):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+    return cleaned.strip()
+
+
+def _extract_targeted_text_entry(command_text):

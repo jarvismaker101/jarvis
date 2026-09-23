@@ -1,0 +1,500 @@
+# ── F37: one eligible-provider cascade (shared with screen Q&A) ────────────
+# The old cascade only offered the registry-selected provider as "primary" and
+# then always ended with an UNGUARDED Groq attempt — a supported
+# single-provider installation needed an unrelated Groq key, one adapter
+# exception escaped the call, and any nonempty text (including malformed JSON)
+# counted as success. Eligibility, ordering, bounding and the actual-attempt
+# record now live in backend/services/vision_cascade.py.
+
+def _dispatch_gemini(prompt, image_data_url, model, max_completion_tokens, response_format):
+    return gemini_client.ask_gemini_vision(
+        prompt,
+        image_data_url,
+        max_completion_tokens=max_completion_tokens,
+        response_format=response_format,
+        model=model,
+    )
+
+
+def _dispatch_openrouter(prompt, image_data_url, model, max_completion_tokens, response_format):
+    from backend.services.openrouter_client import ask_openrouter_vision
+    return ask_openrouter_vision(
+        prompt,
+        image_data_url,
+        max_completion_tokens=max_completion_tokens,
+        model=model,
+        response_format=response_format,
+    )
+
+
+def _dispatch_fireworks(prompt, image_data_url, model, max_completion_tokens, response_format):
+    from backend.services.fireworks_client import ask_fireworks_vision
+    return ask_fireworks_vision(
+        prompt,
+        image_data_url,
+        max_completion_tokens=max_completion_tokens,
+        model=model,
+        response_format=response_format,
+    )
+
+
+def _dispatch_groq(prompt, image_data_url, model, max_completion_tokens, response_format):
+    # NOTE: no response_format here -- Qwen's  thinking blocks break Groq's
+    # strict JSON validation; prompts already request JSON and the
+    # _extract_json_object helper parses it. Generous token budget because
+    # Qwen burns tokens on  thinking before the JSON answer.
+    return ask_groq_vision(
+        prompt,
+        image_data_url,
+        max_completion_tokens=max(max_completion_tokens, 4096),
+        model=model,
+    )
+
+
+def _vision_dispatchers():
+    """provider id -> adapter call for this call site (resolved lazily)."""
+    return {
+        "gemini": _dispatch_gemini,
+        "openrouter": _dispatch_openrouter,
+        "fireworks": _dispatch_fireworks,
+        "groq": _dispatch_groq,
+    }
+
+
+def _screen_control_vision_schema(result):
+    """F37 schema validation: a response is usable only when it carries a JSON
+    object — nonempty prose/malformed JSON must ADVANCE the cascade."""
+    content = _extract_response_content(result)
+    if content is None:
+        return False, "no assistant content"
+    parsed = _extract_json_object(content)
+    if not isinstance(parsed, dict) or not parsed:
+        return False, "content was not a JSON object"
+    return True, ""
+
+
+def _ask_vision_cascade(prompt, image_data_url, max_completion_tokens=800,
+                        response_format=None, attempts_out=None):
+    """Vision plan through the ONE eligible-provider cascade (F37).
+
+    The registry-selected (provider, model) is attempted first when eligible;
+    every other ELIGIBLE configured provider follows, each at most once and
+    bounded by the cascade cap. Providers without a credential are never
+    dispatched, adapter exceptions and schema-invalid output advance safely,
+    and *attempts_out* (optional dict) receives the actual-attempt record.
+    """
+    result, report = vision_cascade.ask_vision_with_fallback(
+        prompt,
+        image_data_url,
+        dispatchers=_vision_dispatchers(),
+        validate=_screen_control_vision_schema,
+        selected=_resolve_vision_model(),
+        max_completion_tokens=max_completion_tokens,
+        response_format=response_format,
+        attempts_out=attempts_out,
+    )
+    if report.get("usable"):
+        logging.info("Vision response from %s (%s)",
+                     report.get("provider"), report.get("model") or "default")
+    else:
+        logging.warning("%s", report.get("unavailable_reason"))
+    return result if result is not None else {}
+
+
+# Coordinate spaces accepted from image-only vision plans. The planner is
+# taught the normalized 0..1000 grid; anything else is rejected rather than
+# mis-scaled into clicks.
+_IMAGE_ONLY_COORD_SPACES = ("normalized_1000", "normalized", "0..1000")
+
+
+def _request_vision_plan(command_text, capture, ocr_context="", ui_context="", element_id_map=None, image_only=False):
+    prompt = _build_vision_prompt(command_text, capture, ocr_context, ui_context, image_only=image_only)
+
+    # F37: the ACTUAL attempted providers/models are recorded per call, so the
+    # plan can name the provider that really answered instead of "unknown".
+    attempts = {}
+    result = _ask_vision_cascade(
+        prompt,
+        capture["image_data_url"],
+        max_completion_tokens=800,
+        response_format={"type": "json_object"},
+        attempts_out=attempts,
+    )
+
+    content = _extract_response_content(result)
+    provider = attempts.get("provider")
+    if not provider and isinstance(result, dict):
+        provider = result.get("model") or result.get("vision_provider") or result.get("vision_model")
+    model = attempts.get("model")
+    if content is None:
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "The screen-vision model did not return a result. %s"
+                      % (vision_cascade.unavailable_reason(attempts),),
+            "capture_mode": capture.get("capture_mode", ""),
+            "steps": [],
+            "source": "Vision Match",
+            "raw_vision": str(result)[:2000] if result else "",
+            "vision_provider": provider or "unknown",
+            "vision_model": model,
+            "vision_attempts": list(attempts.get("attempts") or []),
+        }
+
+    raw_obj = _extract_json_object(content)
+    if image_only:
+        # F45: validate the DECLARED coordinate space before trusting any
+        # point. A missing space is no longer defaulted to normalized_1000 —
+        # guessing the frame is exactly how a hallucinated coordinate became a
+        # real click. Missing or unrecognised spaces reject the plan outright.
+        space = str(raw_obj.get("coordinate_space", "") or "").strip().lower()
+        if not space or space not in _IMAGE_ONLY_COORD_SPACES:
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": ("The screen-vision model returned coordinates in an "
+                           "unexpected space."),
+                "capture_mode": capture.get("capture_mode", ""),
+                "steps": [],
+                "source": "Vision Match",
+                "raw_vision": content,
+                "vision_provider": provider or "unknown",
+                "vision_model": model,
+                "vision_attempts": list(attempts.get("attempts") or []),
+            }
+    plan = _normalize_vision_plan(raw_obj, capture, element_id_map)
+    plan["source"] = "Vision Match"
+    plan["raw_vision"] = content
+    plan["vision_model"] = model
+    plan["vision_attempts"] = list(attempts.get("attempts") or [])
+    if image_only:
+        plan["image_only"] = True
+    if provider:
+        plan["vision_provider"] = provider
+    else:
+        # fallback: try to infer from logging context; keep minimal
+        plan["vision_provider"] = "unknown"
+    return plan
+
+
+def _filter_tree_to_relevant(elements, target_label, max_elements=40):
+    """Keep elements that mention the target word or are clickable.
+
+    F44: candidate nodes are RANKED by relevance, but the returned list
+    preserves the ORIGINAL walk order and re-attaches every kept candidate's
+    ancestors. The downstream depth-based XML serialization therefore
+    reconstructs the real hierarchy instead of a score-sorted flat list with
+    dangling children.
+    """
+    # P0-B: icon targets get larger anchor budget so feed/scrollable containers survive
+    if target_label and _is_icon_target(target_label):
+        max_elements = max(max_elements, 80)
+    if not target_label:
+        return list(elements)
+
+    target_words = set(target_label.lower().split())
+    by_uid = {}
+    for el in elements:
+        uid = el.get("uid")
+        if uid:
+            by_uid.setdefault(uid, el)
+
+    ranked = []
+    for index, el in enumerate(elements):
+        name = (el.get("name") or "").lower()
+        name_words = set(name.split())
+        relevance = len(target_words & name_words)
+        is_clickable = el.get("control_type", "") in CLICKABLE_CONTROL_TYPES
+        ranked.append(((relevance * 2 + int(is_clickable)), index, el))
+    ranked.sort(key=lambda x: -x[0])
+    top = ranked[:max_elements]
+
+    kept_ids = set()
+    bare_top = set()
+    for _, _, el in top:
+        uid = el.get("uid")
+        if not uid:
+            bare_top.add(id(el))
+            continue
+        # F44: walk the parent chain so every ancestor of a ranked candidate
+        # survives in the tree (stable parent identity, original hierarchy).
+        cur = uid
+        guard = 0
+        while cur and cur not in kept_ids and guard < 64:
+            kept_ids.add(cur)
+            parent = by_uid.get(cur, {}).get("parent_uid")
+            cur = parent
+            guard += 1
+
+    if not kept_ids and not bare_top:
+        return []
+
+    kept = [
+        el for el in elements
+        if (el.get("uid") in kept_ids) or (id(el) in bare_top)
+    ]
+    return kept
+
+
+def _gather_ui_tree(capture, snapshot=None, target_label=None):
+    """Build an XML-like Accessibility Tree for the local Text AI to read.
+
+    Combines native Windows UI Automation with Tesseract OCR to ensure
+    hidden web apps (like Electron) are still readable.
+    """
+    tree_lines = []
+    element_id_map = {}
+    id_counter = 1
+    snapshot = snapshot or _build_screen_snapshot(capture)
+    raw_ui = snapshot.get("raw_ui", [])
+    ui_elements = snapshot.get("ui_elements", [])
+
+    # Bug #7: Filter large trees to relevant elements. P0-B: icon targets keep feed containers
+    budget = 80 if target_label and _is_icon_target(target_label) else 40
+    if target_label and len(ui_elements) > budget:
+        ui_elements = _filter_tree_to_relevant(ui_elements, target_label, max_elements=budget)
+
+    title = _escape_xml_attr(capture.get("window_title", "Unknown"))
+    capture_mode = _escape_xml_attr(capture.get("capture_mode", "unknown"))
+    tree_lines.append(
+        f'<window title="{title}" capture_mode="{capture_mode}" size="{capture.get("vision_width", 0)}x{capture.get("vision_height", 0)}">'
+    )
+
+    if ui_elements:
+        ui_lines, ui_map, id_counter = _serialize_accessibility_elements(
+            ui_elements,
+            start_id=id_counter,
+            # F43: never label pixels with a space they are not in. When the
+            # capture lacks the size metadata needed for the screen->vision
+            # transform the elements stay in screen pixels, and declaring them
+            # "vision" would make the executor convert them a second time.
+            space=snapshot.get("ui_space", "screen"),
+        )
+        tree_lines.append("  <accessibility>")
+        tree_lines.extend(ui_lines)
+        tree_lines.append("  </accessibility>")
+        element_id_map.update(ui_map)
+
+    # 2. Visual OCR (Essential for Electron apps like Antigravity)
+    merged = snapshot.get("ocr_merged", [])
+    if merged:
+        try:
+            seen_texts = [el.get("name", "") for el in raw_ui]
+            ocr_lines, ocr_map, id_counter = _serialize_ocr_nodes(
+                merged,
+                seen_texts,
+                start_id=id_counter,
+            )
+            if ocr_lines:
+                tree_lines.append("  <ocr>")
+                tree_lines.extend(ocr_lines)
+                tree_lines.append("  </ocr>")
+                element_id_map.update(ocr_map)
+        except Exception as exc:
+            logging.warning("OCR tree extraction failed: %s", exc)
+
+    tree_lines.append('</window>')
+    return "\n".join(tree_lines), element_id_map
+
+
+def _extract_action_target(command_text):
+    """Extract the likely target element name from a voice command.
+
+    E.g. 'click the search bar' -> 'search'
+         'close the settings tab' -> 'settings'
+         'click on File menu' -> 'file'
+    """
+    targeted_entry = _extract_targeted_text_entry(command_text)
+    if targeted_entry:
+        return targeted_entry["target"]
+
+    text = command_text.lower().strip()
+    # Strip common action verbs and filler words.
+    for prefix in (
+        "click on the ", "click on ", "click the ", "click ",
+        "tap on the ", "tap on ", "tap the ", "tap ",
+        "press the ", "press ", "hit the ", "hit ",
+        "open the ", "open ", "close the ", "close ",
+        "select the ", "select ", "go to the ", "go to ",
+        "switch to the ", "switch to ",
+        "minimize the ", "minimize ", "maximise the ", "maximise ",
+        "maximize the ", "maximize ",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return _clean_action_target_text(text)
+
+
+def _text_match_class(target, candidate):
+    """How a candidate label relates to the target, as a match class (F29).
+
+    The classes are ordered and *disjoint*:
+
+      4 — the labels are the same text;
+      3 — a declared UI alias makes them semantically equivalent;
+      2 — one label contains the other;
+      1 — strong fuzzy similarity (sequence ratio or word overlap);
+      0 — no usable relation.
+
+    The caller scores from the class, so a control-type bonus can never lift
+    a weaker class above a stronger one.
+    """
+    t = target.lower().strip()
+    c = candidate.lower().strip()
+    if not t or not c:
+        return 0
+    if t == c:
+        return 4
+
+    # Check UI aliases for semantic equivalence.
+    for alias_key, aliases in UI_ALIASES.items():
+        t_matches = t == alias_key or t in aliases
+        c_matches = c == alias_key or c in aliases
+        if t_matches and c_matches:
+            return 3
+
+    if t in c or c in t:
+        return 2
+
+    # Sequence-level similarity (replaces loose character-set overlap).
+    if len(t) > 3 and len(c) > 3:
+        if difflib.SequenceMatcher(None, t, c).ratio() > 0.75:
+            return 1
+
+    # Word overlap.
+    t_words = set(t.split())
+    c_words = set(c.split())
+    if t_words and c_words:
+        overlap = len(t_words & c_words) / max(len(t_words), len(c_words))
+        if overlap >= 0.5:
+            return 1
+    return 0
+
+
+#: F29: disjoint score bands, keyed by match class. ``(floor, width)``. The
+#: narrowest inter-band gap (0.05) is wider than the largest control bonus
+#: (0.04), so additive bonuses can reorder candidates *within* a class but
+#: never promote a materially different fuzzy target above an exact one.
+_MATCH_BANDS = {
+    4: (0.95, 0.05),
+    3: (0.85, 0.05),
+    2: (0.70, 0.08),
+    1: (0.55, 0.10),
+}
+
+
+def _score_text_match(target, candidate):
+    """Return 0-1 similarity between target text and a candidate label.
+
+    F29: the score is a class-disjoint band rather than a free-running
+    similarity, so "Save As" cannot outrank an exact "Save" merely because
+    one of them is a Button and the other is not.
+    """
+    rank = _text_match_class(target, candidate)
+    if rank <= 0:
+        return 0.0
+
+    floor, width = _MATCH_BANDS[rank]
+    if rank >= 3:
+        fraction = 1.0
+    else:
+        t = target.lower().strip()
+        c = candidate.lower().strip()
+        if rank == 2:
+            shorter = float(min(len(t), len(c)))
+            longer = float(max(len(t), len(c))) or 1.0
+            fraction = max(0.0, min(1.0, shorter / longer))
+        elif len(t) > 3 and len(c) > 3:
+            fraction = max(
+                0.0, min(1.0, difflib.SequenceMatcher(None, t, c).ratio()))
+        else:
+            t_words = set(t.split())
+            c_words = set(c.split())
+            if t_words and c_words:
+                fraction = len(t_words & c_words) / float(
+                    max(len(t_words), len(c_words)))
+            else:
+                fraction = 0.5
+    return floor + fraction * width
+
+
+def _control_priority(control_type, source):
+    if source == "ocr":
+        return 0
+    if control_type in CLICKABLE_CONTROL_TYPES:
+        return 4
+    if control_type in TEXT_ENTRY_CONTROL_TYPES:
+        return 3
+    if control_type in PASSIVE_CONTROL_TYPES:
+        return 1
+    return 2
+
+
+def _score_band_limits(value):
+    """The ``(low, high)`` score band that *value* already falls inside (F29)."""
+    for _rank, (floor, width) in _MATCH_BANDS.items():
+        if floor - 1e-9 <= value <= floor + width + 1e-9:
+            return floor, floor + width
+    return None
+
+
+def _score_ui_element_match(target, elem):
+    name = elem.get("name", "")
+    ctype = elem.get("control_type", "")
+    label = f"{name} {ctype}".strip()
+    raw = max(_score_text_match(target, name), _score_text_match(target, label))
+    if raw <= 0:
+        return 0.0
+
+    # F29: bonuses order candidates WITHIN their match class only. They are
+    # never allowed to lift a materially different target — "Save As" on a
+    # Button — above an exact "Save", so the total is clamped back into the
+    # band the text match already earned.
+    bonus = 0.0
+    if ctype in CLICKABLE_CONTROL_TYPES:
+        bonus += 0.04
+    elif ctype in TEXT_ENTRY_CONTROL_TYPES:
+        bonus += 0.02
+    elif ctype in PASSIVE_CONTROL_TYPES:
+        bonus -= 0.03
+    # F29: an UNKNOWN enabled state is not evidence of actionability. Only an
+    # explicit True earns the bonus; anything else gets nothing.
+    if elem.get("enabled") is True:
+        bonus += 0.01
+
+    score = raw + bonus
+    limits = _score_band_limits(raw)
+    if limits:
+        score = max(limits[0], min(score, limits[1]))
+    return max(0.0, min(score, 1.0))
+
+
+def _is_better_match(score, priority, best_score, best_priority):
+    if score > best_score + 0.001:
+        return True
+    if abs(score - best_score) <= 0.001 and priority > best_priority:
+        return True
+    return False
+
+
+def _extract_action_verb(command_text):
+    """Determine click type from the command text."""
+    normalized = _normalize_text(command_text)
+    if re.search(r"\bright.?click\b", normalized):
+        return "right_click"
+    if re.search(r"\bdouble.?click\b", normalized):
+        return "double_click"
+    return "click"
+
+
+def _tiebreak_by_proximity(candidates, capture=None, to_screen=None):
+    """When scores tie, prefer the element nearest the current cursor.
+
+    F44: the cursor position is in **screen pixels**, while candidates may be
+    recorded in the vision frame. Comparing them directly mixed coordinate
+    frames (a candidate at vision (100, 100) was treated as if it were at

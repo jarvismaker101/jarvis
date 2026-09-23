@@ -1,0 +1,20 @@
+[REPRO2] run_quick_search('current pricing for gpt 6 astra')
+[REPRO2] RAISED after 1.22s: ResearchBrowserError: Error: BrowserType.launch_persistent_context: Chromium distribution 'chrome' is not found at C:\Users\mayan\AppData\Local\Google\Chrome\Application\chrome.exe
+Run "playwright install chrome"
+Traceback (most recent call last):
+  File "C:\Users\mayan\jarvis-assistant\_repro2.py", line 12, in <module>
+    r = run_quick_search(q)
+  File "C:\Users\mayan\jarvis-assistant\backend\services\quick_search.py", line 527, in run_quick_search
+    overview, fallback = _browser_run(
+  File "C:\Users\mayan\jarvis-assistant\backend\services\quick_search.py", line 465, in _browser_run
+    return research_browser.run(coro_fn, task_id=task_id, timeout=timeout)
+  File "C:\Users\mayan\jarvis-assistant\backend\services\research_browser.py", line 516, in run
+    return get_worker(profile_dir, channel).run(coro_fn, task_id=task_id, timeout=timeout)
+  File "C:\Users\mayan\jarvis-assistant\backend\services\research_browser.py", line 351, in run
+    loop = self._ensure_started()
+  File "C:\Users\mayan\jarvis-assistant\backend\services\research_browser.py", line 308, in _ensure_started
+    self.start()
+  File "C:\Users\mayan\jarvis-assistant\backend\services\research_browser.py", line 193, in start
+    raise ResearchBrowserError(str(self._error))
+backend.services.research_browser.ResearchBrowserError: Error: BrowserType.launch_persistent_context: Chromium distribution 'chrome' is not found at C:\Users\mayan\AppData\Local\Google\Chrome\Application\chrome.exe
+Run "playwright install chrome"

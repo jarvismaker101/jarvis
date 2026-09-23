@@ -1,0 +1,751 @@
+Jarvis Implementation Verification and Hardening Report
+Date: 11 September 2026
+
+Review type: Read-only static implementation review.
+
+Requirements baseline: The saved JARVIS Capability Audit, findings F01-F52 and its migration requirements. The user explicitly approved this baseline because the referenced PDF was not available.
+
+Implementation examined: 48 supplied Python files, totaling 28,598 source lines.
+
+Execution: No project code, tests, browser automation, provider requests, or benchmarks were run. No project code was written or modified. Only review documents were created.
+
+1. Executive Verdict
+The supplied implementation does not satisfy every audit requirement. The G0-G11 remediation claims are not sufficient for audit closure. Substantial foundations exist, but several are bypassed, incorrectly connected, or weaker than the original requirements. Some newly added components introduce direct correctness failures.
+
+Priority	Finding	Consequence	Requirements
+P1	Event sequences stop advancing after retention trimming; active requests can be evicted while executing.	Lost completion delivery and possible duplicate execution on reconnect.	F23
+P1	Synchronous quick-search functions receive asynchronous Playwright pages.	Navigation/extraction is not correctly awaited; owner-loop blocking compounds the failure.	F27
+P1	Execution does not consistently enforce immutable plan-bound permission at the final effect boundary.	Changed, stale, hidden, or insufficiently scoped effects can execute after broad confirmation.	F17-F19, F22
+P1	Screen disable and job cancellation are not enforced before every effect.	Actions continue after revocation; stopping one job can affect another.	F19-F20
+P1	Completion depends on model wording, tool silence, or weak acknowledgments.	Attempted or failed work can be reported as completed.	F01, F03, F41
+P1	Browser and Windows targets are not reliably revalidated against stable live identities.	Reloads, tab changes, expired caches, and focus changes can redirect actions.	F39, F42-F45, F47
+P1	Fish playback bypasses the audio actor; playback-reference audio is process-local.	Stop, exact resume, exclusive playback, and full-duplex AEC are not established.	F32-F33, F50
+P1	Authentication fails open without a token; private polling endpoints remain public.	Local authority or conversation/research data can be exposed.	F51
+P1	Secrets bypass masking through logs, memory references, tool history, and screenshots.	Credentials can reach persistent traces or external models.	F21
+P1	Watcher lifecycle handling is not identity-safe ongoing supervision.	Wrong-token reuse, lost handles, unowned cleanup, and unrecovered worker crashes.	F52
+P2	The orchestrator has a broken screen adapter reference and loses mutation proposals at its caller.	Multi-domain goals can fall back incorrectly or never reach approval/execution.	F02
+Release recommendation: Do not expand unattended or sensitive computer-control authority based on remediation labels. Close P1 enforcement/correctness defects first, then demonstrate behavior on Windows. Preserve deterministic safeguards during migration.
+
+No P0 emergency-level finding is established by this static review. This is not a security or production-readiness certification.
+
+2. Scope and Interpretation
+All supplied files were read completely in six non-overlapping review groups. Findings were reconciled across caller/callee boundaries. The project map provided orientation, not proof of implementation.
+
+References such as brain.py:2385-2404 are absolute line numbers within the supplied flattened file, not a verified checkout or the old audit's symbol-relative citations. A full commit identity and deployment configuration were not supplied.
+
+Status definitions:
+
+Partial: Meaningful implementation exists, but required behavior or integration remains incomplete.
+Incorrect: Supplied implementation contradicts the required guarantee or contains a concrete failure path.
+Not implemented in supplied path: The inspected execution path lacks the mechanism; this does not rule out unused code elsewhere.
+Not verifiable: Necessary source or runtime evidence was not supplied.
+Every F01-F52 requirement is assessed below. None is certified as fully implemented and runtime-verified. Several important subrequirements are demonstrably present; lack of full closure does not mean no useful work was done.
+
+P1 denotes high-priority correctness, authority, privacy, or operational reliability work. P2 denotes significant integration, performance, or robustness work. All acceptance checks are proposed tests, not executed tests.
+
+3. Requirement-by-Requirement Findings
+F01. Replace Open-Loop Task Execution
+Status: Partial. Priority: P1.
+
+Evidence: agent.py:830-932,1611-1765.
+
+Some failures and code-tool results are recognized, but execution remains a precomputed list, not observation-driven replanning. Normalization drops depends_on, undermining dependency enforcement. The eight-step truncation is recorded but does not prevent completion of an incomplete intended plan.
+
+Correction: Preserve/validate dependencies, feed structured observations into next-step planning, retain unmet goals at budget exhaustion, and reapprove changed effects.
+
+Acceptance: Failed prerequisites block dependents; discovered filenames inform later arguments; ten intended steps cannot be completed by executing eight and silently omitting two.
+
+F02. Route Goals, Not Single Categories
+Status: Partial. Priority: P2.
+
+Evidence: orchestrator.py:132-219,289-388; brain.py:2333-2404; config.py:63-69.
+
+A gated native-tool loop exists. _tool_screen_observe calls undefined _coerce_screen_output. Wrong argument types are accepted, and falsey arguments can reach nonexistent envelope.utterance. The orchestrator returns proposed plans, but the brain consumes only the reply instead of carrying the proposal into approval/execution. Multiple proposals can overwrite each other. Legacy speculation starts before orchestration.
+
+Correction: Define explicit answer/proposal/suspension/error contracts, validate schemas, connect proposals to identified approvals, and select the route before speculation.
+
+Acceptance: One screen/research/edit goal retains evidence, arms one identified approval, executes only after consent, and never repeats started work during fallback. Keep safeguards until parity.
+
+F03. Make Completion an Evidence-Backed Status
+Status: Incorrect. Priority: P1.
+
+Evidence: browser_agent.py:2691-2712,2777-2788,2835-2846; brain.py:228-246,1303-1396,2703-2709; agent.py:1697-1817; opencode_client.py:519-552.
+
+Structured statuses exist, but callers still request completion when models stop using tools or produce success-like wording. Virtual failures are incompletely counted; legacy strings can be promoted without evidence. Command-mode results are ignored. Native checks often prove existence rather than intended content. Opencode can accept unknown return status after an unsuccessful wait.
+
+Correction: Derive status from verified goals and known terminal execution, preserving achieved/unmet goals and artifacts through all callers.
+
+Acceptance: Refusals, no-action Done, failed tools, zero-exit no-ops, unknown exit status, and failed output containing created cannot become verified completion. Inspect missing task_result.py before closure.
+
+F04. Give Research Notes the Actual Question
+Status: Partial; core query propagation is present. Priority: P2.
+
+Evidence: research_service.py:360-405,515-568,783-806.
+
+The actual query reaches note generation, with relevant-claim/quotation/date/applicability instructions and some no-evidence filtering. Output remains unvalidated prose, filtering recognizes narrow phrases, and synthesis imposes release/upcoming-oriented headings on unrelated questions.
+
+Correction: Validate structured relevance/evidence and choose synthesis structure from the actual question.
+
+Acceptance: Historical, troubleshooting, regional, and compatibility questions reach every note call intact; irrelevant notes are excluded regardless of wording; unrelated future-release framing is absent.
+
+F05. Enforce Recovery Limits Across Model Turns
+Status: Partial. Priority: P1.
+
+Evidence: browser_agent.py:2504-2537,2544-2637,2684-2689.
+
+Some native exceptions and immediate mutation retries are bounded. Virtual tools bypass the tracker, textual failure can reset it, and identity/state-bound recovery is not established. A possibly committed mutation can be requested again on the next model turn.
+
+Correction: Track structured outcomes for every action using resolved targets and observed state. Treat ambiguous mutation results as outcome-unknown and reconcile before replay.
+
+Acceptance: Virtual/native failures share the same attempt allowance; a lost response after submission cannot cause a second submission without independent evidence of noncommitment. Inspect the missing tracker implementation too.
+
+F06. Build Retrievable Personal Memory
+Status: Partial. Priority: P2.
+
+Evidence: memory_store.py:90-121,271-491,1047-1096; brain.py:751-760,2279-2293.
+
+Facts/entities, metadata, revisions, tombstones, retrieval, and bounded injection exist. Generic notes share one key and can supersede unrelated notes. Correction/entity helpers lack visible core wiring. FTS can retrieve only inactive rows without useful fallback. Unescaped percent/underscore forgetting criteria act as wildcards. Reviewed model proposals and episodic derivation are not established.
+
+Correction: Represent independent facts independently; wire corrections and reviewed proposals; retrieve active facts with metadata; escape literal forgetting criteria.
+
+Acceptance: Unrelated notes coexist; corrections affect one intended fact; the latest revision remains retrievable; aliases resolve; literal percent cannot forget everything.
+
+F07. Remember Work, Not Just Chat
+Status: Partial. Priority: P1.
+
+Evidence: brain.py:188-207,1288-1299,1502-1512,1860-1878; memory_store.py:495-577,1163-1186.
+
+Several exchange/outcome paths reach SQLite, but there is no central identified request/terminal-event contract. Research artifact/source structure is lost in reply recording. Task references contain descriptions rather than reliable artifacts and bypass summary/detail masking. Clipping serialized detail can break structure. Unified work-event retrieval for normal chat is not demonstrated.
+
+Correction: Centrally record redacted requests, results, suspensions, artifacts, and provenance; derive chat and episodic projections from those events.
+
+Acceptance: After restart, a report follow-up retrieves its actual path and sources; every request links to its outcome; no event field leaks seeded secrets.
+
+F08. Resume the Actual Agent Session
+Status: Not implemented in the supplied continuation path. Priority: P1.
+
+Evidence: browser_agent.py:2730-2750,2850-2887; brain.py:1502-1531,2140-2170.
+
+Runs initialize new history, marks, and failure state. Clarification appends text to a description and starts again rather than restoring verified progress. Any question mark, including a URL query, can arm continuation. Negative or materially changed follow-ups are not reliably cancellation or new scope.
+
+Correction: Persist identified suspended checkpoints with verified progress, browser identity, pending question, and authorization; reobserve before resuming; reapprove changed effects.
+
+Acceptance: Clarification does not replay committed actions; query-string URLs do not suspend; cancel does not restart; expanded scope requires approval.
+
+F09. Turn Successful Runs Into Skills
+Status: Partial. Priority: P2.
+
+Evidence: memory_store.py:764-931,1127-1186; agent.py:774-786.
+
+Candidate/version/promotion storage and planner retrieval exist. Capture is largely goal/outcome text, not a verified parameterized procedure. Promotion does not require replay validation. A new candidate can retire the working trusted version prematurely. Retrieved content does not reliably contain procedures, and completed substring matching can accept NOT COMPLETED. Replay-failure feedback is not established end to end.
+
+Correction: Capture verified traces, require version-bound approval plus replay validation, retain trusted versions until replacement qualifies, and retrieve actual procedures.
+
+Acceptance: Failed/unvalidated runs never become trusted; recapture preserves the working version; changed selectors and verified replay failures invalidate applicability.
+
+F10. Add Persistent Commitments and Proactivity
+Status: Partial. Priority: P2.
+
+Evidence: memory_store.py:581-755,985-1125; brain.py:210-224.
+
+Durable reminders and notification-only delivery exist. Scheduler startup is tied to adding a reminder, not demonstrated lifecycle recovery. Delivery is marked complete before callback success; concurrent ticks can duplicate it. Named cancellation targets the newest reminder. Combined date/time parsing can mishandle tomorrow. Job-trigger dispatch is not established; calendar/file triggers are safely rejected rather than implemented.
+
+Correction: Start scheduling under backend ownership, use an acknowledged transactional outbox, identify triggers/reminders, and explicitly implement or defer integrations.
+
+Acceptance: Restart delivers existing reminders; callback failure retries; concurrent ticks notify once; cancelling A preserves B; tomorrow at 9 resolves correctly.
+
+F11. Give Native Coding an Inspection/Edit Loop
+Status: Partial. Priority: P2.
+
+Evidence: code_tools.py:294-607,670-759; agent.py:1366-1427,1742-1753.
+
+Search/range/patch/diff/check tools exist. Consumer clipping can discard most of a page while preserving a cursor beyond it, skipping unseen context. Range reads still load entire files. Structured results/hashes do not reliably feed planning. Unified-diff handling mishandles zero-length insertions and important count, target, and newline semantics.
+
+Correction: Separate planning data from speech, preserve artifacts/cursors/hashes, and use validated patch application with explicit unsupported-input rejection.
+
+Acceptance: Pagination has no gaps; an insertion after line one occurs after it; CRLF/no-final-newline/wrong-target patches yield exact intended bytes or no write.
+
+F12. Preserve Literal Task Payloads
+Status: Partial. Priority: P1 for executable payloads.
+
+Evidence: agent.py:329,470-475,567-592,862-866; brain.py:2224-2231,2626-2686; watcher.py:231-235,354-374; wake_engine.py:65-85,256; listener.py:232-314,537-545.
+
+Active listening retains raw text and some planner matching is separate. Wake processing and command cleanup still lowercase/reconstruct tokens, destroying punctuation, paths, URLs, flags, quotes, and whitespace. Content delimiters can match inside filenames; placeholder replacement can alter quoted code.
+
+Correction: Preserve raw text with matching offsets, parse literal spans, and restrict placeholder resolution to designated path fields.
+
+Acceptance: Mixed-case paths, signed URLs, uppercase flags, quoted and, indentation/newlines, and literal placeholders survive typed, voice, and wake-tail routes unchanged.
+
+F13. Expose Complete Browser Interactions
+Status: Partial. Priority: P1.
+
+Evidence: browser_agent.py:796-969,2158-2294,2409-2441,2480-2483.
+
+Typed interaction wrappers exist. Advertisement and execution schemas diverge; malformed JSON can become empty defaults. Upload checks local access rather than destination-specific disclosure authority. CSS-only resolution loses frame identity. Download completion can lack an artifact, while selected/checked state is inferred rather than verified.
+
+Correction: Generate schemas/validation together, bind uploads to file-plus-origin grants, preserve frames, and return structured verified outcomes/artifacts.
+
+Acceptance: Malformed calls do nothing; readable files cannot upload to unapproved sites; downloads require real artifacts; state changes are read back. Daemon-side implementation remains unverified.
+
+F14. Add Semantic Productivity Connectors
+Status: Not verifiable; no relevant implementation evidenced in supplied tool/planner surfaces. Priority: P2.
+
+Evidence: agent.py:716-770; code_tools.py:745-781; supplied inventory.
+
+The inspected interfaces cover code/editor/browser/Windows actions, not requested calendar/mail/contact operations. No corresponding connector source, OAuth configuration, schemas, or tests were supplied. This does not establish absence elsewhere in the repository.
+
+Correction: Confirm actual user services, then add typed least-privilege read/draft operations with separately approved sending and externally visible changes.
+
+Acceptance: Provide source/tests for account/entity resolution, delegated permissions, revocation, and no unauthorized send/create effects.
+
+F15. Upgrade the Editor Bridge Into a Coding Interface
+Status: Partial. Priority: P1.
+
+Evidence: editor_bridge.py:63-87,133-134,158-257; agent.py:1268-1342,1397-1427.
+
+Inspection/WorkspaceEdit wrappers exist. Active-selection checks omit document version and can fail open. Text-only edit POSTs allow check/use races. Expected versions are optional. Structured inspection becomes clipped prose before planning.
+
+Correction: Require URI/version/range with atomic extension-side validation; preserve structured diagnostics/buffers and per-document preconditions.
+
+Acceptance: Same-position content changes, focus switches, missing state, and stale members of multi-file edits cause no unintended edit. Extension implementation/authentication must be supplied for closure.
+
+F16. Dispatch by Capability, Not One Global Engine
+Status: Incorrect. Priority: P1.
+
+Evidence: capability_resolver.py:88-168; brain.py:1385-1393,1474-1492,2548-2557,2690-2701; opencode_client.py:448-450,612-620.
+
+The resolver can be logged but ignored by execution, which still branches on global engine configuration. Negated opencode mentions can match opt-in; error paths can fail open. Local coding can fall back to a browser-only engine. Some browser recovery still depends on CLI availability.
+
+Correction: Carry required capability, selected executor, availability, and explicit grant through immutable approval/execution; fail closed on incompatible fallback.
+
+Acceptance: Negated opencode requests never enable it; browser recovery needs no CLI; local refactoring does not become browser work; configuration changes after consent cannot change executor.
+
+F17. Enforce Tool Policy at Dispatch
+Status: Incorrect. Priority: P1.
+
+Evidence: tool_policy.py:176-264,284-395; agent.py:1237-1427; code_tools.py:762-781; browser_agent.py:46-67,2480-2537,2661-2677.
+
+Partial name/schema validation does not establish target-bound authority for all mutations/navigation. Native/editor calls bypass the helper. String stripping in probe validation can accept computed mutation calls such as document.querySelector('button')['click'](). Hidden primitives remain dispatchable; empty browser grants can revive environment defaults. Observation text can contaminate trusted tab metadata.
+
+Correction: Enforce one typed effect boundary; replace evaluated probes with typed queries; separate model tools from internal primitives; preserve denial; accept identity only from trusted structured responses.
+
+Acceptance: Computed calls, hidden bypasses, wrong-origin effects, malformed nested arguments, forged tab text, and grantless direct invocation fail before effects.
+
+F18. Bind Consent to the Entire Plan
+Status: Partial. Priority: P1.
+
+Evidence: approvals.py:79-180,208-290; agent.py:1554-1641,1777-1810; brain.py:1903-1915,2033-2170; screen_control.py:2743-2777; tool_policy.py:399-430.
+
+Hash/expiry records exist and screen paths use them, but native and brain handoffs retain mutable independent gates. Native preview shows only the first sensitive effect. Shared preview expects arguments while native steps use args. Research asks a model before deterministic negatives. Screen coordinates can change after approval verification.
+
+Correction: Use immutable request/job-bound full-effect records, negative-first control handling, and atomic verification/consumption immediately before unchanged execution.
+
+Acceptance: Every target/effect appears in the full preview; confirmations cannot cross-authorize; model output cannot override no; changed/expired plans execute nothing.
+
+F19. Make Screen Disable Authoritative
+Status: Incorrect. Priority: P1.
+
+Evidence: screen_state.py:54-86; screen_control.py:31-45,2606-2677,2761-2840; screen_executor.py:134-305; windows_connector.py:82-90.
+
+Enabled/generation state exists, but unbound guards and late stamping allow old planning work to adopt new authority. The executor receives no control generation and does not check before individual focus/input effects. Substring toggles accept some negated requests.
+
+Correction: Capture generation at request creation, enforce it before every effect, serialize dispatch against revocation, and use exact negation-aware controls.
+
+Acceptance: Disable/re-enable during planning invalidates old work; revocation between steps prevents later effects except necessary release cleanup; negated enable never enables.
+
+F20. Cancel Jobs, Not Global Flags
+Status: Incorrect. Priority: P1.
+
+Evidence: jobs.py:118-170; routes.py:453-474; browser_agent.py:196-215,2754-2802; research_service.py:32-72,835-944; agent.py:1611-1765; screen_executor.py:225-305.
+
+Tokens exist but stop lacks target identity and interrupts all registered requests. Global browser/research flags retain cross-job interference, new-run clearing, and idle-stop poisoning. Native/screen execution and composite/synthesis phases lack propagation/checkpoints. Pause can spin without deadlines. Stream interruption does not cancel its worker.
+
+Correction: Make one owning token/deadline authoritative across all phases, retries, children, cleanup, and terminal publication.
+
+Acceptance: Stop A without affecting B; idle stop leaves new work untouched; cancellation before click prevents it; paused expiry cannot resume effects; interruption never later becomes completion/speech.
+
+F21. Keep User Secrets Out of Tool Traces
+Status: Partial. Priority: P1.
+
+Evidence: browser_agent.py:2519-2532,2789-2790,2884-2886; screen_control.py:2502-2557; screen_state.py:177-223; memory_store.py:505-521,1170-1178; opencode_client.py:456-552; tool_policy.py:130-164.
+
+Masking exists, but raw descriptions, virtual results, tool arguments, screen commands/history, and memory references bypass it. Deep nesting can pass through unchanged. Screenshot redaction is not established. Environment-based provider keys do not protect user credentials.
+
+Correction: Use sensitive-field types/local secret handles and one redacted egress boundary for logs, model messages, UI, artifacts, and memory; enforce capture/disclosure policy.
+
+Acceptance: Seeded secrets in text/fills/errors/nested fields/screenshots/references never reach unauthorized traces or providers. Verify rotation of previously exposed credentials separately.
+
+F22. Make Code Changes Reversible and Confined
+Status: Incorrect. Priority: P1.
+
+Evidence: code_tools.py:101-243,554-607,670-742; code_grants.py:139-311,333-501.
+
+Some scoped atomic writes exist. Shell/inline/check execution is inconsistently grant-bound; script location is not effect confinement. Hash preconditions are optional/incomplete. Journal existence is recorded after replacement, breaking new-file undo; restore can overwrite intervening edits. Job Object setup uses incorrect/untyped structures and unchecked calls with cleanup gaps. POSIX group cleanup lacks isolated child ownership.
+
+Correction: Separate file and privileged execution authority, bind approved diffs to create/replace preconditions, persist conflict-aware restore points, and implement checked descendant ownership/cleanup.
+
+Acceptance: Out-of-scope execution fails; concurrent edits survive; undo works after restart; timeout kills only owned descendants; backup/assignment failure is safe.
+
+F23. Reconnect Without Reexecuting Requests
+Status: Incorrect. Priority: P1.
+
+Evidence: request_registry.py:66-86,115-248; routes.py:215-335; voice_mode.py:127-190.
+
+Both transports share an execute-once registry for retained states. Sequence generation uses retained-list length and stops advancing after trimming. Conflicting payloads reuse IDs. Live-state eviction leaves workers running and permits another execution on reconnect. Retention gaps lack snapshots; terminals remain mutable. Voice reuses identity but cannot recover missing events.
+
+Correction: Independent monotonic sequences, immutable terminals, atomic payload binding, active-state retention, bounded admission, and explicit resume/expired-ID behavior with reconstructive snapshots.
+
+Acceptance: More than 1,000 events stay ordered; concurrent transports execute once; conflicts return 409; saturation never forgets live work; reconnect restores text without repeated effects/speech.
+
+F24. Enforce Real End-to-End Deadlines
+Status: Partial. Priority: P2.
+
+Evidence: gemini_client.py:47-58,257-347; fireworks_client.py:63-90; brain.py:865-1041; browser_agent.py:627-699; research_service.py:707-944; executor.py:10-23.
+
+Some deadline/retry improvements exist, but no shared budget spans classification, startup, fallbacks, semaphores, tools, and synthesis. Hidden/manual retries multiply. Non-stream fallback can replay auth/validation failures. Some waits grant fresh time after expiry or abandon only the waiter. YouTube lookup lacks a timeout. The classifier implementation is unavailable.
+
+Correction: Propagate one absolute monotonic deadline/cancellation handle, centralize error classification, and retry only eligible failures within remaining time.
+
+Acceptance: Expired budgets send no requests; auth failures are not replayed; trickling streams cannot extend deadlines; completed evidence survives as partial results.
+
+F25. Make Speculation Pure and Cancellable
+Status: Partial. Priority: P2.
+
+Evidence: brain.py:709-811,1044-1199,2589-2614; fireworks_client.py:174-245; gemini_client.py:374-422; openai_compat_client.py:97-140.
+
+Speculative lookup is deferred and queues bounded. Cancellation cannot promptly interrupt blocked transport iteration; non-stream fallback lacks it. Overflow can leave a partial race adoptable, and sentinel insertion can drop real text. Context/model/memory are not one immutable prebuilt snapshot; first-use memory can initialize durable state.
+
+Correction: Snapshot before spawning, actively close transport, make overflowed/failed races non-adoptable, and signal completion without removing answer chunks. Measure whether speculation is worthwhile.
+
+Acceptance: Cancel before headers/mid-read prevents fallback; full/overflowing queues yield complete output or clean regeneration; speculation performs no external lookup/persistent mutation.
+
+F26. Finish the Existing Streaming Contract
+Status: Partial. Priority: P2.
+
+Evidence: routes.py:85-110,130-212,215-326; brain.py:1243-1299,2390-2403; voice_mode.py:160-173,712-737.
+
+Typed streams feed speech and event types exist. Replacement/final text is not reconciled with spoken content. Voice ignores replacement, collapses interruption into ordinary return, and can finish stale speech. Background delivery does not consistently honor request speech ownership. JSON/stream routes differ; orchestrator callbacks are not streamed. Uncertainty handling differs by delivery mode.
+
+Correction: One canonical accepted-answer stream, request-owned audio, explicit correction policy, pre-speech clarification, and irreversible interruption.
+
+Acceptance: Delta/replace/final/error/interruption sequences align UI/memory/speech; voice-owned requests never double-speak; cancelled audio never restarts. Frontend and speaker internals remain unverified.
+
+F27. Keep One Research Browser Worker Warm
+Status: Incorrect. Priority: P1.
+
+Evidence: research_browser.py:180-242,272-403; quick_search.py:132-413,437-535.
+
+An async persistent owner exists, but synchronous quick-search functions receive async pages and call methods without awaiting them. Same-thread execution does not repair this mismatch. Exceptions can hide coroutine misuse; synchronous sleeps block the owner loop. Timeout does not cancel submitted work, admission is unbounded, and shutdown can forget a live owner.
+
+Correction: Use async quick-search on the existing owner or a genuine sync owner; bound admission, cancel futures, and retain ownership until shutdown completes.
+
+Acceptance: Real async navigation/extraction is awaited; quick/deep reuse one context; polling stays responsive; timeout closes only owned pages; restart cannot create competing profile owners.
+
+F28. Parallelize Research Within Explicit Limits
+Status: Partial. Priority: P2.
+
+Evidence: research_service.py:90-96,223-267,691-944; routes.py:673-702.
+
+Three-fetch/two-note semaphores, deduplication, ordered collection, and incremental callbacks exist. Limits are per invocation, not aggregate. Cancellation is not rechecked after admission or before notes. Timed-out work can continue. Hard failures may retry/duplicate; gathered exceptions can be omitted. Progress is a global snapshot.
+
+Correction: Enforce limits at intended scope, recheck cancellation after waits, use structured task groups/outcomes, and retain ranking and job identity.
+
+Acceptance: Instrumented concurrent runs stay within agreed ceilings; cancelled waiters start no I/O; hard failures run once; all sources have ordered outcomes and partial evidence survives.
+
+F29. Run UIA Matching Before OCR
+Status: Partial. Priority: P1.
+
+Evidence: screen_control.py:1699-1756,1892-1972,2011-2049,2167-2228; screen_ui_elements.py:183-186.
+
+UIA-first genuinely precedes capture/OCR with confidence/margin checks. Later local fallback can regain high confidence by choosing ambiguous controls using cursor proximity. Bonuses can promote Save versus Save As; unknown enabled state defaults to enabled. Stale-resolution defects remain.
+
+Correction: One ambiguity/actionability policy across local routes, no additive promotion of materially different fuzzy targets, and fail-closed state/revalidation.
+
+Acceptance: Unique exact enabled targets require no OCR/provider; duplicates, disabled/unknown controls, and different substring targets cannot regain automatic execution through fallback.
+
+F30. Deliver Screen Answers Before Decorations
+Status: Partial. Priority: P2.
+
+Evidence: brain.py:80-164,2492-2546; routes.py:542-626.
+
+Initial tips precede optional enrichment and patch identity exists. Slow calls escape budgets; threads are unbounded. Capture identity is created after analysis. Late initial posts can replace newer answers, patch merge is non-atomic, and decorations may replace authoritative evidence/tips. Overlay posting can delay primary return.
+
+Correction: Register generation before analysis, publish primary text independently, bound enrichment, atomically reject stale initial/patch results, and restrict patch fields.
+
+Acceptance: Older A finishing after B cannot replace B; images do not delay text; stale races fail; hanging enrichment cannot create unbounded work.
+
+F31. Preserve Streamed Words and Answer Channels
+Status: Partial; speaker internals not verifiable. Priority: P1 for channel leakage.
+
+Evidence: voice_mode.py:160-165,712-715; fireworks_client.py:139-148,229-239; gemini_client.py:168-175,294-338,409-416; openai_compat_client.py:128-134.
+
+Transport forwards deltas unchanged; default Fireworks/custom streams exclude separate reasoning fields. Gemini concatenates text parts without excluding thought-marked parts. Optional Fireworks reasoning merges into the same untyped iterator. Missing voice.py prevents verification of actual split-word/announcement buffering.
+
+Correction: Type reasoning/final channels across adapters and allow only final-answer text to chat/TTS/memory; verify exact speaker concatenation.
+
+Acceptance: hel plus lo remains hello; thought/final mixed responses never narrate reasoning; announcements do not splice into unfinished answers.
+
+F32. Give Playback One Real Owner
+Status: Incorrect. Priority: P1.
+
+Evidence: fish_voice.py:266-408,417-595,712-740,751-900; audio_actor.py:133-217,252-290.
+
+Fish writes explicit output streams before feeding the actor, which does not own them. Global stop is not a reliable abort. Prefetch waits can register playback only after cancellation. Generation/enqueue checks race; overflow drops PCM; cursor tracks submission rather than consumption. Resume can duplicate archive content. Cache cleanup keys mismatch and legacy timeout references undefined ck.
+
+Correction: One actual stream owner for every format, early cancellation registration, immutable generation-tagged chunks, backpressure/EOF, identity-consistent caching, and consumed-frame accounting.
+
+Acceptance: Stop during prefetch/read/write prevents old output; long streams lose nothing; repeated resume neither duplicates nor skips; model changes cannot reuse wrong-identity audio.
+
+F33. Add Echo-Cancelled Full-Duplex Listening
+Status: Incorrect. Priority: P1.
+
+Evidence: echo_cancel.py:86-93,112-173,193-222; fish_voice.py:438-484; listener.py:405-424,468-528; watcher.py:1016-1089.
+
+Reference/AEC singletons are process-local while backend and voice are separate. No inspected PCM transport joins them. Integer-stride 44.1-to-16 kHz conversion yields about 14.7 kHz and loses continuity. Newest-suffix reference selection is not timestamp alignment. Overlapping windows can be reprocessed; final VAD/STT use unfiltered audio and bypass onset cancellation.
+
+Correction: Shared render/capture timeline, continuous stateful resampling, once-only frame processing, filtered onset/final-VAD/STT, and explicit degraded AEC state.
+
+Acceptance: Assistant-only playback never becomes committed user speech, including final fallback; test arbitrary chunk boundaries, buffers, generations, and actual double-talk recordings.
+
+F34. Reuse Local Whisper for Active Conversation
+Status: Partial. Priority: P2.
+
+Evidence: listener.py:244-304,521-545; transcript_stabilizer.py:44-47,86-136.
+
+Local selection exists but capture completes before one transcription. The only produced stabilizer window is final. Local choice does not establish local-only privacy. Stabilization can count duplicate/nonconsecutive agreement and lacks robust turn reset/bounding for partial streams.
+
+Correction: Real identified overlapping partial/final windows, timestamps/turn boundaries, consecutive independent agreement, idempotent commits, and explicit cloud policy.
+
+Acceptance: Partials arrive before utterance end; duplicates/reordering/contradiction/cross-turn windows never authorize unstable actions; local-only failure transmits nothing externally. Daemon behavior remains unverified.
+
+F35. Make Voice Control Commands Unambiguous
+Status: Partial. Priority: P1.
+
+Evidence: voice_mode.py:274-315,357-430,559-586,644-684,743-775; listener.py:336-402.
+
+English shutdown and control ordering improved. Hindi shutdown remains substring-based; negation/apostrophe handling is inconsistent. Negated continuation can resume. Pause lacks a complete path; speech stop depends on local state. Shutdown sends an unauthenticated warm-stop request rather than full shutdown.
+
+Correction: One exact target-aware multilingual grammar before muting, with distinct authenticated speech/task/approval/pause/sleep/shutdown controls.
+
+Acceptance: Test both apostrophe forms, Hindi negation, other-app closing, backend speech, tasks, and prefetch waits; every control affects only its intended owner.
+
+F36. Separate Wake Detection From Full Transcription
+Status: Incorrect. Priority: P1.
+
+Evidence: wake_engine.py:65-117,162-275; watcher.py:456-598,1222-1225.
+
+Keyword spotting is not wired to watcher decisions. Non-wake speech can reach online STT regardless of intended policy. Pre-roll starts after matching and oversized chunks can empty it. Verification uses an incompatible audio interface and can proceed after error. Shortest-span matching extracts unintended wake-only tails. Forwarding lacks authentication, request identity, and reliable readiness handling.
+
+Correction: Wire continuous candidate capture/pre-roll and bounded local verification; enforce cloud policy; preserve raw complete wake spans; forward once through authenticated identified requests after readiness.
+
+Acceptance: Disabled cloud policy produces zero online calls; wake-only phrases create no task; literal command tails execute once despite launch/disconnection failures.
+
+F37. Remove the Unrelated Groq Prerequisite
+Status: Partial; original early-return defect fixed. Priority: P2.
+
+Evidence: screen_analyzer.py:308-464; screen_control.py:1393-1482.
+
+The unrelated Groq-key guard is removed. Complete availability remains weaker: configured alternatives are not uniformly eligible fallbacks, adapter exceptions can bypass recovery, redundant attempts occur, and malformed nonempty output can end the cascade. Actual provider/model provenance is incomplete.
+
+Correction: Centralize eligible-provider/capability discovery, schema validation, bounded fallback, and actual-attempt metadata.
+
+Acceptance: Supported single-provider installations need no unrelated key; exceptions/malformed output advance safely; total unavailability is accurate and names actual attempted providers.
+
+F38. Stop Dropping Gemini Browser Images
+Status: Partial; image preservation present. Priority: P2.
+
+Evidence: browser_agent.py:364-424,450-465,563-578.
+
+Look JPEGs are preserved. Parallel responses are separate messages with images interposed before outstanding responses, without reliable call correlation. Required continuation metadata may be lost. Local tools/vision capability checking accepts unknown providers.
+
+Correction: Implement the deployed API's supported grouped call/response/observation format, preserve identifiers/metadata, and reject incapable model-adapter pairs.
+
+Acceptance: Fixture and deployed-contract tests cover parallel/repeated-name tools and images. Exact API acceptance is unverified, not asserted broken for every version.
+
+F39. Bind Browser Marks to Real Targets
+Status: Incorrect. Priority: P1.
+
+Evidence: browser_agent.py:992-1122,1260-1347,1563-1582,1741-1750.
+
+Metadata/re-resolution exists, but zero epochs become empty and missing epochs skip comparison, permitting stale same-URL reloads. Stored tab/frame identity is not enforced at input. Inventory/capture/tab discovery are unchecked separate calls; duplicate URLs select the first. CSS/image geometry relies on an unverified daemon contract.
+
+Correction: Stable instance/tab/frame/document/node identities independent of page globals, explicit zero handling, missing-identity refusal, and consistent observation/effect epochs and geometry.
+
+Acceptance: Same-URL reload, first mutation, same-position replacement, duplicate tabs, switches, and DPR changes cannot redirect old marks or bypass rejection through raw primitives.
+
+F40. Use Real Browser Input and Frame Control
+Status: Partial. Priority: P1.
+
+Evidence: browser_agent.py:1666-1776,1892-2145,2158-2179.
+
+Native locator calls coexist with synthetic fill/text/point fallbacks. Enter plus requestSubmit can submit twice; click exceptions can be swallowed. Success parsing accepts incidental words/URLs and lowercases literal URLs. Frame identity is lost.
+
+Correction: Real frame-aware primitives everywhere, one submission mechanism, refusal without identity, structured outcomes, and literal-preserving parsing.
+
+Acceptance: Enter-handled forms submit once; disabled/throwing clicks fail; real permitted iframe input works; error text containing URL/navigation fields cannot become success. Daemon primitives remain unverified.
+
+F41. Verify the Goal, Not Generic Motion
+Status: Incorrect. Priority: P1.
+
+Evidence: browser_agent.py:1834-1862,2318-2375; screen_control.py:2329-2479,2684-2695,2777-2785; screen_executor.py:225-305.
+
+Whole-page animation still proves playback, empty waits can succeed, and screen verification accepts text anywhere. Short and confirmed plans can skip checks. Dispatch evidence is not target-specific; file existence is not expected content.
+
+Correction: Per-effect postconditions for actual media time/state, intended field values, exact file content, and target-tab navigation; return uncertainty when evidence is insufficient.
+
+Acceptance: Ads do not prove video playback; wrong-field text fails; confirmed single actions are checked; no-op/unsupported effects cannot establish completion; unmet prerequisites stop dependent actions.
+
+F42. Revalidate Windows Targets Before Acting
+Status: Partial. Priority: P1.
+
+Evidence: screen_ui_elements.py:317-429; screen_control.py:2252-2264,2568-2599; screen_executor.py:225-305; screen_capture.py:103-125,358-387.
+
+Initial focus failure now stops. Fresh runtime lookup can nevertheless return expired cache; cleared cache may not reacquire. Identities are inadequately window/process-scoped. Movement reads current foreground instead of planned HWND; process metadata is lost/unused, and later typing can follow stolen focus.
+
+Correction: Live planned HWND/process/control resolution before effects, real expired-cache bypass, replacement/resize refusal, and target-bound typing.
+
+Acceptance: Expired/cleared caches, reused IDs, duplicate automation IDs, replacement, movement, focus theft, and delayed consent yield safe fresh resolution/refusal, never stale-coordinate input.
+
+F43. Make Capture and Coordinates Explicit
+Status: Partial. Priority: P1.
+
+Evidence: screen_capture.py:36-50,134-188,358-464; screen_geometry.py:21-64; screen_control.py:779-799,2136-2146; screen_analyzer.py:428-438.
+
+Cursor-monitor/negative-origin support and coordinate helpers exist. Ordinary requests still favor primary capture. Last-target bounds can be stale; title matching misidentifies windows. UIA can describe a different foreground than the screenshot. Unknown spaces default silently; identity/DPI initialization guarantees are incomplete.
+
+Correction: Shared live target/epoch for capture and UIA, real pre-focus identity tracking, reacquired geometry, rejected unknown frames, and verified transforms.
+
+Acceptance: Negative-origin, unequal-DPI, moved-target, and Jarvis-focused cases align. Real Windows behavior and frontend overlay positioning need separate validation.
+
+F44. Preserve Hierarchy and Repeated Labels
+Status: Partial. Priority: P1.
+
+Evidence: screen_ui_elements.py:161-236; screen_control.py:839-969,1549-1651,1777-1901; screen_ocr.py:113-132.
+
+Some ancestor ordering and spatial OCR duplicates survive. Parent IDs can refer to omitted containers; depth reconstruction misparents children. IDs are object identities. OCR merging ignores carried block/line compatibility and allows negative gaps. Tie-breaks mix coordinate frames.
+
+Correction: Explicit observation-scoped parent relationships, structural placeholders, compatible bounded OCR merging, spatial deduplication, and same-frame comparison.
+
+Acceptance: Unnamed ancestors, repeated Edit/Delete, staggered columns, and OCR/UIA overlap retain correct hierarchy/distinct targets; translation/resizing does not corrupt tie resolution.
+
+F45. Allow Vision When the Tree Is Empty
+Status: Partial. Priority: P1.
+
+Evidence: screen_control.py:641-645,1037-1111,1172-1177,1259-1297,1520-1535,2055-2076,2621-2636; screen_geometry.py:61-64.
+
+Image-only planning now runs. Missing/unknown coordinate metadata is guessed, step overrides can conflict, invalid points are clamped into actionable pixels, and NaN confidence bypasses comparisons.
+
+Correction: Validate complete schemas first: finite bounded confidence, explicit permitted spaces, bounded coordinates, valid action/target combinations, and no unsupported overrides. Reject malformed plans.
+
+Acceptance: Missing/unknown spaces, NaN/infinity, out-of-range coordinates, malformed steps, and invalid image-only IDs cause zero focus/input effects.
+
+F46. Build One Bounded Context Envelope
+Status: Partial. Priority: P2.
+
+Evidence: context_envelope.py:70-216; agent.py:716-770; orchestrator.py:363-388; brain.py:709-811,2234-2404.
+
+An envelope exists but is not shared across request paths. Native planning still slices serialized JSON. Selected text/version, concrete browser/capture identity, memory, and goal state are incomplete. Intermediate budgeting does not guarantee final size.
+
+Correction: Build one immutable identity-rich request snapshot for every consumer, retain omissions/retrieval references, and budget final serialization.
+
+Acceptance: Fix this using that tab resolves consistently despite focus changes; no truncated JSON; omitted content is retrievable; long keys/escaping cannot exceed the total bound.
+
+F47. Unify Browser Session Identity
+Status: Partial. Priority: P1.
+
+Evidence: browser_cdp.py:54-78,124-156; browser_session_broker.py:65-124,164-194,233-328; browser_agent.py:1482-1582.
+
+Broker publication can lose websocket URLs to stringified booleans, hide later tabs, and assign unstable positional IDs. Duplicate targets resolve ambiguously. Some attach/focus branches only return text; explicit-target failure can launch another browser. Profile aliases/process-local records do not prove exclusive live ownership. Untrusted observation text can pollute identity.
+
+Correction: Canonical connection fields and stable instance-qualified IDs, full discovery independent of UI limits, real attach/navigation, fail-closed explicit targets, and trusted typed identity publication.
+
+Acceptance: All tabs remain addressable; reordering preserves identity; ambiguity prompts resolution; dead sessions authorize nothing; explicit attachment never silently launches elsewhere.
+
+F48. Separate Observation From Verified Knowledge
+Status: Partial. Priority: P2.
+
+Evidence: provenance.py:25-74; screen_analyzer.py:230-259,489-540; research_service.py:420-638; routes.py:522-618.
+
+Labels, secondary-source marking, and lookup exist. Deictic questions can be searched without the actual screen claim. Missing labels become observed; generic prefixes masquerade as supporting spans; boilerplate counts as corroboration. Synthesis lacks claim/source contracts; APIs lose fields; UTC-named timestamps are naive local time.
+
+Correction: Claim-level source spans/lookup references/aware timestamps, relevance and independent-corroboration validation, uncertainty-preserving defaults, and lossless API/synthesis propagation.
+
+Acceptance: Is this true verifies the displayed claim; late-page claims cite actual spans; mirrors/boilerplate/AI summaries do not independently corroborate; contradictions affect answers and metadata survives round trips.
+
+F49. Make Model Selection Capability-Aware
+Status: Partial. Priority: P1.
+
+Evidence: model_registry.py:97-123,240-335,367-439; agent.py:794-819; browser_agent.py:450-465,606-619; brain.py:819-830.
+
+Planner role/wiring exist. Provider-wide assumptions substitute for actual model/adapter capability checks; unknown custom providers inherit support and browser roles omit vision. Persisted overrides can evade use-time validation. Snapshots omit adapter/limit detail. Configuration failures can silently send private-provider work to Fireworks.
+
+Correction: Validate actual model/adapter/endpoint/tools/vision/schema/streaming/limits/reasoning, fail closed on unknown requirements, explicitly authorize compatible fallbacks, and snapshot atomically.
+
+Acceptance: Text-only browser/non-tool planner selections fail; invalid persisted settings cannot run; missing private credentials send nothing elsewhere; in-flight configuration remains consistent.
+
+F50. Give the Backend Sole Ownership of Intelligence State
+Status: Partial. Priority: P1.
+
+Evidence: voice_mode.py:90-190,432-487,712-772,804-807; routes.py:368-434; brain.py:167-185,1474-1915; memory_store.py:200-219.
+
+Ordinary utterances now use backend HTTP. Local normal-setup effects bypass backend jobs and use unsafe substring/negation matching. Audio/AEC remains split. Voice publication lacks worker incarnation/expiry, so restarts can leave new state behind the old sequence. Independent globals/gates and exclusive durable writer/scheduler ownership remain unresolved.
+
+Correction: All effects through one job runtime, one explicit playback owner/reference transport, typed worker-generation state, and centralized transactional events/approvals/checkpoints.
+
+Acceptance: Typed/voice/background work shares authority/history; setup creates backend jobs; new worker state supersedes old generations immediately; only designated owners schedule/write durable state.
+
+F51. Separate Rendering From Computer-Control Authority
+Status: Partial; frontend deployment evidence missing. Priority: P1.
+
+Evidence: local_auth.py:41-170; main.py:14-31; routes.py:329-434,629-799; voice_mode.py:559-570; listener.py:336-353; wake_engine.py:263-270; opencode_client.py:68.
+
+Configured tokens protect POSTs and some GETs, but missing/short tokens disable enforcement. Sensitive polling is public; CORS unrestricted. Wake/barge-in/watcher-stop callers omit authentication. MCP key lookup is environment-based, but rotation is unverified. Electron sandbox/preload/CSP/navigation/sender validation source is missing.
+
+Correction: Fail closed outside explicit development mode; authenticate private reads, restrict origins/publishers, centralize the authenticated client, verify Electron boundaries, and rotate exposed credentials.
+
+Acceptance: Missing/wrong/old tokens cannot mutate or read private data; all legitimate controls work; renderer content cannot gain unrestricted authority; public health is minimal.
+
+F52. Supervise a Versioned, Observable Runtime
+Status: Partial. Priority: P1.
+
+Evidence: runtime_identity.py:34-108; main.py:34-53; routes.py:477-518; watcher.py:660-729,910-935,976-1147; voice_mode.py:503-586.
+
+Health/stamps/token injection exist. Start time is unstable; shared temporary paths and ownership-blind cleanup race. Watcher checks self-consistent identity rather than expected version/authenticated authority. Restarted watcher tokens can mismatch warm backends. Handles are discarded, port/PID cleanup persists, spawn retries do not supervise later crashes, and full shutdown misses owned daemons.
+
+Correction: Retain creation-identity-bound handles, authenticate reuse, use ownership-checked stamps/stable start identity, supervise workers with budgets, invalidate authority and interrupt jobs before recovery, and define sleep/shutdown process sets.
+
+Acceptance: Wrong-token/old-version services are not reused; foreign listeners survive; worker crashes recover while UI lives; old exits cannot delete new stamps; full shutdown leaves no unintended daemon.
+
+4. Migration Assessment
+Keeping legacy routing behind a staged migration is legitimate. Removing safeguards now would be the wrong correction. The problem is treating scaffolding as completed parity.
+
+Stage	Assessment
+Identity/results/approvals/cancellation	Components exist, but F01/F03/F17-F23 expose incomplete guarantees and bypasses.
+Backend ownership	Ordinary voice delegation improved; local effects, audio, state generations, and writer ownership remain unresolved.
+Typed domain tools	Added, but structured results, authorization, artifacts, and cancellation are lost at boundaries.
+Selectable orchestrator	Present; screen adapter and proposal handoff are broken; context/budgets incomplete.
+Classifier retirement after parity	Not completed or demonstrated; classifier/racer/extra research classification/global engine selection remain.
+Before retirement, replay screen questions, fresh-information requests, web-task routing, negatives, stop controls, mixed-domain goals, and sensitive effects. Require equivalent safety and improved verified completion. Tool calling is a proposal format, not permission or evidence of success.
+
+5. Prioritized Correction Program
+Stage A. Contain Authority and Duplicate Effects
+Close P1 boundaries in F17-F23, F35, F39-F45, and F51 before autonomy expansion. Test direct tool invocation as well as conversational paths.
+
+Exit evidence: No unauthorized effect in the adversarial suite; no duplicate mutation under disconnect/retry; no unsupported completion; no post-cancel effect except necessary release cleanup.
+
+Stage B. Repair Runtime Integration
+Repair F27 async/sync misuse, F02 proposal/screen paths, F32 playback ownership, F33 reference/filtering, and F52 supervision. Consolidate lifecycle instead of adding globals.
+
+Exit evidence: Real-browser/audio integration, restart/failure-injection traces, bounded shutdown, and typed/voice/background coexistence.
+
+Stage C. Establish Continuity and Evidence
+Complete checkpoints, event/artifact retrieval, memory correction, validated skills, reliable reminders, provenance, and capability validation.
+
+Exit evidence: Restart/resume avoids replay; follow-ups retrieve real artifacts; notification failures recover; trusted skills require approval, evidence, and replay validation.
+
+Stage D. Optimize Against Measurements
+After correctness gates, tune fast paths, concurrency, caching, streaming, and routing on the actual Windows machine. No supplied benchmark establishes real-time performance.
+
+6. Further Improvements
+These extend the baseline and are proposals, not measured improvements or claims about every unprovided component.
+
+R01. Instrument the Whole Interaction
+Implement redacted request/job/utterance/capture trace spans for capture, endpointing, STT, routing, model calls, tools, verification, synthesis, first audible sample, and terminal delivery. Separate queue delay from service time; record cold/warm state and fallback causes.
+
+Why: Averages conceal retry amplification, cold starts, and blocked owner loops. Optimize the measured critical path.
+
+R02. Add Resource Admission and Priority
+Bound queues/concurrency for browser jobs, model calls, OCR/vision, synthesis, and reports. Reserve a deterministic emergency-control path; prioritize interactive work without starving background jobs. Expose queued/busy/deadline states.
+
+Why: Predictable response under multiple jobs requires backpressure, not unlimited threads.
+
+R03. Use Deadline-Aware Degradation
+Use one remaining-time budget and a quality ladder: structure before OCR/vision, evidence before optional synthesis, text before decorations, and honest partial results before expiry. Circuit-break failing providers and distinguish configuration errors from transient failures.
+
+Why: Bounded useful results outperform repeated full-timeout fallback. Never degrade authorization or invent completion.
+
+R04. Build a Replayable Event Runtime
+Use append-only identified requests/effects/results, immutable terminals, persistent checkpoints, notification outbox, and target-supported idempotency keys. Retain outcome-unknown for ambiguous external mutations.
+
+Why: Reconnect/restart/debugging/memory improve without falsely promising universal exactly-once external effects.
+
+R05. Make Observation Caches Identity-Aware
+Cache UIA/OCR/browser/context by target identity, document/layout epoch, geometry, configuration, and freshness. Invalidate on navigation, focus/resize, replacement, and revocation.
+
+Why: Reuse observations for speed, not stale permission to act.
+
+R06. Build a Full-Duplex Audio Pipeline
+Use timestamped fixed-format capture, continuous AEC/resampling, incremental transcript revisions, one synthesis/playback owner, backpressure/EOF, consumed-frame accounting, and request-scoped interruption. Keep wake detection cheap and local-only policies explicit.
+
+Why: End-of-utterance delay, first audible output, and interruption dominate perceived responsiveness.
+
+R07. Test Real Boundaries
+Combine inert effect backends and deterministic safety tests with real Windows/UIA/DPI/audio/process/browser integration. Add property/fuzz tests for schemas, finite numbers, negation, literals, event retention, and patches; pin adapter contract fixtures to supported APIs.
+
+Why: Synchronous mocks conceal async misuse; happy paths do not prove safe revocation or cancellation during blocked I/O.
+
+R08. Add Supervised Health and Recovery
+Separate alive/ready/degraded state; authenticate instance handshakes; budget restarts; retain owned cleanup; monitor dependency health and queue age; provide redacted diagnostic bundles.
+
+Why: Users must distinguish thinking, queued, offline, and degraded rather than watching silent failures or blind restarts.
+
+R09. Validate Skills as Fast Paths
+Use parameterized declarative workflows with versions, preconditions, grants, and postconditions. Promote after approved replay; invalidate on application drift; compare completion/latency against fresh planning.
+
+Why: Repeated workflows can avoid unnecessary model calls without becoming unsafe cached commands.
+
+R10. Make Privacy and Permission Inspectable
+Show active job, exact granted effects, target sites/files, pending consent, capture scope, provider, and stop/revoke controls. Separate read from upload permission; expose retention and local-only voice settings.
+
+Why: Understandable, revocable authority is essential to trusting a capable assistant.
+
+7. Proposed Performance and Reliability Gates
+These are initial engineering targets for measurement on the deployment, not observed results, guarantees, or universal hardware expectations. Refine after establishing a baseline.
+
+Metric	Initial Target/Gate	Boundary
+Visible acknowledgment	Warm local p95 <=150 ms	Submission to identified acknowledgment, not answer completion.
+First useful chat text	Warm p50 <=1 s; p95 <=2.5 s	Accepted request to useful final-channel text, excluding decorative acknowledgment.
+First audible voice answer	Warm p50 <=1.2 s; p95 <=2.5 s	End of user speech to audible answer; report STT/model/TTS separately.
+Barge-in suppression	p95 <=150 ms after validated onset	Validated onset to last stale-generation audible sample.
+Exact structural UI action	p95 <=300 ms after authorization	Dispatch, live validation, and meaningful local postcondition for qualified fast paths.
+Stop propagation	p95 <=100 ms to executor acknowledgment	Independently prove no later effect starts.
+Reconnect correctness	Zero duplicate mutations in fault-injection suite	Disconnect before acceptance, after effects, mid-stream, and at completion.
+Completion truthfulness	Zero unsupported completed statuses in adversarial suite	Verified goals, not model wording or transport success.
+Resource stability	No unbounded queue/handle/thread/event/PCM/profile-owner growth	Extended mixed-load cancellation/restart soak.
+Wake/privacy	Zero forbidden online calls	Instrument wake/non-wake and transcription failures under local-only policy.
+Report p50/p95/p99, cold/warm state, payload size, concurrency, network, devices, CPU/GPU load, and provider configuration. Never improve latency by weakening validation, hiding uncertainty, or announcing premature success.
+
+8. Missing Evidence and Closure Requirements
+Missing here does not mean missing from the repository.
+
+Material	Remaining Verification
+Electron main/preload/renderers/overlay/capsule source	Sandbox, IPC senders, CSP/navigation, terminal UI, overlay geometry, direct-launch supervision.
+task_result.py and failure tracker	Factory evidence enforcement, status/compatibility semantics, recovery thresholds.
+voice.py, listener-state/audio-input/transcription, Whisper daemon, other TTS providers	Actual buffering/arbitration/audio format, conversation mode, fallback cancellation.
+intent.py, memory.py, remaining routing/provider adapters	Classifier deadline, history projection, complete fallbacks/capability contracts.
+Brave MCP client/server/schemas/manifests/tests	Native input/frames, screenshot scale, server permissions/cancellation/downloads/identity.
+Editor extension	Atomic version checks, authentication, structured endpoint behavior, check ownership.
+Launch scripts, dependencies/lockfiles, sanitized settings	Versions, every token-injection path, actual model/engine/resource configuration.
+Productivity connectors/OAuth	F14 and calendar/file/job integration coverage.
+Tests, sanitized traces, recordings, latency distributions	Actual correctness, regressions, acoustics, speed, and closure evidence.
+Do not supply live credentials. The map's claim of 512 passing tests was not reproduced and is not a result of this review.
+
+9. Supplied-Source Read Manifest
+All listed files were read completely. Names refer to the flattened supplied snapshot.
+
+Group	Files and Line Counts	Total
+Planning/tools/policy	agent.py 1830; approvals.py 299; capability_resolver.py 168; code_grants.py 501; code_tools.py 782; context_envelope.py 216; editor_bridge.py 257; executor.py 427; jobs.py 315; opencode_client.py 739; orchestrator.py 388; tool_policy.py 444	6366
+Core/memory/models	brain.py 2709; config.py 133; fireworks_client.py 245; gemini_client.py 422; memory_store.py 1198; model_registry.py 736; openai_compat_client.py 140	5583
+Browser	browser_agent.py 2895; browser_cdp.py 173; browser_session_broker.py 348	3416
+Windows/screen	screen_analyzer.py 540; screen_capture.py 487; screen_control.py 2853; screen_executor.py 305; screen_geometry.py 210; screen_ocr.py 181; screen_state.py 234; screen_ui_elements.py 435; windows_connector.py 90	5335
+Voice/watcher	audio_actor.py 306; echo_cancel.py 222; fish_voice.py 909; listener.py 551; transcript_stabilizer.py 165; voice_mode.py 820; wake_engine.py 276; watcher.py 1233	4482
+API/research/runtime	local_auth.py 170; main.py 67; provenance.py 74; quick_search.py 535; request_registry.py 258; research_browser.py 435; research_service.py 956; routes.py 813; runtime_identity.py 108	3416
+Total	48 Python files; no unread assigned portions	28598
+The approved requirements document was read fully: 734 lines covering F01-F52 and architecture/migration guidance.
+
+10. Final Sign-Off Position
+Requirement coverage is complete for F01-F52 against the supplied snapshot; implementation compliance is incomplete and runtime compliance remains unverified.
+
+Close findings using execution-path evidence, regression tests, fault-injection outcomes, deployment configuration, and explicit remaining assumptions, not the existence of helper files or remediation labels.
+
+This report contains recommendations only. No project code was changed, no proposed test was represented as executed, and no measured real-time performance is claimed.

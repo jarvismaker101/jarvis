@@ -1,0 +1,648 @@
+    parts = []
+
+    if screen_ui_elements.is_available():
+        try:
+            for elem in screen_ui_elements.get_foreground_window_elements(
+                max_elements=80,
+                max_depth=6,
+            ):
+                parts.extend(
+                    value
+                    for value in (
+                        elem.get("name"),
+                        elem.get("automation_id"),
+                        elem.get("class_name"),
+                    )
+                    if value
+                )
+        except Exception as exc:
+            logging.debug("Local UI verification scan failed: %s", exc)
+
+    raw_image = capture.get("raw_vision_image")
+    if raw_image and screen_ocr.is_available():
+        try:
+            regions = screen_ocr.extract_text_regions(raw_image)
+            merged = screen_ocr._merge_nearby_words(regions)
+            parts.extend(region.get("text", "") for region in merged)
+        except Exception as exc:
+            logging.debug("Local OCR verification scan failed: %s", exc)
+
+    return re.sub(r"\s+", " ", " ".join(parts).lower()).strip()
+
+
+def _typed_targets(steps):
+    """F41: pair every type step with the identity of the field it typed into.
+
+    A type step usually carries no identity of its own — the plan clicks the
+    field first. Inheriting the nearest preceding click target is what makes
+    "did the text land in the INTENDED field?" answerable at all.
+    """
+    typed = []
+    last_target = {"ui_uid": "", "ui_runtime_id": ""}
+    for step in steps or []:
+        if not isinstance(step, dict):
+            continue
+        action = (step.get("action") or "").lower()
+        if action in {"click", "double_click", "right_click"}:
+            last_target = {
+                "ui_uid": step.get("ui_uid") or "",
+                "ui_runtime_id": step.get("ui_runtime_id") or "",
+            }
+        elif action == "type":
+            text = str(step.get("text") or "")
+            if not text.strip():
+                continue
+            typed.append({
+                "text": text,
+                "ui_uid": step.get("ui_uid") or last_target["ui_uid"],
+                "ui_runtime_id": (
+                    step.get("ui_runtime_id") or last_target["ui_runtime_id"]
+                ),
+            })
+    return typed
+
+
+def _read_typed_field_values(typed, hwnd=None):
+    """F41: read back the field each type step wrote into.
+
+    Returns a list of ``(intended_text, observed_value)``, or **None** when the
+    values could not be observed at all. None means uncertainty, and uncertainty
+    must never be reported as verified success.
+    """
+    if not typed:
+        return []
+    if not screen_ui_elements.is_available():
+        return None
+    try:
+        controls = screen_ui_elements.read_control_values(hwnd=hwnd)
+    except Exception as exc:
+        logging.debug("F41 typed-field read failed: %s", exc)
+        return None
+    if not controls:
+        return None
+
+    focused = next((c for c in controls if c.get("focused")), None)
+    by_runtime = {
+        c["runtime_id"]: c for c in controls if c.get("runtime_id")
+    }
+    by_uid = {c["uid"]: c for c in controls if c.get("uid")}
+
+    observed = []
+    for target in typed:
+        control = None
+        runtime_id = target.get("ui_runtime_id") or ""
+        if runtime_id:
+            control = by_runtime.get(runtime_id)
+        if control is None and target.get("ui_uid"):
+            control = by_uid.get(target["ui_uid"])
+        if control is None:
+            # No identity survived planning: the keyboard went to whatever
+            # held focus, so that is the only field we can honestly inspect.
+            control = focused
+        if control is None or control.get("value") is None:
+            return None
+        observed.append((target["text"], str(control["value"])))
+    return observed
+
+
+def _verify_action_locally(steps, capture=None, hwnd=None):
+    """F41: verify the value of the field the plan actually typed into.
+
+    The old check searched the whole window's text, so text that landed in the
+    WRONG field still "verified". Only the intended field's own value counts
+    now, and an unreadable field yields uncertainty rather than success.
+    """
+    typed = _typed_targets(steps)
+    if not typed:
+        # No text postcondition exists locally for a click/scroll plan.
+        return None
+
+    observed = _read_typed_field_values(typed, hwnd=hwnd)
+    if observed is None:
+        return None
+
+    for intended, actual in observed:
+        needle = re.sub(r"\s+", " ", intended.lower()).strip()
+        hay = re.sub(r"\s+", " ", actual.lower()).strip()
+        if needle and needle not in hay:
+            return False
+    return True
+
+
+def _verify_action_with_steps(steps_description, steps=None, hwnd=None):
+    """Verify action state locally first; cloud vision is opt-in."""
+    need_capture = bool(_typed_texts_from_steps(steps)) or _cloud_verification_enabled()
+
+    if need_capture:
+        try:
+            time.sleep(0.25)  # let the UI settle
+            capture = capture_active_window()
+        except RuntimeError:
+            capture = None
+        local_result = _verify_action_locally(steps or [], capture, hwnd=hwnd)
+        if local_result is not None:
+            return local_result
+        if capture is None:
+            return None
+    elif not _cloud_verification_enabled():
+        return None
+
+    if not _cloud_verification_enabled():
+        return None
+
+    prompt = (
+        "You just executed a screen action on this desktop. "
+        f"The action was: {steps_description}\n"
+        "Look at the screenshot and determine whether the action appears to have succeeded. "
+        "Signs of success include: the expected element changing state, a dialog appearing, "
+        "text being entered, a new page loading, or any visible change matching the intent.\n"
+        "Return a JSON object with two keys:\n"
+        '  verified (boolean) - true if the action likely succeeded\n'
+        '  observation (string) - one-sentence description of what you see\n'
+    )
+
+    # F37: verification uses the SAME eligible-provider cascade as planning —
+    # the selected provider first, then every other ELIGIBLE provider, each at
+    # most once, with adapter exceptions and malformed output advancing
+    # instead of ending the check.
+    result = _ask_vision_cascade(
+        prompt,
+        capture["image_data_url"],
+        max_completion_tokens=2048,
+    )
+    content = _extract_response_content(result)
+    if content is None:
+        return None
+
+    parsed = _extract_json_object(content)
+    return parsed.get("verified") if isinstance(parsed.get("verified"), bool) else None
+
+
+_LOG_MAX_BYTES = 2 * 1024 * 1024  # 2MB cap, then rotate
+
+
+def _write_screen_command_log(command, plan, status, error=None, verified=None, raw_vision=None):
+    """Write an audit entry to screen_commands.log."""
+    try:
+        from backend.config import BASE_DIR
+        log_file = BASE_DIR / "screen_commands.log"
+
+        # Rotate when the log grows past the cap: rename to .log.1 (keep 1 backup)
+        try:
+            if log_file.exists() and log_file.stat().st_size > _LOG_MAX_BYTES:
+                backup = log_file.with_suffix(".log.1")
+                if backup.exists():
+                    backup.unlink()
+                log_file.rename(backup)
+        except OSError:
+            pass  # rotation is best-effort; never block logging on it
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        # F21: this log persists typed text. Secrets and credential-shaped
+        # strings are scrubbed before anything is written to disk.
+        steps_str = tool_policy.mask_secrets(
+            json.dumps(tool_policy.scrub_mapping(plan.get("steps", [])), indent=2))
+        capture_mode = plan.get("capture_mode", "unknown")
+        window_title = plan.get("window_title", "")
+        confidence = plan.get("confidence", 0.0)
+        source = plan.get("source", "AI Vision" if plan.get("ok") else "Failed")
+        
+        entry = (
+            f"==================================================\n"
+            f"[{timestamp}] SCREEN COMMAND: \"{command}\"\n"
+            f"--------------------------------------------------\n"
+            f"Status:      {status}\n"
+            f"Source:      {source}\n"
+            f"Confidence:  {confidence:.2f}\n"
+            f"CaptureMode: {capture_mode}\n"
+            f"Window:      \"{window_title}\"\n"
+        )
+        provider = plan.get("vision_provider") or plan.get("vision_model") or plan.get("model")
+        if provider:
+            entry += f"Provider:    {provider}\n"
+        # P1-D: scale audit - EXECUTED lines include vision/origin/scale for one-glance diagnosis
+        if status in ("EXECUTED", "CONFIRMED_EXECUTED"):
+            vw = plan.get("vision_width")
+            vh = plan.get("vision_height")
+            cw = plan.get("capture_width")
+            ch = plan.get("capture_height")
+            ol = plan.get("origin_left")
+            ot = plan.get("origin_top")
+            if vw and vh:
+                entry += f"Vision:      {vw}x{vh}\n"
+            if ol is not None and ot is not None:
+                entry += f"Origin:      {ol},{ot}\n"
+            if cw and ch and vw and vh:
+                try:
+                    x_scale = cw / float(vw)
+                    y_scale = ch / float(vh)
+                    if abs(x_scale - y_scale) < 0.0005:
+                        entry += f"Scale:       {x_scale:.4f}\n"
+                    else:
+                        entry += f"Scale:       x={x_scale:.4f} y={y_scale:.4f}\n"
+                    entry += f"Capture:     {cw}x{ch}\n"
+                except Exception:
+                    pass
+        if error:
+            entry += f"Error:       {error}\n"
+        if verified is not None:
+            entry += f"Verified:    {verified}\n"
+        # P1.3 raw vision logging - persisted truncated to 2000 chars for debuggability
+        raw = raw_vision if raw_vision is not None else plan.get("raw_vision")
+        if raw:
+            raw_str = str(raw)
+            if len(raw_str) > 2000:
+                raw_str = raw_str[:2000]
+            entry += f"RawVision:  {raw_str}\n"
+            
+        entry += f"Steps:\n{steps_str}\n"
+        entry += "==================================================\n\n"
+
+        # F21: one redacted egress boundary for the WHOLE record — the command
+        # text, the window title, the raw vision payload and the error string
+        # used to be written verbatim, so a secret that reached any of them
+        # landed on disk even though the steps were scrubbed.
+        entry = tool_policy.redact_for_egress(entry)
+
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as exc:
+        logging.warning("Failed to write screen command log: %s", exc)
+
+
+def _maybe_adjust_for_window_move(plan):
+    """P1-C / F42: re-acquire the PLANNED window and refuse an altered target.
+
+    Translating stored coordinates is only safe when the target is still the
+    *same* window, in the same process, at the same size:
+
+      * a **moved** window is translated by the origin delta;
+      * a **closed/minimised** window is refused;
+      * a **replaced** window (HWND reused by a different process) is refused;
+      * a **resized** window is refused, because the coordinates were planned
+        against a different geometry and must be re-planned.
+
+    The bounds are read from the plan's own HWND — never from "whatever is
+    foreground now", which is how a click could previously be translated with
+    window A's coordinates using window B's origin.
+    """
+    if plan.get("capture_mode") != "active_window":
+        return None
+    orig_left = plan.get("origin_left")
+    orig_top = plan.get("origin_top")
+    if orig_left is None or orig_top is None:
+        return None
+    planned_hwnd = plan.get("hwnd")
+    if not planned_hwnd:
+        return ("I don't have a verified target window for that action, sir - "
+                "please ask me again so I can re-plan it safely.")
+    try:
+        from backend.services import screen_capture
+
+        new_bounds = screen_capture.get_window_bounds(planned_hwnd)
+    except Exception:
+        new_bounds = None
+    if not new_bounds:
+        return "The window I captured seems to have closed or minimized, sir - please bring it back and try again."
+
+    # F42: process identity — an HWND can be recycled after a window closes.
+    expected_pid = plan.get("process_id")
+    actual_pid = new_bounds.get("process_id")
+    if expected_pid and actual_pid and int(expected_pid) != int(actual_pid):
+        logging.warning(
+            "Screen target HWND %s changed process (%s -> %s) — refusing.",
+            planned_hwnd, expected_pid, actual_pid,
+        )
+        return ("The window I planned against has been replaced by a different "
+                "program, sir - I've stopped instead of clicking blind. Please "
+                "ask me again.")
+
+    cap_w = plan.get("capture_width")
+    cap_h = plan.get("capture_height")
+    if cap_w and cap_h:
+        try:
+            resized = (int(new_bounds["width"]) != int(cap_w)
+                       or int(new_bounds["height"]) != int(cap_h))
+        except Exception:
+            resized = False
+        if resized:
+            logging.info(
+                "Screen target HWND %s resized (%sx%s -> %sx%s) — refusing "
+                "stale coordinates.", planned_hwnd, cap_w, cap_h,
+                new_bounds.get("width"), new_bounds.get("height"),
+            )
+            return ("The window changed size after I planned that action, sir - "
+                    "I've stopped rather than click at stale coordinates. "
+                    "Please ask me again.")
+
+    delta_x = new_bounds["left"] - orig_left
+    delta_y = new_bounds["top"] - orig_top
+    if delta_x != 0 or delta_y != 0:
+        for step in plan.get("steps", []) or []:
+            if "x" in step and "y" in step:
+                try:
+                    step["x"] = int(step["x"]) + delta_x
+                    step["y"] = int(step["y"]) + delta_y
+                except Exception:
+                    continue
+        plan["origin_left"] = new_bounds["left"]
+        plan["origin_top"] = new_bounds["top"]
+        logging.info("Window moved by (%d,%d) - adjusted click coordinates", delta_x, delta_y)
+    return None
+
+
+def _plan_gate(plan):
+    """F19: an effect boundary bound to the plan's captured generation.
+
+    Passing this into :func:`screen_executor.execute_steps` makes revocation
+    authoritative *inside* execution: focus acquisition and every step are
+    re-checked against the generation the request was created under, and the
+    check is serialized against :func:`screen_state.set_enabled`.
+    """
+    stamp = plan.get("screen_generation")
+    return lambda: screen_state.effect_gate(stamp)
+
+
+def _execute_or_queue(plan, command_text):
+    # F19-enforcement: the control boundary is checked HERE, at the point of
+    # effect, not only where the request arrived. A plan produced before the
+    # user turned screen control off must never reach execute_steps.
+    allowed, gate_reason = screen_state.guard(plan.get("screen_generation"))
+    if not allowed:
+        reason = ("Screen controls are off — I've dropped that action, sir."
+                  if gate_reason == "screen controls are off"
+                  else "That action was planned before screen controls were "
+                       "restarted, sir. Please ask again.")
+        _write_screen_command_log(command_text, plan, "BLOCKED_SCREEN_DISABLED",
+                                  error=gate_reason)
+        return reason
+
+    if not plan.get("ok"):
+        reason = plan.get("reason") or "I couldn't complete that screen command, sir."
+        _write_screen_command_log(command_text, plan, "FAILED_PLANNING", error=reason)
+        return reason
+
+    confidence = _coerce_float(plan.get("confidence"), 0.0)
+    confirmation_reason = None
+
+    if confidence < MIN_ACTIONABLE_CONFIDENCE:
+        reason = plan.get("reason") or "I found a possible target, but not confidently enough to click it."
+        _write_screen_command_log(command_text, plan, "LOW_CONFIDENCE_BLOCKED", error=reason)
+        return reason
+
+    if _is_risky_command(command_text):
+        plan["needs_confirmation"] = True
+        confirmation_reason = "risky"
+    elif confidence < LOW_CONFIDENCE_CONFIRMATION:
+        plan["needs_confirmation"] = True
+        confirmation_reason = "low_confidence"
+    elif plan.get("needs_confirmation"):
+        confirmation_reason = "low_confidence"
+
+    if plan.get("needs_confirmation"):
+        plan["command_text"] = command_text
+        # F18: stamp the control generation at the moment the plan is queued
+        # for consent, so disabling (and re-enabling) invalidates it, and
+        # store a plan-hash approval record covering EVERY effect.
+        # F19: ``setdefault`` — a plan that already captured the generation at
+        # request creation keeps that token, so a revocation during planning
+        # cannot be laundered into fresh authority by re-stamping it here.
+        plan.setdefault("screen_generation", screen_state.generation())
+        screen_state.set_pending_plan(plan, command_text)
+        _write_screen_command_log(command_text, plan, "PENDING_CONFIRMATION")
+        spoken = screen_state.pending_spoken()
+        if spoken:
+            # F18: the spoken summary names the command and the action counts
+            # — the full ordered preview travels with the approval record for
+            # the UI to render.
+            return spoken
+        if confirmation_reason == "low_confidence":
+            return (
+                "I found a likely target, but confidence is limited. "
+                "Say confirm screen action to proceed, or say cancel."
+            )
+        return "That action looks risky. Say confirm screen action to proceed, or say cancel."
+
+    # Immediate execution path: re-check the gate right before the effect —
+    # the confirmation delay is exactly the window this protects.
+    allowed, gate_reason = screen_state.guard(plan.get("screen_generation"))
+    if not allowed:
+        _write_screen_command_log(command_text, plan, "BLOCKED_SCREEN_DISABLED",
+                                  error=gate_reason)
+        return ("Screen controls are off — I've dropped that action, sir."
+                if gate_reason == "screen controls are off" else
+                "That action was planned before screen controls were "
+                "restarted, sir. Please ask again.")
+
+    target_hwnd = plan.get("hwnd")
+    race_error = _maybe_adjust_for_window_move(plan)
+    if race_error:
+        _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=race_error)
+        return race_error
+    error = None
+    try:
+        execute_steps(plan["steps"], target_hwnd=target_hwnd, gate=_plan_gate(plan))
+    except RuntimeError as exc:
+        error = str(exc)
+        _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=error)
+        return error
+    screen_state.clear_pending_plan()
+
+    summary = plan.get("summary") or "Done, sir."
+
+    # F41: EVERY executed plan is checked, including a single confirmed
+    # click or type. The old `len(steps) <= 2` skip meant the most common
+    # actions were reported as done without any postcondition at all.
+    verified = None
+    steps = plan.get("steps") or []
+    try:
+        verified = _verify_action_with_steps(
+            summary, steps=steps, hwnd=plan.get("hwnd"),
+        )
+    except Exception as exc:
+        logging.warning("Post-action verification failed: %s", exc)
+
+    # Record in context memory
+    screen_state.add_interaction(command_text, summary, verified=verified, plan=plan)
+    _write_screen_command_log(command_text, plan, "EXECUTED", verified=verified)
+
+    if verified is False:
+        return f"{summary} Though I'm not fully sure it worked - want me to try again?"
+    return summary
+
+
+_MENU_OPEN_HINTS = re.compile(
+    r"\b(menu|dropdown|file|edit|view|tools|options|context)\b",
+    re.IGNORECASE,
+)
+
+
+def _step_likely_opens_menu(step):
+    """Heuristic: does this click step probably open a menu or dropdown?"""
+    desc = step.get("description", "") + " " + step.get("label", "")
+    return step.get("action") == "click" and bool(_MENU_OPEN_HINTS.search(desc))
+
+
+_RETRY_RE = re.compile(
+    r"\b(try again|repeat that|redo that|do (?:it|that) again)\b",
+    re.IGNORECASE,
+)
+
+
+# ---- in-progress guard for vision commands ----
+_vision_busy = threading.Lock()
+_response_callback = None
+
+
+def set_response_callback(callback):
+    """Register a callback(text) that delivers async screen-control results.
+
+    The brain thread sets this so background vision results can be spoken.
+    """
+    global _response_callback
+    _response_callback = callback
+
+
+def maybe_handle_screen_control_message(text):
+    # F19: exact, negation-aware enable/disable commands are resolved BEFORE
+    # anything else — including pending-consent consumption. "Turn screen
+    # controls off" while an approval is pending must revoke control (which
+    # also drops the approval), never be read as an approval verdict and run
+    # the very plan the user is trying to cancel.
+    toggle = _exact_toggle_verdict(text)
+    if toggle == "negated_on":
+        if screen_state.is_enabled():
+            return "Understood, sir — I'll leave screen controls as they are."
+        return "Screen controls stay off, sir — I won't enable them."
+    if toggle == "on":
+        if screen_state.is_enabled():
+            return "Screen controls are already on, sir."
+        screen_state.set_enabled(True)
+        screen_state.clear_interactions()
+        return "Screen controls are on, sir."
+    if toggle == "off":
+        if not screen_state.is_enabled():
+            return "Screen controls are already off, sir."
+        # Disabling bumps the control generation and drops any pending plan /
+        # approval, so an in-flight multi-step plan cannot continue.
+        screen_state.set_enabled(False)
+        screen_state.clear_interactions()
+        return "Screen controls are off, sir."
+
+    if screen_state.has_pending_plan():
+        # F18: resolve the verdict with negation FIRST — "no, don't do it"
+        # must never be read as "do it". The approval is also bound to the
+        # whole plan (hash), expires, and dies with the control generation.
+        answer = approvals.verdict(text)
+        if answer is None and _is_confirmation(text):
+            answer = approvals._YES
+        if answer is None and _is_cancel(text):
+            answer = approvals._NO
+        if answer == approvals._YES:
+            # F18: take the plan AND its approval atomically, then verify the
+            # snapshot. A plan whose coordinates changed (or whose window moved)
+            # after verification cannot slip through, because the consumed
+            # snapshot is the only thing that can execute — and if verification
+            # fails, the record is already gone, so NOTHING runs.
+            plan, record = screen_state.consume_pending_plan()
+            if record is None or plan is None:
+                screen_state.clear_pending_plan()
+                return "That screen action expired, sir. Please ask again."
+            cmd_text = plan.get("command_text", "pending command")
+            ok, why = approvals.verify(plan, record, cmd_text,
+                                       generation=screen_state.generation())
+            if not ok:
+                _write_screen_command_log(cmd_text, plan, "APPROVAL_INVALID", error=why)
+                return "That approval no longer applies (%s), sir. Please ask again." % why
+            allowed, gate_reason = screen_state.guard(plan.get("screen_generation"))
+            if not allowed:
+                _write_screen_command_log(cmd_text, plan, "BLOCKED_SCREEN_DISABLED",
+                                          error=gate_reason)
+                return ("Screen controls are off, sir — I've dropped that action."
+                        if gate_reason == "screen controls are off" else
+                        "Screen controls were restarted, sir — please ask again.")
+            target_hwnd = plan.get("hwnd")
+            race_error = _maybe_adjust_for_window_move(plan)
+            if race_error:
+                _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTION_FAILED", error=race_error)
+                return race_error
+            error = None
+            try:
+                execute_steps(plan["steps"], target_hwnd=target_hwnd,
+                              gate=_plan_gate(plan))
+            except RuntimeError as exc:
+                error = str(exc)
+                _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTION_FAILED", error=error)
+                return error
+            summary = plan.get("summary") or "Done, sir."
+            screen_state.add_interaction("confirm", summary, plan=plan)
+            _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTED")
+            return summary
+        if answer == approvals._NO:
+            plan = screen_state.pop_pending_plan()
+            screen_state.clear_pending_plan()
+            _write_screen_command_log(plan.get("command_text", "pending command") if plan else "pending command", plan or {}, "CANCELLED")
+            return "Cancelled the pending screen action, sir."
+
+    # Bug #10: "Try again" / "repeat that" support.
+    if screen_state.is_enabled() and _RETRY_RE.search(_normalize_text(text)):
+        recent = screen_state.get_recent_interactions()
+        if recent and recent[-1].get("plan"):
+            age = time.time() - recent[-1].get("ts", 0)
+            if age > 30:
+                # Plan is stale — re-plan from scratch. F19: capture the
+                # generation *before* planning so a revocation during this
+                # re-plan cannot be adopted by the finished plan.
+                retry_generation = screen_state.generation()
+                retry_plan = _plan_with_tree(recent[-1]["command"])
+                if isinstance(retry_plan, dict):
+                    retry_plan["screen_generation"] = retry_generation
+                return _execute_or_queue(retry_plan, recent[-1]["command"])
+            return _execute_or_queue(recent[-1]["plan"], recent[-1]["command"])
+        return "I don't have a recent screen action to repeat, sir."
+
+    if not _looks_like_screen_command(text):
+        return None
+
+    if not screen_state.is_enabled():
+        return "Screen controls are off. Say turn on screen controls first."
+
+    command_text = _strip_leading_fillers(text)
+
+    # F19: capture the control generation at REQUEST CREATION, before any
+    # planning work happens. A plan carries the authority that existed when
+    # the user asked; an enable/disable cycle during planning (which can take
+    # seconds) therefore invalidates the plan instead of letting it adopt the
+    # new authority when it finally reaches the gate.
+    request_generation = screen_state.generation()
+
+    # Direct plans (hotkey-based) are instant -- run synchronously.
+    direct_plan = _build_direct_plan(command_text)
+    if direct_plan:
+        direct_plan["screen_generation"] = request_generation
+        return _execute_or_queue(direct_plan, command_text)
+
+    # Vision plans are slow -- guard against duplicates and run in background.
+    if not _vision_busy.acquire(blocking=False):
+        return "Still working on the last screen command, sir."
+
+    def _bg_vision():
+        try:
+            vision_plan = _plan_with_tree(command_text)
+            if isinstance(vision_plan, dict):
+                # Pin the plan to the generation captured before planning.
+                vision_plan["screen_generation"] = request_generation
+            result = _execute_or_queue(vision_plan, command_text)
+            if _response_callback:
+                _response_callback(result)
+            else:
+                print("[SCREEN] (no callback) Result:", result)
+        except Exception as exc:
+            logging.warning("Background vision failed: %s", exc)
+            if _response_callback:
+                _response_callback("Something went wrong with the screen command, sir.")
+        finally:
+            _vision_busy.release()
+
+    threading.Thread(target=_bg_vision, daemon=True).start()
+    return "Working on it, sir."

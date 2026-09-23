@@ -1,0 +1,12 @@
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+API KEY FOUND: True
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+FIREWORKS API KEY FOUND: True
+[REPRO3] asking: 'whats the prcicing for gpr 6 astra'
+
+==============================
+[USER]: whats the prcicing for gpr 6 astra
+[CHAT] Detected language: english
+[INTENT] research intent -> pricing for gpr 6 astra
+[REPRO3] REPLY in 1.42s: 'On it, sir. Quick look coming up. Back in a moment with the short version.'
+[REPRO3] deltas: 0  chars=0

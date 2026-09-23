@@ -1,0 +1,14 @@
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+API KEY FOUND: True
+LOADING ENV FROM: C:\Users\mayan\jarvis-assistant\.env
+FIREWORKS API KEY FOUND: True
+[REPRO3] asking: 'Can you hear me, Jarvis?'
+
+==============================
+[USER]: Can you hear me, Jarvis?
+[CHAT] Detected language: english
+
+[CHAT] Processing chat...
+[CHAT] Reply: Loud and clear, sir. Regarding the pricing for the Astra GPR 6, that typically depends on the specific configuration and your supplier, but it generally ranges from $15,000 to over $25,000 USD. Would you like me to pull up official distributors for you?
+[REPRO3] REPLY in 1.89s: 'Loud and clear, sir. Regarding the pricing for the Astra GPR 6, that typically depends on the specific configuration and your supplier, but it generally ranges from $15,000 to over $25,000 USD. Would you like me to pull up official distributors for you?'
+[REPRO3] deltas: 4  chars=253
