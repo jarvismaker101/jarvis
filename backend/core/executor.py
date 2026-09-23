@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import time
 import webbrowser
@@ -264,8 +265,8 @@ def launch_app(app_name):
     # Edge
     if name == "edge":
         try:
-            subprocess.Popen("start msedge", shell=True)
-            print(f"[EXEC] Launched Edge via shell")
+            os.startfile("microsoft-edge:")
+            print(f"[EXEC] Launched Edge via protocol")
             return True
         except Exception as e:
             print(f"[EXEC] Failed to launch Edge: {e}")
@@ -317,7 +318,10 @@ def launch_app(app_name):
                 print(f"[EXEC] Failed to launch VS Code: {e}")
         else:
             try:
-                subprocess.Popen("code", shell=True)
+                code_path = shutil.which("code")
+                if not code_path:
+                    raise FileNotFoundError("code not on PATH")
+                subprocess.Popen([code_path])
                 print(f"[EXEC] Launched VS Code via PATH")
                 return True
             except Exception as e:
@@ -371,14 +375,11 @@ def launch_app(app_name):
                         except Exception as e:
                             print(f"[EXEC] Failed to launch {full_path}: {e}")
 
-    # 4. Fallback: try spawning via shell if it's safe (simple word)
-    try:
-        if name.isalnum():
-            subprocess.Popen(name, shell=True)
-            print(f"[EXEC] Executed shell command: {name}")
-            return True
-    except Exception:
-        pass
+    # H2: the old "if name.isalnum(): subprocess.Popen(name, shell=True)"
+    # fallback is GONE - any single alphanumeric token (powershell, cmd,
+    # regedit, format...) became a silent shell command. Unknown apps now
+    # report failure so the caller says "I could not find that app". Never
+    # shell=True.
 
     return False
 
