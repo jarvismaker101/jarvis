@@ -676,7 +676,10 @@ def _capture_snapshot():
             "bounds": target.get("bounds"),
             "monitor": (target.get("bounds") or {}).get("monitor"),
             "process_id": target.get("process_id"),
-            "epoch": screen_capture.current_capture_epoch(),
+            # H4: the CAPTURE's own epoch (stamped on the target at capture
+            # time), not whatever happens to be current at envelope time.
+            "epoch": target.get("capture_epoch")
+                or screen_capture.current_capture_epoch(),
         }
     except Exception as exc:  # noqa: BLE001 - identity is optional
         logging.warning("[ORCHESTRATOR] capture identity unavailable: %s", exc)

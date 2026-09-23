@@ -2008,6 +2008,7 @@ class WindowsTargetRevalidationTests(unittest.TestCase):
         screen_state.set_enabled(True)
         with patch.object(screen_executor, "_wait_for_foreground",
                           side_effect=[True, False]), \
+             patch.object(screen_executor.user32, "IsWindow", return_value=1), \
              patch.object(screen_executor.user32, "SetForegroundWindow",
                           return_value=0), \
              patch.object(screen_executor, "type_text") as mock_type:

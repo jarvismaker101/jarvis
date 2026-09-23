@@ -282,6 +282,36 @@ def _ensure_target_focus(target_hwnd, description):
         )
 
 
+def _verify_window_identity(target_hwnd, expected_pid=None):
+    """H5: the planned window must still be the same window - fail closed.
+
+    IsWindow catches closed handles and (when the plan recorded the process)
+    a process-id match catches an HWND recycled by a different program. The
+    probe never "passes by absence": a dead or replaced window REFUSES.
+    """
+    if not target_hwnd:
+        return
+    try:
+        alive = user32.IsWindow(target_hwnd)
+    except Exception:
+        alive = 0
+    if not alive:
+        raise RuntimeError(
+            "The window I planned against is gone, sir - I stopped instead of "
+            "acting on whatever replaced it. Please ask me again.")
+    if expected_pid:
+        try:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(pid))
+            actual = int(pid.value)
+        except Exception:
+            actual = 0
+        if actual != int(expected_pid):
+            raise RuntimeError(
+                "That window now belongs to a different program, sir - I "
+                "stopped instead of clicking on it. Please ask me again.")
+
+
 def _root_window_at_point(x, y):
     """Root (top-level) HWND under a screen point, or 0 when unknown."""
     try:
@@ -315,7 +345,13 @@ def _verify_hit_test(step, target_hwnd):
         return
     root = _root_window_at_point(x, y)
     if not root:
-        return
+        # H5: fail closed - "no window under the point" used to pass silently
+        # (WindowFromPoint returning 0), turning a stale coordinate into a
+        # blind click at the desktop.
+        raise RuntimeError(
+            "There is no window under the spot I planned to click any more, "
+            "sir - I stopped rather than click the desktop. Please ask me "
+            "again.")
     if root != int(target_hwnd):
         raise RuntimeError(
             "Another window moved over the spot I planned to click, sir - "
@@ -366,7 +402,7 @@ def _effect_boundary(gate):
         )
 
 
-def execute_steps(steps, target_hwnd=None, gate=None):
+def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
     _ensure_dpi_awareness()
     # F19: the control generation is enforced immediately before the first
     # effect (focus acquisition itself is an effect) and again before every
@@ -377,6 +413,8 @@ def execute_steps(steps, target_hwnd=None, gate=None):
     # reached the foreground would land on whoever did.
     if target_hwnd:
         with _effect_boundary(gate):
+            # H5: fail-closed identity (IsWindow + process match) first.
+            _verify_window_identity(target_hwnd, expected_pid)
             try:
                 if user32.IsIconic(target_hwnd):
                     user32.ShowWindow(target_hwnd, SW_RESTORE)
@@ -443,14 +481,24 @@ def execute_steps(steps, target_hwnd=None, gate=None):
             # effect. Keyboard input is bound to the planned window's focus and
             # mouse input is hit-tested against it, so a stolen focus or a
             # covering window stops the plan instead of misdirecting input.
+            # H5: fail-closed target identity before EVERY effect - a recycled
+            # hwnd must never receive this plan's input.
+            _verify_window_identity(target_hwnd, expected_pid)
             if action in _KEYBOARD_ACTIONS:
                 _ensure_target_focus(
                     target_hwnd,
                     "type into the window I planned against"
                     if action == "type" else "send that input",
                 )
-            elif action in {"click", "double_click", "right_click"}:
+            elif action in {"click", "double_click", "right_click",
+                            "move", "hover"}:
+                # H5: move/hover used to run completely unvalidated.
                 _verify_hit_test(step, target_hwnd)
+            elif action in {"minimize_window", "maximize_window",
+                            "restore_window"}:
+                # H5: window-state actions acted on whatever held focus.
+                _ensure_target_focus(
+                    target_hwnd, "act on the window I planned against")
 
             if action == "click":
                 click(

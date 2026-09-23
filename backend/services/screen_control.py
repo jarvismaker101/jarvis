@@ -1349,6 +1349,12 @@ def _step_point_to_screen(space, x, y, capture):
     if space == screen_geometry.COORD_VISION_PIXELS:
         return _vision_to_screen_point(capture, x, y)
 
+    # H6: an out-of-frame point is REJECTED, never clamped into an edge click
+    # on whatever control sits there. (The vw-1 step below only absorbs
+    # rounding of in-range values.)
+    if not (0 <= x <= 1000 and 0 <= y <= 1000):
+        return None
+
     # normalized 0..1000 — clamp to the vision frame, then scale once (P1-B).
     vw = max(1, int(capture.get("vision_width") or 1000))
     vh = max(1, int(capture.get("vision_height") or 1000))
@@ -1428,6 +1434,9 @@ def _normalize_vision_plan(plan, capture, element_id_map=None):
         "process_id": capture.get("process_id"),
         "monitor_index": capture.get("monitor_index"),
         "dpi_scale": capture.get("dpi_scale"),
+        # H4: the observation this plan was derived from, carried so the
+        # executor can refuse to act on a screen that changed since.
+        "capture_epoch": capture.get("capture_epoch"),
         "steps": [],
     }
 
@@ -3414,7 +3423,22 @@ def _plan_gate(plan):
     check is serialized against :func:`screen_state.set_enabled`.
     """
     stamp = plan.get("screen_generation")
-    return lambda: screen_state.effect_gate(stamp)
+    plan_epoch = plan.get("capture_epoch")
+
+    def _gate():
+        boundary = screen_state.effect_gate(stamp)
+        # H4: refuse when the screen was re-observed since this plan's capture -
+        # the preview the user confirmed described a DIFFERENT screen. (Per
+        # effect, exactly where F19 already re-checks revocation.)
+        if plan_epoch is not None:
+            from backend.services import screen_capture
+            if screen_capture.current_capture_epoch() != plan_epoch:
+                raise RuntimeError(
+                    "the screen changed after I captured it - the action I "
+                    "planned no longer describes what is on screen")
+        return boundary
+
+    return _gate
 
 
 def _execute_or_queue(plan, command_text):
@@ -3495,7 +3519,9 @@ def _execute_or_queue(plan, command_text):
         return race_error
     error = None
     try:
-        execute_steps(plan["steps"], target_hwnd=target_hwnd, gate=_plan_gate(plan))
+        execute_steps(plan["steps"], target_hwnd=target_hwnd,
+                      gate=_plan_gate(plan),
+                      expected_pid=plan.get("process_id"))
     except Exception as exc:
         # C3: broadened from RuntimeError - a ValueError from a malformed step
         # (bad clicks/button/keys) used to escape and abort the plan mid-
@@ -3626,7 +3652,8 @@ def maybe_handle_screen_control_message(text):
             error = None
             try:
                 execute_steps(plan["steps"], target_hwnd=target_hwnd,
-                              gate=_plan_gate(plan))
+                              gate=_plan_gate(plan),
+                              expected_pid=plan.get("process_id"))
             except Exception as exc:
                 # C3: broadened from RuntimeError (see EXECUTION_FAILED site).
                 error = str(exc)

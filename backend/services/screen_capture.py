@@ -430,6 +430,19 @@ def resolve_ui_hwnd():
     return int(hwnd)
 
 
+def _mint_capture_epoch(region):
+    """H4: mint this observation's epoch and stamp it on the recorded user
+    target, so an envelope can name the CAPTURE's own epoch instead of
+    whatever happens to be current when the envelope is written."""
+    ep = _next_capture_epoch()
+    try:
+        if region.get("hwnd") and not is_own_window(region.get("hwnd")):
+            _last_user_target["capture_epoch"] = ep
+    except Exception:
+        pass
+    return ep
+
+
 def _serialize_capture(region, image, capture_mode):
     vision_image = _resize_for_vision(image)
     annotated = _draw_grid_overlay(vision_image)
@@ -465,7 +478,7 @@ def _serialize_capture(region, image, capture_mode):
         # F43: the observation this frame belongs to. A UIA tree, an OCR pass
         # and a plan must all be derived from ONE epoch; mixing frames is how a
         # click intended for the screenshot's window landed on another one.
-        "capture_epoch": _next_capture_epoch(),
+        "capture_epoch": _mint_capture_epoch(region),
         # F43: an explicit coordinate-space contract. origin_*/capture_* are
         # absolute physical desktop pixels (screen_pixels, may be negative on a
         # multi-monitor desktop); vision_* are the pixels of the image the

@@ -194,3 +194,10 @@ This file is a lightweight running log for future Codex conversations. It should
 - H7: per-thread COM apartment init (_ensure_com, comtypes.CoInitialize) at every UIA entry (load + walk + invoke) - fixes the RPC_E_CHANGED_MODE silent degradation to blind coordinate clicks. +tests.
 - H8: retired groq model llama-3.3-70b-versatile dropped from grok_client default and the offered catalog (qwen/qwen3.6-27b).
 - H9: research overlay markdown links allow only http(s)/mailto hrefs; javascript:/data:/vbscript: render as plain label text. +3 vm tests (node --test green).
+
+## 2026-09-23 - CODE_REVIEW_REPORT H4/H5/H6 implemented (execution staleness + geometry)
+
+- H4 (capture_epoch now enforced): plans carry capture_epoch; _plan_gate probes it before EVERY effect and refuses on mismatch (the confirmed preview described a different screen); screen_capture._mint_capture_epoch stamps the recorded user target so orchestrator envelopes name the CAPTURE epoch, not the current one.
+- H5 (fail-closed revalidation): _verify_window_identity (IsWindow + process-id match) runs before every effect and at focus acquisition; hit-test with no window under the point now REFUSES (was silent pass); move/hover get hit-tests and window-state actions bring the planned window forward first.
+- H6: out-of-frame normalized points are REJECTED, never clamped into edge clicks (rounding clamp kept for in-range values). dpi_scale/monitor_index were verified contract-correct already: captured pixels are documented physical end-to-end (screen_capture.py:82-83) and window origins use DWM extended frame bounds (_window_bounds:109-116) - applying dpi_scale again would have DOUBLE-scaled; the audit claim was stale on those two sub-points.
+- Tests: backend/tests/test_h4_h5_h6_staleness.py (12 cases); one existing F42 test gained an IsWindow=1 mock so it still exercises its focus path under the stricter precondition. Screen+C+F24/F49 surface: 199 passed.
