@@ -1323,9 +1323,10 @@ def _list_groq_models(api_key):
                 models.append({"id": mid, "display": mid})
         return models
     except Exception:
+        # H8: "llama-3.3-70b-versatile" is RETIRED at Groq (404) - dropped from
+        # the offered catalog so the UI can no longer select it.
         return [
             {"id": "qwen/qwen3.6-27b", "display": "qwen/qwen3.6-27b"},
-            {"id": "llama-3.3-70b-versatile", "display": "llama-3.3-70b-versatile"},
         ]
 
 

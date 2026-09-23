@@ -7,7 +7,10 @@ from backend.config import ENV_PATH, GROQ_API_KEY
 
 
 API_KEY = GROQ_API_KEY
-DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# H8: "llama-3.3-70b-versatile" is RETIRED at Groq (404) - it was still the
+# fallback classifier default here. Default to the same Qwen 3.6 27B family
+# this module already uses for vision (and that intent.py documents).
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
 VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
     "qwen/qwen3.6-27b",
