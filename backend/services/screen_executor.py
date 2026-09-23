@@ -2,6 +2,7 @@ import contextlib
 import ctypes
 import importlib
 import logging
+import re
 import time
 from ctypes import wintypes
 
@@ -128,8 +129,18 @@ def _get_keyboard():
         ) from exc
 
 
+#: C3: the only shapes that may reach the keyboard library - alias-mapped
+#: vocabulary words, function keys, single printable characters. NO '+' -
+#: chords are constructed by press_keys itself from separate whitelisted
+#: tokens, never parsed out of one raw string.
+_SAFE_EXECUTOR_KEY_RE = re.compile(r"^(?:f\d{1,2}|[a-z0-9 _-]{1,16})$")
+
+
 def _normalize_key_name(key):
     normalized = " ".join((key or "").strip().lower().split())
+    if not normalized or not _SAFE_EXECUTOR_KEY_RE.match(normalized):
+        # C3: raw model strings never reach press_and_release.
+        return None
     return KEY_ALIASES.get(normalized, normalized)
 
 
@@ -172,7 +183,14 @@ def click(x, y, button="left", clicks=1):
         down_flag = MOUSEEVENTF_LEFTDOWN
         up_flag = MOUSEEVENTF_LEFTUP
 
-    for _ in range(max(1, int(clicks))):
+    # C3: clicks are bounded here too (the plan gate clamps 1..10; this is the
+    # defense-in-depth backstop). A bad type degrades to ONE click, never a
+    # ValueError mid-plan.
+    try:
+        repeat = int(clicks)
+    except (TypeError, ValueError):
+        repeat = 1
+    for _ in range(max(1, min(10, repeat))):
         inp_down = INPUT(type=INPUT_MOUSE)
         inp_down._input.mi.dwFlags = down_flag
         inp_up = INPUT(type=INPUT_MOUSE)
@@ -205,6 +223,10 @@ def type_text(text):
 def press_keys(keys):
     keyboard = _get_keyboard()
     normalized = [_normalize_key_name(key) for key in keys if key]
+    # C3: an unwhitelisted token fails the step loudly instead of being typed.
+    if any(k is None for k in normalized):
+        raise ValueError("unsafe key token in press/hotkey step")
+    normalized = [k for k in normalized if k]
     if not normalized:
         return
 

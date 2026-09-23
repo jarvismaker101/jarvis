@@ -178,3 +178,10 @@ This file is a lightweight running log for future Codex conversations. It should
 - screen_control.py: prompt geometry (UI tree + OCR nodes) is now serialized in NORMALIZED 0..1000 at serialization time (_norm_geom) - the same frame the planner answers in - so an echoed tree/OCR coordinate can no longer be reinterpreted across frames (the 660,550 -> 66% exploit). Internal element_id maps keep pixel truth for the executor. Prompt declaration updated to match.
 - Plausibility: a step that cites an element AND returns coordinates must have them agree (_point_agrees_with_element, bounds grown 25%/min 40px); contradiction rejects the plan instead of silently preferring one half.
 - Tests: backend/tests/test_c2_coordinate_frames.py (12 cases). Suites: screen 141 passed, C1+C2 18 passed.
+
+## 2026-09-23 - CODE_REVIEW_REPORT C3: model output can no longer become raw OS input
+
+- screen_control.py: press/hotkey keys whitelisted against the KEY_TOKEN_MAP vocabulary (_whitelist_key_tokens: named keys/synonyms, f1-f9, single alphanumerics; combined strings like alt+f4 as ONE token rejected); click button whitelisted {left,right}; clicks clamped 1..10 via _coerce_int; both plan-level.
+- screen_executor.py: click() caps repeats 1..10 with bad-type -> 1 (no mid-plan ValueError); _normalize_key_name rejects any token outside a safe grammar (NO plus sign - chords are built from separate whitelisted tokens); press_keys raises on unsafe tokens instead of typing them.
+- screen_control.py: the two execute_steps handlers broadened except RuntimeError -> except Exception (a malformed-step ValueError used to abort mid-sequence after earlier steps fired) with plan-level failure reporting preserved.
+- Tests: backend/tests/test_c3_input_synthesis.py (12 cases). Suites: C1+C2+C3 + screen_control 171 passed.

@@ -217,6 +217,33 @@ KEY_TOKEN_MAP = {
     "pageup": "page up",
 }
 
+#: C3 (2026-09-23 audit): the ONLY key shapes model output may produce - a
+#: KEY_TOKEN_MAP vocabulary token, a function key, or one printable character.
+_SAFE_KEY_TOKEN_RE = re.compile(r"^(?:f\d{1,2}|[a-z0-9])$")
+
+
+def _whitelist_key_tokens(keys):
+    """C3: map raw planner key tokens onto the KEY_TOKEN_MAP vocabulary.
+
+    Anything outside the vocabulary (named keys and their synonyms, f-keys,
+    single printable characters) is rejected - model-authored strings must
+    never reach the keyboard library as raw input ('alt+f4', 'win r',
+    escape sequences...). Returns the canonical token list, or None when any
+    token is not allowed.
+    """
+    out = []
+    for key in keys:
+        token = " ".join(str(key).strip().lower().split())
+        if not token or len(token) > 24:
+            return None
+        if token in KEY_TOKEN_MAP:
+            out.append(KEY_TOKEN_MAP[token])
+        elif _SAFE_KEY_TOKEN_RE.match(token):
+            out.append(token)
+        else:
+            return None
+    return out or None
+
 TEXT_ENTRY_CONTROL_TYPES = {
     "ComboBox",
     "Document",
@@ -1557,13 +1584,19 @@ def _normalize_vision_plan(plan, capture, element_id_map=None):
                 screen_x = max(capture["origin_left"], min(screen_x, max_x))
                 screen_y = max(capture["origin_top"], min(screen_y, max_y))
 
+            # C3: button whitelist + bounded click count - both were raw.
+            button = str(raw_step.get("button") or "left").strip().lower()
+            if button not in {"left", "right"}:
+                button = "left"
+            clicks = max(1, min(10, _coerce_int(raw_step.get("clicks"), 1) or 1))
+
             # F43: emitted steps carry an explicit coordinate-space contract.
             step_payload = {
                 "action": action,
                 "x": screen_x,
                 "y": screen_y,
-                "button": raw_step.get("button", "left"),
-                "clicks": raw_step.get("clicks", 1),
+                "button": button,
+                "clicks": clicks,
                 "space": screen_geometry.COORD_SCREEN_PIXELS,
             }
             # Bug #9: Carry element label into step for menu-open heuristic.
@@ -1636,8 +1669,14 @@ def _normalize_vision_plan(plan, capture, element_id_map=None):
                 return _reject("The screen planner returned a malformed key step.")
             if any(not isinstance(key, str) or not key.strip() for key in keys):
                 return _reject("The screen planner returned a malformed key step.")
+            # C3: whitelist key tokens against the KEY_TOKEN_MAP vocabulary -
+            # raw model strings must never reach the keyboard library.
+            safe_keys = _whitelist_key_tokens([k.strip() for k in keys])
+            if safe_keys is None:
+                return _reject(
+                    "The screen planner asked for a key I don't allow.")
             normalized["steps"].append(
-                {"action": action, "keys": [k.strip() for k in keys]}
+                {"action": action, "keys": safe_keys}
             )
         else:
             # F45: an unsupported action is not silently dropped — a plan whose
@@ -3457,7 +3496,10 @@ def _execute_or_queue(plan, command_text):
     error = None
     try:
         execute_steps(plan["steps"], target_hwnd=target_hwnd, gate=_plan_gate(plan))
-    except RuntimeError as exc:
+    except Exception as exc:
+        # C3: broadened from RuntimeError - a ValueError from a malformed step
+        # (bad clicks/button/keys) used to escape and abort the plan mid-
+        # sequence after earlier steps had already fired.
         error = str(exc)
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=error)
         return error
@@ -3585,7 +3627,8 @@ def maybe_handle_screen_control_message(text):
             try:
                 execute_steps(plan["steps"], target_hwnd=target_hwnd,
                               gate=_plan_gate(plan))
-            except RuntimeError as exc:
+            except Exception as exc:
+                # C3: broadened from RuntimeError (see EXECUTION_FAILED site).
                 error = str(exc)
                 _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTION_FAILED", error=error)
                 return error
