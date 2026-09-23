@@ -172,3 +172,9 @@ This file is a lightweight running log for future Codex conversations. It should
 
 - screen_control.py: screen-derived text (OCR, UIA names, window title, history) is now UNTRUSTED DATA: spoof-proof <<<SCREEN_TEXT_UNTRUSTED>>> delimiters (marker spoofing neutralized first), role-prefix + control-phrase stripping (_sanitize_screen_fragment), and a static never-instructions header that also pins step targets to element ids/coordinates and type payloads to the User command. Single choke point (_build_tree_prompt) covers _build_vision_prompt merges.
 - Tests: backend/tests/test_c1_prompt_injection.py (10 cases: marker spoof, role prefix, control phrases, innocent pass-through, block wrapping, prompt integration). Full screen suite: 149 passed.
+
+## 2026-09-23 - CODE_REVIEW_REPORT C2: one declared coordinate frame for the screen planner
+
+- screen_control.py: prompt geometry (UI tree + OCR nodes) is now serialized in NORMALIZED 0..1000 at serialization time (_norm_geom) - the same frame the planner answers in - so an echoed tree/OCR coordinate can no longer be reinterpreted across frames (the 660,550 -> 66% exploit). Internal element_id maps keep pixel truth for the executor. Prompt declaration updated to match.
+- Plausibility: a step that cites an element AND returns coordinates must have them agree (_point_agrees_with_element, bounds grown 25%/min 40px); contradiction rejects the plan instead of silently preferring one half.
+- Tests: backend/tests/test_c2_coordinate_frames.py (12 cases). Suites: screen 141 passed, C1+C2 18 passed.

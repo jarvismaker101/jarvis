@@ -991,6 +991,42 @@ def _resolve_element_point(element_ref):
     return None
 
 
+def _point_agrees_with_element(space, x, y, element_ref, capture):
+    """C2: a cited element and its coordinates must describe the same target.
+
+    The raw point is converted to screen pixels and compared with the cited
+    element's bounds (converted the same way), grown by 25% of the element
+    size (min 40px). No bounds -> nothing to check -> agree. A large
+    disagreement means the coordinates were serialized in a different frame
+    than declared ("echo" plans) and one of the two would land far off.
+    """
+    bounds = (element_ref or {}).get("bounds") if isinstance(element_ref, dict) else None
+    if not isinstance(bounds, dict):
+        return True
+    left = _coerce_int(bounds.get("left"), None)
+    top = _coerce_int(bounds.get("top"), None)
+    right = _coerce_int(bounds.get("right"), None)
+    bottom = _coerce_int(bounds.get("bottom"), None)
+    if None in (left, top, right, bottom) or right < left or bottom < top:
+        return True
+    point = _step_point_to_screen(space, x, y, capture)
+    if point is None:
+        return True  # unconvertible; the F45 checks upstream own that case
+    sx, sy = point
+    el_space = element_ref.get("space", screen_geometry.COORD_VISION_PIXELS)
+    corners = [
+        _step_point_to_screen(el_space, left, top, capture),
+        _step_point_to_screen(el_space, right, bottom, capture),
+    ]
+    if not all(corners):
+        return True
+    (x1, y1), (x2, y2) = corners
+    grow_x = max(40, int(abs(x2 - x1) * 0.25))
+    grow_y = max(40, int(abs(y2 - y1) * 0.25))
+    return (min(x1, x2) - grow_x <= sx <= max(x1, x2) + grow_x
+            and min(y1, y2) - grow_y <= sy <= max(y1, y2) + grow_y)
+
+
 def _resolve_observation_depth(elements, by_uid):
     """F44: effective depth from explicit parent links, not a raw integer.
 
@@ -1018,7 +1054,43 @@ def _resolve_observation_depth(elements, by_uid):
     return depths
 
 
-def _serialize_accessibility_elements(elements, start_id=1, space="vision"):
+def _norm_geom(left, top, right, bottom, cx, cy, capture, space):
+    """C2: prompt-visible geometry in ONE declared frame (normalized 0..1000).
+
+    The planner used to see capture-local pixel bounds/centers while being
+    asked for NORMALIZED 0..1000 answers, so an echoed tree/OCR coordinate
+    (center="660,550") passed range checks and was reinterpreted as 66% of
+    the frame. Everything serialized for the prompt is converted HERE, at
+    serialization time; internal element_id maps keep their pixel truth.
+    """
+    capture = capture or {}
+    if space == screen_geometry.COORD_VISION_PIXELS:
+        x0, y0 = 0.0, 0.0
+        w, h = capture.get("vision_width"), capture.get("vision_height")
+    else:
+        x0, y0 = capture.get("origin_left"), capture.get("origin_top")
+        w, h = capture.get("capture_width"), capture.get("capture_height")
+    try:
+        w = float(w)
+        h = float(h)
+        x0 = float(x0 or 0)
+        y0 = float(y0 or 0)
+    except (TypeError, ValueError):
+        return (left, top, right, bottom), (cx, cy)
+    if w <= 0 or h <= 0:
+        return (left, top, right, bottom), (cx, cy)
+
+    def _nx(v):
+        return max(0, min(1000, int(round((float(v) - x0) * 1000.0 / w))))
+
+    def _ny(v):
+        return max(0, min(1000, int(round((float(v) - y0) * 1000.0 / h))))
+
+    return ((_nx(left), _ny(top), _nx(right), _ny(bottom)), (_nx(cx), _ny(cy)))
+
+
+def _serialize_accessibility_elements(elements, start_id=1, space="vision",
+                                      capture=None):
     lines = []
     element_id_map = {}
     next_id = start_id
@@ -1067,12 +1139,15 @@ def _serialize_accessibility_elements(elements, start_id=1, space="vision"):
         class_name = (el.get("class_name") or "").strip()
         enabled = bool(el.get("enabled", True))
 
+        # C2: displayed geometry is normalized_1000; element_id_map keeps pixels.
+        (nl, nt, nr, nb), (ncx, ncy) = _norm_geom(
+            left, top, right, bottom, cx, cy, capture, declared_space)
         attrs = [
             f'id="{next_id}"',
             f'role="{_escape_xml_attr(control_type)}"',
             f'enabled="{str(enabled).lower()}"',
-            f'bounds="{left},{top},{right},{bottom}"',
-            f'center="{cx},{cy}"',
+            f'bounds="{nl},{nt},{nr},{nb}"',
+            f'center="{ncx},{ncy}"',
         ]
         if name:
             attrs.append(f'name="{_escape_xml_attr(name)}"')
@@ -1116,7 +1191,7 @@ def _serialize_accessibility_elements(elements, start_id=1, space="vision"):
     return lines, element_id_map, next_id
 
 
-def _serialize_ocr_nodes(regions, seen_texts, start_id=1):
+def _serialize_ocr_nodes(regions, seen_texts, start_id=1, capture=None):
     lines = []
     element_id_map = {}
     next_id = start_id
@@ -1155,12 +1230,16 @@ def _serialize_ocr_nodes(regions, seen_texts, start_id=1):
         cy = int(round((top + bottom) / 2.0))
         confidence = _coerce_int(region.get("confidence"), 0)
 
+        # C2: displayed geometry is normalized_1000; ocr map keeps pixels.
+        (nl, nt, nr, nb), (ncx, ncy) = _norm_geom(
+            left, top, right, bottom, cx, cy, capture,
+            screen_geometry.COORD_VISION_PIXELS)
         lines.append(
             '    <text id="{id}" value="{value}" bounds="{bounds}" center="{center}" confidence="{confidence}"/>'.format(
                 id=next_id,
                 value=_escape_xml_attr(text),
-                bounds=f"{left},{top},{right},{bottom}",
-                center=f"{cx},{cy}",
+                bounds=f"{nl},{nt},{nr},{nb}",
+                center=f"{ncx},{ncy}",
                 confidence=confidence,
             )
         )
@@ -1390,6 +1469,24 @@ def _normalize_vision_plan(plan, capture, element_id_map=None):
                     x = point["x"]
                     y = point["y"]
                     point_space = point["space"]
+                # C2: when the planner ALSO returns coordinates for a cited
+                # element they must agree with it - reject instead of silently
+                # preferring one half of a contradictory step.
+                raw_x = _coerce_int(raw_step.get("x"), None)
+                raw_y = _coerce_int(raw_step.get("y"), None)
+                box_pair = _extract_box_center(raw_step)
+                if box_pair is not None:
+                    raw_x, raw_y = box_pair
+                if raw_x is not None and raw_y is not None:
+                    check_space, check_declared = _declared_space(raw_step)
+                    if not check_declared:
+                        check_space = plan_space
+                    if check_space is not None and not _point_agrees_with_element(
+                            check_space, raw_x, raw_y,
+                            element_id_map[el_id], capture):
+                        return _reject(
+                            "The screen planner's coordinates contradict the "
+                            "element it cites.")
             else:
                 # 2. Fallback: bounding box or direct x, y in the DECLARED space.
                 # F45: the space must be declared explicitly — a missing or
@@ -1697,7 +1794,7 @@ def _build_tree_prompt(command_text, capture, ui_context="", image_only=False):
         f"Active window title: {title}\n"
         f"{history_context}"
         "Below is the XML-like structure of the active window. Every element includes its role, bounds, center, and any known labels.\n"
-        "Bounds and centers are in capture-local vision pixels, not raw screen pixels.\n"
+        "All bounds/centers below are NORMALIZED 0..1000 on each axis (0 = left/top edge, 1000 = right/bottom edge of the capture) - the SAME frame your x,y answers must use, so you may copy them verbatim.\n"
         "Use the tree hierarchy and the metadata to disambiguate repeated labels.\n"
         "--- UI TREE START ---\n"
         f"{ui_context}\n"
@@ -2039,6 +2136,7 @@ def _gather_ui_tree(capture, snapshot=None, target_label=None):
             # transform the elements stay in screen pixels, and declaring them
             # "vision" would make the executor convert them a second time.
             space=snapshot.get("ui_space", "screen"),
+            capture=capture,
         )
         tree_lines.append("  <accessibility>")
         tree_lines.extend(ui_lines)
@@ -2054,6 +2152,7 @@ def _gather_ui_tree(capture, snapshot=None, target_label=None):
                 merged,
                 seen_texts,
                 start_id=id_counter,
+                capture=capture,
             )
             if ocr_lines:
                 tree_lines.append("  <ocr>")
