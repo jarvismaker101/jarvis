@@ -103,9 +103,17 @@ function inline(text) {
     anchors.push(html);
     return token;
   };
-  // markdown links [label](url)
-  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, label, url) =>
-    capture(`<a href="${escapeHtml(url)}" data-ext="1" target="_blank">${label}</a>`));
+  // markdown links [label](url) - H9: only http(s)/mailto schemes may become
+  // anchors; javascript:/data:/vbscript: hrefs render as plain label text
+  // (escapeHtml does not touch schemes, so one poisoned report link could
+  // otherwise run script in the overlay).
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, label, url) => {
+    const scheme = String(url).trim().toLowerCase();
+    if (!/^(https?:\/\/|mailto:)/.test(scheme)) {
+      return label;
+    }
+    return capture(`<a href="${escapeHtml(url)}" data-ext="1" target="_blank">${label}</a>`);
+  });
   // bare URLs -> clickable (keys in "Source: https://..." / "URL:" lines)
   t = t.replace(/(https?:\/\/[^\s<>]+)/g, (m) => {
     const clean = m.replace(/[),.;!?]+$/, "");
