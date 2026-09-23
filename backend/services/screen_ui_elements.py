@@ -14,7 +14,7 @@ _IMPORT_ATTEMPTED = False
 _IMPORT_ERROR = None
 
 _element_cache = {}
-_CACHE_TTL_SECONDS = 8.0
+_CACHE_TTL_SECONDS = 3.0
 #: F42: how long invoke_element re-validates through a FRESH UIA resolution
 #: before giving up (never a silent coordinate fallback).
 _RESOLVE_RETRY_SECONDS = 2.0
@@ -94,9 +94,32 @@ def current_hwnd():
     return _last_hwnd
 
 
+def _ensure_com():
+    """H7: initialize THIS thread's COM apartment (STA) before any UIA call.
+
+    No caller ever did, so on threads whose apartment was already set to a
+    different mode pywinauto's COM import raised RPC_E_CHANGED_MODE
+    (-2147417850) and the whole UIA fast path silently degraded to blind
+    coordinate clicks. COM init is per-thread, so this runs at every entry.
+    Returns False only when the apartment cannot serve UIA at all.
+    """
+    try:
+        import comtypes  # type: ignore
+        comtypes.CoInitialize()  # S_FALSE when already STA is fine
+        return True
+    except Exception as exc:
+        logging.warning(
+            "UIA COM unavailable on this thread (UIA fast path off): %s", exc)
+        return False
+
+
 def _load_pywinauto():
     """Import pywinauto lazily so COM-init issues don't break startup."""
     global _pywinauto, _IMPORT_ATTEMPTED, _IMPORT_ERROR
+
+    # H7: per-thread COM init BEFORE the import (the import itself calls COM).
+    if not _ensure_com():
+        return None
 
     if _pywinauto is not None:
         return _pywinauto
@@ -127,6 +150,10 @@ def get_foreground_window_elements(max_elements=140, max_depth=9, hwnd=None):
     Returns an empty list if pywinauto is not installed or on error.
     """
     global _last_hwnd, _cache_hwnd, _cache_process_id, _observation_seq, _observation_id, _walk_counter
+    # H7: per-thread COM init at every entry (the load-time init may have
+    # happened on a different thread).
+    if not _ensure_com():
+        return []
     pywinauto = _load_pywinauto()
     if pywinauto is None:
         return []
@@ -566,6 +593,9 @@ def invoke_element(uid, action="click", text="", hwnd=None, runtime_id=""):
       * a target that cannot be resolved returns False — the caller must NOT
         fall back to stale coordinates.
     """
+    # H7: per-thread COM init at every entry (invoke calls COM methods).
+    if not _ensure_com():
+        return False
     entry = _element_cache.get(uid) if uid else None
     if isinstance(entry, dict):
         rewind_rid = runtime_id or entry.get("runtime_id", "")
@@ -590,7 +620,14 @@ def invoke_element(uid, action="click", text="", hwnd=None, runtime_id=""):
     if isinstance(entry, dict):
         wrapper = entry.get("wrapper")
     elif entry is not None:
-        wrapper = entry  # legacy bare wrapper
+        # H3: legacy "bare wrapper" entries carry no created_at/hwnd metadata,
+        # so they can NEVER pass _cache_record_is_live - treat them as stale
+        # and fall through to the live re-resolution above instead of typing
+        # into a possibly recycled control.
+        logging.info(
+            "UI cache uid=%s holds a legacy bare wrapper - re-resolving.", uid)
+        entry = None
+        wrapper = None
     else:
         wrapper = None
 
@@ -627,8 +664,14 @@ def invoke_element(uid, action="click", text="", hwnd=None, runtime_id=""):
         elif action == "type":
             try:
                 wrapper.set_focus()
-            except Exception:
-                pass
+            except Exception as exc:
+                # H3: set_focus failure used to be swallowed and type_keys
+                # fired into WHICHEVER window held focus. Abort instead -
+                # typed text (possibly sensitive) must never land blindly.
+                logging.warning(
+                    "UIA set_focus failed for %s - refusing to type: %s",
+                    uid, exc)
+                return False
             wrapper.type_keys(text, with_spaces=True)
             return True
 

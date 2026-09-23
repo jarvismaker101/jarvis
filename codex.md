@@ -185,3 +185,12 @@ This file is a lightweight running log for future Codex conversations. It should
 - screen_executor.py: click() caps repeats 1..10 with bad-type -> 1 (no mid-plan ValueError); _normalize_key_name rejects any token outside a safe grammar (NO plus sign - chords are built from separate whitelisted tokens); press_keys raises on unsafe tokens instead of typing them.
 - screen_control.py: the two execute_steps handlers broadened except RuntimeError -> except Exception (a malformed-step ValueError used to abort mid-sequence after earlier steps fired) with plan-level failure reporting preserved.
 - Tests: backend/tests/test_c3_input_synthesis.py (12 cases). Suites: C1+C2+C3 + screen_control 171 passed.
+
+## 2026-09-23 - CODE_REVIEW_REPORT H1/H2/H3/H7/H8/H9 implemented
+
+- H1: requirements.txt regenerated from the working venv (pip freeze): numpy 1.26.4 ABI pin (was 2.2.6 - breaks ctranslate2/av wheels), pywinauto 0.6.9 (was pinned down), +14 previously missing runtime packages. +3 pin-guard tests.
+- H2: executor launch_app deleted its isalnum shell=True tail (any word became a shell command); Edge launches via protocol, VS Code PATH via argv list; explicit system_apps allowlist kept (fixed constants, never shell=True). +3 tests.
+- H3: screen_ui_elements - set_focus failure now ABORTS the type action (never types into whatever holds focus); legacy bare-wrapper cache entries treated as stale and re-resolved; cache TTL 8s -> 3s. +tests.
+- H7: per-thread COM apartment init (_ensure_com, comtypes.CoInitialize) at every UIA entry (load + walk + invoke) - fixes the RPC_E_CHANGED_MODE silent degradation to blind coordinate clicks. +tests.
+- H8: retired groq model llama-3.3-70b-versatile dropped from grok_client default and the offered catalog (qwen/qwen3.6-27b).
+- H9: research overlay markdown links allow only http(s)/mailto hrefs; javascript:/data:/vbscript: render as plain label text. +3 vm tests (node --test green).
