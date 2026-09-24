@@ -19,6 +19,7 @@ from backend.services.audio_input import (
 )
 from backend.services.earcons import play_capture_complete_earcon
 from backend.services.transcription import (
+    is_hallucinated_transcript,
     recognize_google_or_groq,
     recognize_inworld,
     recognize_local_whisper,
@@ -301,6 +302,11 @@ def _emit_partial_window(chunks, turn_id, index, duration_ms):
     text = (transcript or "").strip()
     if not text:
         return None
+    if is_hallucinated_transcript(text):
+        # STT degeneracy over noise / TTS-echo audio (looped token, prompt
+        # echo, memorised silence phrase): never becomes a partial window and
+        # never reaches the stabilizer.
+        return None
     window = TranscriptWindow(
         wid="partial-%s-%d" % (turn_id, index),
         text=text,
@@ -350,6 +356,9 @@ def recognize_multilingual(audio):
         try:
             text = recognize_inworld(audio, language="en")
             normalized = _normalize_text(text)
+            if normalized and is_hallucinated_transcript(normalized):
+                print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+                return None
             if normalized:
                 if any("\u0900" <= ch <= "\u097F" for ch in text):
                     print("[LISTENER] Inworld STT returned non-English script, falling back")
@@ -366,6 +375,9 @@ def recognize_multilingual(audio):
         try:
             transcript, lang = recognize_local_whisper(audio)
             normalized = _normalize_text(transcript)
+            if normalized and is_hallucinated_transcript(normalized):
+                print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+                return None
             if normalized:
                 print(f"[HEARD:local-whisper] {normalized}")
                 return transcript, normalized, lang
@@ -403,6 +415,9 @@ def recognize_multilingual(audio):
                 log_prefix="LISTENER",
             )
             normalized = _normalize_text(text)
+            if normalized and is_hallucinated_transcript(normalized):
+                print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+                continue
             if normalized:
                 print(f"[HEARD:{language}] {normalized}")
                 return text, normalized, language
@@ -748,6 +763,14 @@ def listen():
         raw, text, _language = recognize_multilingual(audio)
         if not text:
             _record_empty_listen("no transcript")
+            return None
+        # Final belt at the commit boundary: whatever engine produced the
+        # transcript, an STT hallucination is never committed as user speech
+        # (observed live: the wake-bias prompt echoed verbatim over TTS echo
+        # and answered by the brain as if the user had spoken).
+        if is_hallucinated_transcript(raw or text):
+            print(f"[LISTENER] Ignoring STT hallucination: {_normalize_text(text)}")
+            _record_empty_listen("hallucination")
             return None
         empty_listen_count = 0
         # [F12] The RAW transcription is what leaves this function: case,

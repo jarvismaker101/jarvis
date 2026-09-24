@@ -63,7 +63,10 @@ from backend.services.audio_input import (
     resolve_microphone,
     resolve_working_microphone_index,
 )
-from backend.services.transcription import recognize_google_or_groq
+from backend.services.transcription import (
+    is_hallucinated_transcript,
+    recognize_google_or_groq,
+)
 
 LISTEN_TIMEOUT_SECONDS = 8
 PHRASE_TIME_LIMIT_SECONDS = 12
@@ -503,6 +506,11 @@ def wake_pattern_match(text):
 
 
 def is_wake_word(text):
+    # An STT hallucination (the wake-bias prompt echoed back over noise, a
+    # looped token, ...) can look EXACTLY like a wake phrase — never let one
+    # launch the stack.
+    if is_hallucinated_transcript(text):
+        return False
     normalized_text = normalize_text(text)
     words = normalized_text.split()
     has_jarvis = fuzzy_contains(normalized_text, JARVIS_VARIANTS, threshold=0.76)
@@ -600,6 +608,8 @@ def _add_candidates(candidates, seen, texts):
     for raw in texts or ():
         text = str(raw or "").strip()
         if not text:
+            continue
+        if is_hallucinated_transcript(text):
             continue
         key = normalize_text(text)
         if not key or key in seen:
@@ -813,7 +823,13 @@ def _transcribe_with_daemon(wav_bytes):
     request = Request(
         f"{WHISPER_DAEMON_URL}/transcribe",
         data=wav_bytes,
-        headers={"Content-Type": "application/octet-stream"},
+        headers={
+            "Content-Type": "application/octet-stream",
+            # Wake matching ASKS for the wake-bias prompt (it helps spell the
+            # wake words); the daemon only applies it for this purpose. The
+            # conversation path never sends this header.
+            "X-Jarvis-Purpose": "wake",
+        },
         method="POST",
     )
     with urlopen(request, timeout=WHISPER_TRANSCRIBE_TIMEOUT) as response:

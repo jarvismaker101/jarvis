@@ -201,3 +201,28 @@ This file is a lightweight running log for future Codex conversations. It should
 - H5 (fail-closed revalidation): _verify_window_identity (IsWindow + process-id match) runs before every effect and at focus acquisition; hit-test with no window under the point now REFUSES (was silent pass); move/hover get hit-tests and window-state actions bring the planned window forward first.
 - H6: out-of-frame normalized points are REJECTED, never clamped into edge clicks (rounding clamp kept for in-range values). dpi_scale/monitor_index were verified contract-correct already: captured pixels are documented physical end-to-end (screen_capture.py:82-83) and window origins use DWM extended frame bounds (_window_bounds:109-116) - applying dpi_scale again would have DOUBLE-scaled; the audit claim was stale on those two sub-points.
 - Tests: backend/tests/test_h4_h5_h6_staleness.py (12 cases); one existing F42 test gained an IsWindow=1 mock so it still exercises its focus path under the stricter precondition. Screen+C+F24/F49 surface: 199 passed.
+
+## 2026-09-23 — fix: STT hallucinations were being answered as user speech
+
+Live symptom: with the headset AEC degraded (26 frames of Jarvis's own TTS captured into the mic),
+local Whisper transcribed noise/echo into memorised filler and the brain answered it:
+"jarvis, a ver si te acuerdas de esto", "jervis, wake up, jervis, utho, jago, chalu",
+and "chalu, chalu, ..." loops — the wake-bias prompt echoed VERBATIM.
+
+Root causes fixed:
+1. `whisper_daemon.py` applied the wake-bias `INITIAL_PROMPT` to EVERY transcription; on non-speech
+   audio the model echoes the prompt tokens (they literally were the "hallucinated words"). The bias
+   is now opt-in via `X-Jarvis-Purpose: wake` (sent only by `watcher._transcribe_with_daemon`);
+   conversation transcription runs unbiased.
+2. No veto at the commit boundary. New deterministic gate `is_hallucinated_transcript()` in
+   `backend/services/transcription.py`: rejects prompt-vocab echoes (5+ tokens from the wake vocab),
+   looped tokens/phrases, memorised silence phrases ("a ver si te acuerdas de esto", "thanks for
+   watching", ...), and filler-only utterances. Never rejects real commands, short wake phrases,
+   literal payloads, or repeated safety words ("stop stop stop").
+3. Wired at every boundary: listener partial windows, each STT engine's accept in
+   `recognize_multilingual` (hallucination falls through to the next engine), the final `listen()`
+   commit belt, watcher `is_wake_word` (a prompt echo could false-LAUNCH the stack), and
+   `_add_candidates`.
+
+Tests: `backend/tests/test_stt_hallucination_gate.py` (26) pinning every observed live junk shape
+plus the positive cases. Suite: 240 adjacent (F12/F33/F34/F36/F55/inworld/task-agent/G10) green.

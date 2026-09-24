@@ -77,6 +77,11 @@ from backend.services import runtime_identity
 
 PORT = int(os.getenv("JARVIS_WHISPER_PORT", "8767"))
 MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
+# Wake-word biasing prompt. ONLY applied for wake matching — the caller asks
+# for it with ``X-Jarvis-Purpose: wake`` (watcher). Conversation transcription
+# runs WITHOUT it on purpose: on noise / TTS-echo audio the model hallucinates
+# and echoes these prompt tokens verbatim ("jarvis, wake up, jervis, utho,
+# jago, chalu"), which then reached the brain as user speech.
 INITIAL_PROMPT = "Jarvis, wake up, jervis, utho, jago, chalu"
 # Bounded wait for a still-loading model on the transcription path (F55).
 TRANSCRIBE_MODEL_WAIT = float(os.getenv("JARVIS_WHISPER_TRANSCRIBE_WAIT", "20"))
@@ -217,12 +222,16 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             with _lock:
+                wake_bias = (
+                    (self.headers.get("X-Jarvis-Purpose") or "").strip().lower()
+                    == "wake"
+                )
                 segments, info = model.transcribe(
                     io.BytesIO(wav_bytes),
                     temperature=0.0,
                     vad_filter=True,
                     condition_on_previous_text=False,
-                    initial_prompt=INITIAL_PROMPT,
+                    initial_prompt=INITIAL_PROMPT if wake_bias else None,
                 )
                 text = "".join(seg.text for seg in segments).strip()
             self._send_json(
