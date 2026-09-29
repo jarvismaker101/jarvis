@@ -36,6 +36,7 @@ works before a real AEC model is added.
 import base64
 import json
 import math
+import os
 import threading
 import time
 from collections import deque, namedtuple
@@ -55,6 +56,16 @@ REFERENCE_MAX_SECONDS = 30
 #: A mic window is only cancelled against reference PCM rendered within this
 #: many seconds of it (a stale reference means "playback did not overlap").
 REFERENCE_MAX_DRIFT_SECONDS = 2.0
+#: [PERF] How long one fetched AEC reference span may serve consecutive mic
+#: frames. Frames arrive every ~32ms and overlap each other, so a short window
+#: removes almost all repeat fetches while staying well inside the 2.0s drift
+#: bound that decides whether a reference is usable at all.
+AEC_CACHE_TTL_SECONDS = float(os.getenv("JARVIS_AEC_CACHE_TTL", "0.25"))
+#: [PERF] After this long with no rendered audio, the remote reference is
+#: skipped without a request. This is the IDLE case, which is the common one:
+#: the transport is consulted per frame, so probing while Jarvis is silent
+#: costs a round trip per frame to learn "nothing is playing".
+AEC_IDLE_SKIP_SECONDS = float(os.getenv("JARVIS_AEC_IDLE_SKIP", "1.5"))
 
 
 class CaptureFrame(namedtuple("CaptureFrame",
@@ -334,7 +345,8 @@ class RemoteAecTransport:
     ``had_reference=False`` (unfiltered semantics, explicitly degraded).
     """
 
-    def __init__(self, base_url=None, timeout=None):
+    def __init__(self, base_url=None, timeout=None, cache_seconds=None,
+                 idle_skip_seconds=None):
         if base_url is None:
             try:
                 from backend.config import BACKEND_PORT
@@ -344,10 +356,57 @@ class RemoteAecTransport:
         self.base_url = base_url.rstrip("/")
         self.timeout = float(timeout or AEC_REMOTE_TIMEOUT)
         self.stats = {"fetches": 0, "hits": 0, "errors": 0,
+                      "cache_hits": 0, "skipped_idle": 0,
                       "last_age_seconds": None, "last_error": None}
+        # [PERF] This transport is consulted once per captured mic frame from
+        # inside the real-time capture loop. Two guards keep it from turning
+        # into a per-frame HTTP round trip (see _remote_is_idle):
+        #   * a short TTL cache - consecutive frames overlap the same rendered
+        #     audio, so one fetch can serve many frames;
+        #   * an idle early-out - when nothing has been rendered recently there
+        #     is provably no reference to fetch, so the request is skipped.
+        self._cache_ttl = float(
+            cache_seconds if cache_seconds is not None else AEC_CACHE_TTL_SECONDS)
+        self._idle_skip = float(
+            idle_skip_seconds if idle_skip_seconds is not None
+            else AEC_IDLE_SKIP_SECONDS)
+        self._cache_lock = threading.Lock()
+        self._cache_pcm = b""
+        self._cache_age = None
+        self._cache_at = 0.0
+        self._last_fetch_ok_at = None
+
+    def _remote_is_idle(self, mic_t_end=None):
+        """True when no rendered audio exists near *mic_t_end* to cancel against.
+
+        ``/aec/reference`` answers with the span the API process actually
+        rendered, so when its own clock says nothing was played around this
+        window the answer is necessarily empty. Probing costs a round trip on
+        every frame, so the last successful non-empty fetch ages out into
+        "idle" instead.
+        """
+        with self._cache_lock:
+            last_ok = self._last_fetch_ok_at
+        if last_ok is None:
+            # Never seen playback: one probe is still required before we can
+            # claim silence, otherwise the first real utterance would be
+            # uncancelled.
+            return False
+        return (time.monotonic() - last_ok) > self._idle_skip
 
     def fetch_reference(self, duration_seconds, mic_t_end=None):
         """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``."""
+        now = time.monotonic()
+        with self._cache_lock:
+            fresh = (self._cache_pcm
+                     and (now - self._cache_at) < self._cache_ttl)
+            if fresh:
+                self.stats["cache_hits"] += 1
+                return self._cache_pcm, self._cache_age
+        if self._remote_is_idle(mic_t_end):
+            with self._cache_lock:
+                self.stats["skipped_idle"] += 1
+            return b"", None
         self.stats["fetches"] += 1
         url = (f"{self.base_url}/aec/reference"
                f"?seconds={max(0.0, float(duration_seconds or 0.0)):.3f}")
@@ -371,6 +430,14 @@ class RemoteAecTransport:
             return b"", None
         self.stats["hits"] += 1
         self.stats["last_age_seconds"] = age
+        # [PERF] Only a NON-EMPTY span refreshes the cache and the idle timer:
+        # an empty answer means "nothing is playing", which is exactly the
+        # state the idle early-out is allowed to assume without asking.
+        with self._cache_lock:
+            self._cache_pcm = data
+            self._cache_age = (None if age is None else float(age))
+            self._cache_at = now
+            self._last_fetch_ok_at = now
         return data, (None if age is None else float(age))
 
     def state(self):

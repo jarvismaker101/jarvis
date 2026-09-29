@@ -244,6 +244,38 @@ PARTIAL_TRANSCRIBE_MIN_SECONDS = float(
     os.getenv("JARVIS_PARTIAL_TRANSCRIBE_SECONDS", "1.5"))
 MAX_PARTIAL_WINDOWS_PER_UTTERANCE = int(
     os.getenv("JARVIS_MAX_PARTIAL_WINDOWS", "8"))
+#: [PERF] Trailing audio ceiling for ONE partial window. Transcribing the whole
+#: accumulated utterance every window is quadratic (window k re-sends ~1.5k
+#: seconds) and it happens inside the real-time capture loop. Only the tail can
+#: change the newest transcript, so older audio is dropped. The stabiliser's
+#: end_ms is still absolute, so window ranges keep advancing exactly as before.
+PARTIAL_MAX_AUDIO_SECONDS = float(
+    os.getenv("JARVIS_PARTIAL_MAX_AUDIO_SECONDS", "20"))
+#: [PERF] A partial window is an early hint, never the committed answer, so it
+#: must not be able to stall the capture loop for the daemon's full 15s budget.
+PARTIAL_STT_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_PARTIAL_STT_TIMEOUT", "4"))
+
+
+def _bounded_audio_tail(chunks, max_seconds):
+    """Return the trailing ``chunks`` covering at most *max_seconds* of audio.
+
+    Returns the list unchanged when the whole capture already fits, so the
+    common short-utterance case is untouched.
+    """
+    if not chunks or not max_seconds or max_seconds <= 0:
+        return chunks
+    keep = 0
+    total = 0.0
+    for chunk in reversed(chunks):
+        total += _audio_duration_seconds(chunk)
+        keep += 1
+        if total >= max_seconds:
+            break
+    if keep >= len(chunks):
+        return chunks
+    return chunks[len(chunks) - keep:]
+
 
 _partial_observers = []
 _partial_observer_lock = threading.Lock()
@@ -285,6 +317,22 @@ def _cloud_stt_policy():
         return "on"
 
 
+def _transcribe_partial(audio):
+    """Transcribe one partial window with the PARTIAL (short) deadline.
+
+    A partial window is an early hint, not the answer, so it must not be able
+    to hold the real-time capture loop for the daemon's full budget. The
+    ``timeout`` keyword is passed defensively: many tests replace
+    ``recognize_local_whisper`` with a single-argument stub, and a stub that
+    cannot express a deadline must not turn a partial into an error.
+    """
+    try:
+        return recognize_local_whisper(
+            audio, timeout=PARTIAL_STT_TIMEOUT_SECONDS)
+    except TypeError:
+        return recognize_local_whisper(audio)
+
+
 def _emit_partial_window(chunks, turn_id, index, duration_ms):
     """Transcribe the accumulated LOCAL audio and push one partial window.
 
@@ -295,7 +343,7 @@ def _emit_partial_window(chunks, turn_id, index, duration_ms):
     if audio is None:
         return None
     try:
-        transcript, language = recognize_local_whisper(audio)
+        transcript, language = _transcribe_partial(audio)
     except Exception as exc:
         print(f"[LISTENER] Partial transcription unavailable: {exc}")
         return None
@@ -661,26 +709,14 @@ def _capture_audio():
                 # contribute to onset detection: a barge-in must be the user,
                 # never Jarvis's own voice leaking into the mic path.
                 onset_chunks.append(filtered_chunk)
-                # [F34] overlapping partial windows DURING capture: locally
-                # transcribed, bounded, and never produced from echo-only
-                # audio. They arrive before the utterance ends, which is what
-                # lets local agreement commit (or refuse) early.
                 partial_state["seconds"] += frame_duration
-                if (partial_state["seconds"] >= PARTIAL_TRANSCRIBE_MIN_SECONDS
-                        and partial_state["emitted"]
-                        < MAX_PARTIAL_WINDOWS_PER_UTTERANCE):
-                    partial_state["seconds"] = 0.0
-                    partial_state["emitted"] += 1
-                    window = _emit_partial_window(
-                        filtered_chunks, turn_id, partial_state["emitted"],
-                        partial_state["duration_ms"])
-                    if window is not None:
-                        print(
-                            f"[LISTENER] Partial window {window.wid} "
-                            f"({int(partial_state['duration_ms'])}ms): "
-                            f"{_normalize_text(window.text)}"
-                        )
 
+            # [PERF] Onset / barge-in is evaluated BEFORE any partial-window
+            # transcription. Transcribing a partial window is a blocking call
+            # into the local whisper engine, so doing it first delayed the
+            # moment the user is recognised as having started speaking - i.e.
+            # it delayed barge-in by the whole transcription. Onset must never
+            # queue behind transcription.
             if not speech_started and _should_confirm_speech_start(onset_chunks):
                 speech_started = True
                 listener_state.mark_user_speaking(True)
@@ -688,6 +724,38 @@ def _capture_audio():
                 # Barge-in: cut ANY in-progress TTS the instant the user
                 # starts speaking (VAD-gated above, not phrase-gated).
                 barge_in_on_speech_onset()
+
+            # [F34] overlapping partial windows DURING capture: locally
+            # transcribed, bounded, and never produced from echo-only
+            # audio. They arrive before the utterance ends, which is what
+            # lets local agreement commit (or refuse) early.
+            #
+            # [PERF] This is a blocking HTTP call into the whisper daemon and it
+            # runs inside the real-time capture loop, so it is bounded twice:
+            # the audio handed to the engine is capped to a trailing window
+            # (older audio cannot change the newest transcript) and the request
+            # itself has its own deadline. The local-agreement contract is
+            # unchanged - only the amount of audio and the worst-case stall
+            # are.
+            if not suppressed and (
+                partial_state["seconds"] >= PARTIAL_TRANSCRIBE_MIN_SECONDS
+                and partial_state["emitted"]
+                < MAX_PARTIAL_WINDOWS_PER_UTTERANCE
+            ):
+                partial_state["seconds"] = 0.0
+                partial_state["emitted"] += 1
+                window = _emit_partial_window(
+                    _bounded_audio_tail(
+                        filtered_chunks, PARTIAL_MAX_AUDIO_SECONDS),
+                    turn_id, partial_state["emitted"],
+                    partial_state["duration_ms"],
+                )
+                if window is not None:
+                    print(
+                        f"[LISTENER] Partial window {window.wid} "
+                        f"({int(partial_state['duration_ms'])}ms): "
+                        f"{_normalize_text(window.text)}"
+                    )
 
         _report_aec_degraded_once(aec_during)
         audio = _combine_audio_chunks(filtered_chunks) or _combine_audio_chunks(chunks)

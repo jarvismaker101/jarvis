@@ -11,6 +11,7 @@ import uuid
 
 import requests
 
+from backend.core import deadline as budget
 from backend.core.executor import execute_multiple
 from backend.core.memory import add_message, clear_history, get_history
 # G9: guarded import — the memory store is optional and import-safe
@@ -664,6 +665,127 @@ def force_research(query):
     return False
 
 
+# ── [PERF] deterministic "definitely plain chat" fast path ───────────────────
+# The intent classifier is a cloud round trip (one 3-hop call with a 3.5s
+# budget) that sits in front of EVERY message, and nothing it produces is
+# consumed until it returns — so it also gates the first streamed token even
+# when the speculative chat stream is already producing text.
+#
+# For the large class of messages that are obviously conversation, the verdict
+# is already `chat`, and every deterministic net that can UPGRADE a chat
+# verdict (screen question, fresh-info search, tool steps, research, task,
+# web-shaped task) still runs afterwards. Skipping the classifier for those
+# messages therefore removes a network round trip from the hot path without
+# removing a single routing decision.
+#
+# This is deliberately conservative: anything with a plausible signal for
+# another route returns False and still goes to the classifier.
+
+#: Verbs that mean "do something", not "talk to me".
+_CHAT_ACTION_RE = re.compile(
+    r"\b(open|launch|run|execute|create|make|delete|remove|install|download|"
+    r"search|browse|go to|visit|type|click|press|play|pause|stop|close|"
+    r"kill|rename|move|copy|write|read|edit|fix|build|deploy|send|email|"
+    r"kholo|chalu|banao|chalao|band|khatam)\b",
+    re.IGNORECASE,
+)
+
+#: Nouns that point at the world outside a conversation.
+_CHAT_OBJECT_HINT_RE = re.compile(
+    r"(https?://|www\.|\.com\b|\.in\b|\.org\b|\.io\b|"
+    r"\b(file|folder|directory|app|application|website|browser|chrome|edge|"
+    r"brave|youtube|gmail|notepad|vscode|terminal|cmd|powershell|excel|"
+    r"word|calculator|spotify|netflix)\b)",
+    re.IGNORECASE,
+)
+
+#: First-person / second-person framing, the strongest chat signal there is.
+_CHAT_PERSON_RE = re.compile(
+    r"\b(i|me|my|mine|you|your|yours|we|us|our|am i|do i|did i|have i|"
+    r"should i|who are you|who r u|are you|can you|could you|would you|"
+    r"will you|thank|thanks|hello|hi|hey|goodbye|bye|jarvis|sir|"
+    r"good (?:morning|afternoon|evening|night)|kaise ho|kya haal|"
+    r"kya hua|batao|how.?s it going|how is it going|how are you doing|"
+    r"sup\b|namaste)\b",
+    re.IGNORECASE,
+)
+
+#: Utterances longer than this stop being "obviously chat" — a long message is
+#: far more likely to be a task description or a research question.
+_CHAT_FASTPATH_MAX_WORDS = 12
+
+#: Deterministic phrase routes owned by the G9 memory store. These are resolved
+#: before the classifier is ever reached, so the fast path must never apply to
+#: them — the guard is belt-and-braces, not the primary mechanism.
+_CHAT_MEMORY_RE = re.compile(
+    r"\b(remember|forget|remind|reminder|recall|unforget|approve the|"
+    r"retire the|skill)\b",
+    re.IGNORECASE,
+)
+
+
+def _fastpath_chat_enabled():
+    """Kill switch for the deterministic chat fast path.
+
+    Read per call so ``JARVIS_CHAT_FASTPATH=0`` disables it without a restart,
+    the same escape hatch the routing mode flag uses. Any misroute found in
+    testing can be turned off immediately while a fix is written.
+    """
+    return os.getenv("JARVIS_CHAT_FASTPATH", "1").strip() not in ("0", "false",
+                                                                 "off", "no")
+
+
+def is_definitely_plain_chat(msg):
+    """True when *msg* is plain conversation, so the classifier can be skipped.
+
+    Returns a `chat` verdict from :func:`classify_intent`'s shape, which the
+    caller treats exactly like a classifier answer: every deterministic net
+    that can upgrade it still runs. This function may only ever say "skip the
+    network call, it would have said chat" — never "skip the nets".
+    """
+    if not msg or not msg.strip():
+        return False
+    text = msg.strip()
+    if text.lower().startswith("command"):
+        return False
+    # Deterministic phrase routes (memory / commitment / skill ops) resolve
+    # before this point, but the fast path must never be *why* one of them was
+    # skipped, so those verbs always take the classifier.
+    if _CHAT_MEMORY_RE.search(text):
+        return False
+    # Any signal another route could claim wins over the fast path.
+    try:
+        if is_screen_question(msg) or is_region_question(msg):
+            return False
+    except Exception:
+        return False
+    try:
+        if force_research(msg) or force_search(msg) or should_search(msg):
+            return False
+    except Exception:
+        return False
+    try:
+        if is_explicit_task_request(msg) or is_code_tool_request(msg):
+            return False
+    except Exception:
+        return False
+    if _CHAT_ACTION_RE.search(text) or _CHAT_OBJECT_HINT_RE.search(text):
+        return False
+    if len(text.split()) > _CHAT_FASTPATH_MAX_WORDS:
+        return False
+    if not _CHAT_PERSON_RE.search(text):
+        return False
+    # "who/where/when" as an OPENING word usually asks about the world ("who
+    # won", "where is Berlin", "when is the match") and belongs to the
+    # classifier. The exception is a question aimed at the assistant itself
+    # ("who are you"), which the person regex already matched.
+    if re.match(r"^\s*(?:who|where|when)\b", text, re.IGNORECASE) \
+            and not re.match(r"^\s*who\s+(?:are|r)\s+you\b", text,
+                             re.IGNORECASE):
+        return False
+    return True
+
+
 def derive_research_query(raw_query):
     """Turn the user's raw sentence into the actual web query.
 
@@ -781,19 +903,38 @@ def _heuristic_research_query(raw_query):
     return low[:220]
 
 
-def search_internet(query):
+#: F24 / [PERF] The legacy DDGS lookup runs inline in the chat build, BEFORE the
+#: first streamed token. It had no timeout and no budget, so a slow or hung
+#: lookup could stall a turn for as long as the underlying transport allowed.
+#: It is now bounded, and an expired budget sends no request at all.
+SEARCH_TIMEOUT = 8.0
+
+
+def search_internet(query, deadline=None):
+    """Fetch a few live snippets for *query* (best-effort, never blocking long).
+
+    *deadline* (F24) is the shared turn budget: when it is already spent no
+    lookup is attempted, and the caller's remaining window bounds the wait.
+    """
+    handle = budget.resolve(deadline)
+    if handle is not None and handle.stopped():
+        print("[SEARCH] lookup skipped — budget exhausted")
+        return None
+    request_timeout = budget.seconds_for(handle, SEARCH_TIMEOUT)
+    if request_timeout is None:
+        return None
     try:
         from ddgs import DDGS
-        results = DDGS().text(query, max_results=3)
+        results = DDGS(timeout=request_timeout).text(query, max_results=3)
         if not results:
             return None
-            
+
         info_lines = []
         for r in results:
             title = r.get("title", "")
             body = r.get("body", "")
             info_lines.append(f"- {title}: {body}")
-            
+
         return "\n".join(info_lines)
     except Exception as e:
         print("[SEARCH] Error:", e)
@@ -876,7 +1017,10 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
                 "search_info": None,
             }
         print("[CHAT] Search triggered")
-        search_info = search_internet(user_message)
+        # F24/[PERF]: the legacy DDGS lookup runs inline here, before the first
+        # streamed token. It is bounded by this turn's job so a slow lookup can
+        # no longer stall the reply for an unbounded time.
+        search_info = search_internet(user_message, deadline=current_turn_job())
 
         if not search_info or len(search_info) < 20:
             return {
@@ -3269,7 +3413,25 @@ def _process_message_inner(
             except Exception as exc:
                 logging.warning("[CHAT] Racer start failed: %s", exc)
                 racer = None
-        intent = classify_intent(msg)
+        # [PERF] Deterministic "definitely plain chat" fast path. When the
+        # message is obviously conversation, the classifier would only return
+        # "chat" — and it is a cloud round trip that gates EVERYTHING below,
+        # including the first streamed token. Skipping it here removes that
+        # round trip from the hot path. Crucially this yields a *chat verdict*,
+        # so every net that follows (screen question, fresh-info search, tool
+        # steps, research, task, web-shaped task) still runs and can still
+        # upgrade the route. Nothing is skipped except the network call.
+        if _fastpath_chat_enabled() and is_definitely_plain_chat(msg):
+            intent = {
+                "intent": "chat",
+                "steps": [],
+                "task_description": "",
+                "query": msg,
+                "_source": "fastpath",
+            }
+            print("[INTENT] Deterministic chat fast path (classifier skipped)")
+        else:
+            intent = classify_intent(msg)
         # Screen-question safety net — deterministic: routes screen Q&A even
         # when the cloud classifier misfires (chat fallback on throttle, or a
         # research misread). tool/task verdicts are exempt: they carry

@@ -240,9 +240,15 @@ def recognize_inworld(audio_data, language=None, prompts=None):
     return transcript
 
 
-def recognize_local_whisper(audio_data):
+def recognize_local_whisper(audio_data, timeout=None):
     """Transcribe via the local whisper daemon (mirrors watcher's
-    _transcribe_with_daemon). Returns (transcript, language-or-None)."""
+    _transcribe_with_daemon). Returns (transcript, language-or-None).
+
+    *timeout* bounds this one request. The final commit in ``listen()`` uses the
+    default (generous) budget because it IS the answer; an F34 partial window
+    is only an early hint and must never be able to stall the real-time capture
+    loop, so it passes a much smaller one.
+    """
     request = Request(
         f"{LOCAL_WHISPER_URL}/transcribe",
         data=audio_data.get_wav_data(),
@@ -250,7 +256,7 @@ def recognize_local_whisper(audio_data):
         method="POST",
     )
     try:
-        with urlopen(request, timeout=15.0) as response:
+        with urlopen(request, timeout=float(timeout or 15.0)) as response:
             payload = json.load(response)
     except Exception as exc:
         raise sr.RequestError(f"Local whisper request failed: {exc}") from exc

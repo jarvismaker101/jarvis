@@ -73,8 +73,28 @@ class Query(BaseModel):
     #: submitting client (the voice I/O worker) owns playback itself. Typed
     #: UI requests keep the default (True) and are spoken here as before.
     speak: bool = True
-    #: G11 / F50 — submission origin ("ui" | "voice"); diagnostics only.
+    #: G11 / F50 — submission origin ("ui" | "voice").
+    #:
+    #: [PERF] This used to be diagnostics only, which left the voice path
+    #: running the FULL chat profile: no compact prompt, no 300-token cap and
+    #: no spoken filler-word stripping — so a spoken turn produced a longer
+    #: answer (later first audio, more TTS chunks, later completion) than the
+    #: voice path was designed for. The field is now authoritative for two
+    #: decisions: the compact reply profile and ``from_voice`` in the brain.
     origin: str = ""
+
+
+def _is_voice_submission(query) -> bool:
+    """True when this request came from the voice I/O worker.
+
+    ``speak=False`` is the F50 contract the voice worker uses to own playback
+    itself, and ``origin`` is the explicit marker. Either one is accepted so a
+    submission that predates the ``origin`` field still gets the right profile.
+    """
+    origin = (getattr(query, "origin", "") or "").strip().lower()
+    if origin == "voice":
+        return True
+    return not bool(getattr(query, "speak", True))
 
 
 class VoiceLog(BaseModel):
@@ -201,6 +221,10 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
         reply = process_message(
             state.message,
             from_voice=from_voice,
+            # [PERF] A spoken turn uses the compact profile: the reply is
+            # short (under 35 words / 300 max tokens) which is what makes the
+            # first audio arrive sooner and the turn finish sooner.
+            voice_compact=from_voice,
             stream_reply=on_delta,
             progress=on_progress,
             request_id=state.request_id,
@@ -303,7 +327,11 @@ def ask(query: Query):
     except Exception:
         pass
     try:
-        reply = process_message(query.message, from_voice=False)
+        # [PERF] Voice submissions (speak=False / origin=voice) get the compact
+        # profile and the from_voice paths, exactly like /ask/stream.
+        from_voice = _is_voice_submission(query)
+        reply = process_message(query.message, from_voice=from_voice,
+                                voice_compact=from_voice)
         if reply is None:
             reply = "I didn't get a response. Please try again."
         state.complete(reply)
@@ -351,11 +379,15 @@ def ask_stream(query: Query):
         # G11 / F50 — a voice-worker submission (speak=False) runs the very
         # same request runtime but stays silent: the I/O worker speaks it.
         speak = bool(query.speak)
+        # [PERF] A spoken turn gets the compact profile (short answer, 300
+        # max tokens, spoken filler words stripped in command mode) and is
+        # marked from_voice so the brain's voice-specific paths actually run.
+        from_voice = _is_voice_submission(query)
         threading.Thread(
             target=_run_request_worker,
             args=(state,),
             kwargs={
-                "from_voice": False,
+                "from_voice": from_voice,
                 "speak_stream": speak,
                 "speak_terminal": speak,
             },
