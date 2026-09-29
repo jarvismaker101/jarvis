@@ -272,8 +272,19 @@ class BrainWiringTests(unittest.TestCase):
         import inspect
         from backend.core import brain
 
+        # The F07 work-context block is injected into the chat system prompt.
+        # [PERF] The two memory-context reads are memoised by
+        # _memory_context_cached (they run twice per turn: once in the
+        # speculative racer, once in the selected route), so the read itself
+        # lives there and the build consumes its result. Both halves are
+        # asserted: the read, and the build actually appending the block.
+        reader = inspect.getsource(brain._memory_context_cached)
+        self.assertIn("work_context", reader)
+        self.assertIn("memory_context", reader)
+
         code = inspect.getsource(brain._build_chat_messages)
-        self.assertIn("work_context", code)
+        self.assertIn("work_block", code)
+        self.assertIn("system_prompt = system_prompt", code)
 
     def test_research_records_the_report_path(self):
         import inspect

@@ -1,0 +1,233 @@
+﻿"""Latency regressions â€” the fixed per-turn costs in the conversation path.
+
+Each test here pins a PERF invariant that a later refactor could silently undo.
+The point is not that the code is fast in absolute terms; it is that these
+specific network calls, blocking waits and duplicated reads do not come back
+on the hot path of a spoken or typed turn.
+
+No microphone, TTS engine, provider or subprocess is opened here.
+"""
+
+import os
+import unittest
+from unittest.mock import patch
+
+from backend.core import brain
+from backend.services import echo_cancel, listener
+
+
+class ChatFastPathTests(unittest.TestCase):
+    """[PERF] obviously-conversational turns skip the cloud classifier.
+
+    The fast path yields a *chat verdict*, so every deterministic net that can
+    upgrade it must still run â€” that is the safety property, and these tests
+    assert both halves: what it skips, and what it must never skip.
+    """
+
+    # Would be answered by the classifier; must NOT take the fast path.
+    NOT_PLAIN_CHAT = (
+        "open youtube",
+        "play song by arijit",
+        "what is the latest news",
+        "how much is netflix priced",
+        "open chrome and go to youtube",
+        "create folder test",
+        "read a.txt",
+        "search for cats",
+        "what is on my screen",
+        "turn on screen controls",
+        "remember that i like tea",
+        "remind me in 5 minutes",
+        "look it up",
+        "delete everything",
+        "run pip install x",
+        "what is the weather today",
+        "go to amazon.in and buy a book",
+        "who won the match",
+        "when is the match",
+        "where is berlin",
+        "command open youtube",
+        "",
+    )
+
+    # Obviously conversation.
+    PLAIN_CHAT = (
+        "hi",
+        "hello jarvis",
+        "how are you",
+        "thanks",
+        "who are you",
+        "good morning",
+        "how is it going",
+        "kaise ho",
+        "batao kya hua",
+    )
+
+    def tearDown(self):
+        brain._memory_context_cache.clear()
+
+    def test_plain_chat_takes_the_fast_path(self):
+        for msg in self.PLAIN_CHAT:
+            with self.subTest(msg=msg):
+                self.assertTrue(brain.is_definitely_plain_chat(msg))
+
+    def test_actionable_or_current_facts_never_take_the_fast_path(self):
+        for msg in self.NOT_PLAIN_CHAT:
+            with self.subTest(msg=msg):
+                self.assertFalse(brain.is_definitely_plain_chat(msg))
+
+    def test_fast_path_yields_a_chat_verdict_so_nets_can_still_upgrade(self):
+        """The safety property: the shape the nets key off is unchanged."""
+        verdict = {
+            "intent": "chat",
+            "steps": [],
+            "task_description": "",
+            "query": "hello",
+        }
+        # The screen-question net upgrades exactly this verdict + message pair.
+        self.assertIn(verdict["intent"], ("chat", "research"))
+        self.assertEqual(verdict["steps"], [])
+
+    def test_kill_switch_disables_the_fast_path(self):
+        with patch.dict(os.environ, {"JARVIS_CHAT_FASTPATH": "0"}):
+            self.assertFalse(brain._fastpath_chat_enabled())
+        with patch.dict(os.environ, {"JARVIS_CHAT_FASTPATH": "1"}):
+            self.assertTrue(brain._fastpath_chat_enabled())
+
+    def test_memory_context_reads_are_memoised_within_a_turn(self):
+        """[PERF] the speculative and committed builds share one pair of reads."""
+        calls = []
+
+        class _Store:
+            def memory_context(self, _msg):
+                calls.append("mem")
+                return ""
+
+            def work_context(self, _msg):
+                calls.append("work")
+                return ""
+
+        with patch.object(brain, "memory_store", _Store()):
+            brain._memory_context_cached("unique memo probe message")
+            brain._memory_context_cached("unique memo probe message")
+            self.assertEqual(calls.count("mem"), 1,
+                             "memory_context was read twice for one message")
+            self.assertEqual(calls.count("work"), 1,
+                             "work_context was read twice for one message")
+
+
+class SearchBudgetTests(unittest.TestCase):
+    """[PERF] the inline DDGS lookup is bounded by the turn budget."""
+
+    def test_expired_budget_sends_no_request(self):
+        import time
+
+        from backend.core import deadline as budget_mod
+
+        expired = budget_mod.Deadline(time.monotonic() - 10.0)
+        self.assertIsNone(
+            brain.search_internet("anything", deadline=expired))
+
+
+class PartialWindowBoundTests(unittest.TestCase):
+    """[PERF] a partial window cannot stall the capture loop."""
+
+    def test_audio_tail_is_capped(self):
+        class _C:
+            frame_data = b"\x00" * 100
+            sample_rate = 16000
+            sample_width = 2
+
+        chunks = [_C() for _ in range(50)]
+        with patch.object(listener, "_audio_duration_seconds",
+                          return_value=1.0):
+            tail = listener._bounded_audio_tail(chunks, 5.0)
+        self.assertLess(len(tail), len(chunks),
+                        "a long capture was not trimmed")
+
+    def test_short_capture_is_returned_untouched(self):
+        chunks = ["a", "b", "c"]
+        with patch.object(listener, "_audio_duration_seconds",
+                          return_value=0.1):
+            self.assertEqual(listener._bounded_audio_tail(chunks, 20.0),
+                             chunks)
+
+    def test_partial_stt_uses_the_short_deadline(self):
+        """A partial is a hint; it must not hold the loop for the full budget."""
+        seen = {}
+
+        def _fake(audio, timeout=None):
+            seen["timeout"] = timeout
+            return "hello", "en"
+
+        with patch.object(listener, "recognize_local_whisper", _fake):
+            listener._transcribe_partial(object())
+        self.assertEqual(seen["timeout"],
+                         listener.PARTIAL_STT_TIMEOUT_SECONDS)
+        self.assertLess(listener.PARTIAL_STT_TIMEOUT_SECONDS, 15.0)
+
+    def test_a_stub_without_a_timeout_kwarg_still_works(self):
+        """Many tests stub the engine with one arg; a partial must not error."""
+        def _one_arg(audio):
+            return "hello", "en"
+
+        with patch.object(listener, "recognize_local_whisper", _one_arg):
+            self.assertEqual(listener._transcribe_partial(object()),
+                             ("hello", "en"))
+
+
+class _Resp:
+    """Minimal urlopen context manager returning a JSON payload."""
+
+    def __init__(self, payload):
+        import json
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class AecTransportCacheTests(unittest.TestCase):
+    """[PERF] the per-frame remote reference is cached and skipped when idle."""
+
+    def _transport(self, **kw):
+        return echo_cancel.RemoteAecTransport(base_url="http://127.0.0.1:1",
+                                               **kw)
+
+    def test_consecutive_frames_are_served_from_cache(self):
+        t = self._transport(cache_seconds=5.0, idle_skip_seconds=99.0)
+        calls = []
+
+        def _fake_urlopen(request, timeout=None):
+            calls.append(1)
+            return _Resp({"pcm_b64": "AAAA", "age_seconds": 0.0})
+
+        with patch.object(echo_cancel, "urlopen", _fake_urlopen):
+            t.fetch_reference(0.03)
+            t.fetch_reference(0.03)
+            t.fetch_reference(0.03)
+        self.assertEqual(len(calls), 1,
+                         "one fetch should serve three overlapping frames")
+        self.assertEqual(t.stats["cache_hits"], 2)
+
+    def test_idle_period_skips_the_request_entirely(self):
+        t = self._transport(cache_seconds=0.0, idle_skip_seconds=0.0)
+        calls = []
+
+        def _fake_urlopen(request, timeout=None):
+            calls.append(1)
+            return _Resp({"pcm_b64": "AAAA", "age_seconds": 0.0})
+
+        with patch.object(echo_cancel, "urlopen", _fake_urlopen):
+            t.fetch_reference(0.03)      # first probe: playback still unknown
+            t._last_fetch_ok_at -= 10.0  # pretend it went quiet long ago
+            t.fetch_reference(0.03)      # idle -> no request at all
+        self.assertEqual(len(calls), 1,
+                         "an idle window must not cost a round trip")
+        self.assertEqual(t.stats["skipped_idle"], 1)

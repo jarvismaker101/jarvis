@@ -609,6 +609,12 @@ def _should_confirm_speech_start(chunks):
     return stats["speech_ratio"] >= SPEECH_START_VAD_RATIO
 
 
+#: [PERF] AEC failures are counted, not printed per frame (see
+#: _aec_filter_chunk). The count is exposed for diagnostics.
+_aec_error_reported = False
+_aec_error_count = 0
+
+
 def _aec_filter_chunk(chunk, frame_id, t_end):
     """Cancel ONE captured frame.
 
@@ -631,7 +637,14 @@ def _aec_filter_chunk(chunk, frame_id, t_end):
             sample_width=chunk.sample_width,
         )
     except Exception as exc:
-        print(f"[LISTENER] AEC error: {exc}")
+        # [PERF] This runs once per captured frame. A failing AEC path would
+        # otherwise print ~30 lines/second to a redirected handle, inside the
+        # real-time loop. Report the first failure, then count silently.
+        global _aec_error_reported, _aec_error_count
+        _aec_error_count += 1
+        if not _aec_error_reported:
+            _aec_error_reported = True
+            print(f"[LISTENER] AEC error (further ones suppressed): {exc}")
         return chunk, False, False
     if not frame.had_reference or not frame.pcm:
         return chunk, False, False

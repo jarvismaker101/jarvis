@@ -724,6 +724,13 @@ _CHAT_MEMORY_RE = re.compile(
 )
 
 
+#: [PERF] Classifier budget per origin. classify_intent degrades to a `chat`
+#: verdict when the budget expires, and the deterministic nets still run, so a
+#: smaller spoken budget costs nothing but bounds the worst case.
+INTENT_BUDGET_MS = int(os.getenv("JARVIS_INTENT_BUDGET_MS", "3500"))
+INTENT_BUDGET_VOICE_MS = int(os.getenv("JARVIS_INTENT_BUDGET_VOICE_MS", "1200"))
+
+
 def _fastpath_chat_enabled():
     """Kill switch for the deterministic chat fast path.
 
@@ -733,6 +740,28 @@ def _fastpath_chat_enabled():
     """
     return os.getenv("JARVIS_CHAT_FASTPATH", "1").strip() not in ("0", "false",
                                                                  "off", "no")
+
+
+def _mark_latency(request_id, name, value_ms):
+    """[PERF] Record an already-measured span for *request_id* (no-op if none)."""
+    if not request_id:
+        return
+    try:
+        from backend.services import latency as _lat
+        _lat.mark_ms(request_id, name, value_ms)
+    except Exception:
+        pass
+
+
+def _mark_latency_duration(request_id, name, started_at):
+    """[PERF] Record one call's own cost as a span for *request_id*."""
+    if not request_id:
+        return
+    try:
+        from backend.services import latency as _lat
+        _lat.mark_duration(request_id, name, started_at)
+    except Exception:
+        pass
 
 
 def is_definitely_plain_chat(msg):
@@ -941,6 +970,50 @@ def search_internet(query, deadline=None):
         return None
 
 
+#: [PERF] Window in which one message's memory-context reads are reused.
+#: Long enough to cover the speculative build and the selected-route build of
+#: the SAME turn (which are milliseconds apart), short enough that a fact
+#: stored in between is picked up by the next turn.
+_MEMORY_CONTEXT_TTL = 5.0
+_memory_context_cache = {}
+_memory_context_lock = threading.Lock()
+
+
+def _memory_context_cached(user_message):
+    """``(memory_block, work_block)`` for *user_message*, memoised briefly.
+
+    Both reads are pure and keyed only on the message, so the speculative and
+    the committed build of one turn compute the same thing. Failures degrade
+    to empty strings exactly as the uncached version did.
+    """
+    if memory_store is None:
+        return "", ""
+    now = time.monotonic()
+    key = (user_message or "").strip()
+    with _memory_context_lock:
+        hit = _memory_context_cache.get(key)
+        if hit is not None and (now - hit[0]) < _MEMORY_CONTEXT_TTL:
+            return hit[1], hit[2]
+    # Read OUTSIDE the lock: these are SQLite queries and must not serialise
+    # two concurrent turns behind one another.
+    try:
+        mem_block = memory_store.memory_context(user_message)
+    except Exception:
+        mem_block = ""
+    # F07: a follow-up about EARLIER WORK gets the identified request's real
+    # outcome plus its artifact paths and sources — read from the persisted
+    # work-event store, so it survives a restart.
+    try:
+        work_block = memory_store.work_context(user_message)
+    except Exception:
+        work_block = ""
+    with _memory_context_lock:
+        if len(_memory_context_cache) > 64:
+            _memory_context_cache.clear()
+        _memory_context_cache[key] = (now, mem_block, work_block)
+    return mem_block, work_block
+
+
 def _build_chat_messages(user_message, voice_compact=False, speculative=False, history=None):
     """Shared message-construction for chat (used by both streaming and plain paths).
 
@@ -986,22 +1059,19 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
     # G9 (F06): bounded scoped-memory injection — a pure read (speculation
     # safe, F25), silent on an empty store, budget-capped, provenance from
     # the facts table only (never raw chat history).
-    if memory_store is not None:
-        try:
-            mem_block = memory_store.memory_context(user_message)
-        except Exception:
-            mem_block = ""
-        if mem_block:
-            system_prompt = system_prompt + "\n\n" + mem_block
-        # F07: a follow-up about EARLIER WORK gets the identified request's
-        # real outcome plus its artifact paths and sources — read from the
-        # persisted work-event store, so it survives a restart.
-        try:
-            work_block = memory_store.work_context(user_message)
-        except Exception:
-            work_block = ""
-        if work_block:
-            system_prompt = system_prompt + "\n\n" + work_block
+    #
+    # [PERF] These are two SQLite reads (FTS5 lookup + work-event lookup) and
+    # they are keyed only on the user message, but this function runs TWICE per
+    # turn: once inside the speculative racer and once in the selected route.
+    # The result is memoised per message for a short window so the second build
+    # reuses the first one's reads. A TTL (not a permanent cache) keeps it
+    # honest: a fact stored between two builds of the same message is picked
+    # up, and a later turn always re-reads.
+    mem_block, work_block = _memory_context_cached(user_message)
+    if mem_block:
+        system_prompt = system_prompt + "\n\n" + mem_block
+    if work_block:
+        system_prompt = system_prompt + "\n\n" + work_block
 
     search_info = None
 
@@ -3421,6 +3491,12 @@ def _process_message_inner(
         # so every net that follows (screen question, fresh-info search, tool
         # steps, research, task, web-shaped task) still runs and can still
         # upgrade the route. Nothing is skipped except the network call.
+        # [PERF] A spoken turn cannot afford the full classifier budget. A
+        # timeout here does not break the turn: classify_intent degrades to a
+        # `chat` verdict, and the deterministic nets below (screen question,
+        # fresh-info, task, web-shaped) still correct any misroute. The typed
+        # UI keeps the full window because a human is waiting on a screen and
+        # can absorb it.
         if _fastpath_chat_enabled() and is_definitely_plain_chat(msg):
             intent = {
                 "intent": "chat",
@@ -3429,9 +3505,16 @@ def _process_message_inner(
                 "query": msg,
                 "_source": "fastpath",
             }
+            # [PERF] The fast path's whole point: this mark is ~0ms here, where
+            # it used to be the classifier's full round trip.
+            _mark_latency(request_id, "classify", 0.0)
             print("[INTENT] Deterministic chat fast path (classifier skipped)")
         else:
-            intent = classify_intent(msg)
+            _classify_started = time.monotonic()
+            intent = classify_intent(msg, timeout_ms=INTENT_BUDGET_VOICE_MS
+                                     if from_voice else INTENT_BUDGET_MS)
+            # [PERF] Record the classifier's own cost against this turn.
+            _mark_latency_duration(request_id, "classify", _classify_started)
         # Screen-question safety net — deterministic: routes screen Q&A even
         # when the cloud classifier misfires (chat fallback on throttle, or a
         # research misread). tool/task verdicts are exempt: they carry

@@ -18,6 +18,7 @@ from backend.core.brain import (
     BROWSER_AGENT_START_PHRASE,
 )
 from backend.services import browser_agent
+from backend.services import latency as _latency
 from backend.services import local_auth
 from backend.services import model_registry
 from backend.services import request_registry as req_registry
@@ -203,6 +204,9 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
         def on_delta(text):
             if not text:
                 return
+            # [PERF] First streamed token: the first moment the user (or the
+            # voice speaker) can perceive anything at all.
+            _latency.mark(state.request_id, "first_token")
             state.delta(text)
             if speaker is not None:
                 try:
@@ -218,18 +222,25 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
             except Exception:
                 pass
 
-        reply = process_message(
-            state.message,
-            from_voice=from_voice,
-            # [PERF] A spoken turn uses the compact profile: the reply is
-            # short (under 35 words / 300 max tokens) which is what makes the
-            # first audio arrive sooner and the turn finish sooner.
-            voice_compact=from_voice,
-            stream_reply=on_delta,
-            progress=on_progress,
-            request_id=state.request_id,
-            job=request_job,
-        )
+        # [PERF] Telemetry for this turn. Recording is best-effort and can
+        # never fail a request: the helper swallows its own errors.
+        _latency.begin(state.request_id, origin="voice" if from_voice else "ui",
+                       label=(state.message or "")[:60])
+        try:
+            reply = process_message(
+                state.message,
+                from_voice=from_voice,
+                # [PERF] A spoken turn uses the compact profile: the reply is
+                # short (under 35 words / 300 max tokens) which is what makes
+                # the first audio arrive sooner and the turn finish sooner.
+                voice_compact=from_voice,
+                stream_reply=on_delta,
+                progress=on_progress,
+                request_id=state.request_id,
+                job=request_job,
+            )
+        finally:
+            _latency.finish(state.request_id)
         if reply is None:
             reply = "I didn't get a response. Please try again."
 
@@ -809,6 +820,49 @@ def approvals_reset():
     except Exception:
         pass
     return {"ok": True, "dropped": record.to_dict() if record else None}
+
+
+@router.get("/latency")
+def get_latency(limit: int = 50):
+    """[PERF] Per-turn latency telemetry — the numbers the latency work needs.
+
+    Returns the rolling summary (median / p90 / max per span) plus the recent
+    raw records. ``spans`` are cumulative-from-turn-start for
+    ``endpoint``/``stt``/``first_token``/``first_audio`` and the call's own
+    cost for ``classify``.
+
+    Authed like every other private read (F51): it exposes what users said.
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    try:
+        return {
+            "summary": _latency.summary(limit),
+            "recent": _latency.recent(limit),
+            "aec": {
+                "remote": _aec_remote_stats(),
+                "listener_aec_errors": _listener_aec_error_count(),
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _aec_remote_stats():
+    """AEC transport counters, including the [PERF] cache/idle-skip hits."""
+    try:
+        from backend.services import echo_cancel as _aec
+        transport = getattr(_aec.signal_path, "transport", None)
+        return dict(getattr(transport, "stats", {}) or {})
+    except Exception:
+        return {}
+
+
+def _listener_aec_error_count():
+    try:
+        from backend.services import listener as _l
+        return int(getattr(_l, "_aec_error_count", 0))
+    except Exception:
+        return 0
 
 
 @router.get("/health")
