@@ -305,9 +305,9 @@ def ask(query: Query):
             detail="request registry saturated; retry shortly",
         )
     if not req_registry.try_start(state):
-        deadline = time.time() + 60.0
-        while not state.done and time.time() < deadline:
-            time.sleep(0.25)
+        # [PERF] Event-driven wait on the request's own condition instead of a
+        # 0.25s poll, so a terminal frame is observed as soon as it lands.
+        state.wait_done(timeout=60.0)
         if state.reply is not None:
             return {"reply": state.reply, "request_id": state.request_id}
         if state.done:

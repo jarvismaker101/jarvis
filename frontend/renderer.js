@@ -512,7 +512,11 @@ function renderVoiceState(state = {}) {
 function pollDelayFor(state, failures) {
   if (failures > 0) return Math.min(3000, 500 * Math.pow(2, failures - 1));
   const status = state && state.status ? state.status : "listening";
-  if (status === "thinking" || status === "speaking" || status === "hearing") return 250;
+  // [PERF] The active poll is what makes the badge/ring feel responsive, and
+  // the endpoint is a fused local read (loopback, in-process) so a tighter
+  // cadence is cheap: 250ms -> 120ms while something is actually happening.
+  // Idle stays at 600ms — there is nothing to show.
+  if (status === "thinking" || status === "speaking" || status === "hearing") return 120;
   return 600;
 }
 

@@ -222,6 +222,24 @@ class RequestState:
         self.append({"type": ERROR, "error": str(message)[:500]})
 
     # ── consumer side ─────────────────────────────────────────────────────
+    def wait_done(self, timeout):
+        """Block until this request reaches a terminal frame (or *timeout*).
+
+        [PERF] The non-streaming ``POST /ask`` path used to poll ``done`` every
+        0.25s, so a reply that landed 10ms after the last check still waited
+        almost a quarter second. This is an event-driven wait on the SAME
+        condition the frames already notify, so a terminal frame is observed
+        the moment it is appended.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self.cond:
+            while not self.done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(timeout=min(remaining, HEARTBEAT_SECONDS))
+            return self.done
+
     def events_after(self, last_seq):
         """Snapshot of events with seq > last_seq (drop-aware)."""
         with self.cond:

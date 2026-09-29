@@ -39,7 +39,14 @@ from backend.services.transcript_stabilizer import (
 
 LISTEN_TIMEOUT_SECONDS = 10
 MAX_PHRASE_SECONDS = 15
-PAUSE_THRESHOLD_SECONDS = 1.2
+#: [PERF] Trailing silence that ends an utterance. This is a direct
+#: latency/accuracy knob: every turn pays it in full, but a value that is too
+#: low cuts the user off mid-sentence (thinking pauses, trailing clauses).
+#: The default is deliberately UNCHANGED at 1.2s; lowering it is now a runtime
+#: decision (JARVIS_PAUSE_THRESHOLD, e.g. 0.8 on a fast local loop) rather than
+#: a code edit. Raising it helps accuracy at a straight latency cost.
+PAUSE_THRESHOLD_SECONDS = float(
+    os.getenv("JARVIS_PAUSE_THRESHOLD", "1.2"))
 NON_SPEAKING_SECONDS = 0.5
 PHRASE_THRESHOLD_SECONDS = 0.12
 RECALIBRATE_AFTER_EMPTY_LISTENS = 8
