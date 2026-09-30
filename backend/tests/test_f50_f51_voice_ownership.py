@@ -86,11 +86,54 @@ class AuthenticatedCallerTests(unittest.TestCase):
         self.assertEqual(_header(self.seen[0], local_auth.HEADER), TOKEN)
 
     def test_post_backend_speak_stop_authenticates(self):
+        """[P1-03] The stop moved off the capture thread onto the _speak_stop
+        worker with a persistent http.client connection, so the F51 assertion
+        is now made at the DELIVERY (conn.request) instead of urlopen. The
+        contract is unchanged: the per-launch token rides every stop."""
         from backend.services import listener
 
-        with patch("urllib.request.urlopen", side_effect=self._capture()):
-            self.assertTrue(listener._post_backend_speak_stop())
-        self.assertEqual(_header(self.seen[0], local_auth.HEADER), TOKEN)
+        seen = []
+
+        class _FakeConn:
+            def request(self, method, path, body=None, headers=None):
+                seen.append((method, path, dict(headers or {})))
+
+            def getresponse(self):
+                class _Resp:
+                    status = 200
+
+                    def read(self):
+                        return b"{}"
+
+                return _Resp()
+
+            def close(self):
+                pass
+
+        worker = listener._SpeakStopWorker()
+        self.addCleanup(worker.shutdown)
+        with patch.object(worker, "_open_connection", lambda: _FakeConn()):
+            worker._deliver()
+        self.assertEqual(len(seen), 1)
+        method, path, headers = seen[0]
+        self.assertEqual((method, path), ("POST", "/speak/stop"))
+        values = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(values.get(local_auth.HEADER.lower()), TOKEN)
+
+    def test_post_backend_speak_stop_never_blocks_the_caller(self):
+        """[P1-03] The capture-loop contract: queueing a stop is not I/O.
+
+        A hung endpoint must not be able to stall barge-in onset, so the public
+        entry point raises only a flag - it must not open a socket.
+        """
+        from backend.services import listener
+
+        worker = listener._SpeakStopWorker()
+        self.addCleanup(worker.shutdown)
+        with patch.object(worker, "_open_connection",
+                          side_effect=AssertionError("opened a socket")):
+            self.assertTrue(worker.request_stop())
+        self.assertEqual(worker.stats["requests"], 1)
 
     def test_api_is_speaking_authenticates(self):
         from backend.services import listener

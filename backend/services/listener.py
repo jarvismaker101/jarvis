@@ -689,32 +689,206 @@ def _audio_duration_seconds(audio):
     return len(audio.frame_data) / bytes_per_second
 
 
-def _post_backend_speak_stop():
-    """Best-effort stop of the API-process TTS (separate OS process).
+#: [P1-03] Timeout of ONE stop request. Also the persistent connection's
+#: socket timeout - it bounds a hung backend without another mechanism.
+_STOP_TIMEOUT_SECONDS = 0.4
 
-    The voice process hears the user; chat replies / task narration are
-    voiced by the API backend, so a local-only stop would leave them
-    playing. Localhost POST, short timeout, never raises.
+
+class _SpeakStopWorker:
+    """[P1-03] Daemon worker that owns POST /speak/stop for the voice process.
+
+    Why this exists: ``barge_in_on_speech_onset`` used to make two BLOCKING
+    HTTP calls from inside the real-time capture loop - a ``GET /voice-state``
+    probe (0.3s) and the stop POST (0.4s). A hung backend froze the capture
+    loop for up to 0.7s AT SPEECH ONSET, i.e. exactly when responsiveness
+    matters most.
+
+    Shape: one daemon thread, one persistent ``http.client.HTTPConnection``
+    (the handshake is not repeated on every barge-in), and ONE coalescing flag
+    rather than a queue. The flag is cleared BEFORE the send, so:
+
+    * repeated barge-ins while a send is pending collapse into one delivery
+      (``/speak/stop`` is idempotent - duplicates buy nothing), and
+    * a barge-in that arrives WHILE a send is in flight re-arms the loop, so
+      the newest stop is delivered again afterwards and is never swallowed.
+
+    Never raises: every failure is swallowed into a first-only log line plus a
+    counter in :attr:`stats`. A 401/403 is reported LOUDLY once - an F51-class
+    auth bug used to be indistinguishable from "the backend is silent".
+    """
+
+    def __init__(self):
+        self._stop_needed = threading.Event()
+        self._shutdown = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._conn = None
+        self._auth_warned = False
+        self._error_warned = False
+        self.stats = {
+            "requests": 0,
+            "delivered": 0,
+            "failed": 0,
+            "auth_failures": 0,
+            "last_ms": 0.0,
+            "last_status": None,
+            "last_ok": False,
+            "last_error": None,
+        }
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def request_stop(self):
+        """Flag that a stop is needed. NON-BLOCKING; True once queued.
+
+        The capture loop ends here - no socket, no handshake, no wait.
+        """
+        try:
+            with self._lock:
+                self.stats["requests"] += 1
+                if self._thread is None or not self._thread.is_alive():
+                    self._thread = threading.Thread(
+                        target=self._run, name="speak-stop", daemon=True)
+                    self._thread.start()
+            self._stop_needed.set()
+            return True
+        except Exception:
+            return False
+
+    def shutdown(self, timeout=1.0):
+        """Stop the worker and close its connection (listener exit)."""
+        try:
+            self._shutdown.set()
+            self._stop_needed.set()   # wake the loop so it can see the shutdown
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+        except Exception:
+            pass
+        self._close_connection()
+
+    # -- worker side -------------------------------------------------------
+
+    def _run(self):
+        while True:
+            self._stop_needed.wait()
+            if self._shutdown.is_set():
+                break
+            # Clear BEFORE sending: a barge-in arriving during the send sets
+            # the flag again and the loop delivers the newest stop after it.
+            self._stop_needed.clear()
+            self._deliver()
+        self._close_connection()
+
+    def _open_connection(self):
+        """Create the persistent connection (seam for tests)."""
+        from backend.config import BACKEND_PORT as _PORT
+        from http.client import HTTPConnection
+
+        return HTTPConnection("127.0.0.1", int(_PORT), timeout=_STOP_TIMEOUT_SECONDS)
+
+    def _close_connection(self):
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _deliver(self):
+        """Send ONE stop request. Never raises; records timing and result."""
+        from backend.services import local_auth
+
+        started = time.monotonic()
+        ok, status = False, None
+        try:
+            conn = self._conn
+            if conn is None:
+                conn = self._conn = self._open_connection()
+            # F51: the per-launch token goes on EVERY delivery via the shared
+            # header builder - a 401 here is the invisible-barge-in bug class.
+            conn.request("POST", "/speak/stop", body=b"{}",
+                         headers=local_auth.auth_headers())
+            resp = conn.getresponse()
+            status = int(resp.status)
+            # Drain the body: a connection with an unread response cannot be
+            # reused, which would defeat the persistent connection.
+            resp.read()
+            ok = 200 <= status < 300
+            if status in (401, 403):
+                self._warn_auth(status)
+        except Exception as exc:
+            # Drop the connection so the NEXT attempt dials fresh instead of
+            # reusing a socket the server has already closed.
+            self._close_connection()
+            self._warn_error(exc)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        with self._lock:
+            self.stats["last_ms"] = round(elapsed_ms, 1)
+            self.stats["last_status"] = status
+            self.stats["last_ok"] = ok
+            self.stats["delivered" if ok else "failed"] += 1
+        self._mark_delivery(ok, elapsed_ms, status)
+
+    def _warn_auth(self, status):
+        with self._lock:
+            self.stats["auth_failures"] += 1
+            first = not self._auth_warned
+            self._auth_warned = True
+        if first:
+            # Loud ONCE (rate-limited): a 401 must never look like silence.
+            print(
+                f"[LISTENER] speak/stop rejected with HTTP {status} - the voice "
+                f"process token is not accepted, so barge-in cannot stop remote "
+                f"TTS (further rejections counted, not printed)"
+            )
+
+    def _warn_error(self, exc):
+        with self._lock:
+            self.stats["last_error"] = str(exc)[:200]
+            first = not self._error_warned
+            self._error_warned = True
+        if first:
+            print(f"[LISTENER] speak/stop failed (further ones counted only): {exc}")
+
+    def _mark_delivery(self, ok, elapsed_ms, status):
+        """[P1-19] barge-in latency: how long the stop took and its result."""
+        try:
+            _latency.mark_active("barge_in_stop", {
+                "ok": bool(ok),
+                "ms": round(elapsed_ms, 1),
+                "status": status,
+            })
+        except Exception:
+            pass
+
+
+#: [P1-03] The one stop worker for this process (started lazily on first use).
+_speak_stop = _SpeakStopWorker()
+atexit.register(_speak_stop.shutdown)
+
+
+def speak_stop_stats():
+    """[P1-03] Snapshot of the async stop's outcomes (observability)."""
+    with _speak_stop._lock:
+        return dict(_speak_stop.stats)
+
+
+def _post_backend_speak_stop():
+    """QUEUE a stop of the API-process TTS (separate OS process).
+
+    [P1-03] NON-BLOCKING: this only raises the worker's flag, so the capture
+    loop can never stall on it. The actual POST /speak/stop runs on the
+    ``_speak_stop`` daemon thread over a persistent connection. Returns True
+    once the stop is queued.
 
     F51: ``/speak/stop`` is a private control endpoint and auth fails
-    CLOSED, so this request carries the per-launch token — without it the
-    barge-in stop silently 401s and Jarvis keeps talking over the user.
+    CLOSED, so the DELIVERY carries the per-launch token via
+    ``local_auth.auth_headers`` — without it the barge-in stop silently 401s
+    and Jarvis keeps talking over the user.
     """
-    try:
-        from backend.config import BACKEND_PORT as _PORT
-        from backend.services import local_auth
-        from urllib.request import Request, urlopen
-        req = Request(
-            f"http://127.0.0.1:{_PORT}/speak/stop",
-            data=b"{}",
-            method="POST",
-            headers=local_auth.auth_headers(),
-        )
-        with urlopen(req, timeout=0.4):
-            pass
-        return True
-    except Exception:
-        return False
+    return _speak_stop.request_stop()
 
 
 def _api_is_speaking():
@@ -750,26 +924,25 @@ def barge_in_on_speech_onset():
     """Instant barge-in: user started speaking while Jarvis TTS is playing.
 
     Stops local TTS synchronously (generation bump + fish PCM flush via
-    stop_speaking) and stops the API-process TTS too.  When the API is
-    speaking but the voice process is silent (cross-process gap), only
-    the API POST is issued.  VAD-gated callers decide *when* — this only
-    decides *how*.  Never raises.  Returns True if a stop was issued.
+    stop_speaking) and queues a stop of the API-process TTS.  VAD-gated
+    callers decide *when* — this only decides *how*.  Never raises.
+
+    [P1-03] The remote notification is now ASYNC (the ``_speak_stop`` daemon
+    worker), and the old ``GET /voice-state`` probe is GONE: ``/speak/stop`` is
+    idempotent, so asking "is the API speaking?" first bought nothing and cost
+    a blocking round trip (0.3s) plus the stop POST (0.4s) on the real-time
+    capture thread AT SPEECH ONSET. A stop is now queued on every onset.
+
+    Returns True when a stop was issued (local) or queued (remote) — which is
+    every onset, since the idempotent remote stop is queued unconditionally.
     """
     try:
         if listener_state.is_speaking():
             from backend.services.voice import stop_speaking as _stop
             _stop()
-            _post_backend_speak_stop()
-            return True
     except Exception:
-        return False
-    # Cross-process gap: the voice process is silent but the API may be
-    # voicing a chat reply or websearch narration.  Only the API POST
-    # (no local stop — nothing local is playing).
-    if _api_is_speaking():
-        _post_backend_speak_stop()
-        return True
-    return False
+        pass  # a local failure must never keep the remote stop from being queued
+    return _post_backend_speak_stop()
 
 
 def _should_confirm_speech_start(chunks):

@@ -365,15 +365,20 @@ class BargeInStopTests(unittest.TestCase):
         mock_stop.assert_called_once_with()
         mock_post.assert_called_once_with()
 
-    def test_speech_onset_noop_when_silent(self):
+    def test_speech_onset_still_queues_the_stop_when_local_silent(self):
+        """[P1-03] Was "noop when silent". The old gate needed a blocking
+        GET /voice-state probe on the capture thread, which the audit removes:
+        /speak/stop is idempotent and now rides a background worker, so every
+        onset queues one. LOCAL audio is still untouched when nothing plays
+        locally - that half of the old assertion is preserved."""
         from backend.services import listener as listener_mod
         with patch.object(listener_mod.listener_state, "is_speaking", return_value=False), \
              patch("backend.services.voice.stop_speaking") as mock_stop, \
              patch.object(listener_mod, "_post_backend_speak_stop") as mock_post:
             result = listener_mod.barge_in_on_speech_onset()
-        self.assertFalse(result)
+        self.assertTrue(result)
         mock_stop.assert_not_called()
-        mock_post.assert_not_called()
+        mock_post.assert_called_once_with()
 
     def test_stop_invalidates_generation_and_clears_fish_buffer(self):
         from backend.services import voice as voice_mod

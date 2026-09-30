@@ -139,8 +139,10 @@ class SpeechOnsetBargeInTests(unittest.TestCase):
         mock_stop.assert_called_once_with()
         mock_post.assert_called_once_with()
 
-    def test_speech_onset_checks_api_when_local_silent(self):
-        """Cross-process gap: voice process silent, API speaking -> POST only."""
+    def test_speech_onset_still_stops_remote_when_local_silent(self):
+        """[P1-03] Cross-process gap: the remote stop is queued WITHOUT the old
+        blocking GET /voice-state probe. /speak/stop is idempotent, so the probe
+        bought nothing and cost a blocking round trip on the capture thread."""
         with patch.object(listener.listener_state, "is_speaking",
                           return_value=False), \
              patch.object(listener, "_api_is_speaking",
@@ -149,20 +151,29 @@ class SpeechOnsetBargeInTests(unittest.TestCase):
                           return_value=True) as mock_post:
             result = listener.barge_in_on_speech_onset()
         self.assertTrue(result)
-        mock_api.assert_called_once_with()
+        mock_api.assert_not_called()     # probe removed [P1-03]
         mock_post.assert_called_once_with()
 
-    def test_speech_onset_noop_when_silent_everywhere(self):
-        """Existing behaviour preserved: no speech anywhere -> no-op."""
+    def test_speech_onset_queues_the_idempotent_stop_even_when_silent(self):
+        """[P1-03] The old "silent everywhere -> no-op" gate is GONE on purpose.
+
+        The probe that decided "nothing is playing" was itself a blocking GET,
+        and it could MISS a stop that was already queued server-side. The stop
+        is idempotent and now rides a background worker, so every onset queues
+        one. Local audio is still untouched when the voice process is silent.
+        """
         with patch.object(listener.listener_state, "is_speaking",
                           return_value=False), \
+             patch("backend.services.voice.stop_speaking") as mock_stop, \
              patch.object(listener, "_api_is_speaking",
                           return_value=False) as mock_api, \
-             patch.object(listener, "_post_backend_speak_stop") as mock_post:
+             patch.object(listener, "_post_backend_speak_stop",
+                          return_value=True) as mock_post:
             result = listener.barge_in_on_speech_onset()
-        self.assertFalse(result)
-        mock_api.assert_called_once_with()
-        mock_post.assert_not_called()
+        self.assertTrue(result)
+        mock_stop.assert_not_called()      # nothing local to stop
+        mock_api.assert_not_called()       # probe removed [P1-03]
+        mock_post.assert_called_once_with()
 
 
 class StopResearchPhraseTests(unittest.TestCase):
