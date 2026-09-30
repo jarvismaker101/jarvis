@@ -34,6 +34,10 @@ from backend.services.voice import speak, stop_speaking
 
 router = APIRouter()
 
+#: [P1-11] The kind a chat turn's own job carries (see _run_request_worker).
+#: A bare /task/stop excludes it: stopping the conversation is request-scoped.
+REQUEST_JOB_KIND = "request"
+
 last_voice_message = ""
 last_voice_response = ""
 last_voice_log_id = 0
@@ -265,7 +269,7 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
             from backend.services import jobs as job_registry
 
             request_job = job_registry.new_job(
-                kind="request",
+                kind=REQUEST_JOB_KIND,
                 label=(state.message or "")[:80],
             )
             state.attach_job(request_job)
@@ -560,8 +564,10 @@ def cancel_request(request_id: str, reason: str = "cancelled by voice barge-in")
     The voice I/O worker calls this the moment the user barges in: without it,
     an interruption only stopped the *audio*, while the backend kept generating
     the old reply and the next utterance waited behind it. This cancels that one
-    request (never every request — ``/task/stop`` with no target does that under
-    F20) so the new turn can be submitted immediately.
+    request. [P1-11] It is also the ONLY way to stop a chat turn: a bare
+    ``/task/stop`` deliberately leaves ``request`` jobs alone, so request-scoped
+    cancellation is this route (and ``state.attach_job``'s job id for the worker
+    it owns), never the task-shaped stop.
 
     Contract:
 
@@ -908,25 +914,49 @@ def stop_task(job_id: str = "", kind: str = ""):
     """Stop ONE identified job at its next checkpoint (F20).
 
     *job_id* addresses a specific job; without one the NEWEST still-running job
-    is stopped — never every registered request, which is how "stop A" used to
-    take unrelated work down with it. An idle stop cancels nothing: it leaves
-    no flag behind for the next job to trip over.
+    of the requested kind is stopped. [P1-11] A BARE stop (no id, no kind)
+    deliberately EXCLUDES ``request`` jobs: with the P0-08 turn manager there is
+    genuinely more than one thing running, and the newest job of any kind is
+    frequently the chat request the user is reading — "stop the browser task"
+    must never kill the answer to their question. Stopping a chat turn is
+    request-scoped (``POST /ask/cancel/{request_id}``), which is what the turn
+    manager already uses.
+
+    [P1-11] The stop also interrupts ONLY the streams the cancelled job owned.
+    It used to call ``interrupt_active``, so cancelling one job published an
+    INTERRUPTED terminal frame to every live request; a concurrent unrelated
+    turn died with it. A worker whose own job was cancelled still terminates its
+    stream itself (``_run_request_worker`` checks ``job.cancelled``), so nothing
+    is left hanging on the wire.
 
     Idempotent and engine-safe: the owning token is cancelled, its registered
     stop handler arms the engine's legacy flag, the loop exits gracefully, the
     brain's finally resets the task-running flag, and the UI stop button hides
-    on the next /ui-state poll. Any client still attached to a stream gets an
-    INTERRUPTED terminal frame (F26). Also cuts TTS and mutes narration so the
-    user gets silence immediately.
+    on the next /ui-state poll. A stop with nothing to stop reports "stopped
+    nothing" instead of touching unrelated work. Also cuts TTS and mutes
+    narration so the user gets silence immediately.
     """
     from backend.services import jobs as job_registry
 
     cancelled = []
     try:
-        cancelled = job_registry.request_stop(
-            job_id or None, kinds=(kind,) if kind else None)
+        if kind:
+            # An explicit kind is authoritative — including kind="request".
+            cancelled = job_registry.request_stop(
+                job_id or None, kinds=(kind,))
+        elif job_id:
+            cancelled = job_registry.request_stop(job_id)
+        else:
+            cancelled = job_registry.request_stop(
+                None, exclude_kinds=(REQUEST_JOB_KIND,))
     except Exception as exc:  # never let a stop request 500
         logging.warning("[STOP] job cancellation failed: %s", exc)
+    # [P1-11] Interrupt exactly the requests the cancelled job produced.
+    interrupted = []
+    try:
+        interrupted = req_registry.interrupt_job(cancelled, "stopped by user")
+    except Exception as exc:
+        logging.warning("[STOP] request interruption failed: %s", exc)
     # F50: the checkpoint where work halted is part of the shared history, so a
     # replaced/restarted worker can see WHICH job stopped and why.
     if cancelled:
@@ -948,15 +978,17 @@ def stop_task(job_id: str = "", kind: str = ""):
         except Exception:
             pass
     try:
-        req_registry.interrupt_active("stopped by user")
-    except Exception:
-        pass
-    try:
         stop_speaking()
         set_narration_enabled(False)
     except Exception:
         pass
-    return {"ok": True, "cancelled": cancelled}
+    # "Stopped nothing" is a valid and useful answer, so say which it was.
+    return {
+        "ok": True,
+        "cancelled": cancelled,
+        "stopped": cancelled[0] if cancelled else "",
+        "interrupted": interrupted,
+    }
 
 
 @router.post("/approvals/reset")

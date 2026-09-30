@@ -1285,7 +1285,29 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.BROWSER_AGENT_TIMEOUT, 480)
 
 
-class StopControlTests(unittest.TestCase):
+class _CleanStopStateTestCase(unittest.TestCase):
+    """[P1-11] Stop assertions are about GLOBAL state, so establish it.
+
+    ``browser_agent.stop_requested()`` is the shared flag OR any live browser
+    job wanting to stop, and the job registry is process-wide. Another module's
+    background handoff (e.g. test_brain_gate's failed-local-execution path) can
+    still own a live browser job when this file runs, which silently breaks
+    every "nothing is stopping" assertion here — and, worse, makes the first
+    /task/stop CANCEL that unrelated job. Retire those jobs first.
+    """
+
+    def setUp(self):
+        from backend.services import jobs as job_registry
+
+        for job in job_registry.live_jobs(kind="browser"):
+            try:
+                job.finish()
+            except Exception:
+                pass
+        browser_agent._STOP_REQUESTED.clear()
+
+
+class StopControlTests(_CleanStopStateTestCase):
     """User stop: request_stop flips the cancel event; the loop bails out
     gracefully at the next step boundary; runs clear a stale stop."""
 
@@ -1372,7 +1394,7 @@ class StopControlTests(unittest.TestCase):
         self.assertFalse(browser_agent.stop_requested())
 
 
-class TaskStopRouteTests(unittest.TestCase):
+class TaskStopRouteTests(_CleanStopStateTestCase):
     """/task/stop endpoint + task_running exposure in /ui-state."""
 
     def tearDown(self):

@@ -404,8 +404,8 @@ class _Registry:
     def interrupt_active(self, reason="stopped by user"):
         """Append the INTERRUPTED terminal frame to every unfinished request.
 
-        Called from /task/stop so a client still attached to a cancelled job
-        gets a terminal frame instead of hanging on the wire.
+        Called when the whole backend's work is being replaced (a supervisor
+        restart), where "every live request" IS the intended set.
         """
         interrupted = 0
         with self._lock:
@@ -413,6 +413,36 @@ class _Registry:
         for state in states:
             state.interrupt(reason)
             interrupted += 1
+        return interrupted
+
+    def interrupt_job(self, job_ids, reason="stopped by user"):
+        """[P1-11] Interrupt ONLY the requests whose worker job was cancelled.
+
+        ``/task/stop`` used to call :meth:`interrupt_active`, so stopping ONE
+        task also published an INTERRUPTED frame to every unrelated live
+        request — the user asked to stop the browser job and their chat reply
+        died with it. The precise mapping was already in the registry (the
+        request holds the job that produces it), so the stop now hits exactly
+        the streams the cancelled job owned.
+
+        Returns the interrupted request ids. Never raises; an unknown or
+        already-finished job simply matches nothing.
+        """
+        wanted = {str(j) for j in (job_ids or ()) if j}
+        if not wanted:
+            return []
+        interrupted = []
+        with self._lock:
+            states = [st for st in self._requests.values() if not st.done]
+        for state in states:
+            try:
+                job = getattr(state, "job", None)
+                job_id = getattr(job, "job_id", None)
+                if job_id and str(job_id) in wanted:
+                    state.interrupt(reason)
+                    interrupted.append(state.request_id)
+            except Exception:
+                continue
         return interrupted
 
 
@@ -426,3 +456,4 @@ try_start = REGISTRY.try_start
 get = REGISTRY.get
 state_snapshot = REGISTRY.state_snapshot
 interrupt_active = REGISTRY.interrupt_active
+interrupt_job = REGISTRY.interrupt_job

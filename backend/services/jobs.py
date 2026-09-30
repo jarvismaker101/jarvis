@@ -329,17 +329,26 @@ def current_job():
     return job
 
 
-def live_jobs(kind=None):
-    """Live jobs, optionally limited to one *kind* or a collection of kinds."""
+def live_jobs(kind=None, exclude_kinds=None):
+    """Live jobs, optionally limited to one *kind* or a collection of kinds.
+
+    [P1-11] *exclude_kinds* is how an UNADDRESSED stop keeps its hands off chat
+    requests (see :func:`request_stop`): "stop" means the thing doing work for
+    me, never the conversation I am having.
+    """
     with _lock:
         jobs = list(_jobs.values())
     if kind:
         wanted = (kind,) if isinstance(kind, str) else tuple(kind)
         jobs = [j for j in jobs if j.kind in wanted]
+    if exclude_kinds:
+        unwanted = ((exclude_kinds,) if isinstance(exclude_kinds, str)
+                    else tuple(exclude_kinds))
+        jobs = [j for j in jobs if j.kind not in unwanted]
     return jobs
 
 
-def newest_job(kind=None):
+def newest_job(kind=None, exclude_kinds=None):
     """The most recently created live job (optionally of one *kind*).
 
     Ordered by the creation sequence, not by wall-clock time or by job id:
@@ -347,7 +356,7 @@ def newest_job(kind=None):
     is lexicographic ("job-9" > "job-10"), so the unaddressed stop could
     cancel the OLDER job.
     """
-    jobs = live_jobs(kind)
+    jobs = live_jobs(kind, exclude_kinds)
     if not jobs:
         return None
     return max(jobs, key=lambda j: j.seq)
@@ -390,17 +399,24 @@ def cancel_job(job_id=None, reason="cancelled by user"):
         return cancelled
 
 
-def request_stop(job_id=None, reason="cancelled by user", kinds=None):
+def request_stop(job_id=None, reason="cancelled by user", kinds=None,
+                 exclude_kinds=None):
     """Stop by id (or the newest matching job), optionally limited to *kinds*.
 
     F20: without an id this hits exactly ONE job — the newest still-running one
     whose kind matches. It used to iterate every matching job, so a single
     "stop" interrupted unrelated work.
+
+    [P1-11] An UNADDRESSED stop must not pick a ``request`` job: a bare
+    ``/task/stop`` means "stop the task doing work for me", and with more than
+    one thing running (P0-08) the newest job of ANY kind is frequently the chat
+    request the user is reading. Callers that really mean "stop this chat" name
+    the job id or pass ``kinds=("request",)`` explicitly.
     """
     with _lock:
         if job_id:
             return cancel_job(job_id, reason)
-        target = newest_job(kinds)
+        target = newest_job(kinds, exclude_kinds)
     if target is None:
         return []
     return cancel_job(target.job_id, reason)
