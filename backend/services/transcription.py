@@ -20,6 +20,18 @@ INWORLD_STT_URL = os.getenv(
     "https://api.inworld.ai/stt/v1/transcribe",
 )
 INWORLD_STT_MODEL = os.getenv("INWORLD_STT_MODEL", "inworld/inworld-stt-1")
+#: [P0-03] Inworld's budget, split into (connect, read) so a wedged TCP connect
+#: cannot consume the whole read allowance. With one STT engine per turn these
+#: two numbers ARE the worst case of a turn, so they are explicit and tunable
+#: instead of an anonymous ``timeout=(5, 15)``.
+INWORLD_STT_CONNECT_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_INWORLD_STT_CONNECT_TIMEOUT", "3"))
+INWORLD_STT_READ_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_INWORLD_STT_READ_TIMEOUT", "10"))
+INWORLD_STT_TIMEOUT = (
+    INWORLD_STT_CONNECT_TIMEOUT_SECONDS,
+    INWORLD_STT_READ_TIMEOUT_SECONDS,
+)
 LOCAL_WHISPER_PORT = int(os.getenv("JARVIS_WHISPER_PORT", "8767"))
 LOCAL_WHISPER_URL = f"http://127.0.0.1:{LOCAL_WHISPER_PORT}"
 
@@ -215,7 +227,7 @@ def recognize_inworld(audio_data, language=None, prompts=None):
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=(5, 15),
+            timeout=INWORLD_STT_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise sr.RequestError(f"Inworld STT request failed: {exc}") from exc

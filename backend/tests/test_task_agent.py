@@ -191,22 +191,30 @@ class ListenerRawTranscriptionTests(unittest.TestCase):
 
         from backend.services import listener as listener_mod
 
+        # [P0-03] One engine per turn: this used to reach the Google/Groq
+        # language loop only after BOTH other engines had failed, which is the
+        # ladder the audit removed. The raw/normalized F12 contract is unchanged
+        # and is now exercised through the SELECTED engine.
         with patch.object(
-            listener_mod, "recognize_inworld",
-            side_effect=sr.RequestError("offline in tests"),
+            listener_mod.model_registry, "get_model_for_role",
+            return_value={"provider": "whisper"},
         ), patch.object(
             listener_mod, "recognize_local_whisper",
-            side_effect=sr.RequestError("offline in tests"),
+            return_value=("Create File Hello.txt", "en"),
         ), patch.object(
+            listener_mod, "recognize_inworld",
+            side_effect=sr.RequestError("offline in tests"),
+        ) as inworld, patch.object(
             listener_mod, "recognize_google_or_groq",
-            return_value="Create File Hello.txt",
-        ):
+        ) as google:
             raw, normalized, language = listener_mod.recognize_multilingual(
                 object()
             )
         self.assertEqual(raw, "Create File Hello.txt")
         self.assertEqual(normalized, "create file hello.txt")
-        self.assertEqual(language, listener_mod.RECOGNITION_LANGUAGES[0])
+        self.assertEqual(language, "en")
+        inworld.assert_not_called()
+        google.assert_not_called()
 
     def test_recognize_multilingual_no_transcript(self):
         import speech_recognition as sr

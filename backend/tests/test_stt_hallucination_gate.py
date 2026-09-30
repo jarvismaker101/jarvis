@@ -235,18 +235,27 @@ class ListenerCommitGateTests(unittest.TestCase):
                           return_value=("open chrome", "open chrome", "en")):
             self.assertEqual(listener.listen(), "open chrome")
 
-    def test_whisper_hallucination_falls_through_to_the_next_engine(self):
+    def test_a_whisper_hallucination_is_dropped_with_no_second_engine(self):
+        """[P0-03] The gate rejects the transcript; the ladder is gone.
+
+        This used to assert that the hallucinated whisper output "falls through
+        to the next engine" (Inworld). With ONE engine per turn there is no next
+        engine: a hallucination is a failed turn, never a prompt for another
+        network call.
+        """
         with patch.object(listener.model_registry, "get_model_for_role",
                           return_value={"provider": "whisper"}), \
              patch.object(listener, "recognize_local_whisper",
                           return_value=(LIVE_PROMPT_ECHO, "en")) as whisper, \
              patch.object(listener, "recognize_inworld",
-                          return_value="open chrome"), \
+                          return_value="open chrome") as inworld, \
              patch.object(listener, "recognize_google_or_groq") as google:
             raw, normalized, language = listener.recognize_multilingual(object())
-        self.assertEqual((raw, normalized), ("open chrome", "open chrome"))
+        self.assertEqual((raw, normalized, language), (None, None, None))
         whisper.assert_called_once()
+        inworld.assert_not_called()
         google.assert_not_called()
+        self.assertEqual(listener.LAST_STT_FAILURE, ("local-whisper", "hallucination"))
 
 
 class WatcherWakeGateTests(unittest.TestCase):

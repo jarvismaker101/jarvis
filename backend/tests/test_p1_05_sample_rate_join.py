@@ -174,7 +174,9 @@ class SttInputInvariantTests(unittest.TestCase):
         audio = listener._combine_audio_chunks([_chunk(1.0, AEC), _chunk(1.0, 48000)])
         self.assertTrue(listener.assert_single_rate_audio(audio))
 
-        with patch.object(listener, "recognize_inworld", _fake_inworld), \
+        with patch.object(listener.model_registry, "get_model_for_role",
+                          return_value={"provider": "inworld"}), \
+             patch.object(listener, "recognize_inworld", _fake_inworld), \
              patch.object(listener, "recognize_local_whisper",
                           side_effect=sr.UnknownValueError), \
              patch.object(listener, "_cloud_stt_policy", return_value="on"):

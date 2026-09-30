@@ -53,7 +53,12 @@ class InworldRequestShapeTests(unittest.TestCase):
             kwargs["headers"]["Authorization"], "Basic test-inworld-key"
         )
         self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
-        self.assertEqual(kwargs["timeout"], (5, 15))
+        self.assertEqual(kwargs["timeout"], transcription.INWORLD_STT_TIMEOUT)
+        # [P0-03] With one engine per turn this IS the turn's worst case, so it
+        # is tightened from the old anonymous (5, 15).
+        connect, read = transcription.INWORLD_STT_TIMEOUT
+        self.assertLessEqual(connect, 5)
+        self.assertLessEqual(read, 15)
 
         body = kwargs["json"]
         config = body["transcribeConfig"]
@@ -219,11 +224,14 @@ class LocalWhisperTests(unittest.TestCase):
 
 
 class ListenerSttChainTests(unittest.TestCase):
-    """recognize_multilingual: Inworld primary (English-hinted, roman-script
-    only), local whisper fallback, Google->Groq loop unchanged as the final
-    net. The listening-role switch (whisper <-> inworld) is resolved per
-    call from the registry; these tests isolate the settings file so the
-    default (inworld-first) is deterministic."""
+    """recognize_multilingual: [P0-03] exactly ONE engine per turn.
+
+    The engine is resolved per call from the listening role in settings. This
+    used to describe a CHAIN (Inworld primary, local whisper fallback and a
+    per-language Google->Groq loop as the final net) whose serial worst case was
+    117s; the ladder is gone, so these tests now pin that a failure of the
+    selected engine ENDS the turn — the other engines are never contacted.
+    """
 
     def setUp(self):
         from backend.services import listener as listener_mod
@@ -243,7 +251,12 @@ class ListenerSttChainTests(unittest.TestCase):
     def _select_listening(self, provider, model):
         self.model_registry.set_model_for_role("listening", provider, model)
 
-    def test_inworld_success_short_circuits_other_engines(self):
+    def _assert_one_engine(self, inworld, whisper, google):
+        calls = (inworld.call_count, whisper.call_count, google.call_count)
+        self.assertEqual(sum(1 for count in calls if count), 1,
+                         f"more than one engine ran for one turn: {calls}")
+
+    def test_inworld_success_is_the_only_engine_contacted(self):
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", return_value="Jarvis Utho",
@@ -285,7 +298,8 @@ class ListenerSttChainTests(unittest.TestCase):
         whisper.assert_not_called()
         google.assert_not_called()
 
-    def test_inworld_devanagari_transcript_falls_to_local_whisper(self):
+    def test_inworld_devanagari_ends_the_turn_with_no_second_engine(self):
+        """[P0-03] The English hint was ignored: a failed turn, not a retry."""
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld",
@@ -294,36 +308,18 @@ class ListenerSttChainTests(unittest.TestCase):
             listener_mod, "recognize_local_whisper",
             return_value=("main toh hi", "hi"),
         ) as whisper, patch.object(
-            listener_mod, "recognize_google_or_groq",
-        ) as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
-
-        self.assertEqual(
-            (raw, normalized, language), ("main toh hi", "main toh hi", "hi")
-        )
-        inworld.assert_called_once_with(self.audio, language="en")
-        whisper.assert_called_once()
-        google.assert_not_called()
-
-    def test_inworld_devanagari_reaches_google_only_if_whisper_fails(self):
-        listener_mod = self.listener_mod
-        with patch.object(
-            listener_mod, "recognize_inworld",
-            return_value="\u092e\u0948\u0902 \u0924\u094b hi",
-        ), patch.object(
-            listener_mod, "recognize_local_whisper",
-            side_effect=sr.RequestError("no daemon"),
-        ) as whisper, patch.object(
             listener_mod, "recognize_google_or_groq", return_value="main toh hi",
         ) as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        whisper.assert_called_once()
-        google.assert_called()
-        self.assertEqual(raw, "main toh hi")
-        self.assertEqual(language, listener_mod.RECOGNITION_LANGUAGES[0])
+        self.assertEqual(result, (None, None, None))
+        inworld.assert_called_once_with(self.audio, language="en")
+        whisper.assert_not_called()
+        google.assert_not_called()
+        self.assertEqual(listener_mod.LAST_STT_FAILURE,
+                         ("inworld", "non-english-script"))
 
-    def test_inworld_no_speech_falls_to_local_whisper(self):
+    def test_inworld_no_speech_ends_the_turn(self):
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", side_effect=sr.UnknownValueError(),
@@ -333,78 +329,84 @@ class ListenerSttChainTests(unittest.TestCase):
         ) as whisper, patch.object(
             listener_mod, "recognize_google_or_groq",
         ) as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        self.assertEqual((raw, normalized, language), ("namaste", "namaste", "hi"))
+        self.assertEqual(result, (None, None, None))
         inworld.assert_called_once_with(self.audio, language="en")
-        whisper.assert_called_once()
+        whisper.assert_not_called()
         google.assert_not_called()
+        self.assertEqual(listener_mod.LAST_STT_FAILURE, ("inworld", "no-speech"))
 
-    def test_inworld_request_error_falls_to_local_whisper(self):
+    def test_inworld_request_error_ends_the_turn(self):
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", side_effect=sr.RequestError("down"),
         ) as inworld, patch.object(
             listener_mod, "recognize_local_whisper",
             return_value=("hello there", "en"),
-        ), patch.object(listener_mod, "recognize_google_or_groq") as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+        ) as whisper, patch.object(listener_mod, "recognize_google_or_groq") as google:
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        self.assertEqual(
-            (raw, normalized, language), ("hello there", "hello there", "en")
-        )
+        self.assertEqual(result, (None, None, None))
         inworld.assert_called_once_with(self.audio, language="en")
+        whisper.assert_not_called()
         google.assert_not_called()
+        self.assertEqual(listener_mod.LAST_STT_FAILURE, ("inworld", "down"))
 
-    def test_inworld_whitespace_falls_through(self):
+    def test_inworld_whitespace_ends_the_turn(self):
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", return_value="   ",
         ) as inworld, patch.object(
             listener_mod, "recognize_local_whisper",
             return_value=("fallback", None),
-        ), patch.object(listener_mod, "recognize_google_or_groq") as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+        ) as whisper, patch.object(listener_mod, "recognize_google_or_groq") as google:
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        self.assertEqual((raw, normalized, language), ("fallback", "fallback", None))
+        self.assertEqual(result, (None, None, None))
         inworld.assert_called_once_with(self.audio, language="en")
+        whisper.assert_not_called()
         google.assert_not_called()
+        self.assertEqual(listener_mod.LAST_STT_FAILURE,
+                         ("inworld", "empty transcript"))
 
-    def test_new_steps_fail_google_groq_loop_still_runs(self):
+    def test_the_google_groq_loop_is_never_a_fallback(self):
+        """The per-language loop was the third and fourth serial attempt."""
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", side_effect=sr.RequestError("down"),
         ) as inworld, patch.object(
             listener_mod, "recognize_local_whisper",
             side_effect=sr.RequestError("no daemon"),
-        ), patch.object(
+        ) as whisper, patch.object(
             listener_mod, "recognize_google_or_groq", return_value="hey there",
         ) as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        self.assertEqual(raw, "hey there")
-        self.assertEqual(normalized, "hey there")
-        self.assertEqual(language, listener_mod.RECOGNITION_LANGUAGES[0])
+        self.assertEqual(result, (None, None, None))
         inworld.assert_called_once_with(self.audio, language="en")
-        google.assert_called()
+        whisper.assert_not_called()
+        google.assert_not_called()
 
-    def test_all_engines_fail_returns_none_tuple(self):
+    def test_the_single_engine_failing_returns_the_empty_tuple(self):
         listener_mod = self.listener_mod
         with patch.object(
             listener_mod, "recognize_inworld", side_effect=sr.UnknownValueError(),
         ) as inworld, patch.object(
             listener_mod, "recognize_local_whisper",
             side_effect=sr.RequestError("no daemon"),
-        ), patch.object(
+        ) as whisper, patch.object(
             listener_mod, "recognize_google_or_groq",
             side_effect=sr.UnknownValueError(),
-        ):
+        ) as google:
             result = listener_mod.recognize_multilingual(self.audio)
 
         self.assertEqual(result, (None, None, None))
         inworld.assert_called_once_with(self.audio, language="en")
+        whisper.assert_not_called()
+        google.assert_not_called()
 
-    def test_whisper_selected_calls_local_whisper_first_and_skips_inworld(self):
+    def test_whisper_selected_runs_only_local_whisper(self):
         self._select_listening("whisper", "whisper-local")
         listener_mod = self.listener_mod
         with patch.object(
@@ -424,7 +426,7 @@ class ListenerSttChainTests(unittest.TestCase):
         inworld.assert_not_called()
         google.assert_not_called()
 
-    def test_whisper_selected_falls_to_inworld_then_google(self):
+    def test_whisper_selected_failure_never_reaches_another_engine(self):
         self._select_listening("whisper", "whisper-local")
         listener_mod = self.listener_mod
         with patch.object(
@@ -432,19 +434,19 @@ class ListenerSttChainTests(unittest.TestCase):
             side_effect=sr.RequestError("no daemon"),
         ) as whisper, patch.object(
             listener_mod, "recognize_inworld",
-            side_effect=sr.RequestError("offline in tests"),
+            return_value="an inworld second opinion",
         ) as inworld, patch.object(
             listener_mod, "recognize_google_or_groq", return_value="hey there",
         ) as google:
-            raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
+            result = listener_mod.recognize_multilingual(self.audio)
 
-        self.assertEqual(raw, "hey there")
-        self.assertEqual(language, listener_mod.RECOGNITION_LANGUAGES[0])
+        self.assertEqual(result, (None, None, None))
         whisper.assert_called_once()
-        inworld.assert_called_once()
-        google.assert_called()
+        inworld.assert_not_called()
+        google.assert_not_called()
+        self.assertEqual(listener_mod.LAST_STT_FAILURE[0], "local-whisper")
 
-    def test_inworld_selected_keeps_current_chain(self):
+    def test_inworld_selected_runs_only_inworld(self):
         self._select_listening("inworld", "inworld/inworld-stt-1")
         listener_mod = self.listener_mod
         with patch.object(
@@ -463,7 +465,7 @@ class ListenerSttChainTests(unittest.TestCase):
         whisper.assert_not_called()
         google.assert_not_called()
 
-    def test_registry_read_failure_defaults_to_inworld_first(self):
+    def test_registry_read_failure_defaults_to_inworld(self):
         listener_mod = self.listener_mod
         with patch.object(
             self.model_registry, "get_model_for_role",
@@ -479,7 +481,7 @@ class ListenerSttChainTests(unittest.TestCase):
         inworld.assert_called_once()
         whisper.assert_not_called()
 
-    def test_unknown_listening_provider_falls_back_to_inworld_first(self):
+    def test_unknown_listening_provider_falls_back_to_inworld(self):
         self._settings_path.write_text(
             json.dumps({"listening_model": {"provider": "bogus", "model": "x"}}),
             encoding="utf-8",
@@ -489,12 +491,15 @@ class ListenerSttChainTests(unittest.TestCase):
             listener_mod, "recognize_inworld", return_value="jarvis utho",
         ) as inworld, patch.object(
             listener_mod, "recognize_local_whisper",
-        ) as whisper:
+        ) as whisper, patch.object(
+            listener_mod, "recognize_google_or_groq",
+        ) as google:
             raw, normalized, language = listener_mod.recognize_multilingual(self.audio)
 
         self.assertEqual(normalized, "jarvis utho")
         inworld.assert_called_once()
         whisper.assert_not_called()
+        google.assert_not_called()
 
 
 if __name__ == "__main__":

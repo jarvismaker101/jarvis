@@ -162,14 +162,18 @@ class VoiceRouteLiteralTests(unittest.TestCase):
         self.addCleanup(listener._turn_stabilizer.reset)
 
     def test_recognize_multilingual_keeps_raw_and_normalized_separate(self):
-        with patch.object(listener, "recognize_inworld",
+        with patch.object(listener.model_registry, "get_model_for_role",
+                          return_value={"provider": "inworld"}), \
+             patch.object(listener, "recognize_inworld",
                           return_value="Create File Q4 Report.TXT"), \
              patch.object(listener, "recognize_local_whisper",
-                          side_effect=sr.RequestError("offline")):
+                          side_effect=sr.RequestError("offline")) as whisper:
             raw, normalized, _language = listener.recognize_multilingual(
                 object())
         self.assertEqual(raw, "Create File Q4 Report.TXT")
         self.assertEqual(normalized, "create file q4 report.txt")
+        # [P0-03] The other engine is not a fallback any more.
+        whisper.assert_not_called()
 
     def test_listen_returns_the_literal_utterance(self):
         literal = 'run {{step0.files.0}} --Dry-Run -C "D:\\Q4 Report"'

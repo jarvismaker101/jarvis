@@ -125,6 +125,12 @@ vad = webrtcvad.Vad(1)
 #: "record which STT engine produced the transcript").
 LAST_STT_ENGINE = ""
 
+#: [P0-03] Why the last STT turn produced NO transcript: ``(engine, reason)``,
+#: or None when the selected engine answered. Before this, a failed turn
+#: returned None with nothing but a per-engine print, so "the listener heard
+#: nothing" and "every engine failed" looked identical in the log.
+LAST_STT_FAILURE = None
+
 
 def _mark_turn(marks, name, meta=None):
     """[PERF] P1-19 — best-effort mark on this turn's voice timeline.
@@ -301,6 +307,13 @@ PARTIAL_MAX_AUDIO_SECONDS = float(
 #: must not be able to stall the capture loop for the daemon's full 15s budget.
 PARTIAL_STT_TIMEOUT_SECONDS = float(
     os.getenv("JARVIS_PARTIAL_STT_TIMEOUT", "4"))
+#: [P0-03] The FINAL commit is the answer, but it is no longer one rung of a
+#: ladder that could add a local 15s wait to a 20s cloud wait and then two
+#: 35s Groq attempts (117s worst case). With exactly one engine per turn the
+#: budget IS this number, so it is explicit and env-tunable instead of falling
+#: through to ``recognize_local_whisper``'s generic 15s default.
+FINAL_STT_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_STT_FINAL_TIMEOUT", "10"))
 #: [P0-04] Trailing VAD silence that must follow two AGREEING partials before
 #: the capture may end early with the agreed text. This is NOT an end-of-speech
 #: rule: the normal path still waits the full PAUSE_THRESHOLD_SECONDS (1.2s) of
@@ -743,120 +756,169 @@ def _submit_partial(chunks, turn_id, index, duration_ms, on_commit=None):
 
 
 
-def recognize_multilingual(audio):
-    """Recognize speech across languages.
+#: [P0-03] The single-engine map. The registry offers exactly these providers
+#: for the listening role (``model_registry.ROLE_PROVIDERS["listening"]``).
+#: "google-or-groq" is not offered there yet, but it stays addressable so the
+#: engine remains a SELECTION that can be turned on later rather than a
+#: capability this change deletes.
+LOCAL_STT_ENGINE = "whisper"
+CLOUD_STT_ENGINES = frozenset({"inworld", "google-or-groq"})
 
-    Returns (raw, normalized, language): the RAW transcription (case,
-    newlines and quoted content intact) alongside the normalized control
-    text used for logging/matching. (None, None, None) when nothing was
-    understood.
 
-    [F34] The cloud policy is explicit and enforced HERE, before any audio
-    can leave the machine: under a local-only policy the local whisper
-    engine is the only engine tried, and if it fails the utterance simply
-    returns no transcript — nothing is transmitted externally.
+def _engine_for_listening_role():
+    """[P0-03] The ONE engine this turn will use, resolved from settings.
+
+    Resolved PER CALL (P1-05) so a switch in the settings UI takes effect on the
+    very next phrase with no restart. Any registry hiccup degrades to the
+    shipped default (Inworld first).
     """
-    # [P1-05] Selected listening engine (settings UI): resolved PER CALL from the
-    # registry so a switch takes effect on the very next phrase, no
-    # restart. Any registry hiccup degrades to the shipped default
-    # (Inworld first).
-    assert_single_rate_audio(audio)
     try:
         selected = model_registry.get_model_for_role("listening").get(
             "provider", "inworld"
         )
     except Exception:
         selected = "inworld"
+    if selected in (LOCAL_STT_ENGINE, "google-or-groq"):
+        return selected
+    # Anything unexpected (including the shipped default) is Inworld.
+    return "inworld"
 
-    def _try_inworld():
-        # Inworld STT with an English hint (conversation text must stay
-        # roman/English script). Empty transcript = no speech -> second
-        # opinions below. A Devanagari transcript means the hint was
-        # ignored -> fall back.
-        global LAST_STT_ENGINE
+
+def _transcribe_with_engine(engine, audio):
+    """Run exactly ONE STT engine. Returns ``(result, engine_label, reason)``.
+
+    [P0-03] There is NO chaining here: the caller picked the single engine for
+    this turn, and whatever it returns IS the answer. No ``a or b`` between
+    engines and no Google/Groq language loop behind them — which is what bounds
+    a turn by that engine's own timeout instead of the 117s serial ladder.
+
+    ``result`` is ``(raw, normalized, language)`` or None; ``reason`` is a short
+    code describing why nothing came back (None on success).
+
+    The hallucination gate lives here (and again at the commit boundary in
+    ``listen()``): it is never bypassed for any engine.
+    """
+    global LAST_STT_ENGINE
+
+    if engine == LOCAL_STT_ENGINE:
+        label = "local-whisper"
         try:
-            text = recognize_inworld(audio, language="en")
+            transcript, language = recognize_local_whisper(
+                audio, timeout=FINAL_STT_TIMEOUT_SECONDS)
+        except sr.UnknownValueError:
+            return None, label, "no-speech"
+        except Exception as exc:
+            return None, label, str(exc) or type(exc).__name__
+        normalized = _normalize_text(transcript)
+        if not normalized:
+            return None, label, "empty transcript"
+        if is_hallucinated_transcript(normalized):
+            print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+            return None, label, "hallucination"
+        print(f"[HEARD:local-whisper] {normalized}")
+        LAST_STT_ENGINE = label   # [PERF] P1-19
+        return (transcript, normalized, language), label, None
+
+    if engine == "google-or-groq":
+        label = "google-or-groq"
+        reason = "no-speech"
+        # This engine IS the selected one, so its own language list still
+        # applies — the languages are not a fallback ladder.
+        for language in RECOGNITION_LANGUAGES:
+            try:
+                text = recognize_google_or_groq(
+                    recognizer,
+                    audio,
+                    language,
+                    log_prefix="LISTENER",
+                )
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError as exc:
+                print(f"[LISTENER] Recognition request failed [{language}]: {exc}")
+                reason = str(exc) or "request failed"
+                continue
+            except Exception as exc:
+                print(f"[LISTENER] Recognition error [{language}]: {exc}")
+                reason = str(exc) or type(exc).__name__
+                continue
             normalized = _normalize_text(text)
-            if normalized and is_hallucinated_transcript(normalized):
+            if not normalized:
+                continue
+            if is_hallucinated_transcript(normalized):
                 print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
-                return None
-            if normalized:
-                if any("\u0900" <= ch <= "\u097F" for ch in text):
-                    print("[LISTENER] Inworld STT returned non-English script, falling back")
-                else:
-                    print(f"[HEARD:inworld] {normalized}")
-                    LAST_STT_ENGINE = "inworld"   # [PERF] P1-19
-                    return text, normalized, "auto"
-        except sr.UnknownValueError:
-            pass
-        except Exception as exc:
-            print(f"[LISTENER] Inworld STT failed: {exc}")
-        return None
+                reason = "hallucination"
+                continue
+            print(f"[HEARD:{language}] {normalized}")
+            LAST_STT_ENGINE = label   # [PERF] P1-19
+            return (text, normalized, language), label, None
+        return None, label, reason
 
-    def _try_local_whisper():
-        global LAST_STT_ENGINE
-        try:
-            transcript, lang = recognize_local_whisper(audio)
-            normalized = _normalize_text(transcript)
-            if normalized and is_hallucinated_transcript(normalized):
-                print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
-                return None
-            if normalized:
-                print(f"[HEARD:local-whisper] {normalized}")
-                LAST_STT_ENGINE = "local-whisper"   # [PERF] P1-19
-                return transcript, normalized, lang
-        except sr.UnknownValueError:
-            pass
-        except Exception as exc:
-            print(f"[LISTENER] Local whisper STT failed: {exc}")
-        return None
+    # Inworld, with an English hint (conversation text must stay roman/English
+    # script). Also the engine for any unexpected provider value.
+    label = "inworld"
+    try:
+        text = recognize_inworld(audio, language="en")
+    except sr.UnknownValueError:
+        return None, label, "no-speech"
+    except Exception as exc:
+        return None, label, str(exc) or type(exc).__name__
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None, label, "empty transcript"
+    if is_hallucinated_transcript(normalized):
+        print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+        return None, label, "hallucination"
+    if any("\u0900" <= ch <= "\u097F" for ch in text):
+        # The English hint was ignored. There is no second engine to fall back
+        # to (P0-03): an unwanted script is a failed turn, not a retry.
+        print("[LISTENER] Inworld STT returned non-English script")
+        return None, label, "non-english-script"
+    print(f"[HEARD:inworld] {normalized}")
+    LAST_STT_ENGINE = label   # [PERF] P1-19
+    return (text, normalized, "auto"), label, None
+
+
+def recognize_multilingual(audio):
+    """Recognize one utterance with the SINGLE engine this turn selected.
+
+    Returns (raw, normalized, language): the RAW transcription (case,
+    newlines and quoted content intact) alongside the normalized control
+    text used for logging/matching. (None, None, None) when nothing was
+    understood.
+
+    [P0-03] Exactly ONE engine runs per turn, chosen from the settings
+    registry: there is no cross-engine fallback ladder, so the worst case of
+    a turn is that engine's own timeout instead of the serial sum that could
+    reach 117s. When the one engine fails, no transcript is returned AND
+    ``LAST_STT_FAILURE`` records ``(engine, reason)`` so the failure is
+    visible in the log instead of looking like silence.
+
+    [F34] The cloud policy is explicit and enforced HERE, before any audio
+    can leave the machine: under a local-only policy the local whisper
+    engine is the only engine tried, and if it fails the utterance simply
+    returns no transcript — nothing is transmitted externally.
+    """
+    global LAST_STT_FAILURE
+    LAST_STT_FAILURE = None
+    assert_single_rate_audio(audio)
+
+    engine = _engine_for_listening_role()
 
     if _cloud_stt_policy() != "on":
         # F34: local-only. Inworld and Google/Groq are cloud engines; with
         # the policy off they are never called — a local failure produces no
         # transcript instead of an upload.
         print("[LISTENER] Cloud STT disabled by policy - local whisper only")
-        result = _try_local_whisper()
-        if result:
-            return result
-        return None, None, None
+        engine = LOCAL_STT_ENGINE
 
-    if selected == "whisper":
-        # Local whisper primary, Inworld as the first fallback.
-        result = _try_local_whisper() or _try_inworld()
-    else:
-        # Inworld primary (default; also any unexpected provider value).
-        result = _try_inworld() or _try_local_whisper()
+    result, label, reason = _transcribe_with_engine(engine, audio)
     if result:
         return result
 
-    for language in RECOGNITION_LANGUAGES:
-        try:
-            text = recognize_google_or_groq(
-                recognizer,
-                audio,
-                language,
-                log_prefix="LISTENER",
-            )
-            normalized = _normalize_text(text)
-            if normalized and is_hallucinated_transcript(normalized):
-                print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
-                continue
-            if normalized:
-                print(f"[HEARD:{language}] {normalized}")
-                # [PERF] P1-19 — the cloud engine (Google, then Groq) answered.
-                global LAST_STT_ENGINE
-                LAST_STT_ENGINE = "google-or-groq"
-                return text, normalized, language
-        except sr.UnknownValueError:
-            continue
-        except sr.RequestError as exc:
-            print(f"[LISTENER] Recognition request failed [{language}]: {exc}")
-            continue
-        except Exception as exc:
-            print(f"[LISTENER] Recognition error [{language}]: {exc}")
-            continue
-
+    reason = reason or "unknown"
+    LAST_STT_FAILURE = (label, reason)
+    print(f"[LISTENER] STT failed: {label}: {reason}")
     return None, None, None
 
 

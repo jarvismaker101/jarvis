@@ -295,14 +295,24 @@ class CloudPolicyTests(unittest.TestCase):
         self.mock_inworld.assert_not_called()
         self.mock_online.assert_not_called()
 
-    def test_default_policy_still_reaches_cloud_engines(self):
+    def test_default_policy_runs_only_the_selected_engine(self):
+        """[P0-03] The Google/Groq rung of the ladder is gone.
+
+        The old assertion ("default policy still reaches cloud engines") required
+        a fall THROUGH Inworld and local whisper into the per-language
+        Google/Groq loop — the serial path whose worst case was 117s. With one
+        engine per turn, an Inworld failure is the end of the turn.
+        """
         self.mock_local.side_effect = sr.RequestError("local whisper down")
         self.mock_inworld.side_effect = sr.RequestError("no inworld key")
         self.mock_online.return_value = "Create File Hello.txt"
-        raw, normalized, _language = listener.recognize_multilingual(object())
-        self.assertEqual(raw, "Create File Hello.txt")
-        self.assertEqual(normalized, "create file hello.txt")
-        self.mock_online.assert_called()
+        with patch.object(listener.model_registry, "get_model_for_role",
+                          return_value={"provider": "inworld"}):
+            raw, normalized, language = listener.recognize_multilingual(object())
+        self.assertEqual((raw, normalized, language), (None, None, None))
+        self.mock_online.assert_not_called()
+        self.mock_local.assert_not_called()
+        self.assertEqual(listener.LAST_STT_FAILURE[0], "inworld")
 
 
 if __name__ == "__main__":
