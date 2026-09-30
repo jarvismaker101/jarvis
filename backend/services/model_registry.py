@@ -32,6 +32,7 @@ validates can never run and an in-flight call cannot see a half-applied
 configuration change.
 """
 
+import copy
 import json
 import logging
 import os
@@ -221,20 +222,74 @@ class ModelRegistryError(ValueError):
     """User-facing registry error (bad provider / key / model input)."""
 
 
+#: [P1-08] The parsed settings, keyed on (st_mtime_ns, st_size). The audio path
+#: reaches this file several times PER CHUNK, and a file read plus a JSON parse
+#: there is real work on the hot path. A stat is cheap; a parse is not. The key
+#: keeps the project's promise that a change from the UI takes effect on the
+#: very next phrase with NO restart — a long-lived cache without the key would
+#: silently break live switching.
+#:
+#: ``data`` is the LAST GOOD copy: a transient read/parse failure falls back to
+#: it rather than to {}, which used to silently discard the user's settings and
+#: flip the whole system to env defaults. It is kept PER PATH — the path is part
+#: of the key — so a "last good copy" can never be served for a different file.
+_settings_cache = {"path": None, "key": None, "data": None, "loaded": False}
+
+
+def _settings_key_unlocked():
+    """(path, st_mtime_ns, st_size) for the settings file, or None if absent."""
+    try:
+        stat = SETTINGS_FILE.stat()
+    except OSError:
+        return None
+    return (str(SETTINGS_FILE), stat.st_mtime_ns, stat.st_size)
+
+
 def _load_unlocked():
-    """Read the settings file; {} when missing or corrupt.
+    """The parsed settings; {} only when there has never been a good read.
 
     Caller must already hold _lock (read-only callers use _load_settings).
+    Never returns the cached object itself: callers do read-modify-write on the
+    dict they get, and a shared object would corrupt the cache.
     """
+    key = _settings_key_unlocked()
+    if key is None:
+        # No settings file at all is a legitimate empty configuration (nothing
+        # has been selected yet), not a failure.
+        return {}
+    if key == _settings_cache["key"] and _settings_cache["loaded"]:
+        return copy.deepcopy(_settings_cache["data"])
     try:
-        if not SETTINGS_FILE.exists():
-            return {}
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("settings root is not an object")
     except Exception as exc:
-        logging.warning("[MODEL REGISTRY] Could not read settings: %s", exc)
+        # [P1-08] Keep the last good copy. Returning {} here silently reverted
+        # every role to its env default without telling anyone.
+        same_file = _settings_cache["path"] == str(SETTINGS_FILE)
+        if _settings_cache["loaded"] and same_file:
+            logging.warning(
+                "[MODEL REGISTRY] Could not read settings (%s); keeping the "
+                "last successfully loaded copy", exc)
+            return copy.deepcopy(_settings_cache["data"])
+        logging.warning(
+            "[MODEL REGISTRY] Could not read settings (%s); falling back to "
+            "environment defaults for every role", exc)
         return {}
+    _settings_cache["path"] = str(SETTINGS_FILE)
+    _settings_cache["key"] = key
+    _settings_cache["data"] = copy.deepcopy(data)
+    _settings_cache["loaded"] = True
+    return data
+
+
+def _forget_cached_settings_unlocked():
+    """Drop the cache so the next read hits the file. For writers/tests."""
+    _settings_cache["path"] = None
+    _settings_cache["key"] = None
+    _settings_cache["data"] = None
+    _settings_cache["loaded"] = False
 
 
 def _save_unlocked(settings):
@@ -257,6 +312,12 @@ def _save_unlocked(settings):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
     tmp.replace(SETTINGS_FILE)
+    # [P1-08] What we just wrote IS the parsed settings: adopt it instead of
+    # making the next reader re-parse the file we already have in memory.
+    _settings_cache["path"] = str(SETTINGS_FILE)
+    _settings_cache["key"] = _settings_key_unlocked()
+    _settings_cache["data"] = copy.deepcopy(settings)
+    _settings_cache["loaded"] = True
 
 
 def _load_settings():

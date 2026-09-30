@@ -220,7 +220,7 @@ class SpeakerPauseTests(_SpeakerHarness):
         played = []
         first_played = threading.Event()
 
-        def fake_chunk(chunk, generation, is_first_chunk=False):
+        def fake_chunk(chunk, generation, is_first_chunk=False, **_kwargs):
             played.append(chunk)
             if len(played) == 1:
                 first_played.set()

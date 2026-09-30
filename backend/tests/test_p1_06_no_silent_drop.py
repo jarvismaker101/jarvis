@@ -296,7 +296,7 @@ class ReplySessionFlagTests(_SpeakerHarness):
         played = []
         first_played = threading.Event()
 
-        def fake_chunk(chunk, generation, is_first_chunk=False):
+        def fake_chunk(chunk, generation, is_first_chunk=False, **_kwargs):
             played.append(chunk)
             first_played.set()
             return True
@@ -321,7 +321,7 @@ class ReplySessionFlagTests(_SpeakerHarness):
         played = []
         first_played = threading.Event()
 
-        def fake_chunk(chunk, generation, is_first_chunk=False):
+        def fake_chunk(chunk, generation, is_first_chunk=False, **_kwargs):
             played.append(chunk)
             first_played.set()
             return True
@@ -341,7 +341,7 @@ class ReplySessionFlagTests(_SpeakerHarness):
         played = []
         first_played = threading.Event()
 
-        def fake_chunk(chunk, generation, is_first_chunk=False):
+        def fake_chunk(chunk, generation, is_first_chunk=False, **_kwargs):
             played.append(chunk)
             first_played.set()
             return True
@@ -363,7 +363,7 @@ class ReplySessionFlagTests(_SpeakerHarness):
         release = threading.Event()
         playing = threading.Event()
 
-        def fake_chunk(chunk, generation, is_first_chunk=False):
+        def fake_chunk(chunk, generation, is_first_chunk=False, **_kwargs):
             played.append(chunk)
             playing.set()
             release.wait(3)

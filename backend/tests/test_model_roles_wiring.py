@@ -43,9 +43,12 @@ class TTSWiringTests(WiringTestBase):
         from backend.services.fish_voice import _resolve_tts_model
         model_registry.set_model_for_role("tts", "fish", "s1")
         self.assertEqual(_resolve_tts_model(), "s1")
-        # fallback to env default when registry corrupt -> still returns something
+        # [P1-08] A corrupt read no longer reverts every role to its env
+        # default: the registry keeps the LAST GOOD copy of a file it has
+        # already parsed successfully (see test_p1_08_settings_cache.py for the
+        # full contract). Only a first-ever failure falls back to env defaults.
         self._settings_path.write_text("{not json", encoding="utf-8")
-        self.assertEqual(_resolve_tts_model(), FISH_MODEL)
+        self.assertEqual(_resolve_tts_model(), "s1")
 
     def test_request_audio_payload_uses_registry_model(self):
         from backend.services import fish_voice

@@ -438,7 +438,20 @@ def _resolve_tts_provider():
     return "fish"
 
 
-def _cloud_tts_ladder():
+#: [P1-08] A reply session resolves its tts provider EXACTLY ONCE and then
+#: carries it, instead of asking the registry three times per chunk. The
+#: engine cannot meaningfully change mid-utterance, and the settings registry
+#: still re-stats its file on every resolve, so a mid-reply change lands on the
+#: NEXT reply (live switching is preserved). ``StreamSpeaker`` stores its own
+#: copy; a bare ``None`` provider means "resolve now", which keeps direct
+#: callers (and tests) honest.
+
+def _resolve_session_tts_provider():
+    """The provider for a NEW reply session."""
+    return _resolve_tts_provider()
+
+
+def _cloud_tts_ladder(provider=None):
     """Cloud engines in the order they should be tried for this reply.
 
     The user's selected engine is ALWAYS first, so an explicit choice is
@@ -451,13 +464,18 @@ def _cloud_tts_ladder():
         "fish": ("fish", speak_fish_audio, FISH_TTS_CHAR_LIMIT),
         "gtts": ("google", speak_google_tts, GOOGLE_TTS_CHAR_LIMIT),
     }
-    order = ("gtts", "fish") if _resolve_tts_provider() == "gtts" else ("fish", "gtts")
+    chosen = _resolve_tts_provider() if provider is None else provider
+    if chosen == "gtts":
+        order = ("gtts", "fish")
+    else:
+        order = ("fish", "gtts")
     return [engines[name] for name in order]
 
 
-def _tts_char_limit():
+def _tts_char_limit(provider=None):
     """Chunking limit for the engine that will actually speak."""
-    if _resolve_tts_provider() == "gtts":
+    chosen = _resolve_tts_provider() if provider is None else provider
+    if chosen == "gtts":
         return GOOGLE_TTS_CHAR_LIMIT
     return FISH_TTS_CHAR_LIMIT
 
@@ -517,13 +535,14 @@ def _prefetch_implementations():
     }
 
 
-def _prefetch_tts_audio(text, plays_next=False):
+def _prefetch_tts_audio(text, plays_next=False, provider=None):
     """Warm the engine that will actually speak the NEXT sentence.
 
     Prefetching the wrong engine wastes a synthesis call and leaves the real
     one cold, so this follows the same selection as `_cloud_tts_ladder`. The
-    selection is resolved EXACTLY ONCE per call, so a settings change landing
-    mid-call cannot warm a different engine than the one that was chosen.
+    selection is resolved EXACTLY ONCE per call — and, since P1-08, per reply
+    session (``generation``) — so a settings change landing mid-call cannot
+    warm a different engine than the one that was chosen.
 
     Every prefetch in this module goes through here (P1-09). A direct
     ``prefetch_fish_audio`` call spends metered Fish credits even when Google
@@ -541,13 +560,14 @@ def _prefetch_tts_audio(text, plays_next=False):
         return
     if plays_next and not _playback_is_active():
         return
-    warm = _prefetch_implementations().get(_resolve_tts_provider())
+    warm = _prefetch_implementations().get(
+        _resolve_tts_provider() if provider is None else provider)
     if warm is None:
         return
     warm(text)
 
 
-def _speak_chunk(chunk, generation, is_first_chunk=False):
+def _speak_chunk(chunk, generation, is_first_chunk=False, provider=None):
     """Speak one pre-chunked piece using the TTS ladder.
 
     Cloud engines first — the selected one, then the other. Fish uses
@@ -574,7 +594,7 @@ def _speak_chunk(chunk, generation, is_first_chunk=False):
     # earcon hook goes to whichever engine actually runs first, so a fallback
     # can never replay it (the hook fires only after synthesis succeeds).
     is_primary = True
-    for _name, engine, limit in _cloud_tts_ladder():
+    for _name, engine, limit in _cloud_tts_ladder(provider):
         if not is_primary and not _is_current_generation(generation):
             return True
         if len(chunk) > limit:
@@ -626,6 +646,10 @@ def speak(text):
             # Voice each queued sentence while the NEXT one is already being
             # synthesised in the background — hides the Fish round-trip behind
             # the current chunk's playback instead of stalling between chunks.
+            # [P1-08] The engine is resolved ONCE for the whole reply, not three
+            # times per chunk; the registry's own mtime check means a selection
+            # changed mid-reply still applies to the NEXT one.
+            provider = _resolve_session_tts_provider()
             chunks = split_speech_chunks(clean)
             is_first_chunk = True
             for index, chunk in enumerate(chunks):
@@ -634,8 +658,9 @@ def speak(text):
                 if index + 1 < len(chunks):
                     # chunks[index] plays first, so the next chunk is never the
                     # sentence about to play and is always safe to warm.
-                    _prefetch_tts_audio(chunks[index + 1])
-                _speak_chunk(chunk, generation, is_first_chunk=is_first_chunk)
+                    _prefetch_tts_audio(chunks[index + 1], provider=provider)
+                _speak_chunk(chunk, generation, is_first_chunk=is_first_chunk,
+                             provider=provider)
                 is_first_chunk = False
 
         except Exception:
@@ -745,6 +770,17 @@ class StreamSpeaker:
         with _state_lock:
             _speech_generation += 1
             self._generation = _speech_generation
+        #: [P1-08] This reply session's tts engine, resolved on FIRST use and
+        #: then carried: the audio path used to ask the settings registry three
+        #: times per chunk. The registry still re-stats its file per resolve, so
+        #: a selection changed mid-reply lands on the next reply.
+        self._tts_provider = None
+
+    def _tts_engine(self):
+        """[P1-08] The tts provider for THIS reply session (resolved once)."""
+        if self._tts_provider is None:
+            self._tts_provider = _resolve_session_tts_provider()
+        return self._tts_provider
 
     @property
     def spoken_any(self):
@@ -960,11 +996,12 @@ class StreamSpeaker:
                 pending_ahead = self._queue.qsize()
                 self._queue.put(first)
                 self._start_worker()
-                _prefetch_tts_audio(first, plays_next=(pending_ahead == 0))
+                _prefetch_tts_audio(first, plays_next=(pending_ahead == 0),
+                                    provider=self._tts_engine())
             if remainder:
                 self._enqueue(remainder)
             return
-        if len(sentence) > _tts_char_limit():
+        if len(sentence) > _tts_char_limit(self._tts_engine()):
             for chunk in split_speech_chunks(sentence):
                 if chunk.strip():
                     self._enqueue(chunk.strip())
@@ -978,7 +1015,8 @@ class StreamSpeaker:
         # [P0-05] The "is this the sentence about to play?" half of the rule is
         # passed in; `_prefetch_tts_audio` owns the decision, so the engine
         # choice and the timing rule cannot drift apart.
-        _prefetch_tts_audio(sentence, plays_next=(pending_ahead == 0))
+        _prefetch_tts_audio(sentence, plays_next=(pending_ahead == 0),
+                            provider=self._tts_engine())
 
     def _start_worker(self):
         with _state_lock:
@@ -1147,7 +1185,9 @@ class StreamSpeaker:
                 # deliberately dropped — a stop discards, a pause preserves.
                 if not self._pass_pause_gate(sentence):
                     continue
-                _speak_chunk(sentence, self._generation, is_first_chunk=not self._played_first)
+                _speak_chunk(sentence, self._generation,
+                             is_first_chunk=not self._played_first,
+                             provider=self._tts_engine())
                 self._played_first = True
                 # [P1-06] The speaking flag means "Jarvis is mid-reply" for the
                 # WHOLE reply session. It is NOT derived from momentary queue
