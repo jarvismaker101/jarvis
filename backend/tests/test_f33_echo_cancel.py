@@ -429,7 +429,12 @@ class ListenerCommitTests(unittest.TestCase):
             return echo_cancel.CaptureFrame(pcm, False, False, 16000)
 
         self._capture(chunks, aec)
-        self.assertEqual([row[0] for row in seen], [0, 1, 2])
+        # [P0-13] Ids are now (capture_token, index); the property this test
+        # pins - every frame cancelled once, in order, with its own timestamp -
+        # is unchanged, so assert the index within the capture.
+        self.assertEqual([row[0][1] for row in seen], [0, 1, 2])
+        self.assertEqual(len({row[0] for row in seen}), 3,
+                         "each frame must carry a distinct id")
         stamps = [row[1] for row in seen]
         self.assertTrue(all(isinstance(s, float) for s in stamps))
         self.assertEqual(stamps, sorted(stamps))

@@ -23,7 +23,9 @@ F33 corrections in this module:
   is matched to the reference span that OVERLAPS it in time.
 * **Once-only frame processing.** ``cancelled_mic_window(..., frame_id=...)``
   processes each capture frame exactly once, so the listener's overlapping
-  VAD windows cannot re-feed the AEC or double-count statistics.
+  VAD windows cannot re-feed the AEC or double-count statistics. Ids are scoped
+  by a process-unique capture token (``begin_capture()``, P0-13), so a frame id
+  can never be reused by a later capture.
 * **Explicit degraded state.** ``AecSignalPath.state()`` reports whether
   cancellation is real, no-op, or cross-process, and why.
 
@@ -34,6 +36,7 @@ works before a real AEC model is added.
 """
 
 import base64
+import itertools
 import json
 import math
 import os
@@ -610,6 +613,14 @@ class AecSignalPath:
     #: Frames kept for the once-only cache (a few seconds of VAD windows).
     FRAME_CACHE_LIMIT = 512
 
+    #: [P0-13] Process-wide capture counter. Frame ids used to restart at 0 for
+    #: every capture, so capture N+1's frame 0 collided with capture N's frame 0
+    #: and the cache served the PREVIOUS utterance's PCM back as the new one -
+    #: the "self-barge-in on turn 2+ / playback bleeding through" symptom. Ids are
+    #: now (capture_token, index) and the token comes from here, so they are
+    #: unique for the lifetime of the process.
+    _capture_counter = itertools.count(1)
+
     def __init__(self, canceller=None, reference_buffer=None, process=None,
                  transport="auto", echo_gate=None):
         self.canceller = canceller or build_canceller()
@@ -631,12 +642,16 @@ class AecSignalPath:
             "replayed_frames": 0,
             "frames_processed": 0,
             "echo_suppressed": 0,
+            "captures_started": 0,
             "reference_sources": {"local": 0, "remote": 0, "none": 0},
         }
         self._frame_lock = threading.Lock()
         self._frame_cache = {}
         self._frame_order = deque()
         self._last_frame_id = None
+        #: [P0-13] Token identifying the capture in flight; frame ids are
+        #: ``(capture_token, index)`` so they cannot repeat across captures.
+        self._capture_token = None
         #: Stateful 16k conversion for the MIC side too - the canceller is a
         #: 16 kHz model, and the mic must not be resampled with a stride.
         self._mic_resampler = None
@@ -650,6 +665,43 @@ class AecSignalPath:
                                    channels=channels)
 
     # ── mic side ───────────────────────────────────────────────────────
+    def begin_capture(self, turn_id=None):
+        """Open a capture and return the token to scope its frame ids with.
+
+        [P0-13] Two layers of defence against the frame-cache collision that
+        replayed an old capture's PCM into the next one:
+
+        1. *Identity*: ids handed out from here are ``(token, index)`` with a
+           token from a process-wide counter, so capture N+1 can never ask for
+           an id capture N already used. *turn_id* (the listener's own turn
+           number) is folded in so ids stay readable and stay unique even if
+           ``begin_turn`` ever returns a constant.
+        2. *Eviction*: the previous capture's entries are dropped, which bounds
+           memory over a long session and guarantees no cross-turn reuse even
+           if the id scheme is ever changed again.
+
+        Clearing alone would be wrong - it would also discard the WITHIN-capture
+        de-duplication the cache exists for (the sliding VAD window re-asks for
+        frames it already analysed, and those must still be served from cache
+        without re-feeding the AEC).
+
+        Returns an opaque token; pass it to :meth:`frame_id`.
+        """
+        with self._frame_lock:
+            self._frame_cache.clear()
+            self._frame_order.clear()
+            self._last_frame_id = None
+            token = (next(self._capture_counter), turn_id)
+            self._capture_token = token
+            self.stats["captures_started"] += 1
+        return token
+
+    def frame_id(self, index, token=None):
+        """Frame id for the *index*-th frame of the current capture."""
+        if token is None:
+            token = self._capture_token
+        return (token, index)
+
     def _mic_to_aec_rate(self, mic_pcm, sample_rate=None, sample_width=None):
         """Return (16k mono s16 pcm, rate_used) for a captured frame."""
         rate = int(sample_rate or AEC_SAMPLE_RATE)
@@ -707,6 +759,14 @@ class AecSignalPath:
         own playback (see ``ReferenceEchoGate``) and *pcm* is the residual the
         user actually contributed - which is near-silence for assistant-only
         audio. Callers must not let a suppressed frame become user speech.
+
+        [P0-13] *frame_id* must identify a frame uniquely for the WHOLE process,
+        not just within one capture: a bare index restarts at 0 on every capture
+        and used to make capture N+1 frame 0 return capture N's cached PCM. Use
+        :meth:`begin_capture` once per capture and scope ids with its token
+        (``path.frame_id(index)``). Any hashable id still works - the cache does
+        not care about the type - which keeps callers and tests that pass plain
+        ids working.
         """
         if frame_id is not None:
             with self._frame_lock:
@@ -834,6 +894,15 @@ def feed_reference(pcm_bytes, sample_rate=None, sample_width=None, t_end=None,
                    channels=None):
     return signal_path.feed_reference(pcm_bytes, sample_rate, sample_width,
                                       t_end=t_end, channels=channels)
+
+
+def begin_capture(turn_id=None):
+    """[P0-13] Open a capture on the shared signal path; returns its token.
+
+    The listener calls this once per ``_capture_audio()`` and scopes its frame
+    ids with the returned token, so no id is ever reused across captures.
+    """
+    return signal_path.begin_capture(turn_id=turn_id)
 
 
 def cancelled_mic_window(mic_pcm, duration_bytes=None, mic_t_end=None,
