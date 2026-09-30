@@ -1504,6 +1504,11 @@ def _stream_chat_deltas(messages, temperature, max_tokens, cancel=None):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 cancel=cancel,
+                # [P1-13] this client was the one stream with NO deadline: a
+                # provider that accepted the connection and went silent held
+                # the thread until the turn ended. Same F24 handle as the
+                # gemini/fireworks streams.
+                **_budget_kw,
             ):
                 if delta:
                     streamed = True
@@ -1716,6 +1721,10 @@ class _ChatRacer:
         #: [P0-10] True once a route has taken ownership of the speculation.
         self._adopted = False
         self._cancel = threading.Event()
+        #: [P1-13] resources (a streaming provider response) to close the moment
+        #: this speculation is cancelled, so a blocked read is released.
+        self._closers = []
+        self._closer_lock = threading.Lock()
         self._done = threading.Event()
         self._built_ready = threading.Event()
         # Backstop: this thread has no turn budget (see
@@ -1771,7 +1780,7 @@ class _ChatRacer:
             temp = 0.45 if self._voice_compact else 0.7
             mx = 300 if self._voice_compact else 1400
             gen = _stream_chat_deltas(built["messages"], temp, mx,
-                                      cancel=self._cancel)
+                                      cancel=self)
             cancelled = False
             try:
                 for delta in gen:
@@ -1864,10 +1873,53 @@ class _ChatRacer:
         it between chunks and closes its HTTP response when it fires — and
         unblocks a consumer parked on :meth:`adopt` so an abandoned race is
         released immediately instead of waiting for the socket to drain.
+
+        [P1-13] It also CLOSES the resources registered by the running stream
+        (see :meth:`register_closer`): polling an event cannot interrupt a read
+        that is already in progress, and this racer has its own deadline, so a
+        blocked read must be released here rather than at the next chunk.
         """
         self._cancelled = True
         self._cancel.set()
+        self.close_resources()
         self._put_sentinel()
+
+    # ── [P1-13] cancellation handle protocol ────────────────────────────────
+    def is_set(self):
+        """``threading.Event``-compatible view of the cancellation state."""
+        return self._cancel.is_set()
+
+    def register_closer(self, closer):
+        """Register ``closer()`` (a response's ``close``) to run on cancel."""
+        if closer is None:
+            return None
+        with self._closer_lock:
+            if not self._cancel.is_set():
+                self._closers.append(closer)
+                return closer
+        try:
+            closer()
+        except Exception:
+            pass
+        return closer
+
+    def unregister_closer(self, closer):
+        with self._closer_lock:
+            try:
+                self._closers.remove(closer)
+            except ValueError:
+                pass
+
+    def close_resources(self):
+        """Close every registered resource. Never raises."""
+        with self._closer_lock:
+            closers = list(self._closers)
+            self._closers = []
+        for closer in closers:
+            try:
+                closer()
+            except Exception:
+                pass
 
     @property
     def is_done(self):

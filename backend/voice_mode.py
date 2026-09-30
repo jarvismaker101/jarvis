@@ -51,6 +51,14 @@ def _local_token():
     return os.getenv("JARVIS_LOCAL_TOKEN", "")
 
 
+#: [P1-13] Per-read (per-chunk) IDLE budget for the backend SSE stream.
+#: The backend heartbeats every ~4s while a turn is quiet, so a reading that
+#: goes silent for this long means the stream is dead and the reader must give
+#: up rather than park forever. The caller's ``timeout`` still caps the whole
+#: attempt, and a barge-in closes the socket outright.
+_STREAM_READ_TIMEOUT_SECONDS = 15.0
+
+
 def _backend_headers():
     """The ONE authenticated header set for backend calls (F51).
 
@@ -253,6 +261,13 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
 
         Returns ``(reply, finished, cursor)``: *finished* True means the
         terminal frame was reached (or the request failed permanently).
+
+        [P1-13] Two bounds replace what used to be an uninterruptible read:
+        the socket read timeout is a small per-chunk IDLE budget (the backend
+        heartbeats every ~4s, so 15s of silence means the stream is dead), and
+        the whole attempt is capped by the caller's ``timeout``. The response is
+        registered with the turn manager, so a barge-in closes it and the read
+        raises at once instead of waiting out either bound.
         """
         cursor_local = payload.get("last_event_id", -1)
         spoken_local = payload.get("_spoken", "")
@@ -274,8 +289,24 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
             headers=headers,
         )
         terminal_reply = ""
-        with urlopen(request, timeout=timeout) as response:
+        attempt_deadline = time.monotonic() + float(timeout or 0)
+        response = urlopen(request, timeout=_STREAM_READ_TIMEOUT_SECONDS)
+        registered = False
+        try:
+            registered = TURNS.register_stream(request_id, response)
+            if not registered and TURNS.superseded(request_id):
+                # This turn was already replaced/cancelled while the request
+                # was being sent: there is nothing left to read.
+                return terminal_reply, True, cursor_local, spoken_local
             for raw_line in response:
+                # [P1-13] cancellation is checked on EVERY line, so a coalesced
+                # batch or a late reattach still ends the moment the turn is
+                # gone — the old loop only noticed at the next delta.
+                if TURNS.superseded(request_id):
+                    return terminal_reply, True, cursor_local, spoken_local
+                if time.monotonic() >= attempt_deadline:
+                    print("[VOICE-BACKEND] stream attempt hit its budget")
+                    return terminal_reply, True, cursor_local, spoken_local
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -337,8 +368,17 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
                 elif ftype == "error":
                     return ("Error: %s" % (frame.get("error") or "unknown error"),
                             True, cursor_local, spoken_local)
-        # The stream ended without a terminal frame: a dropped connection.
-        return terminal_reply, False, cursor_local, spoken_local
+            # The stream ended without a terminal frame: a dropped connection.
+            return terminal_reply, False, cursor_local, spoken_local
+        except Exception as exc:
+            # [P1-13] a socket timeout / reset is a DROPPED CONNECTION, not an
+            # exception through the caller: the retry loop above decides whether
+            # to reconnect from the cursor or fall back to /ask.
+            print("[VOICE-BACKEND] stream read failed: %s" % exc)
+            return terminal_reply, False, cursor_local, spoken_local
+        finally:
+            TURNS.unregister_stream(request_id, response)
+            _close_quietly(response)
 
     last_error = None
     for attempt in range(3):
@@ -463,6 +503,25 @@ def _cancel_backend_request_async(request_id, reason):
         return False
 
 
+def _close_quietly(stream):
+    """[P1-13] Close an HTTP response/stream. Never raises.
+
+    Closing is what releases a reader blocked in ``recv``: a cancellation flag
+    is only ever consulted BETWEEN lines, so the socket itself has to be
+    closed from the cancelling thread.
+    """
+    if stream is None:
+        return False
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return False
+    try:
+        close()
+        return True
+    except Exception:
+        return False
+
+
 class _TurnManager:
     """One active voice turn, replaceable pre-emptively (P0-08).
 
@@ -480,6 +539,13 @@ class _TurnManager:
         self._request_id = ""
         self._speaker = None
         self._started_at = 0.0
+        #: [P1-13] the in-flight backend SSE response of the current turn.
+        #: Cancelling CLOSES it, so a barge-in releases a blocked socket read
+        #: instead of leaving the reader thread parked until the read timeout.
+        self._stream = None
+        #: The id of the turn most recently cancelled, remembered so a stream
+        #: registered AFTER the barge-in is still refused (and closed).
+        self._cancelled_id = ""
         self.stats = {
             "started": 0,
             "preempted": 0,
@@ -494,8 +560,13 @@ class _TurnManager:
         with self._lock:
             previous = self._request_id
             previous_speaker = self._speaker
+            previous_stream = self._stream
             self._request_id = request_id
             self._speaker = speaker
+            self._stream = None
+            # A new turn clears the "recently cancelled" mark: a fresh turn may
+            # legitimately reuse a request id.
+            self._cancelled_id = ""
             self._started_at = time.monotonic()
             self.stats["started"] += 1
             # Pre-empt on a NEW SPEAKER as well as a new id: the identity that
@@ -505,6 +576,10 @@ class _TurnManager:
                 previous != request_id or previous_speaker is not speaker)
             if replaced:
                 self.stats["preempted"] += 1
+        if replaced:
+            # [P1-13] The replaced turn's reader is still parked on its own
+            # socket: closing it here is what actually frees that thread.
+            _close_quietly(previous_stream)
         if replaced:
             # Outside the lock: this closes a speaker and fires a network call.
             self._teardown(previous, previous_speaker,
@@ -516,14 +591,68 @@ class _TurnManager:
         with self._lock:
             return bool(request_id) and request_id == self._request_id
 
+    def superseded(self, request_id):
+        """True when another turn took over (or cancelled) *request_id*.
+
+        [P1-13] A caller the manager has never seen (a direct ``_ask_backend``
+        call outside a voice turn) is NOT superseded: nothing could have
+        replaced it, so its stream must keep reading.
+        """
+        with self._lock:
+            if request_id and request_id == self._cancelled_id:
+                return True
+            return bool(self._request_id) and self._request_id != request_id
+
     def clear(self, request_id):
         """Release the turn if it is still current. Returns True when it was."""
         with self._lock:
+            if request_id and request_id == self._cancelled_id:
+                # [P1-13] The turn has fully ended, so its cancellation no
+                # longer needs to be remembered: a later turn may legitimately
+                # reuse the id.
+                self._cancelled_id = ""
             if self._request_id != request_id:
                 return False
             self._request_id = ""
             self._speaker = None
+            self._stream = None
             return True
+
+    # -- [P1-13] the turn's in-flight stream ---------------------------------
+
+    def register_stream(self, request_id, stream):
+        """Attach the SSE response this turn is reading. Returns True if kept.
+
+        A stream belonging to a CANCELLED or superseded turn is closed
+        immediately and never adopted, so a late registration cannot outlive
+        the barge-in that cancelled the turn it belongs to.
+        """
+        if stream is None:
+            return False
+        with self._lock:
+            if request_id and request_id == self._cancelled_id:
+                stale = True
+            elif self._request_id and self._request_id != request_id:
+                stale = True
+            else:
+                self._stream = stream
+                stale = False
+        if stale:
+            _close_quietly(stream)
+            return False
+        return True
+
+    def unregister_stream(self, request_id, stream):
+        with self._lock:
+            if self._stream is stream:
+                self._stream = None
+
+    def close_stream(self):
+        """Close the current turn's stream, if any. Never raises."""
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+        _close_quietly(stream)
 
     def cancel_current(self, reason="barge-in"):
         """Cancel the active turn. Never raises, never blocks.
@@ -531,16 +660,25 @@ class _TurnManager:
         Called from the barge-in observer, i.e. on the capture thread, so the
         local teardown is synchronous (audio must die NOW) and the remote cancel
         is fire-and-forget.
+
+        [P1-13] The turn's SSE response is closed here too: the backend's
+        INTERRUPTED frame is the normal exit, but if the socket is wedged the
+        blocked read must be released by US rather than by waiting out its
+        timeout.
         """
         with self._lock:
             request_id = self._request_id
             speaker = self._speaker
+            stream = self._stream
             if request_id:
                 self._request_id = ""
                 self._speaker = None
+                self._stream = None
+                self._cancelled_id = request_id
                 self.stats["barge_in_cancels"] += 1
         if not request_id:
             return False
+        _close_quietly(stream)
         self._teardown(request_id, speaker, reason)
         return True
 

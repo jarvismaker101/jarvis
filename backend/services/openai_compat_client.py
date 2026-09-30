@@ -8,10 +8,13 @@ chain. The API key travels in the Authorization header only.
 """
 
 import json
+import logging
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from backend.core.deadline import resolve
 
 # Persistent session with automatic retries on low-level connection errors
 # (same pattern as gemini_client / fireworks_client).
@@ -165,6 +168,112 @@ def _chat_url(base_url):
     return str(base_url or "").rstrip("/") + "/chat/completions"
 
 
+# ── P1-13 — streaming budgets, cancellation and terminal state ──────────────
+# The stream used to be unbounded and uninterruptible: a provider that accepted
+# the connection and then went silent left the read blocking forever (holding
+# the thread), a `requests` exception escaped the generator as a bare
+# traceback, and the consumer could not tell "finished" from "gave up".
+#: Time-to-FIRST-token budget. Once tokens are flowing, a per-chunk IDLE
+#: timeout is the right shape — a total cap would kill a long, healthy answer.
+DEFAULT_FIRST_TOKEN_TIMEOUT = 4.0
+DEFAULT_STREAM_IDLE_TIMEOUT = 20.0
+STREAM_CONNECT_TIMEOUT = 5.05
+
+#: Terminal states a streaming call can end in. "pending" is only ever seen if
+#: a consumer inspects the holder before iterating.
+STREAM_PENDING = "pending"
+STREAM_COMPLETED = "completed"
+STREAM_CANCELLED = "cancelled"
+STREAM_ERRORED = "errored"
+STREAM_DEADLINE = "deadline"
+
+
+def new_stream_outcome():
+    """[P1-13] The unambiguous terminal state of ONE streaming call.
+
+    The generator's yielded values keep the schema they always had (plain text
+    or :class:`StreamDelta`), so existing consumers are untouched. Pass this
+    holder as ``outcome=`` to also learn HOW the stream ended — a cancelled
+    stream, an errored stream and a completed stream are now distinguishable,
+    which is what the turn manager needs to tell "finished" from "gave up".
+    """
+    return {
+        "status": STREAM_PENDING,
+        "error": "",
+        "finish_reason": "",
+        "chunks": 0,
+        "first_token": False,
+    }
+
+
+def _finish_outcome(outcome, status, error="", finish_reason=""):
+    if not isinstance(outcome, dict):
+        return
+    outcome["status"] = status
+    if error:
+        outcome["error"] = str(error)[:300]
+    if finish_reason:
+        outcome["finish_reason"] = str(finish_reason)
+
+
+def _register_cancel_closer(cancel, closer):
+    """Ask *cancel* to CLOSE *closer* when it fires. Returns the registered
+    closer, or None when the handle cannot do it (a bare Event cannot).
+
+    The P0-08 handles (a ``jobs.JobToken``, the chat racer, the voice turn
+    manager) expose ``register_closer``; a plain ``threading.Event`` does not,
+    and for those the bounded read timeout is what unblocks the loop.
+    """
+    register = getattr(cancel, "register_closer", None)
+    if not callable(register) or closer is None:
+        return None
+    try:
+        register(closer)
+        return closer
+    except Exception:
+        return None
+
+
+def _unregister_cancel_closer(cancel, closer):
+    if closer is None:
+        return
+    unregister = getattr(cancel, "unregister_closer", None)
+    if not callable(unregister):
+        return
+    try:
+        unregister(closer)
+    except Exception:
+        pass
+
+
+def _set_socket_timeout(response, seconds):
+    """Best-effort: relax the per-read timeout once streaming has started.
+
+    ``requests`` fixes the timeout for the whole response, so the tight
+    first-token budget would otherwise stay in force for a long generation.
+    Every known path to the socket is tried; if none works the request's own
+    (already bounded) timeout stands, which is still not a hang. Never raises.
+    """
+    if not seconds or seconds <= 0:
+        return False
+    try:
+        raw = getattr(response, "raw", None)
+        sock = None
+        connection = getattr(raw, "_connection", None)
+        sock = getattr(connection, "sock", None)
+        if sock is None:
+            fp = getattr(raw, "_fp", None)
+            sock = getattr(fp, "fp", None)
+            raw_sock = getattr(fp, "raw", None)
+            sock = getattr(raw_sock, "_sock", None) or sock
+        if sock is None:
+            return False
+        sock.settimeout(seconds)
+        return True
+    except Exception:
+        return False
+
+
 def _headers(api_key):
     return {
         "Authorization": f"Bearer {api_key}",
@@ -223,12 +332,31 @@ def ask_openai_compat(
 
 def ask_openai_compat_stream(
     messages, model, base_url, api_key, temperature=0.7, max_tokens=None,
-    cancel=None, include_reasoning=False, typed=False,
+    cancel=None, include_reasoning=False, typed=False, timeout=None,
+    deadline=None, first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
+    idle_timeout=DEFAULT_STREAM_IDLE_TIMEOUT, outcome=None,
 ):
     """Stream chat-completion text deltas (SSE) — mirrors fireworks_client.
 
-    *cancel* is an optional ``threading.Event`` (F25): when it is set the
-    loop stops reading and the HTTP response is closed immediately.
+    *cancel* is an optional cancellation handle (F25): when it is set the loop
+    stops reading. [P1-13] A handle that supports ``register_closer`` (the F20
+    job token, the chat racer, the voice turn manager) is ALSO given the HTTP
+    response, so cancelling closes the socket and a read that is already in
+    progress raises instead of holding the thread until it times out.
+
+    *timeout* overrides the ``(connect, read)`` budget. By default the READ
+    budget is the time-to-FIRST-token budget (:data:`DEFAULT_FIRST_TOKEN_TIMEOUT`,
+    about 4s) and is relaxed to the per-chunk IDLE budget
+    (:data:`DEFAULT_STREAM_IDLE_TIMEOUT`) once tokens are flowing — a total cap
+    would kill a long, healthy answer, while no cap at all lets a silent
+    provider hold the thread forever.
+
+    *deadline* (F24) is the shared budget handle: a spent budget sends no
+    request, the read timeout is sliced to the time left, and the loop stops
+    between chunks. *outcome* (P1-13) is an optional
+    :func:`new_stream_outcome` holder; it is how a consumer learns whether the
+    stream completed, was cancelled, errored or ran out of budget WITHOUT any
+    change to the yielded values (plain text / :class:`StreamDelta`).
 
     F31 channels: by default only FINAL-answer content is yielded, as plain
     strings. A gateway that streams ``reasoning_content``/``reasoning``/
@@ -238,6 +366,13 @@ def ask_openai_compat_stream(
     but can never be mistaken for an answer by an untyped consumer.
     """
     typed_output = bool(typed or include_reasoning)
+    handle = resolve(deadline)
+    if handle is not None and handle.stopped():
+        _finish_outcome(outcome, STREAM_DEADLINE, "budget already spent")
+        return
+    if cancel is not None and cancel.is_set():
+        _finish_outcome(outcome, STREAM_CANCELLED)
+        return
     data = {
         "model": model,
         "messages": messages,
@@ -246,46 +381,110 @@ def ask_openai_compat_stream(
     }
     if max_tokens is not None:
         data["max_tokens"] = max_tokens
+    if timeout is None:
+        timeout = (STREAM_CONNECT_TIMEOUT,
+                   max(float(first_token_timeout or 0), 0.1))
+    if handle is not None:
+        # F24: the caller's budget, never the provider's, decides how long the
+        # FIRST token may take to arrive.
+        timeout = handle.timeout(timeout)
+        if timeout is None:
+            _finish_outcome(outcome, STREAM_DEADLINE, "budget ran out")
+            return
     try:
         response = _session.post(
             _chat_url(base_url),
             headers=_headers(api_key),
             json=data,
             stream=True,
-            timeout=(5.05, 120),
+            timeout=timeout,
         )
     except Exception as exc:
-        print("[OPENAI-COMPAT] Stream request error:", exc)
+        logging.warning("[OPENAI-COMPAT] Stream request error: %s", exc)
+        _finish_outcome(outcome, STREAM_ERRORED, exc)
         return
     if response.status_code != 200:
-        print(
-            "[OPENAI-COMPAT] Stream error:",
-            response.status_code,
-            response.text[:300],
-        )
+        detail = ""
+        try:
+            detail = response.text[:300]
+        except Exception:
+            pass
+        logging.warning("[OPENAI-COMPAT] Stream error: %s %s",
+                        response.status_code, detail)
+        _finish_outcome(outcome, STREAM_ERRORED,
+                        "HTTP %s %s" % (response.status_code, detail))
+        try:
+            response.close()
+        except Exception:
+            pass
         return
     # [PERF] P1-19 — the provider's HTTP response headers have arrived: the
     # queueing/TTFT part of the call is over and only generation is left.
     _mark_headers("openai-compat", model)
+    # P1-13: a half-read response with no charset used to hand back BYTES
+    # (``line.startswith("data:")`` then raised on the comparison) and a
+    # wrong charset mangled non-ASCII. Pin it, explicitly.
+    try:
+        response.encoding = "utf-8"
+    except Exception:
+        pass
+    registered = _register_cancel_closer(cancel, getattr(response, "close", None))
+    relaxed = False
     try:
         for line in response.iter_lines(decode_unicode=True):
             if cancel is not None and cancel.is_set():
+                _finish_outcome(outcome, STREAM_CANCELLED)
+                break
+            # F24: checked between chunks, before the next chunk is consumed —
+            # a stream that trickles in forever still ends here.
+            if handle is not None and handle.stopped():
+                _finish_outcome(outcome, STREAM_DEADLINE, "budget ran out")
                 break
             if not line or not line.startswith("data:"):
                 continue
             payload = line[len("data:"):].strip()
             if not payload or payload == "[DONE]":
+                if isinstance(outcome, dict):
+                    _finish_outcome(outcome, STREAM_COMPLETED,
+                                    finish_reason=outcome.get("finish_reason"))
                 break
             try:
                 chunk = json.loads(payload)
             except Exception:
                 continue
+            # P1-13: a provider-side error frame used to be silently DROPPED,
+            # which is exactly how a failed turn looked like an empty one.
+            error = chunk.get("error")
+            if error:
+                detail = (error.get("message") if isinstance(error, dict)
+                          else str(error))
+                logging.warning("[OPENAI-COMPAT] in-stream provider error: %s",
+                                detail)
+                _finish_outcome(outcome, STREAM_ERRORED, detail or "provider error")
+                break
             choices = chunk.get("choices") or []
             if not choices:
                 continue
-            delta = choices[0].get("delta") or {}
+            choice = choices[0] or {}
+            reason = choice.get("finish_reason")
+            if reason:
+                if isinstance(outcome, dict):
+                    outcome["finish_reason"] = str(reason)
+                if str(reason) not in ("stop", "null", ""):
+                    logging.warning(
+                        "[OPENAI-COMPAT] stream finished early: finish_reason=%s",
+                        reason)
+            delta = choice.get("delta") or {}
             content = final_text(delta)
             if content:
+                if not relaxed:
+                    # Once the first token is here, the tight first-token
+                    # budget becomes the generous per-chunk idle budget.
+                    relaxed = True
+                    _set_socket_timeout(response, idle_timeout)
+                if isinstance(outcome, dict):
+                    outcome["chunks"] = outcome.get("chunks", 0) + 1
+                    outcome["first_token"] = True
                 yield (StreamDelta(content, FINAL_CHANNEL)
                        if typed_output else content)
             if typed_output:
@@ -294,7 +493,21 @@ def ask_openai_compat_stream(
                 thinking = reasoning_text(delta)
                 if thinking:
                     yield StreamDelta(thinking, REASONING_CHANNEL)
+        else:
+            # The iterator ended without an explicit terminal: the provider
+            # closed a completed stream.
+            if isinstance(outcome, dict) and outcome.get("status") == STREAM_PENDING:
+                _finish_outcome(outcome, STREAM_COMPLETED)
+    except requests.RequestException as exc:
+        # P1-13: a network failure is a TERMINAL ERROR EVENT, never a bare
+        # traceback out of the generator. The consumer decides what to say.
+        logging.warning("[OPENAI-COMPAT] stream read failed: %s", exc)
+        _finish_outcome(outcome, STREAM_ERRORED, exc)
+    except Exception as exc:  # pragma: no cover - defensive, still terminal
+        logging.warning("[OPENAI-COMPAT] stream aborted: %s", exc)
+        _finish_outcome(outcome, STREAM_ERRORED, exc)
     finally:
+        _unregister_cancel_closer(cancel, registered)
         # F25 — never leave the socket open behind a cancelled speculation.
         try:
             response.close()

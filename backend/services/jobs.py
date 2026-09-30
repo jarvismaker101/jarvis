@@ -101,6 +101,10 @@ class JobToken:
         self._paused = threading.Event()
         self._processes = []
         self._proc_lock = threading.Lock()
+        #: [P1-13] open resources (a streaming provider response) that must be
+        #: closed when the job is cancelled, so a blocked read is released.
+        self._closers = []
+        self._closer_lock = threading.Lock()
         self._finished = False
         #: Monotonic deadline; None means "bounded only by the caller".
         self.deadline = (time.monotonic() + timeout) if timeout else None
@@ -135,6 +139,9 @@ class JobToken:
         # A cancelled job must not stay paused: nobody would ever resume it.
         self._paused.clear()
         self.terminate_processes()
+        # [P1-13] …and close what a blocked read is waiting on. The event alone
+        # cannot interrupt a read that is already in progress.
+        self.close_resources()
 
     def pause(self):
         if not self._cancel.is_set():
@@ -220,6 +227,53 @@ class JobToken:
             _jobs.pop(self.job_id, None)
             if _current_id == self.job_id:
                 _current_id = None
+
+    # ── P1-13: resources a cancellation must close NOW ──
+    def register_closer(self, closer):
+        """Register ``closer()`` to run the moment this job is cancelled.
+
+        A blocked ``read()`` on a provider socket cannot notice a flag that is
+        only checked between lines, so cancelling a turn has to CLOSE the
+        socket from the cancelling thread. Clients register their response
+        here (see ``openai_compat_client._register_cancel_closer``) and the
+        read raises immediately instead of holding the thread.
+
+        If the job is already cancelled the closer runs at once, so a late
+        registration can never outlive the cancellation it belongs to.
+        """
+        if closer is None:
+            return None
+        already = self._cancel.is_set()
+        if not already:
+            with self._closer_lock:
+                if not self._cancel.is_set():
+                    self._closers.append(closer)
+                    return closer
+        self._run_closer(closer)
+        return closer
+
+    def unregister_closer(self, closer):
+        """Forget a closer (the client always does this in its ``finally``)."""
+        with self._closer_lock:
+            try:
+                self._closers.remove(closer)
+            except ValueError:
+                pass
+
+    def close_resources(self):
+        """Run and clear every registered closer. Never raises."""
+        with self._closer_lock:
+            closers = list(self._closers)
+            self._closers = []
+        for closer in closers:
+            self._run_closer(closer)
+
+    @staticmethod
+    def _run_closer(closer):
+        try:
+            closer()
+        except Exception as exc:
+            logging.debug("[JOBS] closer failed: %s", exc)
 
     def to_dict(self):
         return {
