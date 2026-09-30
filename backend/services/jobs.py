@@ -99,8 +99,21 @@ class JobToken:
         self.created_at = time.time()
         self._cancel = threading.Event()
         self._paused = threading.Event()
+        #: [P1-10] The RUN GATE: SET while the job may run, CLEARED while it is
+        #: paused. A worker parked on a pause waits on THIS event, so resume()
+        #: and cancel() wake it immediately instead of it polling (the old loop
+        #: re-checked every 250ms, so a cancel could take a quarter second to
+        #: reach a paused job, and the check itself competed for the GIL).
+        self._gate = threading.Event()
+        self._gate.set()
+        #: The interval between deadline re-checks while paused.
+        self.gate_poll = 0.25
         self._processes = []
         self._proc_lock = threading.Lock()
+        #: [P1-10] Set while an asynchronous kill is still in flight, so callers
+        #: can report "cancelling" instead of blocking on the OS call.
+        self._killing = threading.Event()
+        self._kill_thread = None
         #: [P1-13] open resources (a streaming provider response) that must be
         #: closed when the job is cancelled, so a blocked read is released.
         self._closers = []
@@ -133,11 +146,19 @@ class JobToken:
 
     # ── control ──
     def cancel(self, reason="cancelled by user"):
-        """Cancel the job and terminate every process it owns."""
+        """Cancel the job and terminate every process it owns.
+
+        [P1-10] The token becomes terminal HERE, synchronously — but the actual
+        kill (``taskkill`` plus a process wait, up to seconds) runs on a daemon
+        thread. Callers that hold the job registry lock (``cancel_job``) no
+        longer block new_job behind an OS call, and a running job is never left
+        behind: the daemon thread always finishes the kill.
+        """
         self.cancel_reason = reason
         self._cancel.set()
         # A cancelled job must not stay paused: nobody would ever resume it.
         self._paused.clear()
+        self._gate.set()
         self.terminate_processes()
         # [P1-13] …and close what a blocked read is waiting on. The event alone
         # cannot interrupt a read that is already in progress.
@@ -146,9 +167,30 @@ class JobToken:
     def pause(self):
         if not self._cancel.is_set():
             self._paused.set()
+            self._gate.clear()
 
     def resume(self):
         self._paused.clear()
+        # [P1-10] Wake a parked worker at once; a resume must never wait for a
+        # poll interval. It cannot resurrect a cancelled job: the gate is open
+        # but ``_cancel`` is checked first by every checkpoint.
+        self._gate.set()
+
+    @property
+    def killing(self):
+        """[P1-10] True while a cancel's kill is still in flight."""
+        return self._killing.is_set()
+
+    @property
+    def state(self):
+        """The job's reported state: cancelling wins over paused/cancelled."""
+        if self._killing.is_set():
+            return "cancelling"
+        if self.cancelled:
+            return "cancelled"
+        if self.paused:
+            return "paused"
+        return "running"
 
     def wait_if_paused(self, timeout=300.0):
         """Block while the job is paused.
@@ -156,12 +198,22 @@ class JobToken:
         Returns False when the job was cancelled OR when its deadline passed
         while it waited (F20): a pause must not outlive the job's own deadline,
         otherwise pausing is a way to resume effects after the budget expired.
+
+        [P1-10] The wait is on the run GATE, so it costs no CPU and returns the
+        instant the job is resumed or cancelled. ``timeout`` is only the
+        deadline re-check interval, exactly as the old fixed poll was.
         """
+        poll = self.gate_poll if timeout is None else min(self.gate_poll,
+                                                          max(0.01, timeout))
         while self._paused.is_set() and not self._cancel.is_set():
             if self.expired():
                 self._paused.clear()
+                self._gate.set()
                 return False
-            self._paused.wait(timeout=0.25)
+            self._gate.wait(poll)
+        if self._cancel.is_set():
+            # Nobody may stay parked on a gate that belongs to a dead job.
+            self._gate.set()
         return not self._cancel.is_set() and not self.expired()
 
     def checkpoint(self, timeout=300.0):
@@ -214,11 +266,51 @@ class JobToken:
         return popen
 
     def terminate_processes(self):
+        """Kill every owned process.
+
+        [P1-10] The kill itself (``taskkill`` + ``proc.wait``, up to seconds) is
+        handed to a DAEMON THREAD: cancelling a job must never block the caller
+        — the job registry lock, the /task/stop handler and the SSE reader all
+        call in here, and an OS call under the registry lock is what used to
+        stall the next request. The token is already terminal by then, so the
+        "cancelling" window is a REPORT, not a wait.
+        """
+        with self._proc_lock:
+            procs = list(self._processes)
+            self._processes = []
+            if not procs:
+                return []
+            self._killing.set()
+            thread = threading.Thread(
+                target=self._kill_procs, args=(procs,), daemon=True,
+                name="job-kill-%s" % self.job_id)
+            self._kill_thread = thread
+        thread.start()
+        return procs
+
+    def _kill_procs(self, procs):
+        try:
+            for proc in procs:
+                _terminate(proc)
+        finally:
+            self._killing.clear()
+
+    def terminate_processes_now(self):
+        """Kill owned processes SYNCHRONOUSLY (tests + shutdown paths)."""
         with self._proc_lock:
             procs = list(self._processes)
             self._processes = []
         for proc in procs:
             _terminate(proc)
+        return procs
+
+    def wait_for_kill(self, timeout=10.0):
+        """Wait for an in-flight asynchronous kill. True when none is running."""
+        thread = self._kill_thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
     def finish(self):
         global _current_id
@@ -283,6 +375,10 @@ class JobToken:
             "generation": self.generation,
             "cancelled": self.cancelled,
             "paused": self.paused,
+            # [P1-10] Additive: True while a cancel's kill is still in flight.
+            # The existing keys keep their exact meaning and shape.
+            "cancelling": self.killing,
+            "state": self.state,
             "elapsed": round(self.elapsed(), 1),
             "remaining": (round(self.remaining(), 1)
                           if self.remaining() is not None else None),
@@ -421,8 +517,14 @@ def cancel_job(job_id=None, reason="cancelled by user"):
 
     Returns the list of cancelled job ids. An unaddressed stop with nothing
     running cancels nothing — it must not leave a flag set for the next job.
+
+    [P1-10] The registry lock is held only long enough to CHOOSE the target and
+    mark the job cancelled. Everything that can block — the process kill, the
+    closeable resources, the stop handlers — happens after it is released, so a
+    kill in flight can never stall ``new_job`` for the next request.
     """
     global _current_id
+    targets = []
     with _lock:
         if job_id:
             job = _jobs.get(job_id)
@@ -436,21 +538,28 @@ def cancel_job(job_id=None, reason="cancelled by user"):
                 job = max(_jobs.values(), key=lambda j: j.seq) if _jobs else None
             targets = [job] if job is not None else []
         cancelled = []
+        claimed = []
         for target in targets:
             if target is None or target.cancelled:
                 continue
-            target.cancel(reason)
+            claimed.append(target)
             cancelled.append(target.job_id)
-            for handler in _stop_handlers.get(target.kind, []):
-                try:
-                    handler(target)
-                except Exception as exc:
-                    logging.debug("[JOBS] stop handler failed: %s", exc)
+            if _current_id == target.job_id:
+                _current_id = None
+        handlers = [(target, list(_stop_handlers.get(target.kind, [])))
+                    for target in claimed]
         if not job_id and not cancelled:
             logging.info("[JOBS] stop requested with no live job — no-op")
-        if _current_id in cancelled:
-            _current_id = None
-        return cancelled
+    # ── off the registry lock: the OS call, the closers and the handlers ──
+    for target in claimed:
+        target.cancel(reason)
+    for target, target_handlers in handlers:
+        for handler in target_handlers:
+            try:
+                handler(target)
+            except Exception as exc:
+                logging.debug("[JOBS] stop handler failed: %s", exc)
+    return cancelled
 
 
 def request_stop(job_id=None, reason="cancelled by user", kinds=None,
