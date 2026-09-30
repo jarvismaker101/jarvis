@@ -759,6 +759,32 @@ def _mark_latency(request_id, name, meta=None):
         pass
 
 
+def _mark_latency_duration(request_id, name, started_ns, meta=None):
+    """[PERF] P1-19 / [P0-10] — close a PRE-ROUTE PREDICATE step.
+
+    The waterfall derives every step from consecutive ABSOLUTE marks — the ring
+    deliberately stores no step durations (see ``backend/services/latency.py``)
+    — so what the timeline needs is the predicate's END boundary, which is what
+    is recorded here. The predicate's measured cost rides along as
+    ``predicate_ms`` metadata so the numbers P0-10 asked to report are readable
+    straight off the record instead of having to be re-derived from deltas.
+
+    No-op when the turn is unknown, and never raises: telemetry must not be able
+    to break routing.
+    """
+    if not request_id:
+        return
+    try:
+        elapsed_ms = (time.perf_counter_ns() - int(started_ns)) / 1_000_000.0
+        payload = {"predicate": name, "predicate_ms": round(elapsed_ms, 3)}
+        if meta:
+            payload.update(meta)
+        from backend.services import latency as _lat
+        _lat.mark(request_id, name, meta=payload)
+    except Exception:
+        pass
+
+
 def _bind_latency_request(request_id):
     """[PERF] P1-19 — name the turn that untagged marks belong to.
 
@@ -780,6 +806,47 @@ def _release_latency_request(request_id):
         from backend.services import latency as _lat
         if _lat.active_request() == str(request_id or ""):
             _lat.set_active_request("")
+    except Exception:
+        pass
+
+
+#: [P0-10] The speculative racer started for the turn running on THIS thread.
+#: ``process_message`` owns its lifetime in a ``finally``, so an early return
+#: anywhere in the routing chain (memory phrase, a confirmation answer, a task
+#: or screen-control verdict, research, …) cannot leak a background stream.
+_turn_racer = threading.local()
+
+
+def _register_turn_racer(racer):
+    """[P0-10] Hand *racer* to this turn's cleanup. Never raises."""
+    try:
+        _turn_racer.racer = racer
+    except Exception:
+        pass
+
+
+def _cancel_orphan_turn_racer():
+    """[P0-10] Cancel a speculation that no route adopted.
+
+    Runs from ``process_message``'s ``finally``, i.e. exactly once per finished
+    turn, on the thread that ran it. Idempotent: an already-cancelled racer is
+    simply cancelled again, and an ADOPTED one is left alone because it is the
+    reply being streamed. Never raises.
+    """
+    racer = getattr(_turn_racer, "racer", None)
+    try:
+        _turn_racer.racer = None
+    except Exception:
+        pass
+    if racer is None:
+        return
+    try:
+        if getattr(racer, "is_adopted", False):
+            return
+    except Exception:
+        pass
+    try:
+        racer.cancel()
     except Exception:
         pass
 
@@ -1594,6 +1661,12 @@ class _ChatRacer:
     context snapshot taken once at construction, its queue is bounded, and
     :meth:`cancel` closes the underlying HTTP response instead of merely
     setting a flag that is only noticed when the next delta arrives.
+
+    [P0-10] It now starts BEFORE the pre-route predicate chain, which is what
+    makes it necessary for the object to know whether a route ADOPTED it: the
+    turn's cleanup cancels a speculation no route wanted, and cancelling an
+    adopted one would inject the end-of-stream sentinel and truncate the reply
+    that is being streamed from it.
     """
 
     def __init__(self, msg, voice_compact, history=None):
@@ -1608,6 +1681,8 @@ class _ChatRacer:
         self._built = None
         self._has_stream = False
         self._cancelled = False
+        #: [P0-10] True once a route has taken ownership of the speculation.
+        self._adopted = False
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._built_ready = threading.Event()
@@ -1737,6 +1812,11 @@ class _ChatRacer:
         return self._built
 
     def adopt(self):
+        # [P0-10] From here the speculation IS the reply: the turn's cleanup
+        # must not cancel it (cancel() injects the sentinel, which would cut
+        # the drained stream short).
+        self._adopted = True
+
         def _drain():
             while True:
                 item = self._queue.get()
@@ -1760,6 +1840,11 @@ class _ChatRacer:
     @property
     def is_done(self):
         return self._done.is_set()
+
+    @property
+    def is_adopted(self):
+        """[P0-10] True once a route took ownership of this speculation."""
+        return self._adopted
 
     def join(self, timeout=None):
         self._thread.join(timeout=timeout)
@@ -3328,6 +3413,9 @@ def process_message(
             request_id=request_id,
         )
     finally:
+        # [P0-10] The speculation started for this turn is cancelled here unless
+        # a route ADOPTED it, whatever path the routing took to get back to us.
+        _cancel_orphan_turn_racer()
         _unbind_turn_job(token)
         _release_latency_request(request_id)
 
@@ -3373,17 +3461,22 @@ def _process_message_inner(
     # never executes computer control.
     if memory_store is not None:
         memory_reply = None
+        _t = time.perf_counter_ns()
         try:
             memory_reply = memory_store.handle_memory_phrase(msg)
         except Exception as exc:
             logging.debug("[MEMORY] phrase op failed: %s", exc)
+        _mark_latency_duration(request_id, "preroute_memory_phrase", _t)
         if memory_reply is not None:
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, memory_reply)
             return memory_reply
 
     # ── Explicit websearch stop — before any other routing ──
-    if is_stop_research(msg):
+    _t = time.perf_counter_ns()
+    _stop_research = is_stop_research(msg)
+    _mark_latency_duration(request_id, "preroute_stop_research", _t)
+    if _stop_research:
         print("[RESEARCH] Explicit stop request")
         response = handle_stop_research_request(from_voice=from_voice)
         if from_voice and sync_voice:
@@ -3391,14 +3484,18 @@ def _process_message_inner(
         return response
 
     # ── Pending 'shall I look it up?' answer — consume before any routing ──
+    _t = time.perf_counter_ns()
     confirmed = _consume_confirmation(msg)
+    _mark_latency_duration(request_id, "preroute_confirmation", _t)
     if confirmed is not None:
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, confirmed)
         return confirmed
 
     # ── Pending task-action confirmation answer — consume before routing ──
+    _t = time.perf_counter_ns()
     task_confirmed = consume_task_confirmation(msg)
+    _mark_latency_duration(request_id, "preroute_task_confirmation", _t)
     if task_confirmed is not None:
         _record_native_task_outcome(msg)
         _clear_browser_clarification()
@@ -3407,7 +3504,9 @@ def _process_message_inner(
         return task_confirmed
 
     # ── Pending opencode-handoff confirmation answer — consume before routing ──
+    _t = time.perf_counter_ns()
     opencode_confirmed = _consume_opencode_confirmation(msg)
+    _mark_latency_duration(request_id, "preroute_opencode_confirmation", _t)
     if opencode_confirmed is not None:
         _clear_browser_clarification()
         if from_voice and sync_voice:
@@ -3415,15 +3514,57 @@ def _process_message_inner(
         return opencode_confirmed
 
     # ── Pending browser clarification follow-up — continue same task ──
+    _t = time.perf_counter_ns()
     browser_followup = _consume_browser_followup(msg)
+    _mark_latency_duration(request_id, "preroute_browser_followup", _t)
     if browser_followup is not None:
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, browser_followup)
         return browser_followup
 
-    # ── Screen Q&A — "what's on my screen?" ──
+    # ── [P0-10] Speculative chat racer — started HERE ────────────────────
+    # This used to start after the whole predicate chain below (task request,
+    # code tools, screen control, explicit research, route selection), and every
+    # predicate in that chain is dead air between "transcript ready" and "first
+    # token". It is safe to start early because the speculation is PURE and
+    # CANCELLABLE (F25): it performs no search and no other external effect, it
+    # builds from an immutable context snapshot, and its queue is bounded.
+    #
+    # It starts only when a reply stream exists to feed, for a non-`command`
+    # message, and NOT on an orchestrator route: F02 gives that route to the
+    # orchestrator, which must not pay for a chat stream it would throw away
+    # (the route is deterministic and free to compute — no model call, no I/O).
+    #
+    # The gates ABOVE deliberately stay in front of it: a pending confirmation
+    # or clarification answer must never race a speculative answer (test:
+    # test_brain_gate.py), and those consumers return before this point.
+    #
+    # Cancellation is guaranteed by the turn's own cleanup
+    # (``_cancel_orphan_turn_racer`` in ``process_message``'s finally), so no
+    # early return below can leak the background stream. It is only skipped for
+    # a racer a route ADOPTED, which is the reply being streamed.
     is_explicit_command = msg.lower().startswith("command")
-    if not is_explicit_command and is_explicit_task_request(msg):
+    _t = time.perf_counter_ns()
+    route = ("legacy" if is_explicit_command
+             else orchestrator_select_route(
+                 msg, screen_question=is_screen_question(msg)))
+    _mark_latency_duration(request_id, "preroute_route", _t)
+    racer = None
+    if (stream_reply is not None and not is_explicit_command
+            and route != "orchestrator"):
+        _mark_latency(request_id, "racer_start")
+        try:
+            racer = _ChatRacer(msg, voice_compact)
+        except Exception as exc:
+            logging.warning("[CHAT] Racer start failed: %s", exc)
+            racer = None
+        _register_turn_racer(racer)
+
+    _t = time.perf_counter_ns()
+    _explicit_task_request = (
+        (not is_explicit_command) and is_explicit_task_request(msg))
+    _mark_latency_duration(request_id, "preroute_task_request", _t)
+    if _explicit_task_request:
         response = handle_task_message(msg, voice_compact=voice_compact)
         _record_native_task_outcome(msg)
         _disarm_other_gates_if_task_gate_armed()
@@ -3433,7 +3574,11 @@ def _process_message_inner(
 
     # ── Native code tools — plain read/write/run requests route here before
     # the LLM intent router can send them to opencode. ──
-    if not is_explicit_command and is_code_tool_request(msg):
+    _t = time.perf_counter_ns()
+    _code_tool_request = (
+        (not is_explicit_command) and is_code_tool_request(msg))
+    _mark_latency_duration(request_id, "preroute_code_tool", _t)
+    if _code_tool_request:
         response = handle_task_message(msg, voice_compact=voice_compact)
         _record_native_task_outcome(msg)
         _disarm_other_gates_if_task_gate_armed()
@@ -3441,8 +3586,10 @@ def _process_message_inner(
             sync_voice_log(voice_log_message, response)
         return response
 
-    if not msg.lower().startswith("command"):
+    if not is_explicit_command:
+        _t = time.perf_counter_ns()
         screen_control_response = maybe_handle_screen_control_message(msg)
+        _mark_latency_duration(request_id, "preroute_screen_control", _t)
         if screen_control_response is not None:
             _clear_browser_clarification()
             if from_voice and sync_voice:
@@ -3450,7 +3597,10 @@ def _process_message_inner(
             return screen_control_response
 
     # ── Deep research — explicit phrases ("look this up", "find out about X") ──
-    if not msg.lower().startswith("command") and force_research(msg):
+    _t = time.perf_counter_ns()
+    _force_research = (not is_explicit_command) and force_research(msg)
+    _mark_latency_duration(request_id, "preroute_force_research", _t)
+    if _force_research:
         print("[RESEARCH] Explicit research request:", msg)
         response = handle_research_intent(
             msg,
@@ -3467,15 +3617,22 @@ def _process_message_inner(
     # the LLM intent router decides whether this needs tool calling. If it
     # does, we acknowledge like a human ("On it, sir") and execute; if local
     # execution fails, opencode takes over.
-    racer = None
-    if not msg.lower().startswith("command"):
+    #
+    # [P0-10] `racer` is NOT re-initialised here any more: the speculation for a
+    # non-`command` message was started at the top of the turn (and is None only
+    # when it must not run), so resetting it would drop a live stream on the
+    # floor.
+    if not is_explicit_command:
         # ── G8 orchestrator migration (F02) — behind the mode flag ──
         # F02: the ROUTE is selected before any work starts. Speculative chat
         # used to begin first, so an orchestrator-owned goal paid for a chat
         # stream that was thrown away — and on fallback the speculative work
         # had already started, which is exactly the "repeats started work"
         # failure. Speculation now runs only on the legacy chat route.
-        route = orchestrator_select_route(msg, screen_question=is_screen_question(msg))
+        # [P0-10] `route` was selected at the TOP of this turn, before the
+        # predicate chain — the racer could not be started before it without
+        # knowing the orchestrator does not own this message. The F02 rule is
+        # unchanged: only the legacy route may speculate.
         if route == "orchestrator":
             orchestrator_outcome = orchestrator_handle_message(
                 msg,
@@ -3504,17 +3661,6 @@ def _process_message_inner(
             # routing WITHOUT a speculative stream — no chat work was
             # started for a goal, and none is silently re-used from here.
             logging.info("[ORCHESTRATOR] declined after selection; legacy routing")
-        elif stream_reply is not None:
-            try:
-                # [PERF] P1-19 — speculation start. `classify_done` minus
-                # `racer_start` is the classifier's real cost (the racer build
-                # is microseconds), which is what a "make it faster" item needs
-                # to see.
-                _mark_latency(request_id, "racer_start")
-                racer = _ChatRacer(msg, voice_compact)
-            except Exception as exc:
-                logging.warning("[CHAT] Racer start failed: %s", exc)
-                racer = None
         # [PERF] Deterministic "definitely plain chat" fast path. When the
         # message is obviously conversation, the classifier would only return
         # "chat" — and it is a cloud round trip that gates EVERYTHING below,
