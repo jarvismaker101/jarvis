@@ -70,20 +70,42 @@ from backend.services.screen_analyzer import analyze_screen, is_screen_question,
 from backend.services.image_fetcher import build_explore_links, fetch_topic_images
 
 
+#: P1-12 — where the voice log actually lives. The API layer owns that state
+#: (``routes._publish_voice_log``) and registers its updater here.
+#:
+#: The brain used to POST to its OWN ``/update-voice-log`` with no token. Auth
+#: fails closed in this project, so that request 401'd on EVERY voice turn: a
+#: wasted round trip, a background thread and a misleading error in the log,
+#: every time. The backend is already in the same process as the voice-log
+#: state, so there is nothing to call over HTTP. Registering a sink instead of
+#: importing the route module also keeps the voice I/O worker (which imports
+#: this module but has no route state of its own) free of the whole API layer.
+_voice_log_sink = None
+
+
+def register_voice_log_sink(sink):
+    """Install the in-process voice-log updater (the API layer calls this)."""
+    global _voice_log_sink
+    _voice_log_sink = sink
+    return sink
+
+
 def sync_voice_log(message, response):
-    def _do():
-        try:
-            requests.post(
-                f"http://127.0.0.1:{BACKEND_PORT}/update-voice-log",
-                json={"message": message, "response": response},
-                timeout=2,
-            )
-        except Exception:
-            pass
+    """P1-12 — update the voice log IN PROCESS, and never over HTTP.
+
+    Bookkeeping only: the UI's voice indicator reads this state, so it must
+    keep working, and a failure must never touch the reply. There is no thread
+    here any more either — publishing is now a couple of assignments on the
+    calling thread instead of a POST that had to be pushed off it.
+    """
+    sink = _voice_log_sink
+    if sink is None:
+        return False
     try:
-        threading.Thread(target=_do, daemon=True).start()
+        sink(message, response)
+        return True
     except Exception:
-        pass
+        return False
 
 
 #: F30 — a decoration phase is bounded. Exploration links and topic images are

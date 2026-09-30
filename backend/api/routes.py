@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from backend import listener_state
 from backend.core.brain import (
     process_message,
+    register_voice_log_sink,
     set_async_reply_callback,
     opencode_task_in_progress,
     OPENCODE_START_PHRASE,
@@ -200,6 +201,25 @@ def _publish_voice_log(message: str, response: str):
     last_voice_log_id += 1
 
 
+def _voice_log_message(message: str) -> str:
+    """The user text the UI mirror should show for a voice turn.
+
+    P1-12: same normalisation the brain applied before publishing — the spoken
+    "command ..." prefix is an addressing form, not part of what the user asked,
+    so the log shows the request itself.
+    """
+    text = str(message or "").strip()
+    if text.lower().startswith("command"):
+        return text[len("command"):].strip()
+    return text
+
+
+#: P1-12 — this module owns the voice-log state, so the brain updates it by
+#: calling this function DIRECTLY instead of POSTing to /update-voice-log (a
+#: request that carried no token and therefore 401'd on every voice turn).
+register_voice_log_sink(_publish_voice_log)
+
+
 def _publish_async_screen_reply(response: str):
     reply = (response or "").strip()
     if not reply:
@@ -323,6 +343,12 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
             reply = process_message(
                 state.message,
                 from_voice=from_voice,
+                # [P1-12] The brain no longer maintains the voice log on this
+                # path. It used to POST to our own /update-voice-log on EVERY
+                # voice turn — without the token, so it 401'd every time, after
+                # spawning a thread and a round trip. The publish happens once
+                # below, in-process, where the reply is final.
+                sync_voice=False,
                 # [PERF] A spoken turn uses the compact profile: the reply is
                 # short (under 35 words / 300 max tokens) which is what makes
                 # the first audio arrive sooner and the turn finish sooner.
@@ -347,6 +373,17 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
 
         # Terminal authority: one completed frame carries the final reply.
         state.complete(reply)
+        # [P1-12] The voice log is updated IN PROCESS, once, here — the reply is
+        # final at this point. Same update logic the endpoint uses (this IS
+        # `_publish_voice_log`), no HTTP, no thread, and a failure can never
+        # touch the reply because it is swallowed and the turn is already
+        # complete. Only voice turns publish: the log mirrors the last spoken
+        # exchange for the UI, exactly as the brain's `sync_voice_log` did.
+        if from_voice:
+            try:
+                _publish_voice_log(_voice_log_message(state.message), reply)
+            except Exception as exc:
+                logging.debug("[VOICE-LOG] in-process publish failed: %s", exc)
         # P0-08: this turn finished normally, so the barge-in marker no longer
         # describes the newest reply. It never touched the reply text itself.
         _note_reply_completed()
