@@ -111,8 +111,10 @@ class BargeInLatencyTests(unittest.TestCase):
     def test_local_stop_is_synchronous_and_immediate(self):
         """Local audio must die NOW - only the remote notice is async."""
         order = []
+        kwargs = {}
 
-        def _stop():
+        def _stop(**kw):
+            kwargs.update(kw)
             order.append("local_stop")
 
         conn = _RecordingConn(on_request=lambda n: order.append("http"))
@@ -126,6 +128,9 @@ class BargeInLatencyTests(unittest.TestCase):
             listener.barge_in_on_speech_onset()
             # Within the call, local stop already happened; HTTP comes later.
             self.assertEqual(order, ["local_stop"])
+            # [P1-02] ...and it asks for the SILENT stop: no "ready" beep in
+            # the middle of the user's sentence.
+            self.assertEqual(kwargs, {"signal_ready": False})
             self.assertTrue(_wait_for(lambda: "http" in order, 2.0))
 
     def test_zero_blocking_network_calls_on_the_capture_thread(self):
@@ -346,7 +351,7 @@ class UnchangedBehaviourTests(unittest.TestCase):
         """Even when queueing the remote stop fails, local audio still stops."""
         called = []
 
-        def _stop():
+        def _stop(**_kw):
             called.append(1)
 
         with patch.object(listener.listener_state, "is_speaking",

@@ -1271,7 +1271,10 @@ def barge_in_on_speech_onset():
     try:
         if listener_state.is_speaking():
             from backend.services.voice import stop_speaking as _stop
-            _stop()
+            # [P1-02] No "ready" cue on barge-in: the user is already talking,
+            # so a beep confirming "I can hear you" is noise in the middle of
+            # their sentence. Every other stop path keeps the cue.
+            _stop(signal_ready=False)
     except Exception:
         pass  # a local failure must never keep the remote stop from being queued
     return _post_backend_speak_stop()
@@ -1579,6 +1582,10 @@ def _capture_audio(marks=None, early=None):
             user_marked_speaking = False
 
         if not listener_state.is_speaking():
+            # [P1-02] Kept: it acknowledges the end of the user's turn during the
+            # genuinely dead period before STT. Non-blocking (the cue's own
+            # daemon thread does the Beep) and the module-level one-cue-at-a-time
+            # guard means it can never overlap the reply-start cue.
             play_capture_complete_earcon()
         empty_listen_count = 0
         duration = _audio_duration_seconds(audio)

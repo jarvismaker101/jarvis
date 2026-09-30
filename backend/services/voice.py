@@ -145,7 +145,15 @@ def _speak_local(clean, generation, play_earcon=True):
         _tts_lock.release()
 
 
-def stop_speaking():
+def stop_speaking(signal_ready=True):
+    """Stop playback now.
+
+    ``signal_ready`` controls the "I stopped, your turn" cue. [P1-02] The
+    barge-in path passes False: the user is *already talking*, so a beep
+    confirming "I can hear you" is noise, and it is the worst-placed cue in the
+    system — it lands in the middle of their sentence. Every other caller (the
+    UI stop button, a task mute) keeps the cue.
+    """
     global is_speaking, _speech_generation, _engine
 
     try:
@@ -186,7 +194,10 @@ def stop_speaking():
         is_speaking = False
         listener_state.set_speaking(False)
 
-    if should_signal_ready:
+    if should_signal_ready and signal_ready:
+        # [P1-02] Never reached from barge-in (signal_ready=False there). Kept
+        # off the capture thread's critical section regardless: play_ready_earcon
+        # only spawns its own daemon thread and returns.
         play_ready_earcon()
 
     print("[VOICE] Speech stopped")

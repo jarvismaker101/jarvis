@@ -362,7 +362,9 @@ class BargeInStopTests(unittest.TestCase):
              patch.object(listener_mod, "_post_backend_speak_stop", return_value=True) as mock_post:
             result = listener_mod.barge_in_on_speech_onset()
         self.assertTrue(result)
-        mock_stop.assert_called_once_with()
+        # [P1-02] Barge-in asks for the silent stop: no "ready" beep while the
+        # user is mid-sentence. The local stop itself is unchanged.
+        mock_stop.assert_called_once_with(signal_ready=False)
         mock_post.assert_called_once_with()
 
     def test_speech_onset_still_queues_the_stop_when_local_silent(self):
