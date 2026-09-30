@@ -6,7 +6,7 @@ State as of this refresh:
 
 - The **Fable-5 audit remediation** (G0–G11, F01–F55) is landed except the **G8 classifier-retirement step**, which remains open.
 - The **CODE_REVIEW_REPORT hardening wave** is landed for **C1–C3** and **H1–H9**, plus the **STT-hallucination gate**. The review's M/L/structural items are still open.
-- A **responsiveness audit** (43 findings, P0-01…P1-19) was completed 2026-09-29 and triaged by the owner. **Nothing from it is implemented yet.** See "Responsiveness audit state" below and `AUDIT_IMPLEMENTATION_PROMPTS.html` for the one-by-one implementation prompts.
+- A **responsiveness audit** (43 findings, P0-01…P1-19) was completed 2026-09-29 and triaged by the owner. **13 of its items are now implemented** — the 2026-09-30 wave, commits `f37a519`…`6c89095`. Per-item detail is in "Responsiveness audit implementation state" below; the remaining items are still open, and `AUDIT_IMPLEMENTATION_PROMPTS.html` holds the per-item implementation prompts.
 
 ## What This Project Is
 
@@ -475,6 +475,9 @@ One-line roles for the modules the G0-G11 work introduced that are not described
 
 - `backend/voice_mode.py`
   - The always-on voice I/O WORKER once Jarvis is active (G11/F50). It captures, transcribes, submits to the backend and speaks — nothing else. It deliberately does NOT import `backend.core.brain`, because that would give this process a second, never-authoritative copy of the intelligence state.
+  - **`_TurnManager` (P0-08) owns the ONE active voice turn.** `_respond_to_utterance` registers the turn and returns; `_run_turn` does the round trip on its own daemon thread, because the brain thread dispatches rather than waits. A new utterance pre-empts the old one: the old speaker is closed immediately and its backend request is cancelled through `POST /ask/cancel/{request_id}` (fired from a daemon thread — barge-in onset runs on the capture thread). `is_current(request_id)` gates both the streaming sink and the terminal reply, so a stale turn can never speak over its replacement.
+  - `handle_queued_item` holds the control-vs-utterance decision (extracted from `brain_thread` so it is directly testable). A control phrase must never become a turn — that would queue a second generation behind the reply it was meant to silence.
+  - Turn request ids are `voice-<epoch-ms>-<pid>-<counter>`; the counter matters, because two turns submitted in the same millisecond used to share an id and a reused id with a different message is a 409 at the request registry.
   - Has custom phrase handling for:
     - stop speaking (`POST /speak/stop`)
     - shutdown
@@ -487,8 +490,10 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - Uses `speech_recognition` with `stream=True`.
   - Uses `webrtcvad` to reject obvious noise and low-confidence captures.
   - Uses multilingual recognition across `JARVIS_STT_LANGUAGES`, default `en-IN,hi-IN`.
-  - Engine order comes from `transcription.recognize_multilingual` (`listener.py:382`): the registry-selected `listening`-role engine is tried first — **Inworld by default**, with local Whisper as the alternative, and Google STT then Groq as further fallbacks (one call per language in `RECOGNITION_LANGUAGES`). The live setting is currently `whisper`/`whisper-local`, so the local daemon is primary in practice. A hallucinated result falls through to the next engine. This is the order the code actually does; older notes that say "Google STT first" are stale.
+  - Engine order comes from `transcription.recognize_multilingual` (`listener.py:746`): the registry-selected `listening`-role engine is tried first — **Inworld by default**, with local Whisper as the alternative, and Google STT then Groq as further fallbacks (one call per language in `RECOGNITION_LANGUAGES`). The live setting is currently `whisper`/`whisper-local`, so the local daemon is primary in practice. A hallucinated result falls through to the next engine. This is the order the code actually does; older notes that say "Google STT first" are stale. (P0-03, which reduces this to ONE engine, is still open.)
   - Commits a transcript only through the F34 stabiliser and the STT hallucination gate (partial windows are filtered too).
+  - **Nothing blocking in the capture loop** (P1-03/P0-04): the `/speak/stop` POST goes through the `_SpeakStopWorker` daemon thread, partial transcription goes through `_PartialWorker`, and barge-in onset only notifies observers (`register_barge_in_hook`) on a daemon thread. Do not add a synchronous HTTP call or a blocking engine call back into `_capture_audio`/`barge_in_on_speech_onset`.
+  - The capture loop normalises everything to one sample rate (P1-05, `assert_single_rate_audio` at the STT entry) and frame ids are `(capture_token, index)` with `AecSignalPath.begin_capture()` clearing the cache per capture (P0-13).
   - Registers its recognizer with `backend/listener_state.py` so speaking/listening thresholds can be adjusted globally.
 
 - `backend/services/audio_input.py`
@@ -511,7 +516,15 @@ One-line roles for the modules the G0-G11 work introduced that are not described
     - local `pyttsx3`/SAPI5 second (with a silent-playback sanity check)
     - ElevenLabs for short chunks (`JARVIS_REMOTE_TTS_CHAR_LIMIT`)
     - local SAPI5 again as the final safety net
-  - Sentence chunking + background prefetch of the next chunk; interruption via `stop_speaking()` (generation bump + PCM flush) for instant barge-in, with the paused remainder republished on `GET /speak/remaining`.
+  - Sentence chunking + background prefetch of the next chunk. `_prefetch_tts_audio(text, plays_next=…)` is the ONLY prefetch entry point (P1-09): it resolves the selected engine per call and no-ops for an engine without a prefetch implementation, so a non-Fish engine never bills Fish. It also enforces the P0-05 rule — never warm the sentence that is about to play while the worker is idle.
+  - Streaming chunking (P1-01) flushes the first chunk at the first clause boundary (≥3 words) or the last word boundary (≥30 chars), later chunks at sentence boundaries (~200 chars), and **never mid-word**; `STREAM_POLL_SECONDS` (0.05) must stay below the 120 ms punctuated-buffer settle, which must stay below the 0.3 s stall flush.
+  - `stop_speaking(signal_ready=True)`: the barge-in path passes `signal_ready=False` (P1-02) so no "I can hear you" beep lands inside the user's sentence. Interruption is a generation bump + PCM flush, with the paused remainder republished on `GET /speak/remaining`.
+
+- `backend/services/audio_actor.py`
+  - The ONE playback owner for a reply (F32/F50) — nothing else may write to the output device.
+  - `play()` consumes the ring and waits on `_ring_cv` with a 0.05 s floor, and `feed_chunk()` notifies that condition, so a chunk reaches the device in well under a millisecond instead of on a 250 ms poll (P0-06). The producer still waits for ring space rather than dropping audio.
+  - One lazily-opened, long-lived output stream per process (`blocksize=1024`, `latency="low"`), reused across sentences and replies, restarted after a barge-in, reopened once on a write error (P0-07). `abort()` cuts pending buffers; `stop()` drains them — use abort for barge-in and never hold `_gen_lock` while waiting on `_ring_cv`.
+  - The F32 pre-write generation/stale-chunk re-check and the `_spoken_bytes` cursor accounting are load-bearing (P0-08's resume path reads them). Do not "simplify" either.
 
 - `backend/services/fish_voice.py`
   - Fish Audio TTS client: registry `tts` role model resolution (env default `FISH_MODEL`, default `s2.1-pro-free`), PCM streaming playback, prefetch/warm-up, output-device selection.
@@ -523,7 +536,8 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - Optional remote TTS provider (ElevenLabs API, MP3 via pydub).
 
 - `backend/services/earcons.py`
-  - Plays simple Windows beep patterns for ready/capture/reply cues.
+  - Plays simple Windows beep patterns for ready/capture/reply cues. **Already non-blocking** (a daemon thread per cue; caller cost is sub-millisecond), so no extra worker thread is needed here.
+  - The ready cue is not played on barge-in (P1-02), the reply-start cue is off by default (`JARVIS_REPLY_START_EARCON=1` restores it), and a one-cue-at-a-time claim coalesces a burst instead of spawning overlapping beeps. Earcons must never route through the audio actor — the actor is the reply's single playback owner.
 
 ### Wake watcher
 
@@ -610,6 +624,7 @@ Location: `backend/api/routes.py`
 Location: `backend/listener_state.py`
 
 - speaking/thinking/user-speaking booleans, active recognizer threshold, timestamps for user speech events, any stored remaining speech text.
+- The voice process additionally owns the P0-08 turn manager (`voice_mode.TURNS`: one active turn, pre-emption statistics, `active_request_id`) and the P1-19 mark timeline it ships to the backend (`latency.LocalTurn`, one per capture, merged into the backend record under the same `request_id`). Both are process-local by design and reach the backend over HTTP, never by module import.
 
 ### Screen-control runtime state
 
@@ -639,6 +654,8 @@ Location: `backend/services/intelligence_state.py`, `backend/services/jobs.py`, 
 Location: `backend/services/audio_actor.py`, `backend/services/echo_cancel.py`
 
 - One playback owner with a generation token (stale-generation PCM is dropped), the PCM ring plus spoken cursor for exact interrupted resumes, and the AEC reference ring. The API process renders audio while the voice process owns the microphone, so the reference crosses the process boundary through `GET /aec/reference`.
+- Since P0-07 the owner keeps ONE long-lived output stream (`blocksize=1024`, `latency="low"`) for the whole process instead of opening a device per sentence, and `abort()` cuts pending buffers where `stop()` drains them. Since P0-06 the player is woken by the ring condition variable rather than a 250 ms poll.
+- The AEC frame cache is keyed by `(capture_token, index)` and cleared per capture (P0-13); `RemoteAecTransport` (the backend-spoken-audio reference path) authenticates, re-probes when idle, expires cached spans by `mic_t_end` drift, and reports a breaker/auth failure in `state()` instead of pretending the reference is merely absent (P1-04).
 
 ## Environment Variables and What They Actually Affect
 
@@ -744,7 +761,7 @@ Do not put real secret values into docs or prompts. The important thing is the v
 
 ### Running the test suite
 
-The suite is no longer 17 modules. `backend/tests/` now holds **91 `test_*.py` modules** (the F01-F55 audit suites, the G3-G11 suites, the C1-C3 and H1-H9 review suites, plus the original behaviour suites), and `tests/` holds 4 Node test files. The root `conftest.py` guards the developer's real `.env` against any test that would modify or delete it.
+The suite is no longer 17 modules. `backend/tests/` now holds **105 `test_*.py` modules** (the F01-F55 audit suites, the G3-G11 suites, the C1-C3 and H1-H9 review suites, the 13 `test_p*_*` modules added by the 2026-09-30 responsiveness wave, plus the original behaviour suites), and `tests/` holds 4 Node test files. The root `conftest.py` guards the developer's real `.env` against any test that would modify or delete it.
 
 Run everything with the backend venv from the repo root (pytest is pinned in `requirements.txt`, and the root `conftest.py` is pytest-shaped):
 
@@ -767,7 +784,7 @@ node --test tests\overlay-ipc-contract.test.js
 node --test tests\research-overlay-href-scheme.test.js
 ```
 
-On counts: the last full-suite figure recorded in this map was 512 (2026-09-11, 17 modules). The suite has roughly quintupled since, so take the number from an actual run instead of repeating 512. Wall time still varies run-to-run (roughly 15s-300s) â€” the variance is known and comes from a few unmocked live network calls in `test_websearch_modes`, not from flaky assertions. Known pre-existing failures recorded in `codex.md` on 2026-09-23: `test_verification_uses_fireworks` and `test_verification_uses_groq` fail identically on stashed pre-edit code.
+On counts: the last full-suite figure recorded in this map is **2507 passed, 4 failed, 1 skipped (2026-09-30, 105 modules)**. Do not quote the old 512 (2026-09-11, 17 modules) figure. Wall time varies run-to-run (roughly 15s–300s) — the variance is known and comes from a few unmocked live network calls in `test_websearch_modes`, not from flaky assertions. The 4 failures in that run were `test_browser_agent.py` (×3) and `test_f02_goal_routing.py` (×1), which are **order-dependent** rather than broken: they pass in isolation. A number of other failures (`test_verification_uses_fireworks`, `test_verification_uses_groq`, `test_f37_groq_prerequisite`, the `test_g3_request_streaming` racer test, the `live_bugfixes` vision tests) also appear and disappear run-to-run; the reliable way to attribute a failure is to A/B it against a `git stash` of your own change rather than trusting a single run. Advice that survives all of that: run the full suite once per change, and confirm any new failure against HEAD before believing it is yours.
 
 ## Non-Obvious Behaviors Another Model Should Know
 
@@ -783,15 +800,18 @@ It talks to Groq, not xAI Grok. Its former code default `llama-3.3-70b-versatile
 
 `classify_intent` lands on a `chat` verdict whenever its whole chain fails or throttles (today OpenRouter -> Gemini -> Groq), and it can genuinely misread screen questions as chat/research. Four deterministic backstops in `process_message` rewrite or reroute such verdicts: the screen-question net, the fresh-info auto-search net, the all-`search`-steps -> research reroute, and the web-task routing net. When changing routing, check the nets, not just the classifier branch.
 
-### 4. Known live defects in the voice path (as of 2026-09-30, unfixed)
+### 4. Voice-path defects: the three confirmed ones are FIXED (2026-09-30)
 
-Three defects are confirmed present in the running code and are scheduled but **not yet fixed**. Do not assume the voice path is clean:
+The three defects that were confirmed present in the running code have all been fixed. This block is kept so a future session knows they were real, what the fixes are, and what to reach for when the voice path misbehaves again:
 
-- **The AEC frame cache replays the previous utterance's audio** (P0-13). `listener.py` restarts `frame_id` at 0 each capture while the cache is a process-lifetime singleton, so from the second capture onward new audio is returned from the prior turn without echo processing. Expect self-barge-in, suppressed user speech, and garbled STT input on turns 2+.
-- **The remote AEC reference transport cannot work** (P1-04). It sends no auth token (so every request 401s under fail-closed auth) and its idle guard latches off permanently.
-- **Barge-in stops audio but not the turn** (P0-08). Interrupting makes you wait for the previous answer to finish generating.
+- **The AEC frame cache replaying the previous utterance's audio — FIXED** (P0-13, `deee60f`). `listener._capture_audio` restarted `frame_id` at 0 each capture while `_frame_cache` is a process-lifetime singleton, so from the second capture onward frames came back from the prior turn's cache — stale PCM plus stale `had_reference`/`suppressed`, never re-processed by the AEC. That was the cause of self-barge-in. Frames are now identified by `(capture_token, index)` from a process-wide counter, and `AecSignalPath.begin_capture()` clears the cache/order/last-id at the start of every capture. The within-capture dedup the cache exists for is deliberately preserved.
+- **The remote AEC reference transport — FIXED** (P1-04, `f550642`). It sent no token (every fetch 401'd under fail-closed auth), its idle guard latched off permanently, its TTL cache ignored `mic_t_end`, and it had no breaker. All four are addressed; `state()` now distinguishes `auth_failed` / `circuit_open` from "no reference". It remains the BACKEND-spoken-audio path only — the local reference ring is still what serves voice turns.
+- **Barge-in stopping audio but not the turn — FIXED** (P0-08, `6c89095`). `/speak/stop` only called `stop_speaking()`; the running request kept generating and the next utterance queued behind it. `POST /ask/cancel/{request_id}` now cancels that one request, the voice worker runs each turn on its own thread, and barge-in onset cancels the active turn. **The full generated reply still commits to history** — that is an owner decision, not an oversight; do not "fix" it into a spoken-prefix-only record.
 
-If you are debugging voice behaviour, check these three before anything else. Work is planned in `AUDIT_IMPLEMENTATION_PROMPTS.html`.
+Two things found while fixing these, worth knowing:
+
+- The voice turn's request id was `voice-<epoch-ms>-<pid>` and **collided** when two turns were submitted inside one millisecond. Mostly theoretical before, but pre-emptive dispatch submits back-to-back and a reused id carrying a different message is a **409 conflict** at the request registry. It now carries a per-process counter, and `_TurnManager.start()` additionally pre-empts on a changed speaker so an id collision can never leave two turns registered.
+- **The listener's blocking work is gone but the async replacements are only as good as their timeouts**: `_SpeakStopWorker` (P1-03) and the turn manager's cancel both post from daemon threads, so a hung endpoint costs a thread, not the capture loop. If you see barge-in latency, look at `speak_stop_stats()` and the `barge_in_stop{ok,ms,status}` latency mark before changing any VAD constant.
 
 ### 5. Screen control is not always active
 
@@ -916,6 +936,10 @@ Start in:
 - `backend/services/audio_actor.py` (the single playback owner), `echo_cancel.py` (AEC), `transcript_stabilizer.py` (F34)
 - `backend/services/intelligence_state.py` (worker generations, playback ownership, event journal)
 
+**Measure before you change anything here.** `/latency` (P1-19) already renders the whole turn as an ordered waterfall with p50/p90/max per step, sorted slowest-first, and it stitches the voice process's capture/STT/TTS marks into the backend's record under one `request_id`. If you are chasing latency, read that first: the marks (`speech_end`, `capture_end`, `stt_start`, `stt_done{engine}`, `http_in`, `racer_start`, `classify_done{hop}`, `first_token`, `provider_headers`, `tts_first_byte`, `playback_started`, `barge_in_stop{ok,ms,status}`) tell you which stage is actually slow instead of inviting a guess. `speak_stop_stats()` covers the P1-03 stop worker, and `voice_mode.TURNS.snapshot()` covers turn pre-emption.
+
+Two hard rules that have already bitten this area: nothing blocking may enter `_capture_audio` or `barge_in_on_speech_onset` (they run on the real-time capture thread), and `PAUSE_THRESHOLD_SECONDS` / the end-of-speech decision / `MAX_PHRASE_SECONDS` / `LISTEN_TIMEOUT_SECONDS` are frozen by an explicit owner decision (P0-02, declined).
+
 ### Change TTS or spoken reply behavior
 
 Start in:
@@ -1027,7 +1051,7 @@ Top-level directories and files that matter:
 - `PROJECT_MAP.md`
   - this map
 - `AUDIT_IMPLEMENTATION_PROMPTS.html`
-  - the 2026-09-30 responsiveness-audit triage: the owner's decision per finding plus a self-contained implementation prompt for each, in phase order. Nothing in it has been implemented yet.
+  - the 2026-09-30 responsiveness-audit triage: the owner's decision per finding plus a self-contained implementation prompt for each, in phase order. **13 of the 43 items have now been implemented** (see "Responsiveness audit implementation state"); the remaining prompts are still the place to start for the rest.
 - `codex.md`
   - the project's running change log (newest entries at the bottom) — read it for the 2026-08/09 history this map summarises
 - `CODE_REVIEW_REPORT.txt` / `.pdf`
@@ -1046,34 +1070,55 @@ Mostly non-runtime or secondary:
 - `.audit_tmp/`, `_plan.txt`, `_repro*.py`, `_r3.txt`–`_r5.txt`, `.git-broken-20260914-154720/`
   - scratch/repro/backup leftovers from the audit work; not part of the runtime
 
-## Responsiveness Audit State (2026-09-29 — triaged, nothing implemented)
+## Responsiveness Audit State (2026-09-29 triage — 13 of 43 implemented on 2026-09-30)
 
-A responsiveness audit produced 43 findings (P0-01…P1-19). **No code has been changed for it yet.** The owner triaged every item; the decision and a pasteable implementation prompt for each lives in `AUDIT_IMPLEMENTATION_PROMPTS.html` at the repo root. Use that file to do the work — this map only records the decisions so a future session does not re-litigate them.
+A responsiveness audit produced 43 findings (P0-01…P1-19). The owner triaged every item; the decision and a pasteable implementation prompt for each lives in `AUDIT_IMPLEMENTATION_PROMPTS.html` at the repo root. **13 items have since been implemented, one at a time, in the phase order that document gives (P1-19 telemetry first)** — see "Responsiveness audit implementation state" below for the commit and the substance of each. The standing decisions below are recorded so a future session does not re-litigate them.
 
 **The owner's standing decisions:**
 
 - **P0-01 (slow Gemini over VPN) — no action.** The VPN was turned off, so the measured 7–45 s figure no longer applies. **Do not change the chat provider.** Re-measure once P1-19 telemetry exists. (Note: the audit's cited model `gemini-3.8-flash` was stale; the live selection is `gemini-3.5-flash-lite`.)
 - **P0-02 (1.2 s energy-only end-of-speech) — DECLINED, keep as is.** This is now a hard constraint: **no change may be made to `PAUSE_THRESHOLD_SECONDS`, the end-of-speech decision, `MAX_PHRASE_SECONDS`, or `LISTEN_TIMEOUT_SECONDS`.** Several planned items (P0-04, P1-05) carry explicit constraints to that effect.
 - **P0-03 (serial STT ladder) — implement, but as ONE engine only.** The cross-engine fallback chain and the Google/Groq language loop are to be removed. This also makes P0-04's partial-agreement early-exit meaningful, since both come from the same engine.
-- **P0-08 (barge-in does not cancel the backend turn) — implement, with one carve-out.** The full generated reply **stays committed to history** after an interruption, because the owner wants to read what was missed. The audit's "store only the spoken prefix" suggestion is explicitly rejected; an additive `last_reply_interrupted` flag is the substitute.
+- **P0-08 (barge-in does not cancel the backend turn) — implement, with one carve-out. IMPLEMENTED (`6c89095`).** The full generated reply **stays committed to history** after an interruption, because the owner wants to read what was missed. The audit's "store only the spoken prefix" suggestion is explicitly rejected; an additive `last_reply_interrupted` flag is the substitute. **Do not reverse the carve-out** — the reply text is untouched by design.
 - **P0-09 (classifier gating) — suggestion only, do not implement yet.** See the analysis in `AUDIT_IMPLEMENTATION_PROMPTS.html`; the short version is that a local Qwen3-0.6B via the existing Ollama client is the recommended candidate, used as a local-first / cloud-fallback cascade rather than a replacement, and only after a labelled evaluation set exists.
-- **P0-07 — implement only if it measurably helps.** It is split into a measurement gate, an `abort()` fix to do regardless, and a persistent-output-stream refactor to do only if the gate justifies it.
+- **P0-07 — implement only if it measurably helps. IMPLEMENTED (`6d1bedc`) after the gate fired.** It was split into a measurement gate, an `abort()` fix to do regardless, and a persistent-output-stream refactor to do only if the gate justified it; the gate measured a 400 ms inter-sentence gap on a Bluetooth default device (and a 221 ms `stop()` drain), so **both** parts were done. If you change the device setup, re-run that gate before trusting the persistent stream.
 - **P1-17 (wake cold-start) and P1-18 (Whisper daemon settings) — SKIPPED.**
 
-Everything else (P0-04, P0-05, P0-06, P0-10…P0-13, P1-01…P1-16, P1-19) is approved for implementation, one item at a time, in the phase order given in the prompts document (P1-19 telemetry first).
+Everything else (P0-04, P0-05, P0-06, P0-10…P0-13, P1-01…P1-16, P1-19) is approved for implementation, one item at a time, in the phase order given in the prompts document (P1-19 telemetry first). **Landed so far: P0-04, P0-05, P0-06, P0-07, P0-08, P0-13, P1-01, P1-02, P1-03, P1-04, P1-05, P1-09, P1-19.** Still pending from that list: P0-03 (its own decision above), P0-10…P0-12 and P1-06…P1-08, P1-10…P1-16.
 
-**Highest-value items, verified against source while triaging:**
+### Responsiveness audit implementation state (the 2026-09-30 wave)
 
-- **P0-13 — AEC frame-cache collision.** `listener.py:698` resets `frame_id = 0` every capture, but the cache is a process-wide singleton (`echo_cancel.py:830` `signal_path = AecSignalPath()`) holding 512 entries (`FRAME_CACHE_LIMIT`, line 611) that is never cleared between turns. From turn 2 onward, new audio is returned from the previous turn's cache — stale PCM plus stale `had_reference`/`suppressed` — without passing through echo cancellation. This is the most severe known defect and the cause of self-barge-in.
-- **P1-04 — the remote AEC transport can never work.** `echo_cancel.py:414` sends no `X-Jarvis-Token` (auth fails closed, so every fetch 401s), and `_remote_is_idle` is a one-way latch: it can only be cleared by a fetch that the latch itself prevents.
-- **P0-08 — barge-in silences audio but never cancels the turn.** `/speak/stop` (`routes.py`) only calls `stop_speaking()`; `voice_mode.brain_thread` handles one utterance at a time, so an interrupting question waits for the previous generation to finish.
+**Landed, in order.** Each entry gives the commit, what actually changed, and the measured before/after where the item was about latency. Every item has a dedicated `backend/tests/test_p*_*.py` suite; all 13 measured their defect before fixing it.
+
+- **P1-19 — real per-turn latency waterfall (`f37a519`).** `backend/services/latency.py` was rebuilt: a record is now a list of `(name, perf_counter_ns, meta)` tuples holding **absolute timestamps only**, and every duration is differenced at read time (the old ring mixed offsets and durations — the actual bug). Backend marks: `http_in` (in the ROUTE, not the worker thread), `racer_start`, `classify_done{hop}` naming which classifier hop answered, `provider_headers`, `first_token`. Voice marks: `speech_end`, `capture_end`, `stt_start`, `stt_done{engine,language}`, `tts_first_byte`, `playback_started`. `POST /latency/client` (authenticated) merges the voice process's marks into the same `request_id`, and the early batch rides the existing `/ask/stream` submission (`client_marks` + `client_now_ns`) — never a second id, with one clock-offset per turn so late batches cannot drift. `/latency` no longer imports `listener` (the AEC counter arrives in the published snapshot); reporting adds a `waterfall` of p50/p90/max per step sorted slowest-first while keeping the legacy `median_ms`/`p90_ms`/`max_ms` keys. `test_p1_19_latency_waterfall.py`.
+- **P0-13 — AEC frame-cache collision (`deee60f`).** See "Voice-path defects" above. Proven pre-fix: two consecutive captures returned **identical** STT input with `replayed_frames` 4/4; post-fix `0` and distinct audio. `test_p0_13_aec_frame_cache.py` (plus one F33 assertion updated to the new id shape).
+- **P1-04 — remote AEC transport (`f550642`).** Auth header, the idle latch replaced by a bounded re-probe (`idle_reprobes`), the cache keyed on `mic_t_end` with read-time drift expiry, a breaker (`AEC_BREAKER_FAILURES`/`COOLDOWN`), and a non-raising guard. It stays synchronous on purpose — a `RESIDUAL RISK` comment records why threading was deferred. `test_p1_04_remote_aec_transport.py`. **One pinned test was changed deliberately**: `test_latency_reductions.py::test_idle_period_skips_the_request_entirely` asserted the unrecoverable latch, so it was replaced by a recovery test plus a bounded-probe test.
+- **P1-05 — mixed sample rates on one capture (`07796f9`).** Mic now opens at 16 kHz so AEC and native rates coincide; when a device refuses that, mixed chunks are resampled with the existing `StatefulResampler` (one per source rate) and anything that cannot be described at the AEC format refuses to join (`None`) rather than being mislabelled. `assert_single_rate_audio` enforces the invariant at the STT entry (`recognize_multilingual`), where `recognize_inworld` builds its WAV. Pre-fix the joiner claimed **4.000 s for 2.000 s of audio**. `test_p1_05_sample_rate_join.py`.
+- **P1-03 — blocking HTTP out of the capture loop (`11ddee7`).** `_SpeakStopWorker`: one daemon thread, one persistent `HTTPConnection`, a coalescing "stop needed" flag cleared *before* the send (so the newest stop is never lost and duplicates never queue), the `GET /voice-state` probe deleted, 401/403 logged once and counted (`auth_failures`), and a `barge_in_stop{ok,ms,status}` mark. Measured against a hung endpoint: `barge_in_on_speech_onset` **10,016 ms → 0 ms**. `test_p1_03_async_speak_stop.py`; four existing assertions about the probe/silent-everywhere no-op were updated.
+- **P0-04 — partial transcription off the capture loop, and actually used (`e491c40`).** `_PartialWorker` over `queue.Queue(maxsize=1)` (newest-only, dropped-oldest pending, in-flight never dropped), the deadline-less `TypeError` retry removed, partials only start after onset is confirmed, `PARTIAL_MAX_AUDIO_SECONDS` 20 → 6 so the cap is finally below `MAX_PHRASE_SECONDS`, a cached whisper-daemon readiness gate (fails OPEN when unreachable), and two agreeing partials + 250 ms of trailing silence now end the capture early using the stabilizer's commit — with the hallucination gate unchanged on that path. Measured: capture loop **2.45 s → 0.05 s** for the same six windows. `test_p0_04_async_partials.py`.
+- **P0-06 — the audio actor wakes on chunk arrival (`6662bd8`).** `feed_chunk` appended to the ring but notified `_chunk_wait` — an Event `play()` never waited on — while the player slept on `_stop.wait(0.25)`. It now waits on the existing `_ring_cv` with a 0.05 s floor and `feed_chunk` notifies that condition. Measured feed→device-write **125–203 ms → <0.1 ms**. `_chunk_wait` is vestigial and was left alone. `test_p0_06_audio_actor_wake.py` (includes two concurrency stress tests).
+- **P0-07 — abort cuts instead of draining, and one output device per process (`6d1bedc`).** Part 0 measured before choosing: inter-sentence gap p50 **400 ms** on the Bluetooth default device (vs a ~30 ms threshold) and `stop()` drain 221 ms, so **both** parts were implemented. Part 1: `abort()` on `SoundDeviceStream` and `RawPcmStream` with a `stop()` fallback, one actor abort per stop (not two), pyttsx3 interrupted only while its event loop actually runs. Part 2: one lazily-opened, long-lived stream per actor, `blocksize=1024`/`latency="low"`, restart (not reopen) after a barge-in, one lazy reopen on a write error then `last_error`, `shutdown_actor()` at exit. Result: **9 device opens → 1** across 9 sentences, gap p50 **−0.10 ms**, abort-to-silence 8.94/1.86/1.39 ms. `test_p0_07_audio_actor_cut_and_persist.py`. Two existing tests updated (`test_f32_playback_owner` teardown split; `test_voice_latency` stream params).
+- **P0-05 — an in-flight synthesis is JOINED, not waited for (`1c82a0a`).** `_InflightPCM` publishes chunks into a growing buffer under a `Condition`; a `play=True` caller reads it as bytes arrive (`iter_from`), so a prefetch already in flight stops being a penalty. Both owner and joiner stream through one shared `_stream_pcm_to_actor` (a second playback implementation would have drifted). The prefetch guard never warms the sentence about to play while the worker is idle, and the in-flight map is bounded (`_INFLIGHT_MAX`). Measured time-to-first-audio with the prefetch deliberately winning the race: **281 ms → 47 ms**. `test_p0_05_prefetch_stream.py`.
+- **P1-09 — every prefetch goes through the engine-aware helper (`f74a304`).** Both direct `prefetch_fish_audio` call sites now route through `_prefetch_tts_audio`, which resolves the engine once per call and does nothing for an engine without a prefetch implementation — the old `if gtts … else fish` shape silently billed Fish for every non-Fish engine. The implementation map is built **per call** from the module namespace so `patch.object(voice_mod, "prefetch_fish_audio")` keeps working (a module-level map of callables broke the suite and would have let a "no Fish call" test pass while a real metered call ran). Measured with Google selected: Fish calls **1 → 0**, Google **0 → 1**. `test_p1_09_engine_aware_prefetch.py`.
+- **P1-02 — earcons off the hot path (`bf82dfa`).** The audit's assumption was wrong and was verified first: `earcons.py` was **already** non-blocking (a daemon thread per cue; caller cost sub-millisecond), so no worker thread was invented. What did change: the ready cue is dropped on **barge-in** (`stop_speaking(signal_ready=False)`), the reply-start cue is off by default (`JARVIS_REPLY_START_EARCON`) because instant speech is the better cue, and a non-blocking one-cue-at-a-time claim coalesces bursts instead of spawning N overlapping beeps. `test_p1_02_earcons_off_hot_path.py`; four `stop_speaking()` call-contract assertions updated.
+- **P1-01 — streamed chunking cuts sooner and never mid-word (`7720cdd`).** First chunk flushes at the first clause boundary `[,;:—.!?]` once ≥3 words are buffered — punctuation may be the **last** character of the delta, which is what removes the wait for the next token — or at the last word boundary once ≥30 chars are buffered. Later chunks flush at sentence boundaries up to ~200 chars, always at a word boundary, and a punctuated buffer flushes after a 120 ms settle (`STREAM_POLL_SECONDS` lowered to 0.05 so that rule can fire). The 40-char mid-word flush is gone; a chunk that cannot end on a word boundary waits instead. `test_p1_01_stream_chunking.py`. Note the deliberate trade-off: a period that is the last character of a delta counts as a clause end, so a decimal split exactly across deltas could be cut there (pin: mid-buffer `3.5` is never cut).
+- **P0-08 — barge-in cancels the backend turn (`6c89095`).** See "Voice-path defects" above. `POST /ask/cancel/{request_id}` is request-scoped and refuses to touch a finished turn; `_TurnManager` owns the one active turn; each turn runs on its own worker thread; `listener.register_barge_in_hook` notifies onset (non-blocking) and `_on_barge_in` cancels. Measured: submission of the interrupting utterance **3.015 s → 0.005 s**, and the old turn is now cancelled (it never was). `/ui-state` gains an additive `last_reply_interrupted` marker that carries **no reply text** — the reply itself is untouched in history. `test_p0_08_turn_preemption.py`; three existing tests updated for the async handover.
+
+**Still open from the audit:** P0-03 (collapse the STT ladder to ONE engine — its decision was a prerequisite for P0-04's agreement path, which is implemented but currently only meaningful once one engine is used), P0-09 (classifier gating — suggestion only), P0-10…P0-12, and P1-06…P1-08 / P1-10…P1-16. P0-01 has no action, P0-02 is declined, P1-17/P1-18 are skipped. The 43-finding list is the source of truth; do not invent extra scope.
+
+**Cross-cutting lessons from the wave, worth reading before touching this area:**
+
+- **Async-ing a caller breaks tests that observed the old synchronous side effect.** Existing assertions in `test_p1_19_latency_waterfall`, `test_voice_task_mute`, `test_p1_03_async_speak_stop`, `test_websearch_interruption`, `test_live_bugfixes` and `test_f50_f51_voice_ownership` all had to be updated for it, because the effect now lands on a worker thread. When a fix moves work off a thread, grep for the tests that assert its *timing*, not just its outcome.
+- **When you wait for a thread's side effect in a test, wait INSIDE the patch window.** A wait placed after the `with patch...` block lets the worker reach the real function (in one case the real `speak()`, which blocked on TTS) — the failure looks like "the reply was never spoken" and has nothing to do with the assertion.
+- **`voice.py` resolves TTS engines per call from the module namespace**; do not hoist engine callables into module-level constants or `patch.object` stops working (and a metered-provider test can pass while a real call runs).
+- **Telemetry/marks must never raise into the request path** and the latency record is bounded (200 turns, per-turn mark cap). Anything you add there follows the same contract.
 
 ## Short Architecture Summary
 
 If you need the shortest accurate summary possible, use this:
 
 - Electron provides the desktop shell and launches the backend/voice processes unless the watcher already did (`JARVIS_EXTERNAL_RUNTIME=1`). Model switches are live per message; nothing else hot-reloads.
-- FastAPI exposes `/ask`, `/ask/stream`, `/ask/status/{id}`, `/voice-log`, `/voice-mode`, `/voice-state` + `/voice-state/publish`, `/ui-state`, `/speak/stop|pause|resume|remaining`, `/aec/state|reference`, `/screen-answer`, `/research-result`, `/research-progress`, `/settings*` + `/providers/{id}/models`, `/task/stop`, `/approvals/reset`, `/voice-setup/launch`, `/health`. Everything except `/health` needs the per-launch `X-Jarvis-Token` (fails closed; `JARVIS_DEV_MODE=1` is the only bypass).
+- FastAPI exposes `/ask`, `/ask/stream`, `/ask/status/{id}`, `/ask/cancel/{request_id}`, `/voice-log`, `/voice-mode`, `/voice-state` + `/voice-state/publish`, `/ui-state`, `/speak/stop|pause|resume|remaining`, `/latency` + `/latency/client`, `/aec/state|reference`, `/screen-answer`, `/research-result`, `/research-progress`, `/settings*` + `/providers/{id}/models`, `/task/stop`, `/approvals/reset`, `/voice-setup/launch`, `/health`. Everything except `/health` needs the per-launch `X-Jarvis-Token` (fails closed; `JARVIS_DEV_MODE=1` is the only bypass).
 - `backend/core/brain.py` is the central intent router. Memory phrases run first; then explicit task/code-tool handoffs, screen control, explicit research; then (if `JARVIS_ORCHESTRATOR_MODE=orchestrator`) the native tool-use orchestrator; then the legacy path: a speculative chat stream races the cloud classifier (OpenRouter Flash Lite -> Gemini Flash Lite -> Groq Qwen -> `chat` verdict, all hops sharing one deadline), and four deterministic backstops (screen-question net, fresh-info auto-search, all-search-steps -> research reroute, web-task routing) correct classifier misfires.
 - Chat is served by the model-registry-selected provider (currently `gemini/gemini-3.5-flash-lite`) with a same-model non-stream retry and a Gemini -> Fireworks tail — NOT Groq, whose old default model is retired. A terminal auth/validation failure refuses instead of substituting another model.
 - Web lookups default to the Brave AI-Overview quick-search tier; "deepsearch" adds the multi-site research service with a glass-overlay report. Both tiers share one long-lived Playwright worker.
@@ -1135,6 +1180,19 @@ The activity-tail console is retitled "jarvis - task activity" (was "opencode"),
 This change lives in the brave-control MCP server (`server.mjs`). It was originally made only in the external copy at `C:\Users\mayan\mcp-servers\brave-control`, but a copy is now vendored in-tree at `integrations/brave-control/` — check `BRAVE_MCP_SERVER_DIR` to see which one the app actually spawns. A `settlePage(page, opts)` helper replaced the slow `networkidle` waits in `navigate`/`new_tab` (now `waitForEvent('load', 3s)` with a catch, then settle 300ms) and added a 200ms settle after `click_element`. It resolves on a main-frame `framenavigated` event or DOM-mutation quiescence (200ms debounce, 2500ms hard cap), disconnects its MutationObserver cleanly, and is wrapped in try/catch so settling can never fail a tool call. `ask_chat` polls every 300ms instead of 1500ms, and `copy_code_block` switched to a 100ms clipboard poll capped at 2000ms. Measured navigate ~390-406ms (was 2-4s+) and click ~16ms; that repo's node tests pass 18/18.
 
 ## Recent Improvements (2026-09)
+
+### Responsiveness audit wave: P1-19, P0-04…P0-08, P0-13, P1-01…P1-05, P1-09 (2026-09-30, 13 commits)
+
+The first implementation pass over the 43-finding responsiveness audit, one item at a time, `f37a519` → `6c89095`. Headline measured results, each taken before and after on the same probe:
+
+- **Barge-in:** `barge_in_on_speech_onset` **10,016 ms → 0 ms** against a hung endpoint (P1-03), `stop()` drain **221 ms → ~9 ms** with `abort()`, abort-to-silence 1.4–8.9 ms (P0-07).
+- **Interrupting a reply:** submission of the interrupting utterance **3.015 s → 0.005 s**, and the old turn is actually cancelled now (P0-08).
+- **Capture loop:** **2.45 s → 0.05 s** per capture with partials moved off-thread (P0-04).
+- **Audio output:** feed→device-write **125–203 ms → <0.1 ms** (P0-06); inter-sentence gap p50 **400 ms → −0.10 ms** and **9 device opens → 1** with one persistent low-latency stream (P0-07); time-to-first-audio with a prefetch in flight **281 ms → 47 ms** (P0-05).
+- **Correctness:** two consecutive captures no longer return identical audio (P0-13, this was the self-barge-in cause); the **4.000 s-for-2.000 s** sample-rate mislabel is gone (P1-05); a non-Fish TTS engine no longer bills a Fish synthesis (P1-09, **1 → 0** metered calls); the first spoken chunk no longer waits for a following token and no chunk ever ends mid-word (P1-01).
+- **Observability:** `/latency` now renders a real per-turn waterfall stitched across both processes (P1-19) — absolute-stamp marks only, p50/p90/max per step, sorted slowest first, with the legacy keys preserved.
+
+Verification: 13 new `backend/tests/test_p*_*.py` suites (all of them fail before their fix), focused runs of every touched suite, and a full-suite run per item (**2507 passed, 4 failed, 1 skipped** at the end, with the 4 pre-existing and order-dependent). Existing suites that had to be updated deliberately — each because its assertion pinned the old synchronous timing or the exact bug being fixed, and each commented in place with the reason: `test_f33_echo_cancel`, `test_latency_reductions`, `test_p1_03_async_speak_stop`, `test_websearch_interruption`, `test_live_bugfixes`, `test_f50_f51_voice_ownership`, `test_f32_playback_owner`, `test_voice_latency`, `test_p1_19_latency_waterfall`, `test_voice_task_mute`.
 
 Chronological work, newest last. The "Suite:" figures below are the counts recorded at the time of each change (they stopped being a single 17-module number after 2026-09-11 — see "Running the test suite").
 
