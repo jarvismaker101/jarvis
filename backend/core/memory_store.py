@@ -130,12 +130,37 @@ SKILL_POSTCONDITION_CONTRADICTIONS = (
 
 _db_lock = threading.Lock()
 _db_gen = 0
+#: [P1-16] Bumped by every successful memory WRITE. Retrieval results are cached
+#: against it, so a fresh write can never be missed by a stale cache (a timer
+#: alone would have that hole).
+_memory_generation = 0
 _db_path = None
 _local = threading.local()
 _fts_ok = None  # tri-state: None = untested, True/False after first open
 _delivery_cb = None
 _scheduler_thread = None
 _scheduler_stop = threading.Event()
+#: [P1-16] Wakes the scheduler when a new reminder is armed, so it can sleep
+#: until the next DUE item instead of polling every 5 seconds.
+_scheduler_wake = threading.Event()
+
+#: [P1-16] Bumped when the SCHEMA or the FTS layout changes. The expensive
+#: "rebuild the whole FTS index" pass runs only when this differs from the
+#: database's own PRAGMA user_version — not on every process start, which is
+#: what made startup cost grow with the (previously unpruned) events table.
+MEMORY_SCHEMA_VERSION = 1
+#: [P1-16] RETENTION for the events table and its FTS rows.
+MEMORY_EVENT_RETENTION_DAYS = int(
+    os.getenv("JARVIS_MEMORY_EVENT_RETENTION_DAYS", "30") or 30)
+#: …plus a hard row cap, so one very chatty day cannot dominate the table.
+MEMORY_EVENT_MAX_ROWS = int(
+    os.getenv("JARVIS_MEMORY_EVENT_MAX_ROWS", "5000") or 5000)
+#: The longest the scheduler will sleep without re-checking (a safety net for a
+#: clock change or a row armed by another process).
+SCHEDULER_MAX_WAIT = 30.0
+#: [P1-16] The first wait after the scheduler starts. A cold start reads the
+#: due times once and then sleeps, instead of ticking instantly.
+SCHEDULER_SETTLE_SECONDS = 1.0
 #: F50 — whether this process has declared itself the store's durable writer.
 #: A refusal (another live owner) is remembered so it is logged once, not on
 #: every connection.
@@ -353,11 +378,14 @@ def _ensure_writer():
 
 def _run_write(label, fn, args, kwargs):
     """Execute one queued write. Never raises into the caller or the worker."""
-    global _write_failures
+    global _write_failures, _memory_generation
     previous = getattr(_write_local, "in_write", False)
     _write_local.in_write = True
     try:
         fn(*args, **kwargs)
+        # [P1-16] A memory write invalidates every cached retrieval: the cache
+        # is keyed on this counter, so a stale read is impossible.
+        _memory_generation += 1
         return True
     except Exception as exc:
         _write_failures += 1
@@ -587,6 +615,22 @@ def default_db_path():
                / "data" / "jarvis_memory.db")
 
 
+class _MemoryConnection(sqlite3.Connection):
+    """[P1-16] A connection that bumps the retrieval generation on COMMIT.
+
+    Every memory write ends in ``commit()`` — directly, or on the writer thread
+    — so this is the ONE place that can guarantee a fresh write invalidates a
+    cached retrieval, including the paths that bypass the write queue (proposal
+    approval, corrections, commitments). Caching on a timer alone would have
+    exactly the hole this closes.
+    """
+
+    def commit(self):
+        global _memory_generation
+        super().commit()
+        _memory_generation += 1
+
+
 def _conn():
     global _ownership_declared
     # P0-11: read-your-writes — queued bookkeeping that precedes this access
@@ -602,7 +646,7 @@ def _conn():
                 os.makedirs(parent, exist_ok=True)
             except Exception:
                 pass
-        conn = sqlite3.connect(path, timeout=5.0)
+        conn = sqlite3.connect(path, timeout=5.0, factory=_MemoryConnection)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -701,6 +745,63 @@ def _migrate_skills(conn):
         logging.warning("[MEMORY] skills schema migration failed: %s", exc)
 
 
+def prune_events(keep_days=None, max_rows=None, conn=None):
+    """[P1-16] Retention: drop old events AND their FTS rows.
+
+    The events table was never pruned, so it grew without bound and every FTS
+    rebuild got slower with it. Rows older than ``keep_days`` are removed, plus
+    anything beyond the newest ``max_rows``, and each removed row is deleted
+    from the FTS index (the documented external-content 'delete' command) so the
+    index shrinks with the table. Returns the number of pruned rows.
+    """
+    if not MEMORY_ENABLED:
+        return 0
+    days = MEMORY_EVENT_RETENTION_DAYS if keep_days is None else keep_days
+    rows_cap = MEMORY_EVENT_MAX_ROWS if max_rows is None else max_rows
+    try:
+        conn = conn if conn is not None else _conn()
+        ids = []
+        if days is not None and days >= 0:
+            cutoff = time.time() - (float(days) * 86400.0)
+            ids.extend(r[0] for r in conn.execute(
+                "SELECT id FROM events WHERE ts < ?", (cutoff,)).fetchall())
+        if rows_cap is not None and rows_cap >= 0:
+            ids.extend(r[0] for r in conn.execute(
+                "SELECT id FROM events ORDER BY ts DESC, id DESC "
+                "LIMIT -1 OFFSET ?", (int(rows_cap),)).fetchall())
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            return 0
+        pruned = 0
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            if _fts_ok:
+                try:
+                    conn.execute(
+                        "INSERT INTO events_fts(events_fts, rowid, summary) "
+                        "SELECT 'delete', id, summary FROM events "
+                        "WHERE id IN (%s)" % marks, chunk)
+                except Exception as exc:
+                    logging.debug("[MEMORY] fts prune failed: %s", exc)
+            cur = conn.execute(
+                "DELETE FROM events WHERE id IN (%s)" % marks, chunk)
+            pruned += cur.rowcount or 0
+        conn.commit()
+        return pruned
+    except Exception as exc:
+        logging.warning("[MEMORY] event retention failed: %s", exc)
+        return 0
+
+
+def _schema_version(conn):
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        return int((row[0] if row is not None else 0) or 0)
+    except Exception:
+        return 0
+
+
 def _ensure_schema(conn):
     global _fts_ok
     conn.executescript(_SCHEMA)
@@ -727,16 +828,23 @@ def _ensure_schema(conn):
         except Exception as exc:
             logging.warning("[MEMORY] FTS5 unavailable — LIKE fallback: %s", exc)
             _fts_ok = False
-        if _fts_ok:
-            # F06: earlier builds never actually populated the FTS index
-            # (arity bug above); rebuild once per DB open so an existing DB
-            # is searchable rather than silently falling back to LIKE.
-            for fts_table in ("facts_fts", "events_fts", "skills_fts"):
-                try:
-                    conn.execute("INSERT INTO %s(%s) VALUES('rebuild')"
-                                 % (fts_table, fts_table))
-                except Exception as exc:
-                    logging.debug("[MEMORY] fts rebuild failed: %s", exc)
+    version = _schema_version(conn)
+    if _fts_ok and version < MEMORY_SCHEMA_VERSION:
+        # [P1-16] Gated on PRAGMA user_version: this rebuild (plus retention)
+        # used to run on EVERY process start, over a table that was never
+        # pruned, so startup cost grew forever. Additive migrations above still
+        # run every time — they are cheap and idempotent.
+        for fts_table in ("facts_fts", "events_fts", "skills_fts"):
+            try:
+                conn.execute("INSERT INTO %s(%s) VALUES('rebuild')"
+                             % (fts_table, fts_table))
+            except Exception as exc:
+                logging.debug("[MEMORY] fts rebuild failed: %s", exc)
+        prune_events(conn=conn)
+        try:
+            conn.execute("PRAGMA user_version = %d" % MEMORY_SCHEMA_VERSION)
+        except Exception as exc:
+            logging.debug("[MEMORY] user_version bump failed: %s", exc)
     conn.commit()
 
 
@@ -796,6 +904,78 @@ def _fts_query(conn, table, query, limit, extra_where="", extra_args=()):
     except Exception as exc:
         logging.debug("[MEMORY] fts query failed: %s", exc)
         return None
+
+
+#: [P1-16] Retrieval stopwords. Matching on these is pure cost and pure noise:
+#: they appear in almost every fact, so an OR'd query over them returned
+#: loosely-related rows that then cost prompt tokens and misled the model.
+_RETRIEVAL_STOPWORDS = frozenset((
+    "a", "about", "after", "again", "all", "also", "am", "an", "and", "any",
+    "are", "as", "at", "be", "because", "been", "being", "but", "by", "can",
+    "could", "did", "do", "does", "doing", "done", "for", "from", "get", "got",
+    "had", "has", "have", "he", "her", "here", "hers", "him", "his", "how",
+    "i", "if", "in", "into", "is", "it", "its", "just", "know", "like", "me",
+    "mine", "more", "most", "must", "my", "no", "not", "now", "of", "on",
+    "once", "one", "only", "or", "other", "our", "ours", "out", "over", "own",
+    "please", "said", "same", "she", "should", "sir", "so", "some", "such",
+    "than", "that", "the", "their", "them", "then", "there", "these", "they",
+    "this", "those", "to", "too", "under", "up", "us", "very", "was", "we",
+    "were", "what", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "would", "yes", "yet", "you", "your", "yours", "jarvis",
+))
+
+
+def _retrieval_terms(query, limit=8):
+    """[P1-16] Content words of *query*: stopwords dropped, de-duplicated."""
+    words = re.findall(r"[A-Za-z0-9_']{3,}", str(query or "").lower())
+    terms, seen = [], set()
+    for word in words:
+        word = word.strip("'")
+        if len(word) < 3 or word in _RETRIEVAL_STOPWORDS or word in seen:
+            continue
+        seen.add(word)
+        terms.append(word)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _fts_match_any(conn, table, terms, limit):
+    """[P1-16] ONE FTS5 query matching ANY of *terms*, best-ranked first.
+
+    Returns rowids, or None when FTS cannot answer (the caller degrades).
+    """
+    if not _fts_ok or not terms:
+        return None
+    fts_table, _cols = _FTS_TABLES[table]
+    match = " OR ".join('"%s"*' % str(t).replace('"', "") for t in terms[:8])
+    sql = ("SELECT rowid FROM %s WHERE %s MATCH ? ORDER BY rank LIMIT ?"
+           % (fts_table, fts_table))
+    try:
+        return [r[0] for r in conn.execute(
+            sql, [match, int(limit)]).fetchall()]
+    except Exception as exc:
+        logging.debug("[MEMORY] fts any-query failed: %s", exc)
+        return None
+
+
+def _relevance(row, terms):
+    """[P1-16] How many query terms this fact actually contains.
+
+    A whole-word hit always counts; a LONGER term also counts inside a word
+    (``phoenix`` in ``phoenix-9``). Anything else is not relevance — it is a
+    coincidence of letters, and injecting it costs tokens and misleads.
+    """
+    haystack = " ".join(str(row[k] or "") for k in
+                        ("subject", "predicate", "value", "key")).lower()
+    words = set(re.findall(r"[a-z0-9_']{3,}", haystack))
+    hits = 0
+    for term in terms:
+        if term in words:
+            hits += 1
+        elif len(term) >= 5 and term in haystack:
+            hits += 1
+    return hits
 
 
 def _like_tokens(text):
@@ -1167,24 +1347,56 @@ def forget(subject=None, predicate=None, fact_id=None, source=None, key=None):
         return 0
 
 
-def _fact_meta(row, conn=None):
+def _revisions_for(conn, rows):
+    """[P1-16] The revision numbers of *rows* in ONE query.
+
+    ``_fact_meta`` used to ask the database once per returned row, so a lookup
+    that injected eight facts cost eight extra queries on top of the search.
+    """
+    ids = [int(r["id"]) for r in rows if r["id"] is not None]
+    out = {}
+    for start in range(0, len(ids), 200):
+        chunk = ids[start:start + 200]
+        if not chunk:
+            continue
+        marks = ",".join("?" * len(chunk))
+        try:
+            for row in conn.execute(
+                "SELECT f1.id AS id, (SELECT COUNT(*) FROM facts f2 "
+                "WHERE f2.key = f1.key AND f2.id <= f1.id) AS revision "
+                "FROM facts f1 WHERE f1.id IN (%s)" % marks, chunk):
+                out[int(row["id"])] = int(row["revision"] or 1)
+        except Exception as exc:
+            logging.debug("[MEMORY] batched revision lookup failed: %s", exc)
+    return out
+
+
+def _fact_meta(row, conn=None, revisions=None):
     """Attach retrieval metadata (key, revision, active flag, timestamps)
-    to a facts row so callers never have to re-query the chain."""
+    to a facts row so callers never have to re-query the chain.
+
+    Pass *revisions* (see :func:`_revisions_for`) to reuse a batched lookup
+    instead of one COUNT per row.
+    """
     d = _row(row)
     if d is None:
         return None
     d["active"] = (not d.get("forgotten")
                    and d.get("superseded_by") is None)
     d["forgotten"] = bool(d.get("forgotten"))
-    revision = 1
-    try:
-        conn = conn or _conn()
-        if d.get("key"):
-            revision = conn.execute(
-                "SELECT COUNT(*) FROM facts WHERE key = ? AND id <= ?",
-                (d["key"], d["id"])).fetchone()[0] or 1
-    except Exception:
+    revision = None
+    if revisions is not None and d.get("id") is not None:
+        revision = revisions.get(int(d["id"]))
+    if revision is None:
         revision = 1
+        try:
+            conn = conn or _conn()
+            if d.get("key"):
+                revision = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE key = ? AND id <= ?",
+                    (d["key"], d["id"])).fetchone()[0] or 1
+        except Exception:
+            revision = 1
     d["revision"] = int(revision)
     return d
 
@@ -1208,73 +1420,139 @@ def fact_revisions(subject_or_key, limit=20):
 
 
 def relevant_facts(query, limit=RELEVANT_LIMIT):
-    """Retrieval over ACTIVE (never-superseded, not-forgotten) facts,
-    newest first, with metadata.
+    """Retrieval over ACTIVE (never-superseded, not-forgotten) facts.
 
-    F06: FTS is consulted first over every indexed column, but whenever it
-    yields fewer usable ACTIVE rows than requested — FTS unavailable, the
-    rows unindexed, or the match landing only on inactive/tombstoned rows —
-    a LIKE scan over the ACTIVE rows runs as a real fallback, so a query
-    never comes back empty merely because FTS matched only inactive rows.
-    Aliases mentioned in *query* are expanded to their canonical subject.
+    [P1-16] ONE FTS query per lookup, over the CONTENT words of the utterance
+    (stopwords dropped), instead of up to ~100 queries — one FTS query per term
+    per column plus LIKE scans over the stopwords themselves. Candidates are
+    then scored for genuine relevance: a fact that does not actually contain a
+    queried term is NOT injected (an empty context is better than a wrong one).
+    Aliases mentioned in *query* are expanded to their canonical subject, and
+    results are cached against a write GENERATION so a fresh write can never be
+    hidden by a stale cache.
     """
     if not MEMORY_ENABLED:
         return []
+    cached = _cache_get(query, limit)
+    if cached is not None:
+        return cached
     try:
         conn = _conn()
-        base = (
-            "SELECT * FROM facts WHERE forgotten = 0 AND superseded_by IS NULL"
-        )
-        terms = [str(query or "")] + _alias_expansions(query)
-        rows, seen = [], set()
-
-        def _add(row):
-            if row is None or row["id"] in seen:
-                return
+        terms = _retrieval_terms(
+            " ".join([str(query or "")] + list(_alias_expansions(query))))
+        if not terms:
+            _cache_put(query, limit, [])
+            return []
+        rowids = _fts_match_any(conn, "facts", terms, max(limit * 8, 32))
+        rows = _facts_by_rowids(conn, rowids) if rowids else []
+        if not rows:
+            # FTS unavailable, or the index matched only inactive revisions:
+            # ONE bounded LIKE scan over the ACTIVE rows, over the same
+            # stopword-filtered terms (never a scan per stopword).
+            rows = _like_facts(conn, terms, limit * 4)
+        scored = []
+        for row in rows:
+            if row is None or row["forgotten"]:
+                continue
+            matched = row
+            active = row
+            if active["superseded_by"] is not None:
+                # FTS matched a HISTORICAL revision: surface the latest ACTIVE
+                # revision of the same fact instead of coming back empty.
+                active = (_active_fact_for_key(active["key"])
+                          if active["key"] else None)
+                if active is None or active["forgotten"]:
+                    continue
+            # Relevance is judged on the row that actually MATCHED: the active
+            # revision of a corrected fact legitimately no longer contains the
+            # old term, and that must not hide the current truth.
+            score = _relevance(matched, terms)
+            if score <= 0:
+                continue          # weakly related: inject NOTHING
+            scored.append((score, active["created_at"] or 0,
+                           active["id"] or 0, active))
+        seen, ordered = set(), []
+        for _score, _ts, _id, row in sorted(scored, reverse=True,
+                                            key=lambda item: item[:3]):
+            if row["id"] in seen:
+                continue
             seen.add(row["id"])
-            rows.append(row)
-
-        for term in terms[:3]:
-            for fid in (_fts_query(conn, "facts", term, limit * 3) or []):
-                if len(rows) >= limit:
-                    break
-                raw = conn.execute(
-                    "SELECT * FROM facts WHERE id = ?", (fid,)).fetchone()
-                if raw is None or raw["forgotten"]:
-                    continue
-                if raw["superseded_by"] is None:
-                    _add(raw)
-                    continue
-                # FTS matched a HISTORICAL revision: surface the latest
-                # ACTIVE revision of the same independent fact instead of
-                # coming back empty because only inactive rows matched.
-                if raw["key"]:
-                    _add(_active_fact_for_key(raw["key"]))
-            if len(rows) >= limit:
+            ordered.append(row)
+            if len(ordered) >= limit:
                 break
-        if len(rows) < limit:
-            # LIKE fallback over ACTIVE rows: literal, escaped patterns.
-            for term in terms[:3]:
-                tokens = _like_tokens(term) or (
-                    [term.strip()] if str(term).strip() else [])
-                for token in tokens:
-                    if len(rows) >= limit:
-                        break
-                    like = _like_contains(token)
-                    for r in conn.execute(
-                        base + " AND (subject LIKE ? ESCAPE '\\' "
-                        "OR value LIKE ? ESCAPE '\\' "
-                        "OR key LIKE ? ESCAPE '\\') "
-                        "ORDER BY created_at DESC LIMIT ?",
-                        (like, like, like, limit),
-                    ).fetchall():
-                        _add(r)
-        rows.sort(key=lambda r: (r["created_at"] or 0, r["id"] or 0),
-                  reverse=True)
-        return [_fact_meta(r, conn) for r in rows[:limit]]
+        revisions = _revisions_for(conn, ordered)
+        result = [_fact_meta(r, conn, revisions=revisions) for r in ordered]
+        _cache_put(query, limit, result)
+        return result
     except Exception as exc:
         logging.warning("[MEMORY] relevant_facts failed: %s", exc)
         return []
+
+
+def _facts_by_rowids(conn, rowids):
+    """Load every candidate in ONE query (was one query per rowid)."""
+    ids = list(dict.fromkeys(int(r) for r in rowids))
+    if not ids:
+        return []
+    rows = []
+    for start in range(0, len(ids), 200):
+        chunk = ids[start:start + 200]
+        marks = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(
+            "SELECT * FROM facts WHERE id IN (%s)" % marks, chunk).fetchall())
+    return rows
+
+
+def _like_facts(conn, terms, limit):
+    """Bounded LIKE fallback over ACTIVE rows, one statement for all terms."""
+    if not terms:
+        return []
+    clauses, args = [], []
+    for term in terms[:6]:
+        like = _like_contains(term)
+        clauses.append("(subject LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\'"
+                       " OR key LIKE ? ESCAPE '\\')")
+        args.extend([like, like, like])
+    try:
+        return conn.execute(
+            "SELECT * FROM facts WHERE forgotten = 0 AND superseded_by IS NULL"
+            " AND (%s) ORDER BY created_at DESC LIMIT ?" % " OR ".join(clauses),
+            args + [int(limit)]).fetchall()
+    except Exception as exc:
+        logging.debug("[MEMORY] like fallback failed: %s", exc)
+        return []
+
+
+#: [P1-16] Retrieval cache. Keyed on the write generation (plus the active
+#: database), so ANY memory write invalidates it — a timer-based cache could
+#: serve a result that a just-made write should have changed.
+_relevant_cache = {}
+_relevant_cache_lock = threading.Lock()
+_RELEVANT_CACHE_MAX = 64
+
+
+def _cache_key(query, limit):
+    return (_db_gen, _memory_generation,
+            " ".join(str(query or "").lower().split())[:300], int(limit))
+
+
+def _cache_get(query, limit):
+    key = _cache_key(query, limit)
+    with _relevant_cache_lock:
+        return _relevant_cache.get(key)
+
+
+def _cache_put(query, limit, rows):
+    key = _cache_key(query, limit)
+    with _relevant_cache_lock:
+        if len(_relevant_cache) >= _RELEVANT_CACHE_MAX:
+            _relevant_cache.clear()
+        _relevant_cache[key] = rows
+
+
+def memory_generation():
+    """[P1-16] The current write generation (diagnostics/tests)."""
+    return _memory_generation
 
 
 def memory_context(query, budget=CONTEXT_BUDGET_CHARS):
@@ -1671,7 +1949,15 @@ def add_commitment(text, trigger_kind="deadline", due_at=None,
          str(request_id or "")[:60] or None, str(notify or "once")[:10]),
     )
     conn.commit()
+    # [P1-16] A scheduler that is ALREADY running may be asleep on a stale
+    # (long) delay, so a freshly armed reminder has to wake it. A scheduler
+    # this call is about to start needs no wake — it reads the due times when
+    # it starts — and waking it would make it tick instantly, racing a caller
+    # that is ticking concurrently.
+    was_running = _scheduler_thread is not None and _scheduler_thread.is_alive()
     _start_scheduler()
+    if was_running:
+        wake_scheduler()
     return cur.lastrowid
 
 
@@ -1961,12 +2247,59 @@ def set_commitment_delivery(cb):
     _delivery_cb = cb
 
 
+def _next_commitment_delay(default=SCHEDULER_MAX_WAIT, now=None):
+    """[P1-16] Seconds until the next armed commitment is due (bounded).
+
+    The scheduler used to poll every 5 seconds forever, re-running the whole
+    expiry/reclaim/due scan each time. It now sleeps until the next due item —
+    a new reminder is armed through :func:`add_commitment`, which wakes it.
+    """
+    now = now if now is not None else time.time()
+    try:
+        row = _conn().execute(
+            "SELECT MIN(COALESCE(next_attempt_at, due_at)) AS due "
+            "FROM commitments WHERE status = 'armed' AND due_at IS NOT NULL"
+        ).fetchone()
+        due = row["due"] if row is not None else None
+    except Exception as exc:
+        logging.debug("[MEMORY] next-commitment lookup failed: %s", exc)
+        return default
+    if due is None:
+        return default
+    try:
+        return max(0.05, min(float(default), float(due) - now))
+    except (TypeError, ValueError):
+        return default
+
+
 def _scheduler_loop():
-    while not _scheduler_stop.wait(5.0):
-        try:
-            commitment_tick()
-        except Exception as exc:
-            logging.debug("[MEMORY] scheduler tick failed: %s", exc)
+    """Tick when something is due — never on a fixed poll.
+
+    Order matters: the loop WAITS first and ticks afterwards, so a freshly
+    started scheduler cannot snatch a due reminder out from under a caller that
+    is ticking concurrently (arming a reminder had the same race against the
+    old 5s poll). The first wait is a short settle so a cold start cannot
+    tick-storm either.
+    """
+    first = True
+    try:
+        while not _scheduler_stop.is_set():
+            delay = _next_commitment_delay()
+            if first:
+                delay = max(delay, SCHEDULER_SETTLE_SECONDS)
+                first = False
+            if _scheduler_wake.wait(delay):
+                _scheduler_wake.clear()
+            if _scheduler_stop.is_set():
+                return
+            try:
+                commitment_tick()
+            except Exception as exc:
+                logging.debug("[MEMORY] scheduler tick failed: %s", exc)
+    finally:
+        # Release this thread's SQLite connection: on Windows an open handle
+        # keeps the database file locked after the worker stops.
+        _close_local_connection()
 
 
 def _start_scheduler():
@@ -1975,9 +2308,23 @@ def _start_scheduler():
     if not MEMORY_ENABLED or _scheduler_thread is not None:
         return
     _scheduler_stop.clear()
+    _scheduler_wake.clear()
     _scheduler_thread = threading.Thread(
         target=_scheduler_loop, name="jarvis-commitments", daemon=True)
     _scheduler_thread.start()
+
+
+def wake_scheduler():
+    """[P1-16] Tell a RUNNING scheduler that a new commitment was armed.
+
+    A scheduler that is not running needs no wake: it reads the due times when
+    it starts. Waking a brand-new thread would make it tick immediately and
+    race a caller that is about to tick concurrently.
+    """
+    thread = _scheduler_thread
+    if (thread is not None and thread.is_alive()
+            and not _scheduler_stop.is_set()):
+        _scheduler_wake.set()
 
 
 def start_scheduler():
@@ -2004,9 +2351,19 @@ def pending_commitments(now=None):
 
 
 def stop_scheduler():
-    """Test/teardown hook — stops the daemon thread if it is running."""
+    """Test/teardown hook — stops the daemon thread if it is running.
+
+    [P1-16] It JOINS the thread: the loop now runs a tick before its (much
+    longer) sleep, so a stopping scheduler could otherwise still be inside a
+    tick — and re-open the database — after a caller had closed and deleted it.
+    """
     global _scheduler_thread
+    thread = _scheduler_thread
     _scheduler_stop.set()
+    _scheduler_wake.set()
+    if (thread is not None and thread.is_alive()
+            and thread is not threading.current_thread()):
+        thread.join(2.0)
     _scheduler_thread = None
 
 
@@ -2481,16 +2838,30 @@ _SKILLS_LIST_RE = re.compile(
 # deterministic and scoped: a correction names ONE fact, an alias binds one
 # name to one fact target, and a model proposal is only ever APPLIED by an
 # explicit approval phrase.
+#
+# [P1-16] Every one of them now demands EXPLICIT memory wording. "X is also
+# known as Y" and "fix the header to blue" are ordinary sentences; firing on
+# them let casual speech WRITE an alias or a correction, and a false alias is
+# memory corruption that is very hard to undo. The audit's explicit signal
+# words are remember / note / correct / update / actually / forget.
 _CORRECT_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:correct|update|fix)\s+(?:that\s+)?"
+    r"^\s*(?:please\s+)?(?:(?:actually|no)\b[,\s]+)?"
+    r"(?:correct|update)\s+(?:that\s+)?"
     r"(?P<subject>.{1,120}?)\s+(?:to|as)\s+(?P<value>.{1,400})$",
     re.IGNORECASE | re.DOTALL)
+#: "actually, <subject> is <value>" — the explicit correction marker without a
+#: verb. It can only ever supersede a fact that ALREADY exists, so a casual
+#: "actually the sky is green" still writes nothing.
+_ACTUALLY_RE = re.compile(
+    r"^\s*actually\b[,\s]+(?P<subject>.{1,120}?)\s+(?:is|are)\s+"
+    r"(?P<value>.{1,400})$", re.IGNORECASE | re.DOTALL)
 _ALIAS_ADD_RE = re.compile(
     r"^\s*(?:please\s+)?(?:add|create|remember)\s+(?:an?\s+)?alias\s+"
     r"(?P<alias>.{1,80}?)\s+(?:for|to)\s+(?P<target>.{1,120})$",
     re.IGNORECASE | re.DOTALL)
 _ALIAS_KNOWN_RE = re.compile(
-    r"^\s*(?P<target>.{1,120}?)\s+(?:is|are)\s+also\s+"
+    r"^\s*(?:please\s+)?(?:remember|note)\s+(?:that\s+)?"
+    r"(?P<target>.{1,120}?)\s+(?:is|are)\s+also\s+"
     r"(?:known|called)\s+as\s+(?P<alias>.{1,80})$",
     re.IGNORECASE | re.DOTALL)
 _PROPOSAL_LIST_RE = re.compile(
@@ -2598,6 +2969,97 @@ def list_skills(limit=5):
         return []
 
 
+#: [P1-16] A forget target made only of these can never name a memory. "forget
+#: it" / "forget that" are not resolvable targets: guessing deleted the WRONG
+#: fact, so the handler asks instead. Deleting the wrong memory is worse than
+#: failing to delete.
+_UNRESOLVABLE_TARGETS = frozenset((
+    "it", "its", "that", "this", "them", "those", "these", "him", "her",
+    "one", "ones", "thing", "things", "stuff", "something", "anything",
+    "nothing", "everything", "all", "any", "some", "memory", "memories",
+    "fact", "facts", "note", "notes", "record", "records", "about", "the",
+    "a", "an", "my", "your", "his", "hers", "our", "their", "me", "you",
+    "us", "we", "i", "again", "now", "here", "there", "down", "up", "out",
+))
+
+
+def normalise_phrase(msg):
+    """[P1-16] Collapse whitespace and drop trailing punctuation.
+
+    Matching happens on this form: "Forget it." used to reach the patterns with
+    its period attached, so a target could end up as "it." and slip past the
+    pronoun check.
+    """
+    text = " ".join(str(msg or "").strip().split())
+    return text.strip(" \t\r\n.!?,;:")
+
+
+def _forget_target(text):
+    """The subject a forget phrase names, or None when it cannot be resolved.
+
+    Possessive/article prefixes are dropped ("my project" -> "project"), and a
+    target that is only a pronoun or a function word returns None so the caller
+    can ASK which memory was meant.
+    """
+    target = normalise_phrase(text)
+    target = re.sub(r"^(?:my|our|his|her|the|that|this)\s+", "", target,
+                    flags=re.IGNORECASE).strip()
+    if not target or len(target) < 3:
+        return None
+    words = re.findall(r"[a-z0-9_']+", target.lower())
+    if not words:
+        return None
+    if all(word in _UNRESOLVABLE_TARGETS for word in words):
+        return None
+    return target
+
+
+def _forget_candidates(target):
+    """[P1-16] The ACTIVE facts a forget target could mean.
+
+    Matching is by SUBJECT and KEY only — never by ``value``: the value is the
+    content being remembered, not a name for it, and deleting a memory by
+    matching its content text is exactly how the wrong thing gets deleted.
+    Exact subject matches are preferred over substring ones.
+    """
+    text = str(target or "").strip()
+    if not text:
+        return []
+    slug = _key_slug(text, 8)
+    try:
+        rows = _conn().execute(
+            "SELECT * FROM facts WHERE forgotten = 0 AND superseded_by IS NULL "
+            "AND (subject = ? OR key = ? OR key LIKE ? ESCAPE '\\' "
+            "OR subject LIKE ? ESCAPE '\\') "
+            "ORDER BY created_at DESC, id DESC",
+            (text, slug, _like_escape(slug) + ":%", _like_contains(text)),
+        ).fetchall()
+    except Exception as exc:
+        logging.debug("[MEMORY] forget candidates failed: %s", exc)
+        return []
+    exact = [r for r in rows
+             if str(r["subject"] or "").strip().lower() == text.lower()]
+    return exact or list(rows)
+
+
+def forget_target_reply(target):
+    """[P1-16] Resolve a forget phrase to EXACTLY ONE fact, or ask.
+
+    Returns a reply string (never deletes more than one fact, never guesses).
+    """
+    matches = _forget_candidates(target)
+    if not matches:
+        return "I don't have that stored, sir."
+    if len(matches) > 1:
+        subjects = sorted({str(r["subject"] or "").strip() for r in matches})
+        listed = ", ".join(subjects[:4])
+        return ("I have more than one memory matching '%s', sir (%s). "
+                "Which one should I forget?" % (target, listed))
+    if forget(fact_id=int(matches[0]["id"])):
+        return "Forgotten, sir."
+    return "I don't have that stored, sir."
+
+
 def handle_memory_phrase(msg):
     """Deterministic scoped memory/commitment/skill operations.
 
@@ -2608,9 +3070,36 @@ def handle_memory_phrase(msg):
     """
     if not MEMORY_ENABLED or not msg or not msg.strip():
         return None
-    raw = msg.strip()
+    # [P1-16] Match on the punctuation-normalised form.
+    raw = normalise_phrase(msg)
+    if not raw:
+        return None
     if raw.lower() in ("forget it", "forget that", "never mind"):
-        return None  # negation idiom, not a memory op
+        # [P1-16] "never mind" stays a pure idiom (it has no memory verb at
+        # all). "forget it"/"forget that" name NO resolvable target, so they
+        # must ASK instead of guessing — guessing deleted a random fact.
+        if raw.lower() == "never mind":
+            return None
+        return ("Which memory should I forget, sir? Tell me the subject and "
+                "I will remove exactly that one.")
+
+    # [P1-16] The SPECIFIC grammars are tried before the generic "remember
+    # that <clause>" catch-all, which would otherwise swallow them: "remember
+    # that project is also known as phoenix" is an alias binding, not a note.
+    m = _ALIAS_ADD_RE.match(raw) or _ALIAS_KNOWN_RE.match(raw)
+    if m:
+        target = re.sub(r"^(my|our|his|her|the|that|this)\s+", "",
+                        m.group("target").strip(), flags=re.IGNORECASE)
+        alias = m.group("alias").strip()
+        # [P1-16] An alias for a target that is not a stored memory is a
+        # corruption with no meaning: refuse to write it and let routing
+        # continue, rather than inventing a binding.
+        if not _forget_candidates(target):
+            return None
+        if add_alias(alias, target):
+            return ("Noted, sir — I'll treat '%s' as another name for %s."
+                    % (alias, target))
+        return None
 
     m = _REMEMBER_RE.match(raw)
     if m:
@@ -2626,7 +3115,7 @@ def handle_memory_phrase(msg):
                  source="chat")
         return "Noted, sir."
 
-    m = _CORRECT_RE.match(raw)
+    m = _CORRECT_RE.match(raw) or _ACTUALLY_RE.match(raw)
     if m:
         subject = re.sub(r"^(my|our|his|her|the|that|this)\s+", "",
                          m.group("subject").strip(), flags=re.IGNORECASE)
@@ -2635,18 +3124,9 @@ def handle_memory_phrase(msg):
         if new_id:
             return ("Corrected, sir — I updated what I had stored about "
                     "%s." % subject)
-        # "fix the header to blue" is a task, not a memory correction:
-        # when no stored fact matches, routing continues untouched.
-        return None
-
-    m = _ALIAS_ADD_RE.match(raw) or _ALIAS_KNOWN_RE.match(raw)
-    if m:
-        target = re.sub(r"^(my|our|his|her|the|that|this)\s+", "",
-                        m.group("target").strip(), flags=re.IGNORECASE)
-        alias = m.group("alias").strip()
-        if add_alias(alias, target):
-            return ("Noted, sir — I'll treat '%s' as another name for %s."
-                    % (alias, target))
+        # No stored fact matches, so nothing was written: routing continues
+        # untouched. ("fix the header to blue" is a task, not a correction —
+        # and "fix" is not explicit memory wording, so it never gets here.)
         return None
 
     m = _PROPOSAL_APPROVE_RE.match(raw)
@@ -2687,15 +3167,14 @@ def handle_memory_phrase(msg):
 
     m = _FORGET_RE.match(raw)
     if m and not _SCREEN_GUARD_RE.search(m.group(1)):
-        target = m.group(1).strip().rstrip(".")
-        # "forget my project" / "forget the report" -> "project" / "report".
-        target = re.sub(r"^(my|our|his|her|the|that|this)\s+", "", target,
-                        flags=re.IGNORECASE)
-        if not target:
-            return None
-        if forget(subject=target):
-            return "Forgotten, sir."
-        return "I don't have that stored, sir."
+        # [P1-16] Resolve to EXACTLY ONE fact or ask: a pronoun/stopword target
+        # is not resolvable, and the target is matched by subject/key only —
+        # never by value — so the wrong memory cannot be deleted.
+        target = _forget_target(m.group(1))
+        if target is None:
+            return ("Which memory should I forget, sir? Tell me the subject "
+                    "and I will remove exactly that one.")
+        return forget_target_reply(target)
 
     m = _REMIND_RE.match(raw)
     if m:

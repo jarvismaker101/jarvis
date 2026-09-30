@@ -325,8 +325,15 @@ class MemoryPhraseTests(G9MemoryTestBase):
             "forget about the browser action"))
 
     def test_negation_idioms_are_not_memory_ops(self):
-        self.assertIsNone(memory_store.handle_memory_phrase("forget it"))
+        # "never mind" has no memory verb at all: routing continues untouched.
         self.assertIsNone(memory_store.handle_memory_phrase("never mind"))
+        # [P1-16] "forget it" names NO resolvable target. It used to fall
+        # through as an idiom; it now asks which memory was meant, because
+        # guessing deleted a random fact. Nothing may be deleted either way.
+        memory_store.remember("project", "phoenix")
+        reply = memory_store.handle_memory_phrase("forget it")
+        self.assertIn("Which memory", reply)
+        self.assertEqual(len(memory_store.relevant_facts("project")), 1)
 
     def test_remind_me_arms_commitment(self):
         reply = memory_store.handle_memory_phrase(

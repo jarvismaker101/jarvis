@@ -224,7 +224,14 @@ class AliasTests(F06MemoryTestBase):
 
     def test_alias_known_as_phrase(self):
         memory_store.remember("project", "phoenix")
+        # [P1-16] An alias is only written on EXPLICIT memory wording. The bare
+        # sentence "X is also known as Y" is ordinary speech, and firing on it
+        # let casual conversation bind a false alias (memory corruption).
         memory_store.handle_memory_phrase("project is also known as phoenix")
+        self.assertIsNone(memory_store.resolve_alias("phoenix"))
+
+        memory_store.handle_memory_phrase(
+            "remember that project is also known as phoenix")
         self.assertEqual(memory_store.resolve_alias("phoenix"), "project:is")
 
 
