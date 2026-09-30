@@ -1513,6 +1513,9 @@ def _spawn_backend(child_env, attempts=BACKEND_SPAWN_ATTEMPTS):
                     "127.0.0.1",
                     "--port",
                     str(BACKEND_PORT),
+                    # [P1-14] no access log: it is synchronous I/O on the event
+                    # loop, adding latency to every request including barge-in.
+                    "--no-access-log",
                 ],
                 cwd=str(BASE_DIR),
                 env=child_env,

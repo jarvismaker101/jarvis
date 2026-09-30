@@ -680,6 +680,8 @@ function startJarvis() {
   });
 
   // Backend — visible so you can see responses and logs
+  // [P1-14] --no-access-log: the access log is synchronous I/O on the event
+  // loop, so it adds latency to EVERY request, barge-in included.
   const backendArgs = () => [[
     PYTHON_CMD,
     "-u",
@@ -690,6 +692,7 @@ function startJarvis() {
     "127.0.0.1",
     "--port",
     BACKEND_PORT,
+    "--no-access-log",
   ], {
     cwd: ROOT_DIR,
     env: childEnv,

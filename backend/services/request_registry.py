@@ -16,6 +16,7 @@ Fable-5 audit G3:
 Pure data module: stdlib only, no backend imports (no cycles).
 """
 
+import asyncio
 import threading
 import time
 import uuid
@@ -41,6 +42,12 @@ MAX_REQUESTS = 50
 #: When the stream is quiet this long, a heartbeat frame is emitted so the
 #: client (and any proxies) can tell a slow task from a dead connection.
 HEARTBEAT_SECONDS = 4.0
+
+#: [P1-14] How long an async consumer may hold a batch open while more frames
+#: are still arriving. A partial utterance must still reach the client promptly
+#: (streaming TTS), so this is a coalescing window, NOT a delay: whatever is
+#: pending goes out as one socket write when the window closes.
+STREAM_FLUSH_SECONDS = 0.03
 
 
 def new_request_id():
@@ -94,6 +101,42 @@ class RequestState:
         #: cancels the worker — otherwise the client saw INTERRUPTED while the
         #: abandoned worker kept burning model calls and tool effects.
         self.job = None
+        #: [P1-14] ``(loop, asyncio.Event)`` pairs wanting a thread-safe nudge
+        #: when a frame is appended. The producer runs on a WORKER THREAD, so
+        #: the wake-up has to be handed to each consumer's own event loop.
+        self._async_waiters: List[Tuple[object, object]] = []
+
+    # ── P1-14: async consumers (no thread per stream) ─────────────────────
+    def add_async_waiter(self, loop, wake):
+        """Register an async consumer's wake-up event. Returns the waiter."""
+        waiter = (loop, wake)
+        with self.cond:
+            self._async_waiters.append(waiter)
+        return waiter
+
+    def remove_async_waiter(self, waiter):
+        with self.cond:
+            try:
+                self._async_waiters.remove(waiter)
+            except ValueError:
+                pass
+
+    def _wake_async(self):
+        """Nudge every async consumer. MUST be called under ``self.cond``.
+
+        ``call_soon_threadsafe`` is the only safe way for the worker thread to
+        wake a consumer parked on an event loop; a loop that is already closed
+        (the client disconnected) is simply dropped.
+        """
+        for waiter in list(self._async_waiters):
+            loop, wake = waiter
+            try:
+                loop.call_soon_threadsafe(wake.set)
+            except Exception:
+                try:
+                    self._async_waiters.remove(waiter)
+                except ValueError:
+                    pass
 
     # ── F20: worker ownership ─────────────────────────────────────────────
     def attach_job(self, job):
@@ -131,45 +174,71 @@ class RequestState:
         alias a different frame (F23). Returns -1 when the frame was dropped.
         """
         with self.cond:
-            frame = dict(payload)
-            kind = frame.get("type")
-            if self._interrupted and kind != INTERRUPTED:
-                # F20: an interruption is terminal for good. A worker that
-                # finishes late must not turn "stopped" back into "completed",
-                # and must not speak another delta after the user stopped it.
-                return -1
-            if self.done and kind in TERMINAL_TYPES:
-                # F23: terminals are immutable — the first one wins, so a late
-                # completion/error cannot rewrite what the client already saw.
-                return -1
-            seq = self._next_seq
-            self._next_seq += 1
-            frame["seq"] = seq
-            frame["request_id"] = self.request_id
-            self.events.append((seq, frame))
-            self.updated_at = time.time()
-            if kind in TERMINAL_TYPES:
-                self.done = True
-                if kind == INTERRUPTED:
-                    self._interrupted = True
-                elif kind == COMPLETED:
-                    self.reply = frame.get("reply")
-                    if frame.get("reply"):
-                        self.text = frame["reply"]
-            if len(self.events) > EVENT_LIMIT:
-                # The terminal frame is always the newest when one exists,
-                # so trimming from the front can never lose it.
-                keep = self.events[-EVENT_LIMIT:]
-                self._dropped += len(self.events) - len(keep)
-                self.events = keep
-            self.cond.notify_all()
-            return seq
+            return self._append_locked(payload)
+
+    def _publish(self, payload, text=None):
+        """Append a frame AND update the text accumulator atomically (P1-14).
+
+        Both happen under one lock acquisition, so the accumulated text can
+        never disagree with the order of the frames that produced it.
+        """
+        with self.cond:
+            if text is not None:
+                self.text = text(self.text)
+            return self._append_locked(payload)
+
+    def _append_locked(self, payload):
+        """``append`` with the lock already held. Never acquires ``self.cond``."""
+        frame = dict(payload)
+        kind = frame.get("type")
+        if self._interrupted and kind != INTERRUPTED:
+            # F20: an interruption is terminal for good. A worker that
+            # finishes late must not turn "stopped" back into "completed",
+            # and must not speak another delta after the user stopped it.
+            return -1
+        if self.done and kind in TERMINAL_TYPES:
+            # F23: terminals are immutable — the first one wins, so a late
+            # completion/error cannot rewrite what the client already saw.
+            return -1
+        seq = self._next_seq
+        self._next_seq += 1
+        frame["seq"] = seq
+        frame["request_id"] = self.request_id
+        self.events.append((seq, frame))
+        self.updated_at = time.time()
+        if kind in TERMINAL_TYPES:
+            self.done = True
+            if kind == INTERRUPTED:
+                self._interrupted = True
+            elif kind == COMPLETED:
+                self.reply = frame.get("reply")
+                if frame.get("reply"):
+                    self.text = frame["reply"]
+        if len(self.events) > EVENT_LIMIT:
+            # The terminal frame is always the newest when one exists,
+            # so trimming from the front can never lose it.
+            keep = self.events[-EVENT_LIMIT:]
+            self._dropped += len(self.events) - len(keep)
+            self.events = keep
+        self.cond.notify_all()
+        # [P1-14] …and nudge the async consumers, which are not waiting on
+        # this condition (they must not occupy a thread to wait at all).
+        self._wake_async()
+        return seq
 
     def delta(self, text):
-        if text:
-            with self.cond:
-                self.text += text
-            self.append({"type": DELTA, "text": text})
+        """Append one answer delta. [P1-14] The text accumulator and the frame
+        are updated in ONE critical section.
+
+        They used to be two separate lock acquisitions, so two producers could
+        interleave: the frame order said "a" then "b" while ``self.text`` said
+        "ba". A resuming client rebuilds text from the snapshot, so that
+        mismatch was visible as scrambled text after a reconnect.
+        """
+        if not text:
+            return -1
+        return self._publish({"type": DELTA, "text": text},
+                             text=lambda current: current + text)
 
     def replace(self, text):
         """F26 — publish a full replacement for everything streamed so far.
@@ -178,9 +247,8 @@ class RequestState:
         must discard its accumulated deltas and show this instead).
         """
         text = text or ""
-        with self.cond:
-            self.text = text
-        self.append({"type": REPLACE, "text": text})
+        return self._publish({"type": REPLACE, "text": text},
+                             text=lambda _current: text)
 
     def snapshot_frame(self):
         """F23 — a reconstructive snapshot for a client whose events were
@@ -264,6 +332,101 @@ class RequestState:
     def first_buffered_seq(self):
         with self.cond:
             return self.events[0][0] if self.events else 0
+
+    def _drain(self, cursor):
+        """``(frames, done)`` for everything newer than *cursor*. Locked."""
+        with self.cond:
+            newer = [dict(frame) for seq, frame in self.events
+                     if seq > cursor]
+            return newer, self.done
+
+    async def astream(self, last_seq=-1, heartbeat=HEARTBEAT_SECONDS,
+                      stop_event=None, flush=STREAM_FLUSH_SECONDS):
+        """[P1-14] Yield BATCHES of frames newer than *last_seq*.
+
+        The synchronous :meth:`stream` occupies a thread-pool thread for the
+        entire life of a stream, and the control endpoints that barge-in
+        depends on share that pool — a few open streams could starve the very
+        requests needed to stop them. This waits on an ``asyncio.Event`` that
+        the producer wakes through ``loop.call_soon_threadsafe``, so a stream
+        holds NO thread while it waits, and yields everything pending as ONE
+        batch so a burst of tiny deltas costs one socket write instead of one
+        per token.
+
+        The coalescing window is *flush* (tens of milliseconds): a partial
+        utterance still reaches the client promptly, and nothing is buffered
+        indefinitely. Per-frame ``seq`` values are passed through untouched —
+        batching must never renumber, reorder or drop them, because a
+        reconnecting client resumes from exactly one of them.
+        """
+        cursor = last_seq
+        # A client that was so far behind its frames got dropped is handed a
+        # reconstructive snapshot first (F23), then resumes from the oldest
+        # surviving frame — text already rendered is never silently lost.
+        first = self.first_buffered_seq()
+        if self.events and cursor >= 0 and cursor < first - 1:
+            yield [self.snapshot_frame()]
+            cursor = first - 1
+
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+        waiter = self.add_async_waiter(loop, wake)
+        pending: List[dict] = []
+        flush_at = None
+        try:
+            while True:
+                frames, done = self._drain(cursor)
+                if frames:
+                    if flush_at is None:
+                        flush_at = loop.time() + flush
+                    for frame in frames:
+                        seq = frame.get("seq")
+                        if isinstance(seq, int) and seq > cursor:
+                            cursor = seq
+                        pending.append(frame)
+                now = loop.time()
+                if pending and (done or flush_at is None or now >= flush_at):
+                    yield pending
+                    pending = []
+                    flush_at = None
+                    if done:
+                        return
+                    continue
+                if done:
+                    return
+                if stop_event is not None and stop_event.is_set():
+                    # The client went away: hand over what we already have
+                    # rather than silently dropping a rendered partial answer.
+                    if pending:
+                        yield pending
+                    return
+                timeout = heartbeat
+                if pending and flush_at is not None:
+                    timeout = min(timeout, max(0.0, flush_at - now))
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    wake.clear()
+                if not pending and not frames:
+                    # Quiet for a heartbeat: keep the wire (and any proxy)
+                    # alive and let the client tell a slow task from a dead one.
+                    with self.cond:
+                        still_empty = not any(seq > cursor
+                                              for seq, _ in self.events)
+                        done_now = self.done
+                    if still_empty and not done_now:
+                        yield [{
+                            "type": PROGRESS,
+                            "seq": None,
+                            "request_id": self.request_id,
+                            "message": "working",
+                            "elapsed": round(time.time() - self.created_at, 1),
+                            "heartbeat": True,
+                        }]
+        finally:
+            self.remove_async_waiter(waiter)
 
     def stream(self, last_seq=-1, heartbeat=HEARTBEAT_SECONDS, stop_event=None):
         """Yield frames newer than *last_seq*, blocking for new ones.

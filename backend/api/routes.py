@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import os
@@ -5,6 +6,7 @@ import threading
 import time
 from typing import List, Optional
 
+import anyio
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -38,6 +40,32 @@ router = APIRouter()
 #: [P1-11] The kind a chat turn's own job carries (see _run_request_worker).
 #: A bare /task/stop excludes it: stopping the conversation is request-scoped.
 REQUEST_JOB_KIND = "request"
+
+# ── P1-14 — RESERVED capacity for the control plane ─────────────────────────
+# Barge-in is a safety-critical path: /speak/stop, /task/stop, /ask/cancel and
+# /voice-state must answer while chat streams are open. They used to run on the
+# SAME 40-thread pool the streams occupied for their whole lives, so enough open
+# streams starved the very endpoints needed to stop them.
+#
+# Two changes fix that: streams no longer hold a pool thread at all (they are
+# async generators parked on an anyio event — see RequestState.astream), and
+# these four endpoints now run on their OWN limiter, so control work can never
+# queue behind bulk work whatever else happens to the shared pool.
+CONTROL_LIMITER = anyio.CapacityLimiter(4)
+
+
+async def _on_control_plane(handler, *args, **kwargs):
+    """Run a blocking control handler on the RESERVED control capacity.
+
+    ``limiter=`` is anyio's own reservation mechanism: the call takes one of the
+    four control tokens (and anyio uses that same limiter as its thread-pool
+    limit for the call), so a burst of chat traffic cannot consume the capacity
+    barge-in needs.
+    """
+    return await anyio.to_thread.run_sync(
+        functools.partial(handler, *args, **kwargs),
+        limiter=CONTROL_LIMITER,
+    )
 
 last_voice_message = ""
 last_voice_response = ""
@@ -563,7 +591,12 @@ def ask_stream(query: Query):
     def event(payload: dict):
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    def generate():
+    async def generate():
+        # [P1-14] This used to be a SYNC generator, so every open stream held a
+        # thread-pool thread for its whole life — the same 40-thread pool the
+        # control endpoints (barge-in) need. An async generator parked on an
+        # asyncio.Event holds NO thread, and each batch is written as ONE
+        # chunk instead of one socket write per delta.
         yield event({
             "type": "progress",
             "message": "attached",
@@ -572,8 +605,9 @@ def ask_stream(query: Query):
             "resume_from": state.latest_seq(),
             "seq": None,
         })
-        for frame in state.stream(last_seq=query.last_event_id):
-            yield event(frame)
+        async for batch in state.astream(last_seq=query.last_event_id):
+            # One write per batch; the per-frame seq values are untouched.
+            yield "".join(event(frame) for frame in batch)
 
     return StreamingResponse(
         generate(),
@@ -595,6 +629,14 @@ def ask_status(request_id: str):
 
 
 @router.post("/ask/cancel/{request_id}")
+async def cancel_request_route(
+        request_id: str,
+        reason: str = "cancelled by voice barge-in"):
+    """P0-08 — cancel ONE in-flight request, on the RESERVED control capacity
+    (P1-14), so a barge-in is never queued behind open chat streams."""
+    return await _on_control_plane(cancel_request, request_id, reason)
+
+
 def cancel_request(request_id: str, reason: str = "cancelled by voice barge-in"):
     """P0-08 — cancel ONE in-flight request, addressed by its request id.
 
@@ -730,6 +772,15 @@ def launch_voice_setup(payload: dict):
 
 
 @router.get("/voice-state")
+async def get_voice_state_route():
+    """The UI's voice-state read, on the RESERVED control capacity (P1-14).
+
+    The UI polls this while a reply is streaming; it must not wait behind the
+    streams themselves.
+    """
+    return await _on_control_plane(get_voice_state)
+
+
 def get_voice_state():
     state = listener_state.get_voice_state()
     # G11 / F50 — the real listening state lives in the voice I/O worker (a
@@ -838,6 +889,15 @@ def get_ui_state():
 
 
 @router.post("/speak/stop")
+async def stop_speech_route():
+    """Instant barge-in stop for typed queries (and the voice process echo).
+
+    [P1-14] Runs on the RESERVED control capacity so stopping playback is
+    never queued behind open chat streams.
+    """
+    return await _on_control_plane(stop_speech)
+
+
 def stop_speech():
     """Instant barge-in stop for typed queries (and the voice process echo).
 
@@ -947,6 +1007,15 @@ def aec_reference(seconds: float = 0.5):
 
 
 @router.post("/task/stop")
+async def stop_task_route(job_id: str = "", kind: str = ""):
+    """Stop ONE identified job at its next checkpoint (F20).
+
+    [P1-14] Runs on the RESERVED control capacity (see CONTROL_LIMITER), so a
+    stop is never queued behind open chat streams.
+    """
+    return await _on_control_plane(stop_task, job_id, kind)
+
+
 def stop_task(job_id: str = "", kind: str = ""):
     """Stop ONE identified job at its next checkpoint (F20).
 
