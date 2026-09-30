@@ -46,6 +46,17 @@ DEFAULT_CHUNK_BYTES = 4096
 #: How long a producer waits for ring space before giving up (F32
 #: backpressure: overflow must never silently drop PCM).
 FEED_TIMEOUT = 30.0
+#: [P0-06] Bounded floor for the play loop's wait for new audio.
+#:
+#: The loop used to sleep in 250ms slices on ``_stop``, a DIFFERENT event from
+#: the one producers set, so the first chunk of an utterance could wait up to a
+#: quarter second before it reached the device. It now waits on the ring
+#: condition variable that producers notify, so the wake is immediate.
+#:
+#: The floor exists ONLY so a missed notify cannot park the loop forever - it
+#: is not a polling interval, and it is two orders of magnitude below the old
+#: sleep so an idle ring is never perceptible.
+PLAY_WAIT_FLOOR_SECONDS = 0.05
 
 #: One immutable, generation-tagged chunk (F32). The generation travels with
 #: the bytes so a chunk produced for an old answer can never be written into a
@@ -287,6 +298,11 @@ class AudioActor:
                 self._ring_cv.wait(min(0.25, remaining))
             self._ring.append(Chunk(key, generation, bytes(pcm_bytes)))
             self._utterance_pcm.extend(bytes(pcm_bytes))
+            # [P0-06] Wake a play loop that is waiting for this chunk. Without
+            # this notify the consumer could only find new audio on its next
+            # timer tick, which is exactly the latency this item removes. Sent
+            # under the lock, like every other notify on this condition.
+            self._ring_cv.notify_all()
         self._chunk_wait.set()
         # [PERF] P1-19 — the first synthesized audio of this turn exists. The
         # gap between this mark and `playback_started` is synthesis/prefetch;
@@ -359,9 +375,27 @@ class AudioActor:
                 if chunk is None:
                     if eof:
                         break
-                    # Subscribe to arriving synthesis instead of casting for
-                    # a full-synthesis finish: wake on new chunks OR abort.
-                    if self._stop.wait(timeout=0.25):
+                    # [P0-06] Subscribe to arriving synthesis through the SAME
+                    # condition variable the producers notify, instead of
+                    # sleeping on a different event in 250ms slices. The chunk
+                    # that lands next now wakes this loop within a millisecond
+                    # rather than on the next timer tick, which is what removes
+                    # the per-utterance stall before the first device write.
+                    #
+                    # The wait is bounded by PLAY_WAIT_FLOOR_SECONDS only so a
+                    # missed notify cannot park the loop. Nothing inside this
+                    # block takes _gen_lock: _is_current() would, and mixing
+                    # that with the ring lock is how a deadlock starts. The
+                    # state reads below are plain attribute reads, exactly as
+                    # the rest of this loop already does it.
+                    with self._ring_cv:
+                        while (not self._ring and not self._eof
+                               and self._play_state in ("playing", "ended")):
+                            self._ring_cv.wait(PLAY_WAIT_FLOOR_SECONDS)
+                    # The abort fast path stays: _stop is checked after the
+                    # wait, so a stop lands immediately instead of waiting for
+                    # the floor to expire.
+                    if self._stop.is_set():
                         break
                     if self._play_state not in ("playing", "ended"):
                         break
