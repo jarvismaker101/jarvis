@@ -38,6 +38,113 @@ REMOTE_TTS_CHAR_LIMIT = int(os.getenv("JARVIS_REMOTE_TTS_CHAR_LIMIT", "150"))
 FISH_TTS_CHAR_LIMIT = int(os.getenv("JARVIS_FISH_TTS_CHAR_LIMIT", "1800"))
 GOOGLE_TTS_CHAR_LIMIT = int(os.getenv("JARVIS_GOOGLE_TTS_CHAR_LIMIT", "1800"))
 
+#: [P1-01] Streaming chunk boundaries.
+#:
+#: The old rule needed whitespace AFTER the sentence punctuation, so a finished
+#: sentence was not recognised until the NEXT delta arrived — that was the
+#: first-chunk delay. And once 40 characters had accumulated the buffer was
+#: flushed wherever the cut happened to fall, which split words in half.
+FIRST_CHUNK_CLAUSE_BREAKS = ",;:\u2014.!?"
+#: Words that must precede a clause break before it may start playback.
+FIRST_CHUNK_MIN_WORDS = 3
+#: Fallback for the first chunk when no clause break has arrived yet: cut at
+#: the last word boundary once this much text is buffered.
+FIRST_CHUNK_MIN_CHARS = 30
+#: Upper bound for a later chunk. Reached only by text with no sentence
+#: boundary in it; the cut still lands on a word boundary.
+LATER_CHUNK_MAX_CHARS = 200
+#: A sentence that ENDS the buffer (the model finished the sentence and then
+#: paused, so no following delta is coming) counts as a boundary after this
+#: long. Without it a complete sentence would sit in the buffer waiting for a
+#: delta that never arrives.
+PUNCTUATION_SETTLE_SECONDS = 0.12
+#: Last resort for a buffer with no boundary at all. Unchanged [P1-01].
+STALL_FLUSH_SECONDS = 0.3
+#: The playback loop must poll finer than PUNCTUATION_SETTLE_SECONDS, or the
+#: 120ms rule could not fire on time. A Queue.get timeout is a cheap condition
+#: wait, so this costs nothing meaningful while idle.
+STREAM_POLL_SECONDS = 0.05
+#: Punctuation that means "this sentence is complete" for the settle rule.
+_SENTENCE_END_CHARS = ".!?\u2026"
+_WORD_BOUNDARY_RE = re.compile(r"\s")
+
+
+def _word_count(text):
+    return len(text.split())
+
+
+def _last_word_boundary(text):
+    """Index of the LAST whitespace in *text*, or None.
+
+    The last one (rather than the first) puts as much complete text as is
+    available into the first chunk, which is what starts playback soonest.
+    """
+    found = None
+    for match in _WORD_BOUNDARY_RE.finditer(text):
+        found = match.start()
+    return found
+
+
+def _next_word_boundary(text, cap):
+    """Index of the FIRST whitespace at or after *cap*, or None.
+
+    "Extend to the next word boundary rather than cutting": when a length cap
+    lands inside a word the chunk grows to finish it. None means the word runs
+    past the cap with no boundary in sight — wait instead of cutting.
+    """
+    for match in _WORD_BOUNDARY_RE.finditer(text):
+        if match.start() >= cap:
+            return match.start()
+    return None
+
+
+def _clause_cut(text):
+    """Index just after the first usable clause break, or None.
+
+    Usable means at least FIRST_CHUNK_MIN_WORDS words precede it AND the
+    punctuation is either the last character of the buffer (the model has not
+    sent the next delta yet — cutting here is the latency win) or followed by
+    whitespace. The whitespace requirement keeps "3.5" or a URL from reading as
+    a clause break, which would split a real token in two.
+    """
+    for index, char in enumerate(text):
+        if char not in FIRST_CHUNK_CLAUSE_BREAKS:
+            continue
+        if _word_count(text[:index]) < FIRST_CHUNK_MIN_WORDS:
+            continue
+        if index + 1 == len(text) or text[index + 1].isspace():
+            return index + 1
+    return None
+
+
+def _stream_cut(text, first):
+    """``(chunk, remainder)`` to hand to TTS now, or None.
+
+    *first* selects the first-chunk rule (clause boundary, else an early word
+    boundary) instead of the later-chunk rule. Both paths cut at a word
+    boundary: a returned chunk never ends inside a word.
+    """
+    if first:
+        cut = _clause_cut(text)
+        if cut is not None:
+            return text[:cut], text[cut:]
+        # No clause break yet: once this much has been buffered, start anyway
+        # at the last word boundary. The condition is on the BUFFER length —
+        # waiting for a boundary that lands past the threshold would mean
+        # waiting for another delta, which is the delay this item removes.
+        if len(text) >= FIRST_CHUNK_MIN_CHARS:
+            cut = _last_word_boundary(text)
+            if cut is not None:
+                return text[:cut], text[cut + 1:]
+        return None
+
+    if len(text) > LATER_CHUNK_MAX_CHARS:
+        cut = _next_word_boundary(text, LATER_CHUNK_MAX_CHARS - 1)
+        if cut is not None:
+            return text[:cut], text[cut + 1:]
+    return None
+
+
 
 def clean_text(text):
     text = text.replace("\n", ". ")
@@ -525,6 +632,11 @@ class StreamSpeaker:
         self._buffer = ""
         self._buffer_lock = threading.Lock()
         self._last_feed_ts = time.monotonic()
+        # [P1-01] Retained for API compatibility only: this used to be the
+        # character count that flushed the buffer wherever the cut fell, which
+        # split words in half. Chunk boundaries are now decided by
+        # `_stream_cut` (clause / sentence / word boundary), so nothing gates
+        # on `_min_flush` any more. Callers that pass it keep working.
         self._min_flush = max(40, int(min_flush_chars))
         self._sentence_re = re.compile(r"(?<=[.!?])\s+")
         self._finished = False
@@ -612,16 +724,41 @@ class StreamSpeaker:
             # Append deltas EXACTLY as received — the LLM owns spacing, so
             # 'hel' + 'lo' must stay 'hello', never 'hel lo'.
             self._buffer += text
-            parts = self._sentence_re.split(self._buffer)
-            if len(parts) > 1:
-                self._buffer = parts[-1]
-                for part in parts[:-1]:
-                    if part.strip():
-                        to_enqueue.append(part.strip())
-            if len(self._buffer) >= self._min_flush:
-                long, self._buffer = self._buffer, ""
-                if long.strip():
-                    to_enqueue.append(long.strip())
+            # `first_pending` is tracked locally because `_enqueue` — which is
+            # what flips `_first_chunk_enqueued` — is called below, off this
+            # lock, so the attribute still reads "no chunk yet" for a delta that
+            # yields several chunks.
+            first_pending = not self._first_chunk_enqueued
+            while True:
+                if first_pending:
+                    # [P1-01] The first chunk may break mid-sentence at a clause
+                    # boundary. Checked BEFORE the sentence split so a delta
+                    # holding a whole sentence still starts playback with the
+                    # small clause-sized piece: the first TTS request is issued
+                    # either way, but a shorter one returns audio sooner.
+                    cut = _stream_cut(self._buffer, first=True)
+                    if cut is not None:
+                        chunk, self._buffer = cut
+                        if chunk.strip():
+                            to_enqueue.append(chunk.strip())
+                        first_pending = False
+                        continue
+                # Complete sentences, as before.
+                parts = self._sentence_re.split(self._buffer)
+                if len(parts) > 1:
+                    self._buffer = parts[-1]
+                    for part in parts[:-1]:
+                        if part.strip():
+                            to_enqueue.append(part.strip())
+                            first_pending = False
+                    continue
+                # Later chunks: only the length cap remains.
+                cut = _stream_cut(self._buffer, first=False)
+                if cut is None:
+                    break
+                chunk, self._buffer = cut
+                if chunk.strip():
+                    to_enqueue.append(chunk.strip())
         for sentence in to_enqueue:
             self._enqueue(sentence)
         # Ensure worker is running for stall flush even if nothing enqueued yet
@@ -688,6 +825,11 @@ class StreamSpeaker:
         return " ".join(part for part in parts if part).strip()
 
     def _enqueue(self, sentence):
+        # [P1-01] An empty utterance is never handed to TTS: it would either
+        # error or leave a gap, and the contract is that every chunk contains a
+        # complete word.
+        if not sentence or not str(sentence).strip():
+            return
         # Short first chunk optimization: cap first enqueued chunk to ~120 chars
         # Protect flag check+set under _buffer_lock for thread-safety
         needs_first_split = False
@@ -762,13 +904,20 @@ class StreamSpeaker:
         try:
             while True:
                 try:
-                    item = self._queue.get(timeout=0.3)
+                    item = self._queue.get(timeout=STREAM_POLL_SECONDS)
                 except queue.Empty:
-                    # Stall flush: buffer has content but no new delta for ~300ms
+                    # Buffer has content but no new delta: either it ends at a
+                    # complete sentence and the model has paused, or nothing has
+                    # arrived for long enough that we stop waiting.
                     to_flush = None
                     with self._buffer_lock:
                         if self._buffer.strip() and not self._finished and not self._closed:
-                            if time.monotonic() - self._last_feed_ts >= 0.3:
+                            idle = time.monotonic() - self._last_feed_ts
+                            settled = (
+                                idle >= PUNCTUATION_SETTLE_SECONDS
+                                and self._buffer.rstrip()[-1] in _SENTENCE_END_CHARS
+                            )
+                            if settled or idle >= STALL_FLUSH_SECONDS:
                                 to_flush, self._buffer = self._buffer, ""
                     if to_flush and to_flush.strip():
                         self._enqueue(to_flush.strip())

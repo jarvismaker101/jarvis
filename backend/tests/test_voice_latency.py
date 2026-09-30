@@ -27,26 +27,47 @@ class VoiceLatencyTests(unittest.TestCase):
             fish_mod._in_flight.clear()
         fish_mod._clear_device_cache()
 
-    # (a) StreamSpeaker flushes at >=40 chars without sentence end
-    def test_stream_speaker_min_flush_40(self):
+    # (a) [P1-01] The 40-char MID-WORD flush is gone; the boundary rules replace
+    #     it. This test used to assert the opposite: feeding 40 characters with
+    #     no whitespace at all produced a chunk at exactly 40, i.e. a word cut in
+    #     half. Requirement 4 removes that, and nothing is lost by waiting —
+    #     the stall flush still drains the buffer.
+    def test_stream_speaker_never_flushes_mid_word(self):
         with patch.object(voice_mod, 'prefetch_fish_audio'), \
-             patch.object(voice_mod, '_speak_chunk', return_value=True):
+             patch.object(voice_mod, '_speak_chunk', return_value=True) as mock_speak:
             sp = voice_mod.StreamSpeaker()
             # default should be 40
             self.assertEqual(sp._min_flush, 40)
-            # feed 30 chars without punct -> should NOT enqueue yet (no sentence, <40)
+            # 40 characters with NO boundary anywhere: one long token.
             sp.feed("a" * 30)
             time.sleep(0.05)
-            # queue should be empty, spoken_any False
             self.assertFalse(sp.spoken_any)
             self.assertTrue(sp._queue.empty())
-            # feed 10 more to reach exactly 40 -> should flush (deltas are
-            # appended verbatim, no injected space)
-            sp.feed("b" * 10)  # now total 40
-            # give loop time to process
+            sp.feed("b" * 10)                     # now 40, still one token
             time.sleep(0.1)
-            # Should have enqueued one item
-            self.assertTrue(sp.spoken_any)
+            # A mid-word cut here is exactly the bug: playback must not start.
+            self.assertFalse(sp.spoken_any,
+                             "the buffer was flushed mid-word at 40 chars")
+            # The text is still spoken — by the stall flush, which is now the
+            # last resort rather than the normal path.
+            deadline = time.time() + 1.5
+            while time.time() < deadline and not mock_speak.called:
+                time.sleep(0.05)
+            self.assertTrue(mock_speak.called,
+                            "the stalled word never reached TTS")
+            sp.close()
+            time.sleep(0.05)
+
+    def test_stream_speaker_flushes_early_at_a_word_boundary(self):
+        """The replacement rule: 30+ chars with a boundary starts playback."""
+        with patch.object(voice_mod, 'prefetch_fish_audio'), \
+             patch.object(voice_mod, '_speak_chunk', return_value=True):
+            sp = voice_mod.StreamSpeaker()
+            sp.feed("alpha bravo charlie delta echo")
+            time.sleep(0.05)
+            self.assertTrue(sp.spoken_any,
+                            "a punctuation-free delta with a word boundary "
+                            "should not have waited for the stall flush")
             self.assertTrue(sp._first_chunk_enqueued)
             sp.close()
             time.sleep(0.05)
