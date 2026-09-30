@@ -284,6 +284,7 @@ def _headers(api_key):
 def ask_openai_compat(
     messages, model, base_url, api_key, temperature=0.7, max_tokens=None,
     tools=None, tool_choice=None, reasoning_effort=None, timeout=None,
+    response_format=None,
 ):
     """Non-stream chat completion; {} on any failure (fireworks pattern).
 
@@ -294,6 +295,10 @@ def ask_openai_compat(
     *reasoning_effort* (F49): sent only when the caller's validated model
     snapshot says the model takes it — a model that runs its own default
     reasoning must never receive the field.
+
+    *response_format*: optional structured-output directive (OpenAI dialect,
+    e.g. ``{"type": "json_object"}``). Sent only when the caller passes one,
+    so gateways that reject the field never see it.
 
     *timeout*: optional (connect, read) override — latency-critical callers
     (the intent classifier) pass a tight slice of their own deadline.
@@ -311,6 +316,8 @@ def ask_openai_compat(
             data["tool_choice"] = tool_choice
     if reasoning_effort:
         data["reasoning_effort"] = reasoning_effort
+    if response_format:
+        data["response_format"] = response_format
     try:
         response = _session.post(
             _chat_url(base_url),
@@ -328,6 +335,37 @@ def ask_openai_compat(
         return response.json()
     except Exception:
         return {}
+
+
+def ask_openai_compat_vision(
+    prompt, image_data_url, model, base_url, api_key,
+    max_completion_tokens=None, response_format=None,
+):
+    """One non-stream vision completion over an OpenAI-compatible gateway.
+
+    The screenshot rides the standard ``image_url`` content part; the return
+    is the raw OpenAI-shaped result dict (``{}`` on any failure) — the same
+    shape every dedicated vision adapter returns, so the F37 vision cascade
+    can treat a user-added provider as one more dispatcher instead of a
+    special case. The API key never leaves this call: errors from
+    ask_openai_compat are already key-safe.
+    """
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": str(prompt or "")},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ],
+    }]
+    return ask_openai_compat(
+        messages,
+        model,
+        base_url,
+        api_key,
+        temperature=0.2,
+        max_tokens=max_completion_tokens,
+        response_format=response_format,
+    )
 
 
 def ask_openai_compat_stream(

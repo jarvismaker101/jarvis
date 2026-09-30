@@ -109,6 +109,8 @@ def provider_available(provider):
     asked through its own client (it owns the availability rule); every other
     vision provider is a keyed HTTP adapter, so the registry's masked
     credential record is the single source of truth for "is it configured".
+    A REGISTERED custom provider is ready only with BOTH its stored key and
+    its stored base URL — a half-written record must never look ready.
     """
     pid = _normalize(provider)
     if not pid:
@@ -121,16 +123,64 @@ def provider_available(provider):
             return False
     try:
         from backend.services import model_registry
-        if pid not in {_normalize(p) for p in (model_registry.ENV_PROVIDERS or {})}:
+        env_ids = {_normalize(p) for p in (model_registry.ENV_PROVIDERS or {})}
+        custom_ids = {_normalize(p)
+                      for p in (model_registry.custom_provider_ids() or [])}
+        if pid not in env_ids and pid not in custom_ids:
             return False
-        key, _base_url = model_registry.get_provider_credentials(pid)
+        key, base_url = model_registry.get_provider_credentials(pid)
         # Configured means "has a usable key" - a base URL alone must not make
         # a keyless provider look ready (env base URLs are canonical constants
         # now, so an or-condition here would dispatch an unconfigured
         # provider). Custom providers always store their key WITH the URL.
+        if pid in custom_ids:
+            return bool(key) and bool(base_url)
         return bool(key)
     except Exception:
         return False
+
+
+def _make_custom_dispatcher(provider_id):
+    """One ``prompt, image, model, max_tokens, response_format`` adapter bound
+    to a registered custom provider id (the dispatcher map's contract)."""
+    def dispatch(prompt, image_data_url, model, max_completion_tokens,
+                 response_format):
+        try:
+            from backend.services import model_registry
+            from backend.services.openai_compat_client import (
+                ask_openai_compat_vision)
+            api_key, base_url = model_registry.get_provider_credentials(
+                provider_id)
+            if not api_key or not base_url:
+                return {}
+            return ask_openai_compat_vision(
+                prompt, image_data_url, model, base_url, api_key,
+                max_completion_tokens=max_completion_tokens,
+                response_format=response_format)
+        except Exception as exc:  # noqa: BLE001 - one bad provider advances
+            logging.warning("[VISION] custom provider '%s' failed: %s",
+                            provider_id, exc)
+            return {}
+    return dispatch
+
+
+def custom_vision_dispatchers():
+    """``{provider id: adapter}`` for every REGISTERED custom provider.
+
+    A user-added OpenAI-compatible provider rides ONE generic vision adapter
+    (the standard ``image_url`` content part) at every call site, so a call
+    site merges this map instead of special-casing custom ids. Credentials
+    resolve lazily per call through the registry — a provider removed while
+    Jarvis runs dispatches to nothing rather than to stale keys. Call sites
+    keep ownership of their shipped adapters and their response-shape checks.
+    """
+    try:
+        from backend.services import model_registry
+        ids = model_registry.custom_provider_ids()
+    except Exception as exc:  # noqa: BLE001 - degrade, never crash a vision call
+        logging.warning("[VISION] custom provider discovery failed: %s", exc)
+        return {}
+    return {pid: _make_custom_dispatcher(pid) for pid in ids}
 
 
 def vision_provider_order(selected=None):

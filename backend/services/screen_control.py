@@ -1963,13 +1963,20 @@ def _dispatch_groq(prompt, image_data_url, model, max_completion_tokens, respons
 
 
 def _vision_dispatchers():
-    """provider id -> adapter call for this call site (resolved lazily)."""
-    return {
+    """provider id -> adapter call for this call site (resolved lazily).
+
+    User-added custom providers ride the shared generic OpenAI-compatible
+    vision adapter (vision_cascade.custom_vision_dispatchers) — one image
+    part on the wire, same raw result shape as the shipped adapters.
+    """
+    dispatchers = {
         "gemini": _dispatch_gemini,
         "openrouter": _dispatch_openrouter,
         "fireworks": _dispatch_fireworks,
         "groq": _dispatch_groq,
     }
+    dispatchers.update(vision_cascade.custom_vision_dispatchers())
+    return dispatchers
 
 
 def _screen_control_vision_schema(result):

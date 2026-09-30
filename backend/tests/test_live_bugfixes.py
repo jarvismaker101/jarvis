@@ -135,11 +135,15 @@ class AllowlistValidationTests(LiveBugfixBase):
         with self.assertRaises(model_registry.ModelRegistryError):
             model_registry.set_model_for_role("tts", "fireworks", "accounts/fireworks/models/qwen3p7-plus")
 
-    def test_vision_rejects_custom(self):
+    def test_vision_accepts_custom(self):
+        # [custom-provider UI] CONTRACT ADAPTED: a registered custom provider
+        # now serves the vision role through the generic OpenAI-compatible
+        # vision adapter (image_url content part). It used to be refused
+        # here; the refusals that remain are for the voice roles.
         with patch.object(model_registry, "_list_openai_compat_models", return_value=[{"id":"m","display":"m"}]):
             model_registry.add_custom_provider("acme", "Acme", "sk-1", "https://acme.example/v1")
-        with self.assertRaises(model_registry.ModelRegistryError):
-            model_registry.set_model_for_role("vision", "acme", "m")
+        model_registry.set_model_for_role("vision", "acme", "m")
+        self.assertEqual(model_registry.get_model_for_role("vision")["provider"], "acme")
 
     def test_vision_accepts_fireworks_groq_openrouter_gemini(self):
         for prov, model in [("fireworks","accounts/fireworks/models/deepseek-v4-flash-vision-exp"),("groq","qwen/qwen3.6-27b"),("openrouter","google/gemma-4-31b-it:free"),("gemini","gemini-2.5-flash")]:

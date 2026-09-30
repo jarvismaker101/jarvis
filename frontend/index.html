@@ -142,6 +142,24 @@
       <div class="sidebar-section" id="section-chat">
         <div class="sidebar-section-title">TEXT CHAT</div>
         <div class="sidebar-body" id="model-provider-list"></div>
+        <div class="provider-add" data-role="chat">
+          <button type="button" class="btn-add-provider role-add-btn">+ ADD CUSTOM PROVIDER</button>
+          <form class="add-provider-form role-add-form" hidden autocomplete="off">
+            <input class="ap-name" placeholder="Name (optional, e.g. My Gateway)" autocomplete="off" spellcheck="false" />
+            <input class="ap-url" placeholder="Base URL (https://…/v1)" autocomplete="off" spellcheck="false" />
+            <input class="ap-key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" />
+            <div class="ap-actions">
+              <button type="button" class="btn-provider-test">TEST</button>
+              <button type="submit" class="btn-provider-save">SAVE</button>
+            </div>
+            <span class="provider-form-error ap-status" role="status"></span>
+            <div class="ap-pick" hidden>
+              <span class="ap-pick-label">Saved — choose the model for this function</span>
+              <select class="ap-model"></select>
+              <button type="button" class="btn-provider-save ap-use">USE MODEL</button>
+            </div>
+          </form>
+        </div>
       </div>
       <div class="sidebar-section" id="section-tts">
         <div class="sidebar-section-title">VOICE MODEL (TTS)</div>
@@ -154,6 +172,24 @@
       <div class="sidebar-section" id="section-vision">
         <div class="sidebar-section-title">VISION MODEL</div>
         <div class="sidebar-body" id="vision-provider-list"></div>
+        <div class="provider-add" data-role="vision">
+          <button type="button" class="btn-add-provider role-add-btn">+ ADD CUSTOM PROVIDER</button>
+          <form class="add-provider-form role-add-form" hidden autocomplete="off">
+            <input class="ap-name" placeholder="Name (optional, e.g. My Gateway)" autocomplete="off" spellcheck="false" />
+            <input class="ap-url" placeholder="Base URL (https://…/v1)" autocomplete="off" spellcheck="false" />
+            <input class="ap-key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" />
+            <div class="ap-actions">
+              <button type="button" class="btn-provider-test">TEST</button>
+              <button type="submit" class="btn-provider-save">SAVE</button>
+            </div>
+            <span class="provider-form-error ap-status" role="status"></span>
+            <div class="ap-pick" hidden>
+              <span class="ap-pick-label">Saved — choose the model for this function</span>
+              <select class="ap-model"></select>
+              <button type="button" class="btn-provider-save ap-use">USE MODEL</button>
+            </div>
+          </form>
+        </div>
       </div>
       <div class="sidebar-section" id="section-browser">
         <div class="sidebar-section-title">BROWSER TOOL MODEL</div>
@@ -164,10 +200,46 @@
           <span class="provider-form-error" id="browser-form-error"></span>
           <button type="button" class="btn-provider-save" id="btn-browser-save">SAVE BROWSER MODEL</button>
         </div>
+        <div class="provider-add" data-role="browser_tool">
+          <button type="button" class="btn-add-provider role-add-btn">+ ADD CUSTOM PROVIDER</button>
+          <form class="add-provider-form role-add-form" hidden autocomplete="off">
+            <input class="ap-name" placeholder="Name (optional, e.g. My Gateway)" autocomplete="off" spellcheck="false" />
+            <input class="ap-url" placeholder="Base URL (https://…/v1)" autocomplete="off" spellcheck="false" />
+            <input class="ap-key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" />
+            <div class="ap-actions">
+              <button type="button" class="btn-provider-test">TEST</button>
+              <button type="submit" class="btn-provider-save">SAVE</button>
+            </div>
+            <span class="provider-form-error ap-status" role="status"></span>
+            <div class="ap-pick" hidden>
+              <span class="ap-pick-label">Saved — choose the model for this function</span>
+              <select class="ap-model"></select>
+              <button type="button" class="btn-provider-save ap-use">USE MODEL</button>
+            </div>
+          </form>
+        </div>
       </div>
       <div class="sidebar-section" id="section-planner">
         <div class="sidebar-section-title">PLANNER MODEL (ORCHESTRATOR)</div>
         <div class="sidebar-body" id="planner-provider-list"></div>
+        <div class="provider-add" data-role="planner">
+          <button type="button" class="btn-add-provider role-add-btn">+ ADD CUSTOM PROVIDER</button>
+          <form class="add-provider-form role-add-form" hidden autocomplete="off">
+            <input class="ap-name" placeholder="Name (optional, e.g. My Gateway)" autocomplete="off" spellcheck="false" />
+            <input class="ap-url" placeholder="Base URL (https://…/v1)" autocomplete="off" spellcheck="false" />
+            <input class="ap-key" type="password" placeholder="API key" autocomplete="off" spellcheck="false" />
+            <div class="ap-actions">
+              <button type="button" class="btn-provider-test">TEST</button>
+              <button type="submit" class="btn-provider-save">SAVE</button>
+            </div>
+            <span class="provider-form-error ap-status" role="status"></span>
+            <div class="ap-pick" hidden>
+              <span class="ap-pick-label">Saved — choose the model for this function</span>
+              <select class="ap-model"></select>
+              <button type="button" class="btn-provider-save ap-use">USE MODEL</button>
+            </div>
+          </form>
+        </div>
       </div>
       <div class="sidebar-add">
         <button class="btn-add-provider" id="btn-add-provider" type="button">+ ADD PROVIDER</button>

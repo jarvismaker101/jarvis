@@ -63,8 +63,11 @@ ENV_PROVIDERS = {
     "inworld": {"name": "Inworld STT"},
 }
 
-# Per-role allowlist (env providers). Custom providers are allowed only
-# for chat and browser_tool (openai_compatible chat completions).
+# Per-role allowlist (env providers). Custom providers are allowed for every
+# LLM-backed role — the roles whose calls ride the OpenAI-compatible chat
+# completions adapter (chat / vision / browser_tool / planner). The voice
+# roles (tts / listening) drive dedicated audio engines with their own wire
+# APIs, so a base-url + key provider cannot serve them.
 _ROLE_ALLOWED_ENV = {
     # openrouter: same Gemini-family models over Cloudflare-fronted endpoints.
     # Added for chat after the 2026-09-23 incident: the direct Gemini API was
@@ -83,7 +86,7 @@ _ROLE_ALLOWED_ENV = {
     # allowlist is narrow and capability-validated below.
     "planner": {"fireworks"},
 }
-_ROLE_ALLOWS_CUSTOM = {"chat", "browser_tool"}
+_ROLE_ALLOWS_CUSTOM = {"chat", "vision", "browser_tool", "planner"}
 
 _GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _FIREWORKS_MODELS_URL = "https://api.fireworks.ai/inference/v1/models"
@@ -1070,6 +1073,53 @@ def list_providers():
 def list_custom_providers():
     """Stored custom providers, masked."""
     return [_mask_provider(p) for p in _custom_providers()]
+
+
+def custom_provider_ids():
+    """Ids of the stored custom providers (for adapter dispatch maps)."""
+    return sorted(str(p.get("id") or "").strip()
+                  for p in _custom_providers() if p.get("id"))
+
+
+def roles_allowing_custom():
+    """Roles a user-added OpenAI-compatible provider may serve.
+
+    Part of GET /settings so the UI can show the per-functionality
+    "add custom provider" entry exactly where it will be accepted.
+    """
+    return sorted(_ROLE_ALLOWS_CUSTOM)
+
+
+def test_custom_provider(base_url, api_key):
+    """Live-check a candidate custom provider WITHOUT storing anything.
+
+    The "Test" button of the add-provider form lands here: the exact
+    (base_url, api_key) pair gets one model-list round trip, so the user
+    learns whether the provider works before anything is persisted. A junk
+    key or unreachable endpoint raises a scrubbed ModelRegistryError and
+    nothing is written — same validation add_custom_provider enforces,
+    minus the write.
+    """
+    key = str(api_key or "").strip()
+    base = str(base_url or "").strip().rstrip("/")
+    if not key:
+        raise ModelRegistryError("api_key is required")
+    if not (base.startswith("http://") or base.startswith("https://")):
+        raise ModelRegistryError(
+            "base_url must start with http:// or https://")
+    try:
+        models = _list_openai_compat_models(base, key)
+    except ModelRegistryError:
+        raise
+    except Exception:
+        raise ModelRegistryError(
+            "could not reach the provider to validate the API key"
+        )
+    if not models:
+        raise ModelRegistryError(
+            "API key validated but the provider returned no models"
+        )
+    return models
 
 
 # Key-material echo patterns for scrubbing provider error text: key=value

@@ -468,18 +468,36 @@ def _dispatch_groq(prompt, image_data_url, model, max_completion_tokens, respons
     return result
 
 
+def _with_empty_grounding(dispatch):
+    """Wrap a generic adapter so its result carries the empty
+    ``grounding_links`` default every shipped adapter gets here."""
+    def wrapped(prompt, image_data_url, model, max_completion_tokens,
+                response_format):
+        result = dispatch(prompt, image_data_url, model,
+                          max_completion_tokens, response_format)
+        if result:
+            result.setdefault("grounding_links", [])
+        return result
+    return wrapped
+
+
 def _vision_dispatchers():
     """provider id -> adapter call for this call site (resolved lazily).
 
     The adapters are module-level functions so existing patch points
     (``screen_analyzer.ask_groq_vision``, the client modules) keep working.
+    User-added custom providers ride the shared generic OpenAI-compatible
+    vision adapter, wrapped with this site's empty-grounding default.
     """
-    return {
+    dispatchers = {
         "gemini": _dispatch_gemini,
         "openrouter": _dispatch_openrouter,
         "fireworks": _dispatch_fireworks,
         "groq": _dispatch_groq,
     }
+    for pid, fn in vision_cascade.custom_vision_dispatchers().items():
+        dispatchers[pid] = _with_empty_grounding(fn)
+    return dispatchers
 
 
 def _screen_vision_schema(result):

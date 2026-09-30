@@ -1547,6 +1547,16 @@ class ProviderAddRequest(BaseModel):
     capabilities: Optional[List[str]] = None
 
 
+class ProviderTestRequest(BaseModel):
+    """Candidate credentials for the add-provider form's TEST button.
+
+    Deliberately carries NO id/name: this endpoint validates a (base_url,
+    api_key) pair live and persists nothing.
+    """
+    api_key: str
+    base_url: str
+
+
 @router.get("/settings")
 def get_settings():
     """Current models per role + selectable providers (masked: has_key only,
@@ -1595,6 +1605,9 @@ def get_settings():
         "model_errors": {r: e for r, e in errors.items() if e},
         "providers": model_registry.list_providers(),
         "role_allowed": role_allowed,
+        # Which functionality sections accept a user-added OpenAI-compatible
+        # provider (so the UI shows "add custom provider" exactly there).
+        "custom_provider_roles": model_registry.roles_allowing_custom(),
         "last_fallback": last_fb,
     }
 
@@ -1701,3 +1714,21 @@ def add_provider(payload: ProviderAddRequest):
     except ModelRegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "provider": provider}
+
+
+@router.post("/settings/provider/test")
+def test_provider(payload: ProviderTestRequest):
+    """TEST button of the add-provider form: live-check (base_url, api_key)
+    with one model-list call and store NOTHING — the user sees whether the
+    provider works before saving. Success returns the discovered models
+    (ids/displays only) so the caller can show what a save would offer."""
+    try:
+        models = model_registry.test_custom_provider(
+            payload.base_url, payload.api_key
+        )
+    except ModelRegistryError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=model_registry._scrub_secrets(str(exc))[:200],
+        )
+    return {"ok": True, "count": len(models), "models": models}

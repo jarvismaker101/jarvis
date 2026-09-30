@@ -781,6 +781,7 @@ const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const filterState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {} };
 const showAllState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {} };
 let roleAllowedCache = null; // {role: [provider ids]} for every registry role
+let customProviderRoles = null; // roles that accept a user-added provider
 let lastFallback = null;
 
 function escapeHtml(s) {
@@ -828,6 +829,7 @@ async function loadProviders() {
     const data = await res.json();
     providersCache = data.providers || [];
     roleAllowedCache = data.role_allowed || null;
+    customProviderRoles = data.custom_provider_roles || null;
     lastFallback = data.last_fallback || null;
     activeChatModel = data.chat_model || null;
     activeTtsModel = data.tts_model || null;
@@ -842,6 +844,7 @@ async function loadProviders() {
     renderBrowserToolSection();
     renderPlannerProviders();
     renderChatFallbackWarning();
+    _syncAddProviderVisibility();
   } catch (err) {
     if (list) list.innerHTML =
       '<span class="model-error">could not load settings (' +
@@ -1276,6 +1279,183 @@ async function submitAddProvider(ev) {
   }
 }
 
+/* ═══════════════════════════════════════════════════════
+   Per-functionality custom providers (add / test / save / choose).
+   Every model section that accepts a user-added OpenAI-compatible
+   provider gets its own "+ ADD CUSTOM PROVIDER" entry. The form asks
+   for base URL + API key (name optional), offers TEST (live check that
+   stores nothing) and SAVE, and after a save auto-fetches the models on
+   that key so one can be chosen for that function right away.
+   ═══════════════════════════════════════════════════════ */
+function _syncAddProviderVisibility() {
+  // Backend is the source of truth for which roles accept custom providers;
+  // fall back to the shipped LLM-backed set when it does not say.
+  const roles = Array.isArray(customProviderRoles) && customProviderRoles.length
+    ? customProviderRoles
+    : ["chat", "vision", "browser_tool", "planner"];
+  document.querySelectorAll(".provider-add").forEach((wrap) => {
+    wrap.hidden = roles.indexOf(wrap.dataset.role) === -1;
+  });
+}
+
+function _hostNameFromUrl(url) {
+  try { return new URL(url).hostname || ""; } catch (_e) { return ""; }
+}
+
+function _apStatus(wrap, msg, isError) {
+  const el = wrap.querySelector(".ap-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.className = "provider-form-error ap-status" + (isError || !msg ? "" : " ok");
+}
+
+function _apReset(wrap) {
+  const form = wrap.querySelector(".role-add-form");
+  const pick = wrap.querySelector(".ap-pick");
+  if (form) { form.reset(); form.hidden = true; }
+  if (pick) pick.hidden = true;
+  _apStatus(wrap, "", true);
+}
+
+async function _testRoleProvider(wrap) {
+  const urlEl = wrap.querySelector(".ap-url");
+  const keyEl = wrap.querySelector(".ap-key");
+  const btn = wrap.querySelector(".btn-provider-test");
+  const baseUrl = urlEl ? urlEl.value.trim() : "";
+  const apiKey = keyEl ? keyEl.value.trim() : "";
+  if (!baseUrl || !apiKey) {
+    _apStatus(wrap, "Base URL and API key are required.", true);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  _apStatus(wrap, "testing…", true);
+  try {
+    const res = await jarvisFetch(BACKEND_URL + "/settings/provider/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    _apStatus(wrap, "✓ working — " + (data.count || 0) + " models found", false);
+  } catch (err) {
+    _apStatus(wrap, "✗ " + (err.message || err), true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function _fetchProviderModels(providerId) {
+  const res = await jarvisFetch(
+    BACKEND_URL + "/providers/" + encodeURIComponent(providerId) + "/models"
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+  return data.models || [];
+}
+
+function _populateModelPicker(wrap, providerId, models, roleLabel) {
+  const pick = wrap.querySelector(".ap-pick");
+  const select = wrap.querySelector(".ap-model");
+  if (!pick || !select) return;
+  select.innerHTML = "";
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.display || m.id;
+    select.appendChild(opt);
+  }
+  pick.dataset.providerId = providerId;
+  pick.hidden = false;
+  _apStatus(wrap,
+    "✓ saved — " + models.length + " models found; choose one for " +
+    roleLabel + " (or pick later from the list)", false);
+  select.focus();
+}
+
+async function _saveRoleProvider(role, wrap) {
+  const nameEl = wrap.querySelector(".ap-name");
+  const urlEl = wrap.querySelector(".ap-url");
+  const keyEl = wrap.querySelector(".ap-key");
+  const saveBtn = wrap.querySelector(".ap-actions .btn-provider-save");
+  const baseUrl = urlEl ? urlEl.value.trim() : "";
+  const apiKey = keyEl ? keyEl.value.trim() : "";
+  if (!baseUrl || !apiKey) {
+    _apStatus(wrap, "Base URL and API key are required.", true);
+    return;
+  }
+  // Name is optional: fall back to the endpoint's host, then "custom".
+  const name = (nameEl && nameEl.value.trim()) ||
+    _hostNameFromUrl(baseUrl) || "custom";
+  const id = slugifyProviderId(name) || "custom";
+  const roleLabel = (wrap.closest(".sidebar-section")
+    ? wrap.closest(".sidebar-section").querySelector(".sidebar-section-title")
+    : null);
+  const label = roleLabel ? roleLabel.textContent.trim().toLowerCase() : role;
+  if (saveBtn) saveBtn.disabled = true;
+  _apStatus(wrap, "validating & saving…", true);
+  try {
+    const res = await jarvisFetch(BACKEND_URL + "/settings/provider", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name, api_key: apiKey, base_url: baseUrl }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    // Refresh the provider lists everywhere, then auto-fetch the models on
+    // this key and let the user choose one for this function.
+    providersCache = null;
+    for (const k of Object.keys(modelsCache)) delete modelsCache[k];
+    await loadProviders();
+    _apStatus(wrap, "✓ saved — fetching models…", true);
+    try {
+      const models = await _fetchProviderModels(id);
+      _populateModelPicker(wrap, id, models, label);
+    } catch (err) {
+      _apStatus(wrap, "✓ saved, but the model list failed: " +
+        (err.message || err), true);
+    }
+    flashSidebarConfirm("✓ provider added: " + name);
+  } catch (err) {
+    _apStatus(wrap, "✗ " + (err.message || err), true);
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+}
+
+async function _useRoleProviderModel(role, wrap) {
+  const pick = wrap.querySelector(".ap-pick");
+  const select = wrap.querySelector(".ap-model");
+  const providerId = pick ? pick.dataset.providerId : "";
+  const modelId = select ? select.value : "";
+  if (!providerId || !modelId) return;
+  await _selectModelForRole(role, providerId, modelId);
+  _apReset(wrap);
+}
+
+function initRoleAddForms() {
+  document.querySelectorAll(".provider-add").forEach((wrap) => {
+    const role = wrap.dataset.role;
+    const btn = wrap.querySelector(".role-add-btn");
+    const form = wrap.querySelector(".role-add-form");
+    const testBtn = wrap.querySelector(".btn-provider-test");
+    const useBtn = wrap.querySelector(".ap-use");
+    if (!btn || !form) return;
+    btn.addEventListener("click", () => {
+      if (!form.hidden) { _apReset(wrap); return; }
+      form.hidden = false;
+      const nameEl = wrap.querySelector(".ap-name");
+      if (nameEl) nameEl.focus();
+    });
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      _saveRoleProvider(role, wrap);
+    });
+    if (testBtn) testBtn.addEventListener("click", () => _testRoleProvider(wrap));
+    if (useBtn) useBtn.addEventListener("click", () => _useRoleProviderModel(role, wrap));
+  });
+}
+
 // sidebar wiring (guarded like the capsule/voice buttons)
 try {
   const _burgerBtn = document.getElementById("btn-hamburger");
@@ -1298,6 +1478,8 @@ try {
   }
   const _browserSaveBtn = document.getElementById("btn-browser-save");
   if (_browserSaveBtn) _browserSaveBtn.addEventListener("click", saveBrowserToolModel);
+  initRoleAddForms();
+  _syncAddProviderVisibility();
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && sidebarOpen) toggleSidebar(false);
   });

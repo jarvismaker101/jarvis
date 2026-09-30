@@ -1001,10 +1001,10 @@ Start in:
 
 Start in:
 
-- `backend/services/model_registry.py` (`VALID_ROLES`, `ROLE_CAPABILITIES`, `_ROLE_ALLOWED_ENV`, `_MODEL_CAPABILITY_RULES`)
-- `backend/api/routes.py` (`/settings/*`, `/providers/{id}/models`)
-- `frontend/renderer.js` (the per-role provider sections)
-- `data/jarvis_settings.json` (live state; gitignored)
+- `backend/services/model_registry.py` (`VALID_ROLES`, `ROLE_CAPABILITIES`, `_ROLE_ALLOWED_ENV`, `_ROLE_ALLOWS_CUSTOM`, `_MODEL_CAPABILITY_RULES`, `add_custom_provider`, `test_custom_provider`)
+- `backend/api/routes.py` (`/settings/*`, `/settings/provider`, `/settings/provider/test`, `/providers/{id}/models`)
+- `frontend/renderer.js` (the per-role provider sections; the per-functionality add/test/save/choose form)
+- `data/jarvis_settings.json` (live state incl. custom provider keys; gitignored)
 
 ### Change process supervision, auth or the local control plane
 
@@ -1020,7 +1020,7 @@ Start in:
 
 Start in:
 
-- `backend/tests/` — 92 unittest modules; per-feature suites are named `test_fNN_*` (Fable-5), `test_gNN_*` (G-groups), `test_cN_*` (review criticals), `test_hN_*` (review highs), plus 25 unnumbered feature suites (including `test_stt_hallucination_gate.py`)
+- `backend/tests/` — 120 unittest modules; per-feature suites are named `test_fNN_*` (Fable-5), `test_gNN_*` (G-groups), `test_cN_*` (review criticals), `test_hN_*` (review highs), `test_pNN_*` (priority/audit waves), plus 21 unnumbered feature suites (including `test_custom_provider_ui.py` and `test_stt_hallucination_gate.py`)
 - `tests/` — Node `node --test` suites
 - `conftest.py` — the `.env` session guard
 
@@ -1180,6 +1180,15 @@ The activity-tail console is retitled "jarvis - task activity" (was "opencode"),
 This change lives in the brave-control MCP server (`server.mjs`). It was originally made only in the external copy at `C:\Users\mayan\mcp-servers\brave-control`, but a copy is now vendored in-tree at `integrations/brave-control/` — check `BRAVE_MCP_SERVER_DIR` to see which one the app actually spawns. A `settlePage(page, opts)` helper replaced the slow `networkidle` waits in `navigate`/`new_tab` (now `waitForEvent('load', 3s)` with a catch, then settle 300ms) and added a 200ms settle after `click_element`. It resolves on a main-frame `framenavigated` event or DOM-mutation quiescence (200ms debounce, 2500ms hard cap), disconnects its MutationObserver cleanly, and is wrapped in try/catch so settling can never fail a tool call. `ask_chat` polls every 300ms instead of 1500ms, and `copy_code_block` switched to a 100ms clipboard poll capped at 2000ms. Measured navigate ~390-406ms (was 2-4s+) and click ~16ms; that repo's node tests pass 18/18.
 
 ## Recent Improvements (2026-09)
+
+### Per-functionality custom providers from the Electron UI (custom-provider-ui, 2026-10-01)
+
+Each model section of the sidebar (TEXT CHAT, VISION MODEL, BROWSER TOOL MODEL, PLANNER MODEL) now has its own **+ ADD CUSTOM PROVIDER** entry next to the providers already available for that functionality. The form asks for a name (optional — falls back to the endpoint host), the **base URL** and the **API key**, and below the fields offers **TEST** and **SAVE**: TEST live-checks the (base_url, api_key) pair with one model-list round trip and **stores nothing** (`POST /settings/provider/test`); SAVE persists the provider (still validated live before the write, key stored only in the gitignored `data/jarvis_settings.json`) and then **auto-fetches the models on that key** so one can be chosen for that functionality immediately from the dropdown (`USE MODEL` → `POST /settings/model`), or later from the usual provider → model list.
+
+- Scope: custom providers now serve every LLM-backed role (`_ROLE_ALLOWS_CUSTOM = chat, vision, browser_tool, planner` — was chat + browser_tool); the voice roles (tts, listening) still refuse them because Fish/gTTS/Whisper/Inworld are dedicated audio engines, not base-url + key endpoints. `GET /settings` reports `custom_provider_roles` so the UI shows the entry exactly where it is accepted.
+- Vision support for custom providers rides ONE generic adapter (`openai_compat_client.ask_openai_compat_vision`, standard `image_url` content part, optional `response_format` passthrough) registered per provider through `vision_cascade.custom_vision_dispatchers()` and merged into both call sites (`screen_control._vision_dispatchers`, `screen_analyzer._vision_dispatchers`). `vision_cascade.provider_available` now accepts a registered custom provider (key **and** base URL required) — the env-only gate would have silently skipped a selected custom provider.
+- Planner and chat needed no dispatch change: `orchestrator._chat` and the chat chain already resolve any snapshot through `ask_openai_compat`; `browser_agent` already had a custom-provider branch.
+- Test contracts adapted (deliberate, documented in the tests): `test_model_registry.py::test_custom_provider_selectable_for_any_role` and `test_live_bugfixes.py::test_vision_rejects_custom` (→ `test_vision_accepts_custom`) pinned the old chat/browser_tool-only allowlist. Suite: `backend/tests/test_custom_provider_ui.py` (15 tests). Key files: `frontend/renderer.js`, `frontend/index.html`, `frontend/style.css`, `backend/api/routes.py`, `backend/services/model_registry.py`, `backend/services/openai_compat_client.py`, `backend/services/vision_cascade.py`.
 
 ### Responsiveness audit wave II: P1-06, P1-07, P0-03, P0-10…P0-12, P1-11…P1-16, P1-08, P1-10 (2026-10-01, 14 commits, tagged per item)
 

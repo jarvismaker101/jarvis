@@ -609,16 +609,24 @@ class RoleModelTests(ModelRegistryTestBase):
     def test_custom_provider_selectable_for_any_role(self):
         with patch.object(model_registry, "_list_openai_compat_models", return_value=[{"id": "m", "display": "m"}]):
             model_registry.add_custom_provider("acme", "Acme", "sk-1", "https://acme.example/v1")
-        # custom allowed only for chat and browser_tool per allowlist
-        model_registry.set_model_for_role("chat", "acme", "acme-chat")
-        model_registry.set_model_for_role("browser_tool", "acme", "acme-browser")
-        self.assertEqual(model_registry.get_model_for_role("chat")["provider"], "acme")
+        # [custom-provider UI] CONTRACT ADAPTED: custom is now allowed for
+        # every LLM-backed role (chat / vision / browser_tool / planner) —
+        # the per-functionality "add custom provider" feature. Previously the
+        # allowlist was chat + browser_tool only and vision had to reject.
+        for role, model in [
+            ("chat", "acme-chat"),
+            ("vision", "acme-vision"),
+            ("browser_tool", "acme-browser"),
+            ("planner", "acme-planner"),
+        ]:
+            model_registry.set_model_for_role(role, "acme", model)
+            self.assertEqual(
+                model_registry.get_model_for_role(role)["provider"], "acme")
         self.assertEqual(model_registry.get_model_for_role("browser_tool")["model"], "acme-browser")
-        # tts, vision and listening must reject custom
+        # tts and listening must still reject custom: their dedicated audio
+        # engines cannot be served by a base-url + key provider.
         with self.assertRaises(model_registry.ModelRegistryError):
             model_registry.set_model_for_role("tts", "acme", "acme-tts")
-        with self.assertRaises(model_registry.ModelRegistryError):
-            model_registry.set_model_for_role("vision", "acme", "acme-vision")
         with self.assertRaises(model_registry.ModelRegistryError):
             model_registry.set_model_for_role("listening", "acme", "acme-stt")
 
