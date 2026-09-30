@@ -83,6 +83,15 @@ class Query(BaseModel):
     #: voice path was designed for. The field is now authoritative for two
     #: decisions: the compact reply profile and ``from_voice`` in the brain.
     origin: str = ""
+    #: [PERF] P1-19 — the voice worker's already-captured turn marks
+    #: (speech_end / capture_end / stt_start / stt_done …), shipped WITH the
+    #: submission so one waterfall can span both processes. Each entry is
+    #: ``[name, perf_counter_ns, meta]`` — absolute marks, never durations.
+    client_marks: List[list] = []
+    #: [PERF] P1-19 — the client's own clock sampled at send time; it is the
+    #: single reference used to align ``client_marks`` onto this process's
+    #: clock. Absent means "assume a shared clock".
+    client_now_ns: Optional[int] = None
 
 
 def _is_voice_submission(query) -> bool:
@@ -96,6 +105,43 @@ def _is_voice_submission(query) -> bool:
     if origin == "voice":
         return True
     return not bool(getattr(query, "speak", True))
+
+
+def _begin_turn_clock(request_id, query, route):
+    """[PERF] P1-19 — start this turn's waterfall at the request boundary.
+
+    The clock used to start inside the worker thread, so everything the request
+    spent before the worker was scheduled was invisible. ``begin`` is
+    idempotent, so an F23 retry/reconnect re-attaches instead of restarting.
+
+    Best-effort by contract: a telemetry failure must never touch the request
+    path, so every call here swallows its own errors.
+    """
+    try:
+        _latency.begin(request_id,
+                       origin="voice" if _is_voice_submission(query) else "ui",
+                       label=(getattr(query, "message", "") or "")[:60])
+        _latency.mark(request_id, "http_in", meta={"route": route})
+    except Exception:
+        pass
+
+
+def _merge_client_marks(request_id, query):
+    """[PERF] P1-19 — merge the voice worker's marks into THIS turn.
+
+    The worker and this backend are separate OS processes (F50), so its
+    capture/STT marks — and, later, its playback marks — are shipped here under
+    the SAME ``request_id``. An unknown turn simply drops them.
+    """
+    try:
+        marks = getattr(query, "client_marks", None)
+        if not marks:
+            return 0
+        return _latency.merge_client_marks(
+            request_id, marks,
+            client_now_ns=getattr(query, "client_now_ns", None))
+    except Exception:
+        return 0
 
 
 class VoiceLog(BaseModel):
@@ -222,8 +268,11 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
             except Exception:
                 pass
 
-        # [PERF] Telemetry for this turn. Recording is best-effort and can
-        # never fail a request: the helper swallows its own errors.
+        # [PERF] P1-19 — the turn clock is begun by the ROUTE handler (it sees
+        # `http_in`, where the request actually arrived); this is the
+        # idempotent fallback for a caller that reaches the worker directly,
+        # and `finish` closes the record. Recording is best-effort and can
+        # never fail a request: both helpers swallow their own errors.
         _latency.begin(state.request_id, origin="voice" if from_voice else "ui",
                        label=(state.message or "")[:60])
         try:
@@ -315,6 +364,12 @@ def ask(query: Query):
         return {"reply": "Request still processing, sir.",
                 "request_id": state.request_id}
 
+    # [PERF] P1-19 — start this turn's waterfall here: the request has arrived
+    # and has an identity, and everything the request spends before the worker
+    # thread is scheduled is part of the turn's latency.
+    _begin_turn_clock(state.request_id, query, "/ask")
+    _merge_client_marks(state.request_id, query)
+
     current_time = time.time()
     if (
         query.message == last_request["message"]
@@ -342,13 +397,22 @@ def ask(query: Query):
         # profile and the from_voice paths, exactly like /ask/stream.
         from_voice = _is_voice_submission(query)
         reply = process_message(query.message, from_voice=from_voice,
-                                voice_compact=from_voice)
+                                voice_compact=from_voice,
+                                # [PERF] P1-19 — the transport identity, so this
+                                # turn's marks (racer_start, classify_done,
+                                # first_token) and its screen answer are
+                                # attributed to THIS request like they are on
+                                # the streaming path.
+                                request_id=state.request_id)
         if reply is None:
             reply = "I didn't get a response. Please try again."
         state.complete(reply)
     except Exception as exc:
         state.error(exc)
         raise
+    finally:
+        # [PERF] P1-19 — close this turn's waterfall (marks `end`).
+        _latency.finish(state.request_id)
 
     print("[API] Sending reply:", reply)
     if query.speak:
@@ -382,6 +446,13 @@ def ask_stream(query: Query):
             status_code=503,
             detail="request registry saturated; retry shortly",
         )
+
+    # [PERF] P1-19 — the waterfall starts at the request boundary, not inside
+    # the worker thread (which made admission and thread start invisible), and
+    # the voice worker's capture/STT marks are merged in under this SAME
+    # request_id. Both calls are best-effort.
+    _begin_turn_clock(state.request_id, query, "/ask/stream")
+    _merge_client_marks(state.request_id, query)
 
     # Execute-once: only the first attach starts the worker; reconnects just
     # reattach to the same numbered event buffer.
@@ -826,10 +897,19 @@ def approvals_reset():
 def get_latency(limit: int = 50):
     """[PERF] Per-turn latency telemetry — the numbers the latency work needs.
 
-    Returns the rolling summary (median / p90 / max per span) plus the recent
-    raw records. ``spans`` are cumulative-from-turn-start for
-    ``endpoint``/``stt``/``first_token``/``first_audio`` and the call's own
-    cost for ``classify``.
+    P1-19: every mark in a record is an ABSOLUTE ``perf_counter_ns`` boundary;
+    durations are DERIVED at read time by differencing consecutive marks, so a
+    duration can no longer contradict the offset it is stored next to, and the
+    step deltas of a turn sum to its ``total_ms``. ``summary`` keeps the
+    pre-P1-19 keys (``samples``, ``spans``, ``total`` and their
+    ``median_ms`` / ``p90_ms`` / ``max_ms``) and adds the ``waterfall`` rows
+    (p50 / p90 / max per step over the window, ordered by median offset) plus
+    ``p50_ms`` and the ``offset_*`` numbers.
+
+    The ``listener`` module is deliberately NOT imported here (P1-19,
+    requirement 7): this process owns no microphone, so reading the listener's
+    AEC counter from here always reported 0 anyway — the voice worker
+    publishes it with its state snapshot instead.
 
     Authed like every other private read (F51): it exposes what users said.
     """
@@ -840,11 +920,60 @@ def get_latency(limit: int = 50):
             "recent": _latency.recent(limit),
             "aec": {
                 "remote": _aec_remote_stats(),
-                "listener_aec_errors": _listener_aec_error_count(),
+                "listener_aec_errors": _published_voice_aec_errors(),
             },
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+class ClientMarks(BaseModel):
+    """[PERF] P1-19 — one batch of the voice worker's already-stamped marks."""
+
+    #: The SAME request id the utterance was submitted with.
+    request_id: str = ""
+    #: ``[[name, perf_counter_ns, meta], ...]`` — absolute marks only.
+    marks: List[list] = []
+    #: The client's clock at send time (the alignment reference).
+    client_now_ns: Optional[int] = None
+
+
+@router.post("/latency/client")
+def post_latency_client(payload: ClientMarks):
+    """[PERF] P1-19 — merge another process's marks into one turn's waterfall.
+
+    The voice worker and this backend are separate OS processes (F50), so a
+    mark it records is invisible here until it is merged. The worker ships its
+    capture/STT marks inline with the submission and the later ones (the
+    playback boundaries) through this endpoint, always under the request_id it
+    submitted with — never a second id, or the two halves would describe
+    different turns.
+
+    Authenticated like every other private endpoint (F51, via the installed
+    middleware). Telemetry is never allowed to fail a turn, so a mark that
+    cannot be merged is dropped and the answer says how many were accepted.
+    """
+    try:
+        merged = _latency.merge_client_marks(
+            payload.request_id, payload.marks,
+            client_now_ns=payload.client_now_ns)
+    except Exception:
+        merged = 0
+    return {"ok": True, "merged": merged}
+
+
+def _published_voice_aec_errors():
+    """The voice worker's AEC error count, as IT published it (F50 / P1-19).
+
+    The count lives in the listener, which runs in the VOICE process (the
+    process that owns the microphone). Reading it here used to mean importing
+    the listener module into the API process, where the counter is always 0.
+    """
+    try:
+        with _published_voice_lock:
+            return int(_published_voice.get("aec_errors") or 0)
+    except Exception:
+        return 0
 
 
 def _aec_remote_stats():
@@ -855,14 +984,6 @@ def _aec_remote_stats():
         return dict(getattr(transport, "stats", {}) or {})
     except Exception:
         return {}
-
-
-def _listener_aec_error_count():
-    try:
-        from backend.services import listener as _l
-        return int(getattr(_l, "_aec_error_count", 0))
-    except Exception:
-        return 0
 
 
 @router.get("/health")

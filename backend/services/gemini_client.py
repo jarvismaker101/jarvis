@@ -33,6 +33,7 @@ from backend.services.openai_compat_client import (
     FINAL_CHANNEL,
     REASONING_CHANNEL,
     StreamDelta,
+    _mark_headers,
 )
 
 
@@ -511,6 +512,9 @@ def ask_gemini_chat_stream(messages, temperature=0.7, max_tokens=None, model=Non
             "[GEMINI CHAT] Stream error: %d %s", resp.status_code, _redact(resp.text[:300])
         )
         return
+
+    # [PERF] P1-19 — response headers in: from here on the delay is generation.
+    _mark_headers("gemini", m)
 
     try:
         for raw_line in resp.iter_lines(decode_unicode=True):

@@ -235,12 +235,21 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
     A single monotonic deadline (timeout_ms) spans the whole classification:
     primary and fallbacks share the remaining budget, so fast-fail never
     exceeds the advertised window.
+
+    [PERF] P1-19: the verdict carries ``_source`` — the hop that answered
+    (openrouter | gemini | groq | none). Which hop won is invisible in a single
+    "classify" duration, and it is the first thing to check when a turn is
+    slow.
     """
     fallback = {
         "intent": "chat",
         "steps": [],
         "task_description": "",
         "query": message,
+        # [PERF] P1-19 — which hop produced a verdict travels with the verdict,
+        # so the latency waterfall can say whether OpenRouter, Gemini or Groq
+        # answered (and "none" when every hop failed).
+        "_source": "none",
     }
     if not message or not message.strip():
         return fallback
@@ -256,6 +265,7 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
             result = _parse_intent_json(content, message)
             if result["intent"] != "chat" or content:
                 # Even a chat verdict from the model is a deliberate answer.
+                result["_source"] = "openrouter"   # [PERF] P1-19 (hop label)
                 return result
         except Exception as exc:
             logging.warning("[INTENT] OpenRouter classifier unavailable: %s", exc)
@@ -268,6 +278,7 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
             result = _parse_intent_json(content, message)
             if result["intent"] != "chat" or content:
                 # Even a chat verdict from the model is a deliberate answer.
+                result["_source"] = "gemini"       # [PERF] P1-19 (hop label)
                 return result
         except Exception as exc:
             logging.warning("[INTENT] Gemini classifier unavailable: %s", exc)
@@ -279,6 +290,7 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
             content = _classify_with_groq(message, timeout=timeout)
             result = _parse_intent_json(content, message)
             if result["intent"] != "chat" or content:
+                result["_source"] = "groq"         # [PERF] P1-19 (hop label)
                 return result
         except Exception as exc:
             logging.warning("[INTENT] Groq Qwen classifier unavailable: %s", exc)

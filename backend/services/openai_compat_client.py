@@ -137,6 +137,23 @@ _retry_strategy = Retry(
 _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
 
 
+def _mark_headers(provider, model=None):
+    """[PERF] P1-19 — mark the model provider's HTTP response boundary.
+
+    The split that matters on a chat turn: everything before this mark is
+    connect + queue + time-to-headers, everything after it is generation. One
+    "time to first token" number cannot tell a slow provider apart from a slow
+    prompt. It lives in this module because every streaming adapter
+    (openai-compat, Gemini, Fireworks) already imports from here. Telemetry
+    only: it swallows its own errors and marks nothing when no turn is active.
+    """
+    try:
+        from backend.services import latency as _lat
+        _lat.mark_provider_headers(provider, model)
+    except Exception:
+        pass
+
+
 def _chat_url(base_url):
     return str(base_url or "").rstrip("/") + "/chat/completions"
 
@@ -240,6 +257,9 @@ def ask_openai_compat_stream(
             response.text[:300],
         )
         return
+    # [PERF] P1-19 — the provider's HTTP response headers have arrived: the
+    # queueing/TTFT part of the call is over and only generation is left.
+    _mark_headers("openai-compat", model)
     try:
         for line in response.iter_lines(decode_unicode=True):
             if cancel is not None and cancel.is_set():

@@ -742,26 +742,47 @@ def _fastpath_chat_enabled():
                                                                  "off", "no")
 
 
-def _mark_latency(request_id, name, value_ms):
-    """[PERF] Record an already-measured span for *request_id* (no-op if none)."""
+def _mark_latency(request_id, name, meta=None):
+    """[PERF] P1-19 — record one ABSOLUTE boundary mark for *request_id*.
+
+    Deliberately not a duration: a pre-computed duration stored next to
+    offsets is what made the telemetry ring's numbers un-addable. The boundary
+    is marked here; the step's cost is derived from consecutive marks when the
+    waterfall is read. No-op when the turn is unknown, and never raises.
+    """
     if not request_id:
         return
     try:
         from backend.services import latency as _lat
-        _lat.mark_ms(request_id, name, value_ms)
+        _lat.mark(request_id, name, meta=meta)
     except Exception:
         pass
 
 
-def _mark_latency_duration(request_id, name, started_at):
-    """[PERF] Record one call's own cost as a span for *request_id*."""
-    if not request_id:
-        return
+def _bind_latency_request(request_id):
+    """[PERF] P1-19 — name the turn that untagged marks belong to.
+
+    The provider stream clients (``provider_headers``) and the audio actor
+    (``tts_first_byte`` / ``playback_started``) observe their boundary from a
+    worker thread that carries no transport identity, so the turn is named
+    here for the duration of the turn.
+    """
     try:
         from backend.services import latency as _lat
-        _lat.mark_duration(request_id, name, started_at)
+        _lat.set_active_request(request_id)
     except Exception:
         pass
+
+
+def _release_latency_request(request_id):
+    """[PERF] P1-19 — stop attributing untagged marks to a finished turn."""
+    try:
+        from backend.services import latency as _lat
+        if _lat.active_request() == str(request_id or ""):
+            _lat.set_active_request("")
+    except Exception:
+        pass
+
 
 
 def is_definitely_plain_chat(msg):
@@ -3290,6 +3311,11 @@ def process_message(
     print("[USER]:", user_message)
 
     token = _bind_turn_job(job)
+    # [PERF] P1-19 — marks recorded deep inside the turn (the provider stream
+    # clients' `provider_headers`, the audio actor's playback boundaries) have
+    # no transport identity of their own, so this turn is named for their
+    # duration. Cleared only if it still points at THIS request.
+    _bind_latency_request(request_id)
     try:
         return _process_message_inner(
             user_message,
@@ -3303,6 +3329,7 @@ def process_message(
         )
     finally:
         _unbind_turn_job(token)
+        _release_latency_request(request_id)
 
 
 def _process_message_inner(
@@ -3479,6 +3506,11 @@ def _process_message_inner(
             logging.info("[ORCHESTRATOR] declined after selection; legacy routing")
         elif stream_reply is not None:
             try:
+                # [PERF] P1-19 — speculation start. `classify_done` minus
+                # `racer_start` is the classifier's real cost (the racer build
+                # is microseconds), which is what a "make it faster" item needs
+                # to see.
+                _mark_latency(request_id, "racer_start")
                 racer = _ChatRacer(msg, voice_compact)
             except Exception as exc:
                 logging.warning("[CHAT] Racer start failed: %s", exc)
@@ -3505,16 +3537,22 @@ def _process_message_inner(
                 "query": msg,
                 "_source": "fastpath",
             }
-            # [PERF] The fast path's whole point: this mark is ~0ms here, where
-            # it used to be the classifier's full round trip.
-            _mark_latency(request_id, "classify", 0.0)
+            # [PERF] P1-19 — the hop is part of the mark now: "fastpath" is a
+            # ~0ms classify where a cloud classifier round trip used to be.
+            _mark_latency(request_id, "classify_done",
+                          {"hop": "fastpath", "intent": "chat",
+                           "classifier": False})
             print("[INTENT] Deterministic chat fast path (classifier skipped)")
         else:
-            _classify_started = time.monotonic()
             intent = classify_intent(msg, timeout_ms=INTENT_BUDGET_VOICE_MS
                                      if from_voice else INTENT_BUDGET_MS)
-            # [PERF] Record the classifier's own cost against this turn.
-            _mark_latency_duration(request_id, "classify", _classify_started)
+            # [PERF] P1-19 — WHICH hop answered (openrouter | gemini | groq |
+            # none) is recorded with the boundary: a throttled primary hides
+            # completely inside a single "classify" duration.
+            _mark_latency(request_id, "classify_done", {
+                "hop": intent.get("_source") or "unknown",
+                "intent": intent.get("intent"),
+            })
         # Screen-question safety net — deterministic: routes screen Q&A even
         # when the cloud classifier misfires (chat fallback on throttle, or a
         # research misread). tool/task verdicts are exempt: they carry

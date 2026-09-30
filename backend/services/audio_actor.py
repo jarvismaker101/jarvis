@@ -34,6 +34,8 @@ import threading
 import time
 from collections import deque, namedtuple
 
+from backend.services import latency as _latency
+
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_CHANNELS = 1
 DEFAULT_SAMPLE_WIDTH = 2  # s16le
@@ -204,6 +206,12 @@ class AudioActor:
         self._eof = False
         self._dropped_chunks = 0
         self._last_error = None
+        #: [PERF] P1-19 — one mark attempt per producer/consumer side. The turn
+        #: keeps only the FIRST mark of a name, so a multi-sentence reply marks
+        #: the true first byte of the turn even though each sentence starts its
+        #: own utterance.
+        self._fed_once = False
+        self._played_once = False
 
         self._chunk_wait = threading.Event()
         self._stop = threading.Event()
@@ -227,6 +235,11 @@ class AudioActor:
             self._ring_cv.notify_all()
         self._chunk_wait.clear()
         self._stop.clear()
+        # [PERF] P1-19 — a new utterance may mark its first byte again; the TURN
+        # keeps only the first mark of a name, so a later sentence can never
+        # rewrite the boundary the turn already recorded.
+        self._fed_once = False
+        self._played_once = False
         return generation
 
     def _is_current(self, key, generation):
@@ -275,6 +288,15 @@ class AudioActor:
             self._ring.append(Chunk(key, generation, bytes(pcm_bytes)))
             self._utterance_pcm.extend(bytes(pcm_bytes))
         self._chunk_wait.set()
+        # [PERF] P1-19 — the first synthesized audio of this turn exists. The
+        # gap between this mark and `playback_started` is synthesis/prefetch;
+        # the gap before it is model + TTS time to the first byte.
+        if not self._fed_once:
+            self._fed_once = True
+            try:
+                _latency.mark_active("tts_first_byte", {"bytes": len(pcm_bytes)})
+            except Exception:
+                pass
         return True
 
     def end_utterance(self, key=None, generation=None):
@@ -323,6 +345,8 @@ class AudioActor:
             stream = self._factory()
         self._stream = stream
         written = 0
+        # [PERF] P1-19 — allow one first-write mark for THIS play loop.
+        self._played_once = False
         try:
             while True:
                 if self._play_state not in ("playing", "ended"):
@@ -363,6 +387,15 @@ class AudioActor:
                     # Consumed-frame accounting: the cursor is where the
                     # DEVICE was fed, never where synthesis was submitted.
                     self._spoken_bytes += len(chunk.pcm)
+                # [PERF] P1-19 — the device really has audio now: this is the
+                # moment the user can hear something, as opposed to bytes
+                # merely existing in the ring.
+                if not self._played_once:
+                    self._played_once = True
+                    try:
+                        _latency.mark_active("playback_started")
+                    except Exception:
+                        pass
                 if callable(on_chunk):
                     on_chunk(chunk.pcm)
         finally:

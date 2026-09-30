@@ -20,6 +20,7 @@ from backend.services.openai_compat_client import (
     FINAL_CHANNEL,
     REASONING_CHANNEL,
     StreamDelta,
+    _mark_headers,
     reasoning_text as _reasoning_text,
 )
 
@@ -336,6 +337,11 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
                 return
         else:
             return
+
+    # [PERF] P1-19 — response headers in: from here on the delay is generation.
+    # After the optional reasoning_effort replay, so it marks the response the
+    # stream actually reads.
+    _mark_headers("fireworks", data.get("model"))
 
     try:
         for line in response.iter_lines(decode_unicode=True):

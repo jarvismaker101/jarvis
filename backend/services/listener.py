@@ -30,12 +30,14 @@ from backend.services.echo_cancel import (
     AEC_SAMPLE_RATE as _AEC_RATE,
     AEC_SAMPLE_WIDTH as _AEC_WIDTH,
     aec_state as _aec_state,
+    begin_capture as _aec_begin_capture,
     cancelled_capture_frame as _aec_capture_frame,
 )
 from backend.services.transcript_stabilizer import (
     TranscriptWindow,
     stabilizer as _turn_stabilizer,
 )
+from backend.services import latency as _latency
 
 LISTEN_TIMEOUT_SECONDS = 10
 MAX_PHRASE_SECONDS = 15
@@ -110,6 +112,28 @@ print(
 )
 
 vad = webrtcvad.Vad(1)
+
+#: [PERF] P1-19 — which STT engine produced the last accepted transcript
+#: ("inworld" | "local-whisper" | "google-or-groq" | ""). Telemetry only: it is
+#: what lets the waterfall say WHICH engine cost that time (the audit's
+#: "record which STT engine produced the transcript").
+LAST_STT_ENGINE = ""
+
+
+def _mark_turn(marks, name, meta=None):
+    """[PERF] P1-19 — best-effort mark on this turn's voice timeline.
+
+    *marks* is the optional ``latency.LocalTurn`` the capture thread created for
+    this utterance. Telemetry must never break capture, so a missing sink or a
+    failing sink is silently ignored.
+    """
+    if marks is None:
+        return
+    try:
+        marks.mark(name, meta)
+    except Exception:
+        pass
+
 
 
 def _close_microphone_source():
@@ -408,6 +432,7 @@ def recognize_multilingual(audio):
         # roman/English script). Empty transcript = no speech -> second
         # opinions below. A Devanagari transcript means the hint was
         # ignored -> fall back.
+        global LAST_STT_ENGINE
         try:
             text = recognize_inworld(audio, language="en")
             normalized = _normalize_text(text)
@@ -419,6 +444,7 @@ def recognize_multilingual(audio):
                     print("[LISTENER] Inworld STT returned non-English script, falling back")
                 else:
                     print(f"[HEARD:inworld] {normalized}")
+                    LAST_STT_ENGINE = "inworld"   # [PERF] P1-19
                     return text, normalized, "auto"
         except sr.UnknownValueError:
             pass
@@ -427,6 +453,7 @@ def recognize_multilingual(audio):
         return None
 
     def _try_local_whisper():
+        global LAST_STT_ENGINE
         try:
             transcript, lang = recognize_local_whisper(audio)
             normalized = _normalize_text(transcript)
@@ -435,6 +462,7 @@ def recognize_multilingual(audio):
                 return None
             if normalized:
                 print(f"[HEARD:local-whisper] {normalized}")
+                LAST_STT_ENGINE = "local-whisper"   # [PERF] P1-19
                 return transcript, normalized, lang
         except sr.UnknownValueError:
             pass
@@ -475,6 +503,9 @@ def recognize_multilingual(audio):
                 continue
             if normalized:
                 print(f"[HEARD:{language}] {normalized}")
+                # [PERF] P1-19 — the cloud engine (Google, then Groq) answered.
+                global LAST_STT_ENGINE
+                LAST_STT_ENGINE = "google-or-groq"
                 return text, normalized, language
         except sr.UnknownValueError:
             continue
@@ -674,7 +705,14 @@ def _report_aec_degraded_once(during):
               f"overlapped playback")
 
 
-def _capture_audio():
+def _capture_audio(marks=None):
+    """Capture one utterance (streaming) and return its combined audio.
+
+    *marks* is the optional [PERF] P1-19 telemetry sink for this turn: the two
+    capture boundaries (``speech_end`` = the last frame arrived, ``capture_end``
+    = the audio was assembled and handed on) are recorded on it. Optional so a
+    caller without a turn (a test, a probe) is unaffected.
+    """
     global empty_listen_count
 
     speech_started = False
@@ -695,13 +733,24 @@ def _capture_audio():
         onset_chunks = []
         aec_during = {"frames": 0, "reported": False}
         aec_suppressed = {"frames": 0, "other": 0}
-        frame_id = 0
         # [F34] One conversation turn per capture: partial windows produced
         # here can only ever agree with windows of THIS utterance.
         try:
             turn_id = _turn_stabilizer.begin_turn()
         except Exception:
             turn_id = 0
+        # [P0-13] Open the AEC capture BEFORE the first frame and scope every
+        # frame id with the returned token. The old code restarted ``frame_id``
+        # at 0 on every capture, so capture N+1's frame 0 hit capture N's cache
+        # entry and the listener analysed the PREVIOUS utterance's PCM as if it
+        # were the new one - heard as Jarvis talking over itself from turn 2 on.
+        # Within one capture the ids are still stable, which is what keeps the
+        # sliding VAD window from re-feeding the AEC (F33).
+        try:
+            capture_token = _aec_begin_capture(turn_id=turn_id)
+        except Exception:
+            capture_token = turn_id
+        frame_index = 0
         partial_state = {"seconds": 0.0, "emitted": 0, "duration_ms": 0.0}
         for chunk in audio_stream:
             if not chunk or not chunk.frame_data:
@@ -714,8 +763,8 @@ def _capture_audio():
             # filtered frames, so Jarvis's own playback cannot be captured
             # as user speech - including the final fallback path.
             filtered_chunk, had_reference, suppressed = _aec_filter_chunk(
-                chunk, frame_id, time.monotonic())
-            frame_id += 1
+                chunk, (capture_token, frame_index), time.monotonic())
+            frame_index += 1
             filtered_chunks.append(filtered_chunk)
             frame_duration = _audio_duration_seconds(filtered_chunk)
             partial_state["duration_ms"] += frame_duration * 1000.0
@@ -777,6 +826,10 @@ def _capture_audio():
                         f"{_normalize_text(window.text)}"
                     )
 
+        # [PERF] P1-19 — the streaming capture ended: the user stopped talking
+        # and this is the last frame of the utterance. Everything from here on
+        # is Jarvis's own processing cost.
+        _mark_turn(marks, "speech_end", {"frames": len(filtered_chunks)})
         _report_aec_degraded_once(aec_during)
         audio = _combine_audio_chunks(filtered_chunks) or _combine_audio_chunks(chunks)
         if audio is None:
@@ -821,6 +874,8 @@ def _capture_audio():
         if not is_human_voice(audio):
             print("[LISTENER] Voice check uncertain - sending to STT anyway")
 
+        # [PERF] P1-19 — the capture is finalised and about to be handed to STT.
+        _mark_turn(marks, "capture_end", {"seconds": round(duration, 2)})
         return audio
 
     except sr.WaitTimeoutError:
@@ -838,17 +893,26 @@ def _capture_audio():
             listener_state.mark_user_speaking(False)
 
 
-def listen():
+def listen(marks=None):
+    """Capture and transcribe one committed utterance (None when there is none).
+
+    *marks* is the optional [PERF] P1-19 telemetry sink for this turn (see
+    :func:`_capture_audio`); the STT boundaries are recorded on it, including
+    WHICH engine produced the transcript.
+    """
     global empty_listen_count
 
-    audio = _capture_audio()
+    audio = _capture_audio(marks)
     if audio is None:
         return None
 
     listener_state.set_thinking(True)
     try:
         print("[LISTENER] Processing speech...")
-        raw, text, _language = recognize_multilingual(audio)
+        _mark_turn(marks, "stt_start")
+        raw, text, language = recognize_multilingual(audio)
+        _mark_turn(marks, "stt_done", {"engine": LAST_STT_ENGINE or "none",
+                                       "language": language})
         if not text:
             _record_empty_listen("no transcript")
             return None

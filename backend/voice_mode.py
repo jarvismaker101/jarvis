@@ -14,6 +14,8 @@ from urllib.request import Request, urlopen
 from backend import config as _config  # noqa: F401 - loads .env before service imports
 from backend.config import BACKEND_PORT
 from backend import listener_state
+from backend.services import latency as _latency
+from backend.services import listener as _listener_module
 from backend.services.listener import listen, _close_microphone_source
 from backend.services import local_auth
 from backend.services.fish_voice import warm_up_fish_tts
@@ -120,9 +122,78 @@ def backend_task_running():
 # ── Voice-state publisher (F50: publish, don't expose a module copy) ────────
 _voice_state_seq = 0
 
+#: [PERF] P1-19 — the voice turn whose marks are still being shipped to the
+#: backend. The submission carries the capture/STT marks; the playback
+#: boundaries land AFTER it (playback is still running when the request
+#: returns), so they are shipped on the publisher's existing ~1s cadence.
+_latency_ship = {"turn": None, "request_id": "", "until": 0.0}
+#: How long a finished turn may keep collecting late marks. Bounded, so a turn
+#: can never hold the shipping slot forever (a barge-in may mean
+#: ``playback_started`` never arrives at all).
+LATENCY_TURN_GRACE_SECONDS = 8.0
+
+
+def _flush_turn_marks(turn, request_id):
+    """[PERF] P1-19 — ship *turn*'s not-yet-sent marks. True when drained."""
+    pending = turn.pending()
+    if not pending:
+        return True
+    if not request_id:
+        return False
+    ok, _ = _post_backend("/latency/client", {
+        "request_id": request_id,
+        "marks": pending,
+        "client_now_ns": _latency.local_now_ns(),
+    }, timeout=1.5)
+    if ok:
+        turn.ack(len(pending))
+    return not turn.pending()
+
+
+def _watch_turn_for_shipping(turn, request_id):
+    """[PERF] P1-19 — hand *turn* to the publisher for staggered shipping.
+
+    Any previous turn gets one last flush first: its playback marks are worth
+    keeping even when a new utterance starts before its grace period ended.
+    """
+    previous = _latency_ship["turn"]
+    if previous is not None and previous is not turn:
+        try:
+            _flush_turn_marks(previous, _latency_ship["request_id"])
+        except Exception:
+            pass
+    _latency_ship["turn"] = turn
+    _latency_ship["request_id"] = request_id
+    _latency_ship["until"] = time.monotonic() + LATENCY_TURN_GRACE_SECONDS
+
+
+def _ship_turn_marks():
+    """[PERF] P1-19 — ship the current turn's marks and then let it go.
+
+    Runs on the state publisher's cadence, so the voice worker needs no thread
+    of its own for telemetry. The FIRST batch rode the /ask/stream submission
+    under the same ``request_id`` — never a second id, which would describe a
+    different turn.
+    """
+    turn = _latency_ship["turn"]
+    if turn is None:
+        return
+    drained = _flush_turn_marks(turn, _latency_ship["request_id"])
+    if drained and time.monotonic() >= _latency_ship["until"]:
+        _latency_ship["turn"] = None
+        _latency_ship["request_id"] = ""
+        if _latency.local_turn() is turn:
+            _latency.set_local_turn(None)
+
 
 def _publish_voice_state_loop():
-    """Publish this worker's real listening state to the backend every ~1s."""
+    """Publish this worker's real listening state to the backend every ~1s.
+
+    [PERF] P1-19: the same cadence ships the current turn's late latency marks,
+    and the snapshot carries the listener's AEC error count — that counter lives
+    in THIS process (which owns the microphone), so the backend's /latency
+    endpoint reads it from here instead of importing the listener module.
+    """
     global _voice_state_seq
     while True:
         try:
@@ -130,7 +201,10 @@ def _publish_voice_state_loop():
             _voice_state_seq += 1
             snapshot["state_seq"] = _voice_state_seq
             snapshot["publisher_pid"] = os.getpid()
+            snapshot["aec_errors"] = int(
+                getattr(_listener_module, "_aec_error_count", 0) or 0)
             _post_backend("/voice-state/publish", snapshot, timeout=1.0)
+            _ship_turn_marks()
         except Exception:
             pass
         time.sleep(1.0)
@@ -138,7 +212,7 @@ def _publish_voice_state_loop():
 
 # ── Backend submission (F50: the utterance goes to the ONE runtime) ─────────
 def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
-                 timeout=600):
+                 timeout=600, client_marks=None):
     """Submit one utterance to the backend task runtime; return the reply.
 
     Prefers the SSE /ask/stream contract (F23/F26): deltas are fed to
@@ -155,6 +229,11 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
     already been spoken is fed to the sink (audio that has been played cannot
     be un-played), and ``replace_sink`` is told about the authoritative text
     when the caller can re-render it.
+
+    [PERF] P1-19: ``client_marks`` are this process's already-stamped turn
+    marks (``[name, perf_counter_ns, meta]``). They ride THIS submission, under
+    the SAME ``request_id``, so the backend's record and the voice process's
+    marks describe one turn instead of two disconnected halves.
     """
     payload = {
         "message": text,
@@ -163,6 +242,7 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
         "origin": "voice",
     }
     headers = _backend_headers()
+    marks_batch = [list(mark) for mark in (client_marks or ())]
 
     def _attempt_stream():
         """One stream attempt starting at the current cursor.
@@ -180,6 +260,11 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
                 "speak": False,
                 "origin": "voice",
                 "last_event_id": cursor_local,
+                # [PERF] P1-19 — the alignment reference is sampled HERE, at
+                # send time, so a retried attempt re-aligns instead of reusing a
+                # stale clock.
+                "client_marks": marks_batch,
+                "client_now_ns": _latency.local_now_ns(),
             }).encode("utf-8"),
             method="POST",
             headers=headers,
@@ -277,7 +362,10 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
     try:
         request = Request(
             f"http://127.0.0.1:{BACKEND_PORT}/ask",
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps({**payload,
+                             "client_marks": marks_batch,
+                             "client_now_ns": _latency.local_now_ns()
+                             }).encode("utf-8"),
             method="POST",
             headers=headers,
         )
@@ -1093,7 +1181,12 @@ def listener_thread():
                     pass
                 time.sleep(0.25)
                 continue
-            text = listen()
+            # [PERF] P1-19 — one mark timeline per capture. The listener stamps
+            # this utterance's capture/STT boundaries on it and it travels with
+            # the text to the brain thread, which ships it to the backend under
+            # the request_id it submits the utterance with.
+            turn = _latency.new_local_turn()
+            text = listen(marks=turn)
             if not text:
                 continue
 
@@ -1132,14 +1225,14 @@ def listener_thread():
                 print("[TASK] backend task running — listener muted.")
                 continue
 
-            command_queue.put(text)
+            command_queue.put((text, turn))
 
         except Exception as e:
             print(f"Listener thread error: {e}")
             time.sleep(0.5)
 
 
-def _respond_to_utterance(text):
+def _respond_to_utterance(text, turn=None):
     """Turn one queued voice utterance into a Jarvis reply — via the backend.
 
     G11 / F50: this process no longer executes its own ``process_message``
@@ -1149,24 +1242,46 @@ def _respond_to_utterance(text):
     reply is authoritative. While a backend task runs, ONLY the task
     speaks — the utterance is dropped so a pre-queued one can never produce
     Jarvis speech mid-task.
+
+    [PERF] P1-19: *turn* is this utterance's mark timeline from the capture
+    thread. Its marks ride the submission under the request_id below and are
+    merged into the backend's record for the SAME turn; the playback
+    boundaries it collects afterwards are shipped by the state publisher.
     """
     if backend_task_running():
         print("[TASK] backend task running — voice reply suppressed.")
         return
+    if turn is None:
+        turn = _latency.new_local_turn()
+    request_id = "voice-%s-%s" % (int(time.time() * 1000), os.getpid())
     listener_state.set_thinking(True)
     previous = get_active_stream()
     if previous is not None:
         previous.close()
     speaker = StreamSpeaker()
     set_active_stream(speaker)
+    # [PERF] P1-19 — from here on, untagged marks (the audio actor's
+    # tts_first_byte / playback_started) belong to THIS turn.
+    _latency.set_local_turn(turn)
+    early_marks = turn.marks()
     try:
         response = _ask_backend(
             text,
-            request_id="voice-%s-%s" % (int(time.time() * 1000), os.getpid()),
+            request_id=request_id,
             stream_sink=speaker.feed,
+            client_marks=early_marks,
         )
+    except Exception:
+        # Nothing reached the backend, so this turn has no record to join:
+        # release it instead of letting its marks bleed into the next
+        # utterance's shipping slot.
+        _latency.set_local_turn(None)
+        raise
     finally:
         listener_state.set_thinking(False)
+        # Those marks have been handed over (inline, under this request_id);
+        # everything the turn records from now on is shipped later.
+        turn.ack(len(early_marks))
     print("🤖:", response)
 
     if not response:
@@ -1174,6 +1289,7 @@ def _respond_to_utterance(text):
         speaker.close()
         set_active_stream(None)
         speak("I couldn't reach the backend, sir.")
+        _watch_turn_for_shipping(turn, request_id)
         return
 
     if speaker.spoken_any:
@@ -1186,6 +1302,9 @@ def _respond_to_utterance(text):
         speaker.close()
         set_active_stream(None)
         speak(response)
+    # [PERF] P1-19 — hand the turn to the publisher: the playback boundaries
+    # land while the audio is still playing, so they are shipped on its cadence.
+    _watch_turn_for_shipping(turn, request_id)
 
 
 # ─────────────────────────────────────────
@@ -1194,7 +1313,11 @@ def _respond_to_utterance(text):
 def brain_thread():
     while True:
         try:
-            text = command_queue.get(timeout=1)
+            item = command_queue.get(timeout=1)
+            # [PERF] P1-19 — the capture thread pairs the utterance with its
+            # mark timeline; a plain string (a test, a legacy producer) keeps
+            # working with no timeline.
+            text, turn = item if isinstance(item, tuple) else (item, None)
 
             # ── F35: the SAME one grammar, so a queued utterance is handled
             # exactly like a live one (a control can never be re-interpreted
@@ -1230,7 +1353,7 @@ def brain_thread():
                 continue
 
             # ── PROCESS ──
-            _respond_to_utterance(text)
+            _respond_to_utterance(text, turn)
 
         except queue.Empty:
             continue
