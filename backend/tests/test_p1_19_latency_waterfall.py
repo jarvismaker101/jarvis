@@ -461,6 +461,23 @@ class _FakeSpeaker:
 class VoiceWorkerTests(_LatencyCase):
     """Requirement 6: the worker's marks ride its own submission."""
 
+    def _wait_for_turn_handover(self, turn, timeout=2.0):
+        """Wait for the turn to be handed to the publisher.
+
+        [P0-08] The handover now happens at the END of the turn, which runs on
+        its own worker thread (the audit's requirement 3: `brain_thread`
+        dispatches instead of waiting). These tests used to observe it
+        synchronously; the property they pin — the turn is handed over and then
+        released once its grace period expires — is unchanged, only the moment
+        of the handover moved off the dispatcher.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if voice_mode._latency_ship["turn"] is turn:
+                return True
+            time.sleep(0.01)
+        return voice_mode._latency_ship["turn"] is turn
+
     def tearDown(self):
         _LatencyCase.tearDown(self)
         voice_mode._latency_ship.update({"turn": None, "request_id": "",
@@ -532,6 +549,9 @@ class VoiceWorkerTests(_LatencyCase):
             with patch.object(voice_mode, "_ask_backend",
                               side_effect=_fake_ask):
                 voice_mode._respond_to_utterance("hello", turn)
+            # [P0-08] the turn runs on its own worker thread now
+            self.assertTrue(self._wait_for_turn_handover(turn),
+                            "the turn was never handed to the publisher")
             # The publisher's cadence ships whatever arrived after submission.
             voice_mode._ship_turn_marks()
 
@@ -561,6 +581,11 @@ class VoiceWorkerTests(_LatencyCase):
             with patch.object(voice_mode, "_ask_backend",
                               return_value="the reply"):
                 voice_mode._respond_to_utterance("hello", turn)
+            # [P0-08] the handover happens at the END of the per-turn worker
+            # thread, so it is awaited INSIDE this patch window (outside it the
+            # worker would reach the real StreamSpeaker/speak).
+            self.assertTrue(self._wait_for_turn_handover(turn),
+                            "the turn was never handed to the publisher")
         self.assertIs(voice_mode._latency_ship["turn"], turn)
         voice_mode._latency_ship["until"] = time.monotonic() - 1.0
         voice_mode._ship_turn_marks()

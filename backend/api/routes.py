@@ -39,6 +39,46 @@ last_voice_response = ""
 last_voice_log_id = 0
 last_request = {"message": None, "time": 0}
 
+# ── P0-08 — barge-in visibility, NOT a history rewrite ──
+# The user's decision stands: an interrupted turn still commits its FULL
+# generated reply to history (brain.handle_chat, unchanged), because they want
+# to read what they missed. Nothing here touches that text — no "(interrupted)"
+# suffix, no replacement with the spoken prefix. This is a separate, additive
+# marker so the UI CAN indicate "this reply was cut off" later. It carries no
+# reply text at all, and clearing it is a matter of dropping this block.
+_last_interrupt_lock = threading.Lock()
+_last_interrupt = {
+    "interrupted": False,
+    "request_id": "",
+    "reason": "",
+    "at": 0.0,
+}
+
+
+def _note_reply_interrupted(request_id, reason=""):
+    """Record that the turn for *request_id* was cut off mid-reply."""
+    with _last_interrupt_lock:
+        _last_interrupt.update(
+            interrupted=True,
+            request_id=str(request_id or ""),
+            reason=str(reason or ""),
+            at=time.time(),
+        )
+
+
+def _note_reply_completed():
+    """A reply finished normally, so the last interruption no longer describes
+    the newest turn."""
+    with _last_interrupt_lock:
+        _last_interrupt.update(interrupted=False, at=time.time())
+
+
+def get_last_reply_interrupted():
+    """Snapshot of the barge-in marker for /ui-state."""
+    with _last_interrupt_lock:
+        return dict(_last_interrupt)
+
+
 # G11 / F50 — the voice I/O worker publishes its real listening state here
 # (one snapshot, newest state_seq wins); /voice-state and /ui-state serve it
 # instead of this process's unrelated listener_state module copy.
@@ -303,6 +343,9 @@ def _run_request_worker(state, from_voice=False, speak_stream=False,
 
         # Terminal authority: one completed frame carries the final reply.
         state.complete(reply)
+        # P0-08: this turn finished normally, so the barge-in marker no longer
+        # describes the newest reply. It never touched the reply text itself.
+        _note_reply_completed()
         print("[API] Stream done, speaking:", reply[:80])
         if not speak_terminal:
             # Voice I/O worker owns playback — the backend stays silent.
@@ -510,6 +553,62 @@ def ask_status(request_id: str):
     return snapshot
 
 
+@router.post("/ask/cancel/{request_id}")
+def cancel_request(request_id: str, reason: str = "cancelled by voice barge-in"):
+    """P0-08 — cancel ONE in-flight request, addressed by its request id.
+
+    The voice I/O worker calls this the moment the user barges in: without it,
+    an interruption only stopped the *audio*, while the backend kept generating
+    the old reply and the next utterance waited behind it. This cancels that one
+    request (never every request — ``/task/stop`` with no target does that under
+    F20) so the new turn can be submitted immediately.
+
+    Contract:
+
+    * **Request-scoped.** Only *request_id* is touched; a concurrent unrelated
+      request keeps running.
+    * **Never cancels a finished turn.** A request that already reached a
+      terminal state keeps its terminal frame — a ``completed`` reply stays
+      completed, which is exactly the F23/F20 immutability rule.
+    * **Idempotent and safe when the request is gone.** An unknown id, an
+      already-finished id and an already-interrupted id are all ``ok: True``
+      no-ops with a distinct ``reason``, so a caller never has to check first.
+    * **Never raises.** Any internal failure is reported in the body.
+    * **Does not touch history.** Cancelling publishes the INTERRUPTED terminal
+      frame and cancels the worker; the full generated reply has already been
+      committed by ``brain.handle_chat`` and stays readable (user decision).
+    """
+    rid = (request_id or "").strip()
+    try:
+        state = req_registry.get(rid)
+    except Exception as exc:                      # never raise into the caller
+        return {"ok": True, "cancelled": False, "reason": "lookup_failed",
+                "error": str(exc)[:200]}
+    if state is None:
+        return {"ok": True, "cancelled": False, "reason": "unknown_request",
+                "request_id": rid}
+    try:
+        with state.cond:
+            already_done = state.done
+        if already_done:
+            # A terminal frame is immutable: report which one it was rather
+            # than pretending the cancel did something.
+            return {
+                "ok": True,
+                "cancelled": False,
+                "reason": "already_interrupted" if state.interrupted
+                          else "already_finished",
+                "request_id": rid,
+            }
+        state.interrupt(reason)
+        _note_reply_interrupted(rid, reason)
+        return {"ok": True, "cancelled": True, "reason": reason,
+                "request_id": rid}
+    except Exception as exc:
+        return {"ok": True, "cancelled": False, "reason": "error",
+                "request_id": rid, "error": str(exc)[:200]}
+
+
 @router.post("/update-voice-log")
 def update_voice_log(data: VoiceLog):
     _publish_voice_log(data.message, data.response)
@@ -689,6 +788,9 @@ def get_ui_state():
         },
         "voice_input_enabled": state.get("voice_input_enabled", True),
         "task_running": opencode_task_in_progress(),
+        # P0-08: additive barge-in marker. The interrupted reply is still in
+        # `voice_log`/history in full — this only lets the UI say it was cut off.
+        "last_reply_interrupted": get_last_reply_interrupted(),
     }
 
 

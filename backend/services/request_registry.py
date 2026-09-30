@@ -221,6 +221,17 @@ class RequestState:
     def error(self, message):
         self.append({"type": ERROR, "error": str(message)[:500]})
 
+    @property
+    def interrupted(self):
+        """F20/P0-08 — True once an INTERRUPTED terminal frame was published.
+
+        Public read-only accessor: the cancel route reports *why* a cancel was
+        a no-op (already finished vs already interrupted) without reaching into
+        the private flag.
+        """
+        with self.cond:
+            return self._interrupted
+
     # ── consumer side ─────────────────────────────────────────────────────
     def wait_done(self, timeout):
         """Block until this request reaches a terminal frame (or *timeout*).

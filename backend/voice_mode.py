@@ -8,7 +8,9 @@ import os
 import re
 import glob
 import json
+import itertools
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from backend import config as _config  # noqa: F401 - loads .env before service imports
@@ -375,6 +377,219 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
     except Exception as exc2:
         print("[VOICE→BACKEND] ask fallback failed: %s" % exc2)
         return None
+
+# ─────────────────────────────────────────
+# P0-08 — PRE-EMPTIVE TURN MANAGER
+# ─────────────────────────────────────────
+# The voice process stays a strict I/O worker (F50): it speaks, the backend owns
+# the turn. But every interruption used to WAIT for the old generation to finish,
+# because nothing cancelled it — "actually, what about X?" said in the middle of
+# a reply queued behind the very answer it was interrupting (typically 1-5s, far
+# longer for a tool, screen or research turn), and a non-streamed reply even
+# voiced the OLD answer first.
+#
+# This manager owns the ONE active voice turn. A new utterance — or a barge-in
+# onset — tears the previous turn down pre-emptively: its local audio is closed
+# at once, its backend request gets an INTERRUPTED terminal frame (so the SSE
+# reader exits instead of blocking on a dead stream) and its worker job is
+# cancelled. The new turn is submitted without waiting for any of that to unwind.
+#
+# What it deliberately does NOT do: rewrite history. The interrupted turn's FULL
+# generated reply is still committed by the backend (brain.handle_chat), because
+# the user wants to read what they missed. Cancelling stops the *audio* and the
+# *pending tool work* (F20 checkpoints); the stored reply text is untouched.
+_TURN_CANCEL_TIMEOUT = 1.0
+
+#: P0-08 — per-process turn counter. The previous id was
+#: ``voice-<epoch-ms>-<pid>``, which COLLIDES when two utterances are submitted
+#: inside the same millisecond. That was mostly theoretical before, but
+#: pre-emptive dispatch submits the interrupting utterance immediately, and a
+#: reused id is not merely cosmetic: the backend request registry treats a
+#: reused id carrying a different message as a 409 conflict, so the second turn
+#: would have been refused outright. The counter makes the id unique for the
+#: life of the process.
+_TURN_SEQ = itertools.count(1)
+
+
+def _new_turn_request_id():
+    """A request id that is unique even for turns submitted back to back."""
+    return "voice-%s-%s-%s" % (int(time.time() * 1000), os.getpid(),
+                               next(_TURN_SEQ))
+
+
+def _cancel_backend_request(request_id, reason="cancelled by voice barge-in"):
+    """POST /ask/cancel/{request_id}. Best-effort, never raises.
+
+    Returns True when the backend reported that it actually cancelled something.
+    Idempotent by construction: the endpoint answers ``cancelled: False`` with a
+    reason (``unknown_request`` / ``already_finished`` / ``already_interrupted``)
+    for every case where there is nothing left to cancel, so this caller never
+    has to check first and can never flip a completed turn to interrupted.
+    """
+    if not request_id:
+        return False
+    url = ("http://127.0.0.1:%s/ask/cancel/%s?reason=%s"
+           % (BACKEND_PORT, quote(str(request_id), safe=""),
+              quote(str(reason), safe="")))
+    try:
+        request = Request(url, method="POST", headers=_backend_headers())
+        with urlopen(request, timeout=_TURN_CANCEL_TIMEOUT) as response:
+            body = json.loads(response.read().decode("utf-8", errors="replace"))
+        return bool(body.get("cancelled"))
+    except Exception as exc:
+        print("[VOICE→BACKEND] cancel failed for %s: %s" % (request_id, exc))
+        return False
+
+
+def _cancel_backend_request_async(request_id, reason):
+    """Fire the cancel on a daemon thread.
+
+    Barge-in onset runs on the real-time capture thread, so the network call
+    must never happen inline (P1-03 took the blocking calls out of that loop and
+    this must not put one back). Only the thread spawn is synchronous; it costs
+    a few microseconds.
+    """
+    try:
+        threading.Thread(
+            target=_cancel_backend_request,
+            args=(request_id, reason),
+            name="voice-turn-cancel",
+            daemon=True,
+        ).start()
+        return True
+    except Exception:
+        return False
+
+
+class _TurnManager:
+    """One active voice turn, replaceable pre-emptively (P0-08).
+
+    Invariants this class owns:
+
+    * at most ONE current turn, so two turns can never speak at once;
+    * a cancelled/replaced turn is no longer *current*, so its late reply is
+      dropped instead of being voiced over the newer answer;
+    * cancellation is request-scoped, idempotent and non-raising;
+    * nothing here blocks the caller on the network.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._request_id = ""
+        self._speaker = None
+        self._started_at = 0.0
+        self.stats = {
+            "started": 0,
+            "preempted": 0,
+            "barge_in_cancels": 0,
+            "stale_replies_dropped": 0,
+        }
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self, request_id, speaker):
+        """Register a new turn, pre-empting the previous one. Returns the id."""
+        with self._lock:
+            previous = self._request_id
+            previous_speaker = self._speaker
+            self._request_id = request_id
+            self._speaker = speaker
+            self._started_at = time.monotonic()
+            self.stats["started"] += 1
+            # Pre-empt on a NEW SPEAKER as well as a new id: the identity that
+            # matters is the one that owns playback, so an id collision (or a
+            # caller reusing an id) can never leave two turns registered.
+            replaced = bool(previous) and (
+                previous != request_id or previous_speaker is not speaker)
+            if replaced:
+                self.stats["preempted"] += 1
+        if replaced:
+            # Outside the lock: this closes a speaker and fires a network call.
+            self._teardown(previous, previous_speaker,
+                           "replaced by a newer utterance")
+        return request_id
+
+    def is_current(self, request_id):
+        """True while *request_id* is still the turn that owns playback."""
+        with self._lock:
+            return bool(request_id) and request_id == self._request_id
+
+    def clear(self, request_id):
+        """Release the turn if it is still current. Returns True when it was."""
+        with self._lock:
+            if self._request_id != request_id:
+                return False
+            self._request_id = ""
+            self._speaker = None
+            return True
+
+    def cancel_current(self, reason="barge-in"):
+        """Cancel the active turn. Never raises, never blocks.
+
+        Called from the barge-in observer, i.e. on the capture thread, so the
+        local teardown is synchronous (audio must die NOW) and the remote cancel
+        is fire-and-forget.
+        """
+        with self._lock:
+            request_id = self._request_id
+            speaker = self._speaker
+            if request_id:
+                self._request_id = ""
+                self._speaker = None
+                self.stats["barge_in_cancels"] += 1
+        if not request_id:
+            return False
+        self._teardown(request_id, speaker, reason)
+        return True
+
+    def note_stale_reply(self):
+        with self._lock:
+            self.stats["stale_replies_dropped"] += 1
+
+    def active_request_id(self):
+        with self._lock:
+            return self._request_id
+
+    def snapshot(self):
+        with self._lock:
+            state = dict(self.stats)
+            state["active_request_id"] = self._request_id
+        return state
+
+    # -- internals ---------------------------------------------------------
+
+    def _teardown(self, request_id, speaker, reason):
+        """Silence the old turn locally, then cancel it remotely."""
+        # (a) local audio dies immediately — this is what the user hears
+        if speaker is not None:
+            try:
+                speaker.close()
+            except Exception:
+                pass
+        # (b)+(c) the backend publishes INTERRUPTED (its SSE reader exits) and
+        # cancels that request's worker job. Request-scoped: nothing else is hit.
+        _cancel_backend_request_async(request_id, reason)
+
+
+#: The process-wide turn manager.
+TURNS = _TurnManager()
+
+
+def _on_barge_in():
+    """[P0-08] Barge-in onset observer — cancel the turn being interrupted."""
+    try:
+        TURNS.cancel_current("barge-in")
+    except Exception:
+        pass
+
+
+try:  # the listener owns WHEN a barge-in happens; this process owns the turn
+    from backend.services.listener import register_barge_in_hook
+
+    register_barge_in_hook(_on_barge_in)
+except Exception:
+    pass
+
 
 BOOT_RESPONSES = [
     "Good to see you back, sir. What's on your mind today?",
@@ -1232,8 +1447,21 @@ def listener_thread():
             time.sleep(0.5)
 
 
+def _clear_active_stream_if(speaker):
+    """Clear the module-level active stream only while it is still ours.
+
+    With per-turn workers a stale turn must not de-register the NEWER turn's
+    speaker: that would leave background announcements with nowhere to go.
+    """
+    try:
+        if get_active_stream() is speaker:
+            set_active_stream(None)
+    except Exception:
+        pass
+
+
 def _respond_to_utterance(text, turn=None):
-    """Turn one queued voice utterance into a Jarvis reply — via the backend.
+    """Dispatch one queued voice utterance as its own pre-emptive TURN.
 
     G11 / F50: this process no longer executes its own ``process_message``
     copy. The utterance is submitted to the ONE backend task runtime
@@ -1247,49 +1475,139 @@ def _respond_to_utterance(text, turn=None):
     thread. Its marks ride the submission under the request_id below and are
     merged into the backend's record for the SAME turn; the playback
     boundaries it collects afterwards are shipped by the state publisher.
+
+    [P0-08] This function now DISPATCHES: it registers the turn with the turn
+    manager and hands the backend round trip to its own worker thread. Waiting
+    here (as it used to) meant an interruption could not start until the reply
+    it was interrupting had finished generating and speaking — the brain thread
+    is a dispatcher, not a waiter. Registering before the thread starts is what
+    makes a barge-in that lands mid-submission able to cancel this turn, and
+    starting the turn is what pre-empts the previous one.
     """
     if backend_task_running():
         print("[TASK] backend task running — voice reply suppressed.")
         return
     if turn is None:
         turn = _latency.new_local_turn()
-    request_id = "voice-%s-%s" % (int(time.time() * 1000), os.getpid())
-    listener_state.set_thinking(True)
+    request_id = _new_turn_request_id()
     previous = get_active_stream()
     if previous is not None:
         previous.close()
     speaker = StreamSpeaker()
     set_active_stream(speaker)
     # [PERF] P1-19 — from here on, untagged marks (the audio actor's
-    # tts_first_byte / playback_started) belong to THIS turn.
+    # tts_first_byte / playback_started) belong to THIS turn. Set at SUBMIT
+    # time so submission ORDER decides ownership deterministically, even though
+    # the turns themselves now run concurrently.
     _latency.set_local_turn(turn)
     early_marks = turn.marks()
+    # [P0-08] Register BEFORE the worker starts, so a barge-in that arrives
+    # while this turn is still being submitted can already cancel it — and so
+    # this turn pre-empts whatever was active.
+    TURNS.start(request_id, speaker)
+    threading.Thread(
+        target=_run_turn,
+        name="voice-turn",
+        daemon=True,
+        args=(text, request_id, speaker, turn, early_marks),
+    ).start()
+
+
+def _safe_print(*args):
+    """Print without letting an encoding failure derail the caller.
+
+    The reply text is model output and the console is often cp1252, so echoing
+    it can raise UnicodeEncodeError. On the brain thread that used to be
+    swallowed by the loop's handler; a turn now runs on its own thread, so the
+    echo must not be able to kill it.
+    """
+    try:
+        print(*args)
+    except Exception:
+        try:
+            print(*(str(arg).encode("ascii", "replace").decode("ascii")
+                    for arg in args))
+        except Exception:
+            pass
+
+
+def _run_turn(text, request_id, speaker, turn, early_marks):
+    """Run one turn, guaranteeing no exception escapes the worker thread."""
+    try:
+        _run_turn_inner(text, request_id, speaker, turn, early_marks)
+    except Exception as exc:
+        print("[VOICE] turn error: %s" % exc)
+        try:
+            listener_state.set_thinking(False)
+        except Exception:
+            pass
+        try:
+            speaker.close()
+        except Exception:
+            pass
+        TURNS.clear(request_id)
+
+
+def _run_turn_inner(text, request_id, speaker, turn, early_marks):
+    """One turn's backend round trip, on its own worker thread (P0-08).
+
+    Every exit path releases the turn so the next utterance can start cleanly.
+    """
+    def _sink(delta):
+        # A superseded turn must not feed the actor — the turn manager owns
+        # "one voice at a time" and this is the belt to its braces for the
+        # streaming path.
+        if TURNS.is_current(request_id):
+            try:
+                speaker.feed(delta)
+            except Exception:
+                pass
+
+    listener_state.set_thinking(True)
+    response = None
     try:
         response = _ask_backend(
             text,
             request_id=request_id,
-            stream_sink=speaker.feed,
+            stream_sink=_sink,
             client_marks=early_marks,
         )
-    except Exception:
+    except Exception as exc:
         # Nothing reached the backend, so this turn has no record to join:
         # release it instead of letting its marks bleed into the next
         # utterance's shipping slot.
+        print("[VOICE→BACKEND] turn failed: %s" % exc)
         _latency.set_local_turn(None)
-        raise
     finally:
         listener_state.set_thinking(False)
         # Those marks have been handed over (inline, under this request_id);
         # everything the turn records from now on is shipped later.
-        turn.ack(len(early_marks))
-    print("🤖:", response)
+        try:
+            turn.ack(len(early_marks))
+        except Exception:
+            pass
+    _safe_print("🤖:", response)
+
+    # [P0-08] A superseded turn must never speak: its audio would land on top
+    # of the answer that replaced it. The reply itself is already committed to
+    # history by the backend (brain.handle_chat), so nothing the user wanted to
+    # read is lost — only the out-of-date narration is dropped.
+    if not TURNS.is_current(request_id):
+        TURNS.note_stale_reply()
+        try:
+            speaker.close()
+        except Exception:
+            pass
+        _clear_active_stream_if(speaker)
+        return
 
     if not response:
         # The one runtime was unreachable — never leave the user in silence.
         speaker.close()
-        set_active_stream(None)
+        _clear_active_stream_if(speaker)
         speak("I couldn't reach the backend, sir.")
         _watch_turn_for_shipping(turn, request_id)
+        TURNS.clear(request_id)
         return
 
     if speaker.spoken_any:
@@ -1300,16 +1618,63 @@ def _respond_to_utterance(text, turn=None):
         # Task/tool/screen branches return a full reply without
         # streaming — speak it the normal way.
         speaker.close()
-        set_active_stream(None)
+        _clear_active_stream_if(speaker)
         speak(response)
     # [PERF] P1-19 — hand the turn to the publisher: the playback boundaries
     # land while the audio is still playing, so they are shipped on its cadence.
     _watch_turn_for_shipping(turn, request_id)
+    TURNS.clear(request_id)
 
 
 # ─────────────────────────────────────────
 # THREAD 2 — BRAIN
 # ─────────────────────────────────────────
+def handle_queued_item(text, turn=None):
+    """Dispatch ONE queued utterance. Returns True when the loop must stop.
+
+    Extracted from :func:`brain_thread` so the control-vs-utterance decision is
+    directly testable. [P0-08] A control phrase is dispatched as a CONTROL and
+    never becomes a turn: it must not be submitted to the backend as an
+    interrupting utterance, which is what would otherwise make "stop" queue a
+    second generation behind the reply it was meant to silence.
+    """
+    # ── F35: the SAME one grammar, so a queued utterance is handled
+    # exactly like a live one (a control can never be re-interpreted
+    # as a chat message after it was classified). ──
+    control = classify_control(text)
+    if control == "shutdown":
+        print("🔴 Shutdown command received")
+        shutdown_everything()
+        return True
+    if control == "continue":
+        _deliver_continue()
+        return False
+    if control == "pause":
+        _deliver_pause()
+        return False
+    if control in ("speech_stop", "task_stop", "approval_cancel", "sleep"):
+        print(f"🎛️ Control command: {control}")
+        dispatch_control(control)
+        return False
+
+    # While a backend task runs, only the task speaks — drop
+    # anything queued before the mute took effect. (Shutdown stays
+    # available as a deliberate kill switch.)
+    if backend_task_running():
+        print("[TASK] backend task running — utterance dropped.")
+        return False
+
+    # ── NORMAL SETUP ──
+    if is_normal_setup(text):
+        speak("Opening your normal setup, sir.")
+        threading.Thread(target=launch_normal_setup, daemon=True).start()
+        return False
+
+    # ── PROCESS ──
+    _respond_to_utterance(text, turn)
+    return False
+
+
 def brain_thread():
     while True:
         try:
@@ -1318,43 +1683,11 @@ def brain_thread():
             # mark timeline; a plain string (a test, a legacy producer) keeps
             # working with no timeline.
             text, turn = item if isinstance(item, tuple) else (item, None)
-
-            # ── F35: the SAME one grammar, so a queued utterance is handled
-            # exactly like a live one (a control can never be re-interpreted
-            # as a chat message after it was classified). ──
-            control = classify_control(text)
-            if control == "shutdown":
-                print("🔴 Shutdown command received")
-                shutdown_everything()
+            # [P0-08] Submit and return: this thread dispatches, it does not
+            # wait for a generation. Waiting here is what made every
+            # interruption queue behind the reply it was interrupting.
+            if handle_queued_item(text, turn):
                 break
-            if control == "continue":
-                _deliver_continue()
-                continue
-            if control == "pause":
-                _deliver_pause()
-                continue
-            if control in ("speech_stop", "task_stop", "approval_cancel",
-                           "sleep"):
-                print(f"🎛️ Control command: {control}")
-                dispatch_control(control)
-                continue
-
-            # While a backend task runs, only the task speaks — drop
-            # anything queued before the mute took effect. (Shutdown stays
-            # available as a deliberate kill switch.)
-            if backend_task_running():
-                print("[TASK] backend task running — utterance dropped.")
-                continue
-
-            # ── NORMAL SETUP ──
-            if is_normal_setup(text):
-                speak("Opening your normal setup, sir.")
-                threading.Thread(target=launch_normal_setup, daemon=True).start()
-                continue
-
-            # ── PROCESS ──
-            _respond_to_utterance(text, turn)
-
         except queue.Empty:
             continue
         except Exception as e:

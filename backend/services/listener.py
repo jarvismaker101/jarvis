@@ -1252,6 +1252,59 @@ def _api_is_speaking():
         return False
 
 
+#: [P0-08] Barge-in observers. The listener owns *when* a barge-in happens; the
+#: process that owns the in-flight turn (voice_mode's turn manager) registers
+#: here to hear about it and cancel its own backend request.
+_barge_in_hooks = []
+_barge_in_hooks_lock = threading.Lock()
+
+
+def register_barge_in_hook(fn):
+    """Register ``fn()`` to run when a barge-in onset is handled.
+
+    Idempotent, and never raises. Observers run on the CAPTURE thread, so they
+    must return immediately (the turn manager fires its cancel on a daemon
+    thread for exactly that reason).
+    """
+    if not callable(fn):
+        return False
+    try:
+        with _barge_in_hooks_lock:
+            if fn in _barge_in_hooks:
+                return False
+            _barge_in_hooks.append(fn)
+        return True
+    except Exception:
+        return False
+
+
+def unregister_barge_in_hook(fn):
+    """Drop a previously registered observer (used by tests). Never raises."""
+    try:
+        with _barge_in_hooks_lock:
+            if fn in _barge_in_hooks:
+                _barge_in_hooks.remove(fn)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _notify_barge_in():
+    """Tell every observer that a barge-in happened. Never raises, never blocks
+    on a slow observer — an observer failure must not disturb capture."""
+    try:
+        with _barge_in_hooks_lock:
+            hooks = list(_barge_in_hooks)
+    except Exception:
+        return
+    for hook in hooks:
+        try:
+            hook()
+        except Exception:
+            pass
+
+
 def barge_in_on_speech_onset():
     """Instant barge-in: user started speaking while Jarvis TTS is playing.
 
@@ -1265,6 +1318,12 @@ def barge_in_on_speech_onset():
     a blocking round trip (0.3s) plus the stop POST (0.4s) on the real-time
     capture thread AT SPEECH ONSET. A stop is now queued on every onset.
 
+    [P0-08] Onset also notifies the registered barge-in observers, so the
+    process that owns the in-flight turn can cancel THAT backend request.
+    Stopping the audio alone left the old generation running and made the next
+    utterance wait behind it. Observers run here on the capture thread, so they
+    must be non-blocking; a slow one is never awaited and never raises.
+
     Returns True when a stop was issued (local) or queued (remote) — which is
     every onset, since the idempotent remote stop is queued unconditionally.
     """
@@ -1277,6 +1336,7 @@ def barge_in_on_speech_onset():
             _stop(signal_ready=False)
     except Exception:
         pass  # a local failure must never keep the remote stop from being queued
+    _notify_barge_in()
     return _post_backend_speak_stop()
 
 

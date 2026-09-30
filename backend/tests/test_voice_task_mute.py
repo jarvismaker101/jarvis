@@ -125,6 +125,15 @@ class VoiceMuteWhileTaskRunningTests(unittest.TestCase):
              patch.object(voice_mode, "StreamSpeaker", return_value=stream), \
              patch.object(voice_mode, "speak") as fake_speak:
             voice_mode._respond_to_utterance("hello there")
+            # [P0-08] The dispatch returns as soon as the turn is registered —
+            # the reply is produced on the turn's own worker thread (the
+            # audit's requirement 3), so its effects are awaited INSIDE this
+            # patch window. Outside it the worker would reach the real `speak`
+            # and block on real TTS.
+            self.assertTrue(_wait_until(lambda: fake_submit.called),
+                            "the utterance was never submitted")
+            self.assertTrue(_wait_until(lambda: fake_speak.called),
+                            "the reply was never spoken")
         fake_submit.assert_called_once()
         fake_speak.assert_called_once_with("hi sir")
 
