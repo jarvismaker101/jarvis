@@ -585,6 +585,73 @@ def _on_barge_in():
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P0-12 — PRE-WARM ON VAD ONSET
+# ─────────────────────────────────────────────────────────────────────────────
+# VAD onset gives this process a head start of several hundred milliseconds
+# before the transcript exists. The provider handshake (chat + classifier + STT)
+# used to be paid at the START of the turn, i.e. on the user's clock; the
+# backend's /prewarm opens it during that head start instead.
+#
+# Two rules, both non-negotiable:
+#   * NEVER inline in the capture loop. This hook runs on the real-time capture
+#     thread, so it only (maybe) spawns a daemon thread — the same shape as the
+#     P0-08 cancel the onset path already fires.
+#   * Rate-limited here AND in the backend. The local timestamp stops this
+#     process from spawning a thread on every onset of a long utterance.
+_PREWARM_REQUEST_INTERVAL_SECONDS = 20.0
+_prewarm_lock = threading.Lock()
+_last_prewarm_request_at = 0.0
+
+
+def _request_backend_prewarm():
+    """POST /prewarm once. Authenticated, best-effort, never raises."""
+    url = "http://127.0.0.1:%s/prewarm" % BACKEND_PORT
+    try:
+        request = Request(url, data=b"{}", method="POST",
+                          headers=_backend_headers())
+        with urlopen(request, timeout=_TURN_CANCEL_TIMEOUT) as response:
+            # Read the body fully: a half-read response holds the socket and
+            # would turn the warm into a leak.
+            response.read()
+        return True
+    except Exception as exc:
+        # Advisory only: a provider being down (or the backend not up yet) is
+        # not an error the user should ever see. ASCII-only so this line can
+        # never itself fail on a cp1252 console.
+        print("[PREWARM] skipped: %s" % exc)
+        return False
+
+
+def _prewarm_backend_async():
+    """[P0-12] Warm the provider connections while the user is still talking.
+
+    Called from the speech-onset hook, which runs on the real-time capture
+    thread: the only synchronous work here is a timestamp check and (at most) a
+    thread spawn. Never raises, never blocks.
+    """
+    global _last_prewarm_request_at
+    try:
+        now = time.monotonic()
+        with _prewarm_lock:
+            if (now - _last_prewarm_request_at) < _PREWARM_REQUEST_INTERVAL_SECONDS:
+                return False
+            _last_prewarm_request_at = now
+        threading.Thread(
+            target=_request_backend_prewarm,
+            name="voice-prewarm",
+            daemon=True,
+        ).start()
+        return True
+    except Exception:
+        return False
+
+
+def _on_speech_onset():
+    """[P0-12] Onset observer — the connection warm rides the barge-in signal."""
+    _prewarm_backend_async()
+
+
 def _interrupt_active_turn(reason="interrupted by a new utterance"):
     """Cut the active turn because the user committed a new utterance.
 
@@ -609,6 +676,8 @@ try:  # the listener owns WHEN a barge-in happens; this process owns the turn
     from backend.services.listener import register_barge_in_hook
 
     register_barge_in_hook(_on_barge_in)
+    # [P0-12] the same onset signal is the head start the warm uses
+    register_barge_in_hook(_on_speech_onset)
 except Exception:
     pass
 

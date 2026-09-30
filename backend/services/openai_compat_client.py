@@ -134,7 +134,14 @@ _retry_strategy = Retry(
     status_forcelist=[429, 502, 503, 504],
     allowed_methods=["POST"],
 )
-_session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+# P0-12: keepalive on the pool, so a socket held for the next turn is not
+# dropped by a VPN / NAT in between (see backend/services/prewarm.py).
+try:
+    from backend.services.prewarm import KeepAliveAdapter as _KeepAliveAdapter
+
+    _session.mount("https://", _KeepAliveAdapter(max_retries=_retry_strategy))
+except Exception:  # pragma: no cover - never lose the plain adapter
+    _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
 
 
 def _mark_headers(provider, model=None):

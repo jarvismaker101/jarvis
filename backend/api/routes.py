@@ -1468,6 +1468,44 @@ def get_provider_models(provider_id: str):
     return {"models": models}
 
 
+@router.post("/prewarm")
+def prewarm(force: bool = False):
+    """[P0-12] Open the pooled provider connections BEFORE the turn needs them.
+
+    Called by the voice worker on VAD onset — several hundred milliseconds
+    before a transcript exists — so the chat / classifier / STT handshake is
+    already done when the turn starts. Advisory in every direction:
+
+    * authenticated like every other control endpoint (auth fails closed here,
+      so an unauthenticated pre-warm would be a new hole);
+    * rate-limited per process to one warm per ``WARM_INTERVAL_SECONDS``, and
+      skipped outright while a warm is already in flight — never queued, so it
+      can never become a bottleneck of its own;
+    * silent but COUNTED on failure. A provider being down returns
+      ``ok: True`` with a ``degraded`` list: it is an optimisation, not a
+      precondition, and the system must work exactly as before without it.
+    """
+    from backend.services import prewarm as prewarm_service
+
+    try:
+        return prewarm_service.warm(force=force)
+    except Exception as exc:  # a warm must never 500
+        logging.debug("[PREWARM] refused: %s", exc)
+        return {"ok": True, "warmed": [], "degraded": ["warm"]}
+
+
+@router.get("/prewarm/stats")
+def prewarm_stats():
+    """[P0-12] What the pre-warm has actually done (counters, last result)."""
+    from backend.services import prewarm as prewarm_service
+
+    try:
+        return prewarm_service.stats()
+    except Exception:
+        return {"warms": 0, "skipped": 0, "degraded": 0, "errors": 0,
+                "targets": {}}
+
+
 @router.post("/settings/provider")
 def add_provider(payload: ProviderAddRequest):
     """Add a custom OpenAI-compatible provider. The key is validated with a

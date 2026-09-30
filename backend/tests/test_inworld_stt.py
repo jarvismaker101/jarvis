@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import io
 import json
 import tempfile
@@ -40,7 +40,7 @@ class InworldRequestShapeTests(unittest.TestCase):
     def test_posts_documented_payload_with_basic_auth(self):
         with patch.object(transcription, "INWORLD_STT_API_KEY", "test-inworld-key"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  return_value=_inworld_response("hello jarvis"),
              ) as post:
             result = transcription.recognize_inworld(self.audio)
@@ -77,7 +77,7 @@ class InworldRequestShapeTests(unittest.TestCase):
     def test_language_is_reduced_to_iso639_base(self):
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  return_value=_inworld_response(),
              ) as post:
             transcription.recognize_inworld(self.audio, language="en-IN")
@@ -92,7 +92,7 @@ class InworldRequestShapeTests(unittest.TestCase):
         prompts = ["Jarvis", "jervis", "utho", "jago", "chalu"]
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  return_value=_inworld_response(),
              ) as post:
             transcription.recognize_inworld(self.audio, prompts=prompts)
@@ -108,7 +108,7 @@ class InworldFailureTests(unittest.TestCase):
     def test_missing_key_raises_request_error_without_network(self):
         post = Mock()
         with patch.object(transcription, "INWORLD_STT_API_KEY", ""), \
-             patch.object(transcription.requests, "post", post):
+             patch.object(transcription._session, "post", post):
             with self.assertRaises(sr.RequestError) as ctx:
                 transcription.recognize_inworld(self.audio)
         self.assertIn("INWORLD_STT_API_KEY", str(ctx.exception))
@@ -117,7 +117,7 @@ class InworldFailureTests(unittest.TestCase):
     def test_empty_transcript_raises_unknown_value(self):
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  return_value=_inworld_response("   "),
              ):
             with self.assertRaises(sr.UnknownValueError):
@@ -136,7 +136,7 @@ class InworldFailureTests(unittest.TestCase):
             response.json.return_value = body
             with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
                  patch.object(
-                     transcription.requests, "post", return_value=response,
+                     transcription._session, "post", return_value=response,
                  ):
                 with self.assertRaises(sr.RequestError) as ctx:
                     transcription.recognize_inworld(self.audio)
@@ -146,7 +146,7 @@ class InworldFailureTests(unittest.TestCase):
     def test_request_exception_maps_to_request_error(self):
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  side_effect=requests.RequestException("connection reset"),
              ):
             with self.assertRaises(sr.RequestError):
@@ -157,7 +157,7 @@ class InworldFailureTests(unittest.TestCase):
         response.status_code = 200
         response.json.side_effect = ValueError("bad json")
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
-             patch.object(transcription.requests, "post", return_value=response):
+             patch.object(transcription._session, "post", return_value=response):
             with self.assertRaises(sr.RequestError):
                 transcription.recognize_inworld(self.audio)
 
@@ -230,7 +230,7 @@ class ListenerSttChainTests(unittest.TestCase):
     used to describe a CHAIN (Inworld primary, local whisper fallback and a
     per-language Google->Groq loop as the final net) whose serial worst case was
     117s; the ladder is gone, so these tests now pin that a failure of the
-    selected engine ENDS the turn — the other engines are never contacted.
+    selected engine ENDS the turn â€” the other engines are never contacted.
     """
 
     def setUp(self):
@@ -278,7 +278,7 @@ class ListenerSttChainTests(unittest.TestCase):
         listener_mod = self.listener_mod
         with patch.object(transcription, "INWORLD_STT_API_KEY", "k"), \
              patch.object(
-                 transcription.requests, "post",
+                 transcription._session, "post",
                  return_value=_inworld_response("jarvis utho"),
              ) as post, patch.object(
                  listener_mod, "recognize_local_whisper",

@@ -103,7 +103,15 @@ _retry_strategy = BudgetedRetry(
     status_forcelist=[429, 502, 503, 504],
     allowed_methods=["POST"],    # retries for POST requests
 )
-_session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+# P0-12: the pooled session now also carries TCP keepalive, so an idle socket
+# kept for the next turn is not silently dropped by a VPN / NAT in between —
+# which would turn a "warm" connection into a fresh handshake anyway.
+try:
+    from backend.services.prewarm import KeepAliveAdapter as _KeepAliveAdapter
+
+    _session.mount("https://", _KeepAliveAdapter(max_retries=_retry_strategy))
+except Exception:  # pragma: no cover - never lose the plain adapter
+    _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
 
 
 def is_available():

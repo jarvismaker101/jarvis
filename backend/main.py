@@ -59,6 +59,23 @@ def _startup_checks():
         name="tts-warmup",
         daemon=True,
     ).start()
+    # [P0-12] startup used to warm only Ollama and TTS, so the FIRST turn of a
+    # session paid the provider handshake on the user's clock. Same contract as
+    # the others: best-effort, background, and silent when a provider is down.
+    threading.Thread(
+        target=_warm_up_connections_background,
+        name="provider-prewarm",
+        daemon=True,
+    ).start()
+
+
+def _warm_up_connections_background():
+    try:
+        from backend.services import prewarm as prewarm_service
+
+        prewarm_service.warm(force=True)
+    except Exception as exc:
+        logging.debug("Provider pre-warm skipped: %s", exc)
 
 
 def _warm_up_tts_background():

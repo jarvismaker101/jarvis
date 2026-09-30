@@ -9,6 +9,17 @@ import speech_recognition as sr
 
 from backend.config import GROQ_API_KEY
 
+# P0-12: STT used bare ``requests.post`` calls, so every transcription paid a
+# fresh TCP + TLS handshake (there was no pool at all) and the connection could
+# not be pre-warmed. ONE pooled, keepalive-enabled session is shared by every
+# cloud STT call now — and it is the same session the pre-warm opens, which is
+# the point: warming an unpooled call would warm nothing.
+try:
+    from backend.services.prewarm import pooled_session as _pooled_session
+    _session = _pooled_session(pool_connections=2, pool_maxsize=4)
+except Exception:  # pragma: no cover - prewarm import fallback
+    _session = requests.Session()
+
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_STT_URL = os.getenv(
     "GROQ_STT_URL",
@@ -20,12 +31,21 @@ INWORLD_STT_URL = os.getenv(
     "https://api.inworld.ai/stt/v1/transcribe",
 )
 INWORLD_STT_MODEL = os.getenv("INWORLD_STT_MODEL", "inworld/inworld-stt-1")
+
+#: P0-12 — latency-critical CONNECT budget for a cloud STT call. The socket is
+#: pre-warmed at VAD onset, so a cold handshake here means the warm did not run;
+#: the READ side stays generous because the upload + transcription is the work.
+STT_CONNECT_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_STT_CONNECT_TIMEOUT", "1.0"))
 #: [P0-03] Inworld's budget, split into (connect, read) so a wedged TCP connect
 #: cannot consume the whole read allowance. With one STT engine per turn these
 #: two numbers ARE the worst case of a turn, so they are explicit and tunable
 #: instead of an anonymous ``timeout=(5, 15)``.
+#: [P0-12] The CONNECT side is now the latency-critical 1s: this socket is
+#: pre-warmed at VAD onset, so a cold handshake here means the warm did not run.
 INWORLD_STT_CONNECT_TIMEOUT_SECONDS = float(
-    os.getenv("JARVIS_INWORLD_STT_CONNECT_TIMEOUT", "3"))
+    os.getenv("JARVIS_INWORLD_STT_CONNECT_TIMEOUT",
+              str(STT_CONNECT_TIMEOUT_SECONDS)))
 INWORLD_STT_READ_TIMEOUT_SECONDS = float(
     os.getenv("JARVIS_INWORLD_STT_READ_TIMEOUT", "10"))
 INWORLD_STT_TIMEOUT = (
@@ -170,12 +190,12 @@ def _recognize_groq(audio_data, language):
         data["language"] = api_language
 
     try:
-        response = requests.post(
+        response = _session.post(
             GROQ_STT_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             data=data,
             files={"file": ("speech.wav", wav_bytes, "audio/wav")},
-            timeout=(5, 30),
+            timeout=(STT_CONNECT_TIMEOUT_SECONDS, 30),
         )
     except requests.RequestException as exc:
         raise sr.RequestError(f"Groq STT request failed: {exc}") from exc
@@ -220,7 +240,7 @@ def recognize_inworld(audio_data, language=None, prompts=None):
     }
 
     try:
-        response = requests.post(
+        response = _session.post(
             INWORLD_STT_URL,
             headers={
                 "Authorization": f"Basic {INWORLD_STT_API_KEY}",
@@ -250,6 +270,26 @@ def recognize_inworld(audio_data, language=None, prompts=None):
     if not transcript:
         raise sr.UnknownValueError()
     return transcript
+
+
+def prewarm_target():
+    """P0-12 — the STT session to pre-warm, or None when there is nothing to warm.
+
+    Only a CLOUD engine pays a TCP + TLS handshake, so only a cloud engine is
+    worth warming; the local whisper daemon is loopback HTTP and is deliberately
+    skipped (its "handshake" is free and it is already resident in the voice
+    process). Groq's host is the classifier's host too, so a Groq target is
+    never duplicated here — one connection per (host, port) is what the pool
+    actually holds, which is exactly what the dedupe in ``prewarm.targets()``
+    relies on.
+    """
+    if INWORLD_STT_API_KEY:
+        return {
+            "name": "inworld-stt",
+            "url": INWORLD_STT_URL,
+            "headers": {"Authorization": f"Basic {INWORLD_STT_API_KEY}"},
+        }
+    return None
 
 
 def recognize_local_whisper(audio_data, timeout=None):
