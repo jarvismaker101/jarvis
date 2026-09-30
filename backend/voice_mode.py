@@ -583,6 +583,26 @@ def _on_barge_in():
         pass
 
 
+def _interrupt_active_turn(reason="interrupted by a new utterance"):
+    """Cut the active turn because the user committed a new utterance.
+
+    [P1-06] The listener used to DISCARD a committed transcript whenever the
+    "speaking" flag was set, so the user could talk during a reply and be
+    ignored with no error, no log and no interruption. Speaking during a reply
+    means "change the subject", i.e. an interruption: the turn manager cancels
+    the turn that owns playback and the utterance is dispatched as the new
+    turn.
+
+    Idempotent and non-raising by construction — the barge-in onset hook has
+    usually already cancelled the turn, in which case this simply reports that
+    there was nothing active. Never blocks: the remote cancel is fire-and-forget.
+    """
+    try:
+        return TURNS.cancel_current(reason)
+    except Exception:
+        return False
+
+
 try:  # the listener owns WHEN a barge-in happens; this process owns the turn
     from backend.services.listener import register_barge_in_hook
 
@@ -1428,10 +1448,6 @@ def listener_thread():
                 _deliver_stop_research()
                 continue
 
-            # While Jarvis is speaking, only the controls above get through.
-            if listener_state.is_speaking():
-                continue
-
             # While an opencode task runs, only opencode speaks. The agent's
             # narration is heard by the mic; queueing it here would echo it
             # back as a Jarvis reply — drop it instead. The flag is the
@@ -1439,6 +1455,27 @@ def listener_thread():
             if backend_task_running():
                 print("[TASK] backend task running — listener muted.")
                 continue
+
+            # [P1-06] A COMMITTED transcript is never silently discarded. It has
+            # already passed the VAD, the human-voice gate and the hallucination
+            # gate, so throwing it away wastes all that work and loses intent.
+            #
+            # If Jarvis is mid-reply, the user speaking means "change the
+            # subject": that is an INTERRUPTION, so cut the current turn now
+            # (audio dies, the old backend request is cancelled) and hand the
+            # utterance to the P0-08 turn manager, which dispatches it
+            # pre-emptively. The old `if listener_state.is_speaking(): continue`
+            # dropped the transcript with no handling, no log and no
+            # interruption — and because the speaking flag used to flicker off
+            # between sentences, the drop was unpredictable as well. The flag is
+            # now scoped to the whole reply session (voice.StreamSpeaker), so
+            # this branch is the reliable "the user talked over the reply"
+            # signal. Onset barge-in still cut the audio immediately in the
+            # listener's own barge-in path; this is the commit-time belt.
+            if listener_state.is_speaking():
+                interrupted = _interrupt_active_turn()
+                print("[LISTENER] Utterance during a reply — interrupting: %s"
+                      % ("yes" if interrupted else "no active turn"))
 
             command_queue.put((text, turn))
 

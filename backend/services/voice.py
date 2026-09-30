@@ -889,6 +889,33 @@ class StreamSpeaker:
                 self._worker = threading.Thread(target=self._playback_loop, daemon=True)
                 self._worker.start()
 
+    def _queue_has_audio(self):
+        """True when at least one real utterance is still queued.
+
+        The ``_STREAM_STOP`` sentinel is not audio: ``close()`` means "stop the
+        worker once the queue drains", so a queue holding only the sentinel has
+        nothing left to speak. Peeked non-destructively (the only consumer is
+        this speaker's own playback thread).
+        """
+        with self._queue.mutex:
+            return any(item is not _STREAM_STOP for item in self._queue.queue)
+
+    def _reply_session_over(self):
+        """True once this reply is COMPLETE and nothing is left to speak.
+
+        [P1-06] The speaking flag is scoped to the reply *session*, never to the
+        queue's momentary occupancy. The session is over when the reply text is
+        finished (``finish()``) or the speaker was closed, AND the queue and the
+        pending buffer are both empty — i.e. the last chunk has actually been
+        played (``_speak_chunk`` blocks for the duration of its chunk).
+        """
+        if not (self._finished or self._closed):
+            return False
+        if self._queue_has_audio():
+            return False
+        with self._buffer_lock:
+            return not self._buffer.strip()
+
     def _playback_loop(self):
         global is_speaking, _current_text
 
@@ -921,6 +948,13 @@ class StreamSpeaker:
                                 to_flush, self._buffer = self._buffer, ""
                     if to_flush and to_flush.strip():
                         self._enqueue(to_flush.strip())
+                    # [P1-06] A reply can complete with nothing left to
+                    # enqueue — the final delta was already voiced and
+                    # ``finish()`` arrived with an empty buffer. The session
+                    # ends HERE as well, otherwise the speaking flag would stay
+                    # set after the audio stopped.
+                    if self._reply_session_over():
+                        set_speaking_state(False)
                     continue
                 if item is _STREAM_STOP:
                     break
@@ -933,12 +967,17 @@ class StreamSpeaker:
                     set_speaking_state(True)
                 _speak_chunk(sentence, self._generation, is_first_chunk=not self._played_first)
                 self._played_first = True
-                # Queue drained — clear the speaking flag so the listener
-                # accepts the next command. Previously the worker stayed
-                # idle-blocked on the queue with is_speaking stuck True, so
-                # the voice listener dropped every command after the first
-                # reply (voice worked once, then went deaf until restart).
-                if self._queue.empty():
+                # [P1-06] The speaking flag means "Jarvis is mid-reply" for the
+                # WHOLE reply session. It is NOT derived from momentary queue
+                # occupancy: clearing it the instant the queue happened to drain
+                # made the flag flicker off in the gap between two sentences of
+                # the SAME reply, which is what made the listener's old
+                # "ignore while speaking" gate unpredictable (sometimes an
+                # interruption landed, sometimes the utterance vanished without
+                # a trace). The session ends only once the reply is COMPLETE
+                # (``finish()``/``close()``) and everything queued has actually
+                # been played — see ``_reply_session_over``.
+                if self._reply_session_over():
                     set_speaking_state(False)
         except Exception:
             print("Stream voice error:")
