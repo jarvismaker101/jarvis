@@ -74,8 +74,141 @@ _in_flight = {}
 _cache_lock = threading.Lock()
 _CACHE_MAX = 32
 
+#: [P0-05] How long a JOINER waits for progress from a synthesis it joined.
+#: The owner's own HTTP read is bounded separately; this only stops a joiner
+#: from streaming forever off a synthesis that has genuinely hung.
+_INFLIGHT_JOIN_TIMEOUT_SECONDS = 60.0
+
+#: [P0-05] Bound on the in-flight map. Owners pop their own entry, so this only
+#: bites when an owner dies; completed entries are evicted oldest-first, the
+#: same rule _CACHE_MAX applies to the decoded-audio cache.
+_INFLIGHT_MAX = 8
+
 _playback_lock = threading.Lock()
 _current_playback = None
+
+
+class _InflightPCM:
+    """One synthesis in flight, joinable by later callers as bytes arrive.
+
+    [P0-05] An in-flight entry used to be all-or-nothing. If a prefetch thread
+    claimed the entry first, the playback thread became a mere waiter: it could
+    not start until synthesis had FINISHED, then replayed the finished bytes.
+    Sentence 1 therefore lost streaming playback whenever the prefetch won the
+    race — and the prefetch usually won, because the playback worker first
+    reads the model registry and starts an earcon thread.
+
+    The owner now publishes every chunk here as it reads it, and a joiner plays
+    them AS THEY ARRIVE: the first bytes are worth as much to the joiner as
+    they are to the owner, so nothing is gained by making it wait for the last
+    one.
+
+    ``wait()`` keeps the old Event-shaped contract for callers that only want
+    to know when the synthesis finished, so an entry for this path and an entry
+    for the MP3 path stay interchangeable.
+    """
+
+    #: A joiner re-checks at most this often, so a missed notify can never park
+    #: playback. Every publish/finish also notifies, so this is a safety floor.
+    WAIT_SLICE = 0.05
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._buffer = bytearray()
+        self._done = False
+        #: True while the owner is ITSELF feeding the device. A second
+        #: ``play=True`` caller must not stream alongside it: two players on
+        #: one sentence would double-speak it, so that case keeps the old
+        #: wait-then-replay behaviour.
+        self.playing = False
+
+    # ── owner side ─────────────────────────────────────────────────────────
+    def publish(self, chunk):
+        """Add freshly synthesised bytes and wake every joiner."""
+        if not chunk:
+            return
+        with self._cv:
+            self._buffer.extend(chunk)
+            self._cv.notify_all()
+
+    def finish(self):
+        """Mark the synthesis over. Idempotent, and safe on every exit path."""
+        with self._cv:
+            self._done = True
+            self._cv.notify_all()
+
+    # ── joiner side ────────────────────────────────────────────────────────
+    def iter_from(self, offset=0, timeout=None):
+        """Yield the buffer's bytes as they arrive, in synthesis order.
+
+        Ends when the owner finishes, or when *timeout* elapses with no further
+        bytes — a hung synthesis must not hang its joiner.
+        """
+        position = max(0, int(offset))
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while True:
+            with self._cv:
+                while position >= len(self._buffer) and not self._done:
+                    if deadline is None:
+                        self._cv.wait(self.WAIT_SLICE)
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._cv.wait(min(self.WAIT_SLICE, remaining))
+                if position >= len(self._buffer):
+                    return
+                chunk = bytes(self._buffer[position:])
+                position = len(self._buffer)
+            if chunk:
+                yield chunk
+
+    def snapshot(self):
+        with self._cv:
+            return bytes(self._buffer)
+
+    def is_done(self):
+        with self._cv:
+            return self._done
+
+    def wait(self, timeout=None):
+        """Event-compatible completion wait; True when the synthesis ended."""
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        with self._cv:
+            while not self._done:
+                if deadline is None:
+                    self._cv.wait(self.WAIT_SLICE)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(min(self.WAIT_SLICE, remaining))
+            return True
+
+
+def _claim_inflight(ck):
+    """Claim ownership of *ck*'s synthesis, or hand back the live entry.
+
+    Returns ``(entry, is_owner)``. De-duplication is unchanged: two callers
+    asking for the same text still share exactly ONE synthesis, and the loser
+    now joins the winner's stream instead of replaying its finished output.
+    """
+    with _cache_lock:
+        entry = _in_flight.get(ck)
+        if entry is not None:
+            return entry, False
+        entry = _InflightPCM()
+        _in_flight[ck] = entry
+        if len(_in_flight) > _INFLIGHT_MAX:
+            for old_key in list(_in_flight):
+                if old_key == ck:
+                    continue
+                candidate = _in_flight.get(old_key)
+                if isinstance(candidate, _InflightPCM) and candidate.is_done():
+                    _in_flight.pop(old_key, None)
+                    if len(_in_flight) <= _INFLIGHT_MAX:
+                        break
+    return entry, True
 
 
 def _pcm_cache_key(text):
@@ -425,6 +558,85 @@ def _pcm_chunks_from_response(response):
             yield boosted
 
 
+def _publishing_chunks(response, inflight):
+    """Yield the response's PCM chunks, publishing each one to *inflight*.
+
+    [P0-05] The publish happens BEFORE the chunk is handed to the actor feed,
+    so a joiner's copy is never behind the owner's: whatever the owner is about
+    to play, the joiner can already play too.
+    """
+    for chunk in _pcm_chunks_from_response(response):
+        inflight.publish(chunk)
+        yield chunk
+
+
+def _stream_pcm_to_actor(key, chunks, handle, out=None):
+    """Feed *chunks* to the ONE playback owner as they arrive.
+
+    Returns ``(full, failed)``. Shared by the synthesising owner and by a
+    P0-05 joiner streaming off an in-flight synthesis, so both get exactly the
+    same stop/abort/drain contract — a joiner that behaved differently would be
+    a second playback implementation waiting to drift.
+
+    *out* receives ``{"generation": ...}`` as soon as this call opens its own
+    utterance, so a caller can tell "audio already reached the device" from
+    "nothing was ever played" even when this raises.
+    """
+    generation = actor_begin(key)
+    if out is not None:
+        out["generation"] = generation
+    done = threading.Event()
+    written = {}
+    _player_thread(key, done, written)
+    full = bytearray()
+    failed = False
+    read_error = None
+    try:
+        for chunk in chunks:
+            if handle is not None and handle.stopped:
+                actor_abort()
+                break
+            full.extend(chunk)
+            if not actor_feed(key, generation, chunk):
+                if not actor_is_current(key, generation):
+                    break
+                actor_abort()
+                failed = True
+                break
+        else:
+            actor_end(key, generation)
+    except BaseException as exc:
+        read_error = exc
+    finally:
+        if not failed and actor_is_current(key, generation):
+            actor_end(key, generation)
+        done.wait(timeout=_drain_seconds(len(full)))
+    if written.get("error") is not None:
+        raise written["error"]
+    if read_error is not None:
+        raise read_error
+    return full, failed
+
+
+def _play_inflight_stream(inflight, ck, handle):
+    """[P0-05] Play a synthesis that is already in flight, as it arrives.
+
+    The owner of this synthesis is a prefetch, so it is not feeding the device:
+    this caller becomes the player and starts at the FIRST chunk instead of
+    after the last one.
+    """
+    key = _stream_key(ck)
+    opened = {}
+    full, failed = _stream_pcm_to_actor(
+        key,
+        inflight.iter_from(0, timeout=_INFLIGHT_JOIN_TIMEOUT_SECONDS),
+        handle,
+        out=opened)
+    if not full:
+        return False
+    return not failed
+
+
 def _do_pcm_stream(text, play=True):
     """Core streaming: fetch PCM chunks, optionally play, always cache full.
 
@@ -457,7 +669,11 @@ def _do_pcm_stream(text, play=True):
         return True
 
     is_owner = False
-    generation = None
+    #: [P0-05] Filled in by _stream_pcm_to_actor the moment this call opens its
+    #: own utterance, so the error path below can still tell "audio already
+    #: reached the device" from "nothing was ever played".
+    opened = {}
+    inflight = None
     try:
         if not play:
             if cached is not None:
@@ -466,19 +682,27 @@ def _do_pcm_stream(text, play=True):
             return _play_pcm_through_actor(cached, handle, ck=ck)
 
         # ── in-flight deduplication, keyed by the identity key ──
-        wait_evt = None
-        with _cache_lock:
-            evt = _in_flight.get(ck)
-            if evt is not None:
-                wait_evt = evt
-            else:
-                wait_evt = threading.Event()
-                _in_flight[ck] = wait_evt
-                is_owner = True
+        inflight, is_owner = _claim_inflight(ck)
+        if is_owner and play:
+            # [P0-05] Announce ownership of the DEVICE before the network call,
+            # not after it: `playing` is what stops a second play caller from
+            # streaming the same sentence alongside this one, so it must be
+            # true for the whole life of a playing owner — including the window
+            # while this thread is still waiting for the TTS response.
+            inflight.playing = True
         if not is_owner:
-            # Wait for the owner, then play the shared result rather than
-            # silently dropping the sentence.
-            if not wait_evt.wait(timeout=60):
+            # [P0-05] A prefetch is already synthesising this sentence and is
+            # NOT feeding the device, so join its stream and start at the first
+            # chunk. This is what makes losing the race cost nothing: the
+            # player no longer waits for the whole sentence to be synthesised.
+            if (play and isinstance(inflight, _InflightPCM)
+                    and not inflight.playing):
+                return _play_inflight_stream(inflight, ck, handle)
+            # Otherwise keep the documented behaviour: wait for the owner (a
+            # hanging synthesis still has to time out), then play the shared
+            # result. A second play=True caller must NOT stream alongside a
+            # playing owner — that would speak the sentence twice.
+            if not inflight.wait(timeout=60):
                 return False
             with _cache_lock:
                 entry = _audio_cache.get(ck)
@@ -511,52 +735,25 @@ def _do_pcm_stream(text, play=True):
             if response.status_code != 200:
                 return False
             if not play:
-                # Prefetch: drain into the cache without touching the device.
+                # Prefetch: publish each chunk as it arrives so a joiner can
+                # play immediately, then cache the whole sentence. The publish
+                # must happen even though nothing plays here: this thread is
+                # the one holding the synthesis the joiner is waiting on.
                 full = bytearray()
-                for chunk in _pcm_chunks_from_response(response):
-                    full.extend(chunk)
+                try:
+                    for chunk in _pcm_chunks_from_response(response):
+                        full.extend(chunk)
+                        inflight.publish(chunk)
+                finally:
+                    inflight.finish()
                 if not full:
                     return False
                 _cache_pcm(ck, bytes(full))
                 return True
 
             # [F32] ONE owner: the actor plays while this thread only feeds.
-            generation = actor_begin(key)
-            done = threading.Event()
-            written = {}
-            _player_thread(key, done, written)
-            full = bytearray()
-            failed = False
-            read_error = None
-            try:
-                for chunk in _pcm_chunks_from_response(response):
-                    if handle is not None and handle.stopped:
-                        actor_abort()
-                        break
-                    full.extend(chunk)
-                    if not actor_feed(key, generation, chunk):
-                        if not actor_is_current(key, generation):
-                            break
-                        actor_abort()
-                        failed = True
-                        break
-                else:
-                    actor_end(key, generation)
-            except BaseException as exc:
-                # A read/network error mid-utterance: the chunks already fed
-                # ARE played (never replay the sentence from the start), then
-                # the error surfaces for the caller to decide about fallback.
-                read_error = exc
-            finally:
-                if not failed and actor_is_current(key, generation):
-                    actor_end(key, generation)
-                done.wait(timeout=_drain_seconds(len(full)))
-            if written.get("error") is not None:
-                raise written["error"]
-            if read_error is not None:
-                raise read_error
-            if written.get("error") is not None:
-                raise written["error"]
+            full, failed = _stream_pcm_to_actor(
+                key, _publishing_chunks(response, inflight), handle, out=opened)
             if not full:
                 return False
             if failed:
@@ -573,6 +770,7 @@ def _do_pcm_stream(text, play=True):
         # (and never fall back and replay the sentence from the beginning).
         # `generation` is only set once THIS call opened its own utterance, so
         # a stale cursor from an earlier sentence cannot be mistaken for it.
+        generation = opened.get("generation")
         if play and generation is not None and _actor_heard_audio():
             print(f"[FISH] pcm stream error after partial playback: {exc}")
             return True
@@ -582,15 +780,20 @@ def _do_pcm_stream(text, play=True):
     finally:
         if handle is not None:
             _clear_sounddevice_playback(handle)
+        popped = None
         with _cache_lock:
             if is_owner:
                 # [F32] the in-flight entry is keyed by the IDENTITY key; the
                 # old code popped by text and leaked the entry forever.
-                evt2 = _in_flight.pop(ck, None)
+                popped = _in_flight.pop(ck, None)
+        if popped is not None:
+            # [P0-05] Every exit path must release a joiner: an entry left
+            # unfinished would hang the next play=True caller for the full
+            # timeout even though the synthesis is over (or never started).
+            if isinstance(popped, _InflightPCM):
+                popped.finish()
             else:
-                evt2 = None
-        if evt2 is not None:
-            evt2.set()
+                popped.set()
 
 
 def _actor_heard_audio():

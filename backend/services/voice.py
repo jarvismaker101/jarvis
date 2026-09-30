@@ -635,6 +635,25 @@ class StreamSpeaker:
         parts.extend(str(item) for item in items if item)
         return " ".join(part for part in parts if part).strip()
 
+    def _prefetch_allowed(self, pending_ahead):
+        """[P0-05] True only when prefetching cannot delay the next sentence.
+
+        Prefetching the sentence that is ABOUT to play is what cost sentence 1
+        its streaming playback: if the prefetch thread claimed the in-flight
+        slot first, the playback thread became a waiter and could not start
+        until synthesis had FINISHED. So a sentence is only safe to prefetch
+        when it cannot be the next thing spoken — something is already playing,
+        or an earlier sentence is still queued ahead of it.
+
+        This is belt-and-braces: the joinable in-flight entry means losing the
+        race is no longer a penalty, but not starting the race at all is both
+        cheaper and obviously correct.
+        """
+        with _state_lock:
+            if self._active:
+                return True
+        return pending_ahead > 0
+
     def _enqueue(self, sentence):
         # Short first chunk optimization: cap first enqueued chunk to ~120 chars
         # Protect flag check+set under _buffer_lock for thread-safety
@@ -666,9 +685,11 @@ class StreamSpeaker:
                         self._enqueue(chunk.strip())
             else:
                 self._spoken_any = True
+                pending_ahead = self._queue.qsize()
                 self._queue.put(first)
                 self._start_worker()
-                _prefetch_tts_audio(first)
+                if self._prefetch_allowed(pending_ahead):
+                    _prefetch_tts_audio(first)
             if remainder:
                 self._enqueue(remainder)
             return
@@ -678,11 +699,16 @@ class StreamSpeaker:
                     self._enqueue(chunk.strip())
             return
         self._spoken_any = True
+        pending_ahead = self._queue.qsize()
         self._queue.put(sentence)
         self._start_worker()
         # Start synthesising this sentence now so the playback loop (which is
         # still speaking the previous one) finds it ready when its turn comes.
-        prefetch_fish_audio(sentence)
+        # [P0-05] ...but never while the worker is idle: this sentence is then
+        # the one about to play, and a prefetch racing its own playback is
+        # exactly what made sentence 1 wait for full synthesis.
+        if self._prefetch_allowed(pending_ahead):
+            prefetch_fish_audio(sentence)
 
     def _start_worker(self):
         with _state_lock:
