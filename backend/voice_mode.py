@@ -24,6 +24,8 @@ from backend.services.fish_voice import warm_up_fish_tts
 from backend.services.voice import (
     StreamSpeaker,
     get_active_stream,
+    pause_speaking,
+    resume_local_playback,
     set_active_stream,
     speak,
     stop_speaking,
@@ -1105,32 +1107,55 @@ def _deliver_speech_stop():
 
 
 def _deliver_pause():
-    """Pause narration but KEEP the remainder resumable (F35).
+    """Pause narration but KEEP the remainder resumable (F35 / P1-07).
 
-    Distinct from a stop: the backend remembers the unplayed text
-    (/speak/pause) so "continue" has a real target in the process that owns
-    the speech — the voice process's own listener_state copy never sees it.
+    A VOICE reply's audio lives in THIS process, so the pause has to happen
+    here. The old implementation called the local ``stop_speaking()`` FIRST —
+    which discards the queue and bumps the generation — and only then posted
+    ``/speak/pause`` to the backend, whose active stream is empty for a voice
+    turn. Net effect: pause was exactly a stop and "continue" had nothing to
+    resume.
+
+    Pause is now a LOCAL, non-destructive control (``pause_speaking`` parks the
+    play loop at the byte it reached and keeps the queue). The backend endpoint
+    is still used when nothing was playing here, because the BACKEND process is
+    the one narrating typed-UI replies and task announcements.
     """
+    resumable = False
     try:
-        stop_speaking()
-    except Exception:
-        pass
+        resumable = bool(pause_speaking())
+    except Exception as exc:
+        print("[VOICE] local pause failed: %s" % exc)
+        resumable = False
+    if resumable:
+        print("⏸️ Speech paused locally — resumable")
+        return True
     ok, reply = _post_backend("/speak/pause", {})
     resumable = bool(isinstance(reply, dict) and reply.get("resumable"))
     print("⏸️ Speech paused (%s): %s"
           % ("ok" if ok else "FAILED",
              "resumable" if resumable else "nothing to resume"))
-    return ok
+    return bool(ok and resumable)
 
 
 def _deliver_continue():
-    """Resume what a pause/interruption left unplayed, on the backend.
+    """Resume what a pause left unplayed (F35 / P1-07).
 
-    F35/F50: the backend owns playback, so /speak/resume is the ONLY place a
-    remainder can be resumed from. The old fallback played
-    ``listener_state.pop_remaining()`` from THIS process — a second playback
-    owner, which is exactly what the single-owner rule forbids.
+    A pause armed in THIS process is resumed in THIS process: the actor's parked
+    play loop replays the unplayed tail from its cursor and the stream speaker's
+    queue carries on. Only when nothing is paused here does this fall back to
+    the backend, which owns the narration the BACKEND process speaks.
+
+    Deliberately does NOT re-speak a text snapshot from here: the old
+    ``listener_state.pop_remaining()`` + ``speak()`` fallback made this process a
+    second playback owner, which F50 forbids.
     """
+    try:
+        if resume_local_playback():
+            print("▶️ Resumed the paused audio locally")
+            return True
+    except Exception as exc:
+        print("[VOICE] local resume failed: %s" % exc)
     ok, reply = _post_backend("/speak/resume", {})
     resumed = bool(isinstance(reply, dict) and reply.get("resumed"))
     print("▶️ Resume delivered to backend: %s"

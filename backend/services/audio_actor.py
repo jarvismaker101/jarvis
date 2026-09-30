@@ -323,6 +323,25 @@ class AudioActor:
         self._stop = threading.Event()
         self._stream = None
 
+        #: [P1-07] A true pause. Unlike an abort this is NOT a cancellation:
+        #: the play loop PARKS (still draining the producer so a backpressured
+        #: synth never times out, but writing nothing to the device and not
+        #: advancing the spoken cursor) and ``_pause_cursor`` remembers exactly
+        #: which byte the device reached, so the remainder is replayed without
+        #: re-synthesising anything. ``abort()``/``begin()`` clear it.
+        self._paused = False
+        self._pause_cursor = None
+        #: [P1-07] How many play loops are live right now. A pause is only
+        #: meaningful while a loop is actually draining this utterance: without
+        #: one there is nobody to park and nobody to replay the tail, so
+        #: ``pause()`` must report "nothing was playing" instead of arming a
+        #: resume that can never happen.
+        self._loops = 0
+        #: [P1-07] Held across "write this chunk to the device and account for
+        #: it", so a pause can wait for an in-flight write instead of reading a
+        #: cursor that is about to move.
+        self._device_lock = threading.Lock()
+
         #: [P0-07] The ONE long-lived output device for this actor, opened
         #: lazily on first playback and reused across sentences AND replies.
         #: The production path uses the module singleton below, so this is one
@@ -351,6 +370,10 @@ class AudioActor:
             generation = self._generation
             self._active_key = key
             self._play_state = "playing"
+            # [P1-07] A new utterance supersedes any pause: the parked position
+            # belonged to the previous one and must never be replayed into this.
+            self._paused = False
+            self._pause_cursor = None
         with self._ring_cv:
             self._ring.clear()
             self._utterance_pcm.clear()
@@ -545,6 +568,8 @@ class AudioActor:
         persistent = self._owns_device and not owns_sentence_stream
         self._stream = stream
         written = 0
+        with self._gen_lock:
+            self._loops += 1
         # [PERF] P1-19 — allow one first-write mark for THIS play loop.
         self._played_once = False
         # [P0-07] One lazy device reopen is allowed per play loop.
@@ -553,89 +578,113 @@ class AudioActor:
             while True:
                 if self._play_state not in ("playing", "ended"):
                     break
+                # [P0-06] Subscribe to arriving synthesis through the SAME
+                # condition variable the producers notify, instead of sleeping on
+                # a different event in 250ms slices. The chunk that lands next now
+                # wakes this loop within a millisecond rather than on the next
+                # timer tick, which is what removes the per-utterance stall before
+                # the first device write.
+                #
+                # The wait is bounded by PLAY_WAIT_FLOOR_SECONDS only so a missed
+                # notify cannot park the loop, and it stays OUTSIDE _device_lock:
+                # a parked pause must never hold up the control path that is
+                # trying to resume it. Nothing inside this block takes _gen_lock:
+                # _is_current() would, and mixing that with the ring lock is how a
+                # deadlock starts. The state reads below are plain attribute
+                # reads, exactly as the rest of this loop already does it.
+                #
+                # [P1-07] While paused the wait must NOT end on EOF: the producer
+                # may already have finished the utterance, and the parked loop is
+                # exactly what replays its tail on resume.
                 with self._ring_cv:
-                    chunk = self._ring.popleft() if self._ring else None
-                    if chunk is not None:
-                        self._ring_cv.notify_all()
-                    eof = self._eof
-                if chunk is None:
-                    if eof:
-                        break
-                    # [P0-06] Subscribe to arriving synthesis through the SAME
-                    # condition variable the producers notify, instead of
-                    # sleeping on a different event in 250ms slices. The chunk
-                    # that lands next now wakes this loop within a millisecond
-                    # rather than on the next timer tick, which is what removes
-                    # the per-utterance stall before the first device write.
-                    #
-                    # The wait is bounded by PLAY_WAIT_FLOOR_SECONDS only so a
-                    # missed notify cannot park the loop. Nothing inside this
-                    # block takes _gen_lock: _is_current() would, and mixing
-                    # that with the ring lock is how a deadlock starts. The
-                    # state reads below are plain attribute reads, exactly as
-                    # the rest of this loop already does it.
+                    while (not self._ring
+                           and self._play_state in ("playing", "ended")
+                           and (self._paused or not self._eof)):
+                        self._ring_cv.wait(PLAY_WAIT_FLOOR_SECONDS)
+                # The abort fast path stays: _stop is checked after the wait, so
+                # a stop lands immediately instead of waiting for the floor.
+                if self._stop.is_set():
+                    break
+                if self._play_state not in ("playing", "ended"):
+                    break
+                # [P1-07] Pop, decide and write as ONE step under _device_lock.
+                #
+                # A chunk must never be written after a pause or a resume it did
+                # not observe. A pause KEEPS the unplayed audio in _utterance_pcm
+                # and the resume re-feeds that same audio from the cursor, so a
+                # chunk still in the ring across a pause would otherwise be spoken
+                # twice. Popping under the same lock that pause() and
+                # resume_playback() take closes every such window — and it is what
+                # makes pause()'s cursor read stable, so the resumed tail is
+                # exactly the bytes the device had not been fed.
+                with self._device_lock:
                     with self._ring_cv:
-                        while (not self._ring and not self._eof
-                               and self._play_state in ("playing", "ended")):
-                            self._ring_cv.wait(PLAY_WAIT_FLOOR_SECONDS)
-                    # The abort fast path stays: _stop is checked after the
-                    # wait, so a stop lands immediately instead of waiting for
-                    # the floor to expire.
-                    if self._stop.is_set():
-                        break
-                    if self._play_state not in ("playing", "ended"):
-                        break
-                    continue
-                # Generation re-check immediately before the device write: a
-                # chunk tagged with an older generation is discarded here even
-                # if it somehow reached this ring.
-                if not self._is_current(chunk.key, chunk.generation):
-                    continue
-                try:
-                    stream.write(chunk.pcm)
-                except Exception:
-                    # A stop landing between the generation check above and
-                    # this write leaves the stream stopped underneath us. That
-                    # is an intentional abort, not a playback failure, so end
-                    # the utterance quietly instead of reporting a PortAudio
-                    # error for a stop the user asked for.
-                    if self._play_state not in ("playing", "ended"):
-                        break
-                    # [P0-07] On a reused device a write failure means the
-                    # device itself went away (headset unplugged, driver
-                    # reset). Reopen it ONCE and retry this chunk; anything
-                    # beyond that is surfaced rather than looped on.
-                    if persistent and not self._reopened:
-                        self._reopened = True
-                        fresh = self._reopen_persistent_stream()
-                        if fresh is None:
-                            raise
-                        stream = fresh
-                        self._stream = fresh
-                        stream.write(chunk.pcm)
-                    else:
-                        raise
-                written += len(chunk.pcm)
-                with self._ring_lock:
-                    # Consumed-frame accounting: the cursor is where the
-                    # DEVICE was fed, never where synthesis was submitted.
-                    self._spoken_bytes += len(chunk.pcm)
-                # [PERF] P1-19 — the device really has audio now: this is the
-                # moment the user can hear something, as opposed to bytes
-                # merely existing in the ring.
-                if not self._played_once:
-                    self._played_once = True
+                        chunk = self._ring.popleft() if self._ring else None
+                        if chunk is not None:
+                            self._ring_cv.notify_all()
+                        eof = self._eof
+                    if self._paused:
+                        # Keep draining the producer — so a backpressured
+                        # synthesis never times out and never declares the
+                        # sentence lost — while writing NOTHING to the device and
+                        # leaving the spoken cursor where it is.
+                        continue
+                    if chunk is None:
+                        if eof:
+                            break
+                        continue
+                    # Generation re-check immediately before the device write: a
+                    # chunk tagged with an older generation is discarded here even
+                    # if it somehow reached this ring.
+                    if not self._is_current(chunk.key, chunk.generation):
+                        continue
                     try:
-                        _latency.mark_active("playback_started")
+                        stream.write(chunk.pcm)
                     except Exception:
-                        pass
-                if callable(on_chunk):
-                    on_chunk(chunk.pcm)
+                        # A stop landing between the generation check above and
+                        # this write leaves the stream stopped underneath us.
+                        # That is an intentional abort, not a playback failure,
+                        # so end the utterance quietly instead of reporting a
+                        # PortAudio error for a stop the user asked for.
+                        if self._play_state not in ("playing", "ended"):
+                            break
+                        # [P0-07] On a reused device a write failure means the
+                        # device itself went away (headset unplugged, driver
+                        # reset). Reopen it ONCE and retry this chunk; anything
+                        # beyond that is surfaced rather than looped on.
+                        if persistent and not self._reopened:
+                            self._reopened = True
+                            fresh = self._reopen_persistent_stream()
+                            if fresh is None:
+                                raise
+                            stream = fresh
+                            self._stream = fresh
+                            stream.write(chunk.pcm)
+                        else:
+                            raise
+                    written += len(chunk.pcm)
+                    with self._ring_lock:
+                        # Consumed-frame accounting: the cursor is where the
+                        # DEVICE was fed, never where synthesis was submitted.
+                        self._spoken_bytes += len(chunk.pcm)
+                    # [PERF] P1-19 — the device really has audio now: this is
+                    # the moment the user can hear something, as opposed to
+                    # bytes merely existing in the ring.
+                    if not self._played_once:
+                        self._played_once = True
+                        try:
+                            _latency.mark_active("playback_started")
+                        except Exception:
+                            pass
+                    if callable(on_chunk):
+                        on_chunk(chunk.pcm)
         finally:
             # [P0-07] The long-lived device is deliberately NOT torn down here:
             # that per-sentence open/close is exactly the ~400ms hole between
             # sentences of one reply. It is released by shutdown() instead.
             # Every caller-supplied device is still stopped and closed.
+            with self._gen_lock:
+                self._loops = max(0, self._loops - 1)
             if not persistent:
                 try:
                     stream.stop()
@@ -664,6 +713,10 @@ class AudioActor:
         """
         with self._gen_lock:
             self._play_state = "aborted"
+            # [P1-07] A cancellation ends the pause for good: the remainder of
+            # an aborted utterance must never be replayable later.
+            self._paused = False
+            self._pause_cursor = None
         self._stop.set()
         self._chunk_wait.set()
         stream = self._stream
@@ -685,6 +738,75 @@ class AudioActor:
             self._ring_cv.notify_all()
         return cursor
 
+    # ── pause (P1-07) ──────────────────────────────────────────────────
+    def pause(self):
+        """Cut the device now, KEEPING this utterance resumable.
+
+        A pause is a distinct control from an abort. ``abort()`` is a
+        cancellation: it kills the generation, empties the ring and makes the
+        remainder unplayable. ``pause()`` deliberately does none of that — the
+        generation, the utterance PCM and the consumed cursor all survive, the
+        play loop PARKS instead of exiting, and ``resume_playback()`` replays
+        the exact remainder from the cursor.
+
+        Returns the cursor, or ``None`` when there was nothing to pause (so the
+        caller can report "nothing was playing" instead of pretending).
+        """
+        with self._gen_lock:
+            if (self._play_state not in ("playing", "ended")
+                    or not self._loops):
+                return None
+        cursor = self.spoke_bytes()
+        with self._ring_cv:
+            unplayed = len(self._utterance_pcm) - cursor
+            still_arriving = bool(self._ring) or not self._eof
+        if unplayed <= 0 and not still_arriving:
+            return None
+        with self._gen_lock:
+            if (self._play_state not in ("playing", "ended")
+                    or not self._loops):
+                return None
+            self._paused = True
+        # Wait for an in-flight device write to land before reading the cursor.
+        # The play loop re-checks ``_paused`` UNDER this lock, so once it is
+        # held no further byte can reach the device and the cursor is stable —
+        # which is what makes the resume replay exactly the unplayed remainder
+        # instead of duplicating a chunk the device had already taken. Bounded:
+        # a stalled device must not hang the control path.
+        acquired = self._device_lock.acquire(timeout=1.0)
+        try:
+            cursor = self.spoke_bytes()
+        finally:
+            if acquired:
+                self._device_lock.release()
+        with self._gen_lock:
+            self._pause_cursor = cursor
+        # Cut what the device has ALREADY buffered, so the audio stops now
+        # rather than after the PortAudio buffer drains. ``write()`` restarts
+        # the stream on resume (``ensure_started``), so this is reversible.
+        self._cut_device()
+        with self._ring_cv:
+            self._ring_cv.notify_all()
+        return cursor
+
+    def paused(self):
+        """True while this actor is parked in a resumable pause."""
+        with self._gen_lock:
+            return self._paused
+
+    def _cut_device(self):
+        stream = self._stream
+        if stream is None:
+            return
+        try:
+            cut = getattr(stream, "abort", None)
+            if callable(cut):
+                cut()
+            else:
+                stream.stop()
+        except Exception:
+            pass
+
     # ── cursor / resume ────────────────────────────────────────────────
     def spoke_bytes(self):
         with self._ring_lock:
@@ -696,6 +818,20 @@ class AudioActor:
     def utterance_pcm(self):
         with self._ring_lock:
             return bytes(self._utterance_pcm)
+
+    def _requeue_for_resume(self, key, generation, pcm_bytes):
+        """Re-enqueue PCM that is ALREADY remembered on this utterance.
+
+        ``feed_chunk`` appends every accepted chunk to ``_utterance_pcm`` so the
+        cursor can be differenced against it. A resume re-enqueues a SLICE of
+        that same buffer, so it must NOT be appended a second time — otherwise
+        the utterance grows on every pause/resume cycle and the next cursor
+        points into duplicated audio.
+        """
+        with self._ring_cv:
+            self._ring.append(Chunk(key, generation, bytes(pcm_bytes)))
+            self._ring_cv.notify_all()
+        self._chunk_wait.set()
 
     def resume_from(self, from_byte=None):
         """Re-enqueue the CURRENT utterance's unplayed tail.
@@ -723,8 +859,54 @@ class AudioActor:
         chunks = [tail[i:i + self._chunk_bytes]
                   for i in range(0, len(tail), self._chunk_bytes)]
         for chunk in chunks:
-            self.feed_chunk(active, generation, chunk)
+            self._requeue_for_resume(active, generation, chunk)
         return len(tail)
+
+    def resume_playback(self):
+        """Continue a paused utterance from exactly where it stopped.
+
+        The play loop never exited on a pause, so there is no second playback
+        here to race with: this only lifts the park and re-queues the unplayed
+        tail into the ring the SAME loop is already draining. Returns True when
+        audio actually resumed.
+
+        Never raises: a resume is a control path, so a failure degrades to
+        "nothing to resume" rather than disturbing the caller.
+        """
+        try:
+            with self._gen_lock:
+                if not self._paused:
+                    return False
+            # [P1-07] Lift the park and re-feed the tail while HOLDING
+            # _device_lock: the play loop pops, decides and writes under that
+            # same lock, so no chunk from the pre-pause ring can slip out after
+            # the re-feed and be spoken a second time. Bounded, so a stalled
+            # device can never wedge the control path.
+            acquired = self._device_lock.acquire(timeout=1.0)
+            try:
+                with self._gen_lock:
+                    if not self._paused:
+                        return False
+                    cursor = self._pause_cursor
+                    self._paused = False
+                    self._pause_cursor = None
+                with self._ring_cv:
+                    was_eof = self._eof
+                requeued = self.resume_from(cursor)
+                if was_eof:
+                    # ``resume_from`` clears EOF so the tail can be re-queued,
+                    # but synthesis for this utterance was already complete —
+                    # restore it or the parked loop would wait for a producer
+                    # with nothing left to send and never finish the utterance.
+                    with self._ring_cv:
+                        self._eof = True
+                        self._ring_cv.notify_all()
+            finally:
+                if acquired:
+                    self._device_lock.release()
+            return requeued > 0
+        except Exception:
+            return False
 
 
 def audio_cache_key(model, reference_id, fmt, text):
@@ -773,6 +955,21 @@ def actor_play(on_chunk=None, stream=None, stream_factory=None):
 
 def actor_is_current(key, generation):
     return _actor._is_current(key, generation)
+
+
+def actor_pause():
+    """[P1-07] Pause the ONE owner's current utterance (resumable)."""
+    return _actor.pause()
+
+
+def actor_resume_playback():
+    """[P1-07] Replay a paused utterance's unplayed tail. True when it resumed."""
+    return _actor.resume_playback()
+
+
+def actor_is_paused():
+    """[P1-07] True while the ONE owner is parked in a resumable pause."""
+    return _actor.paused()
 
 
 def shutdown_actor():

@@ -247,14 +247,40 @@ class DeliveryTests(unittest.TestCase):
             vm.dispatch_control("approval_cancel")
         self.assertEqual(posted, ["/approvals/reset"])
 
-    def test_pause_asks_the_backend_to_keep_the_remainder(self):
+    def test_pause_is_local_when_this_process_owns_the_audio(self):
+        """[P1-07] A VOICE reply's audio lives HERE, so the pause happens here.
+
+        The old assertion — "pause asks the backend to keep the remainder" with
+        the local ``stop_speaking`` patched out — pinned the defect: for a voice
+        turn the backend's active stream is EMPTY, so the backend pause resumed
+        nothing while the real audio had already been stopped locally. Pause is
+        a LOCAL, non-destructive control now; the backend is only used when
+        nothing was playing here (see the next test).
+        """
         posted = []
 
         def fake_post(path, payload, timeout=2.5):
             posted.append(path)
             return True, {"resumable": True, "remaining_chars": 42}
 
-        with patch.object(vm, "_post_backend", side_effect=fake_post), \
+        with patch.object(vm, "pause_speaking", return_value=True) as pause, \
+             patch.object(vm, "_post_backend", side_effect=fake_post), \
+             patch.object(vm, "stop_speaking") as stop:
+            self.assertTrue(vm.dispatch_control("pause"))
+        pause.assert_called_once_with()
+        stop.assert_not_called()
+        self.assertEqual(posted, [])
+
+    def test_pause_falls_back_to_the_backend_owner(self):
+        """The BACKEND narrates typed-UI replies, so its pause still matters."""
+        posted = []
+
+        def fake_post(path, payload, timeout=2.5):
+            posted.append(path)
+            return True, {"resumable": True, "remaining_chars": 42}
+
+        with patch.object(vm, "pause_speaking", return_value=False), \
+             patch.object(vm, "_post_backend", side_effect=fake_post), \
              patch.object(vm, "stop_speaking"):
             self.assertTrue(vm.dispatch_control("pause"))
         self.assertEqual(posted, ["/speak/pause"])
@@ -266,7 +292,8 @@ class DeliveryTests(unittest.TestCase):
             posted.append(path)
             return True, {"resumed": True}
 
-        with patch.object(vm, "_post_backend", side_effect=fake_post):
+        with patch.object(vm, "resume_local_playback", return_value=False), \
+             patch.object(vm, "_post_backend", side_effect=fake_post):
             self.assertTrue(vm.dispatch_control("continue"))
         self.assertEqual(posted, ["/speak/resume"])
 

@@ -20,6 +20,7 @@ from backend.services.audio_actor import (
     actor_end,
     actor_feed,
     actor_is_current,
+    actor_is_paused,
     actor_play,
     audio_cache_key,
     make_sounddevice_factory,
@@ -510,7 +511,15 @@ def _play_pcm_through_actor(pcm_bytes, handle, ck=None, stream_factory=None,
     finally:
         if not failed and actor_is_current(key, generation):
             actor_end(key, generation)
-    done.wait(timeout=_drain_seconds(len(pcm_bytes), rate, channels))
+    # [P1-07] A pause parks the play loop WITHOUT ending the utterance, so the
+    # drain timeout has to be suspended while the actor is paused. Otherwise a
+    # pause longer than the drain budget would look exactly like a finished
+    # sentence, the caller would start the next one, and two play loops would
+    # write to the one device.
+    deadline = time.monotonic() + _drain_seconds(len(pcm_bytes), rate, channels)
+    while not done.wait(timeout=0.25):
+        if time.monotonic() > deadline and not actor_is_paused():
+            break
     if written.get("error") is not None:
         raise written["error"]
     return not failed

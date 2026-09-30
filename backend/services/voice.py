@@ -311,30 +311,89 @@ def stop_speaking(signal_ready=True):
 
 
 def pause_speaking():
-    """Stop the current playback but KEEP the remainder for a resume (F35).
+    """Pause the current playback while KEEPING the remainder resumable.
 
-    Distinct from ``stop_speaking()``: a pause makes the remaining narration
-    resumable (``listener_state.set_remaining``), so "continue" has a real
-    target instead of depending on whatever the stream happened to leave
-    behind. Returns True when there was something left to resume.
+    [P1-07] A TRUE pause, not a stop — that distinction is the whole point:
+
+      * the device stops immediately, because the actor's play loop is parked
+        and its already-buffered audio is cut;
+      * the byte POSITION is preserved (``pause()`` returns the cursor), so
+        "continue" replays the remainder of the interrupted chunk from exactly
+        where it stopped instead of re-synthesising it;
+      * the sentences still queued or buffered survive, because the generation
+        is deliberately NOT bumped (the old implementation called
+        ``stop_speaking()``, which is what made pause behave like stop).
+
+    Returns True when there was something to resume.
     """
+    speaker = get_active_stream()
+    paused = False
+    if speaker is not None:
+        try:
+            paused = bool(speaker.pause())
+        except Exception:
+            paused = False
+    else:
+        # No stream speaker owns this audio (a backend ``speak()`` reply, a task
+        # announcement): pause the ONE actor directly. This is also the path the
+        # backend process uses for typed-UI replies.
+        try:
+            paused = _pause_actor_playback() is not None
+        except Exception:
+            paused = False
     remaining = pending_speaking_text()
-    stop_speaking()
     if remaining:
         listener_state.set_remaining(remaining)
-        print(f"[VOICE] Speech paused — {len(remaining)} chars remain")
-        return True
-    print("[VOICE] Speech paused — nothing remained")
-    return False
+    if not paused and not remaining:
+        # Nothing was playing: a pause is a safe no-op and must NOT stop
+        # anything. Claiming success here is what turned "pause" into "stop".
+        print("[VOICE] Speech pause — nothing was playing")
+        return False
+    print(f"[VOICE] Speech paused — {len(remaining)} chars remain")
+    return True
+
+
+def resume_local_playback():
+    """Un-park locally paused audio. True when audio actually resumed.
+
+    Never starts a second playback: a pause leaves the actor's play loop PARKED,
+    so the resume is a replay of the unplayed tail into that same loop. The
+    speaker's gate is opened afterwards, which is what lets the reply carry on
+    with the sentences that were still queued.
+    """
+    resumed = False
+    try:
+        resumed = bool(_resume_actor_playback())
+    except Exception:
+        resumed = False
+    speaker = get_active_stream()
+    if speaker is not None:
+        try:
+            speaker.resume()
+        except Exception:
+            pass
+    return resumed
 
 
 def resume_speaking():
-    """Speak the text a pause (or an interruption) left unplayed (F35).
+    """Speak what a pause left unplayed (F35 / P1-07).
 
-    Returns the resumed text ("" when there was nothing to resume), so a
-    caller can report the truth instead of silently doing nothing.
+    Returns the resumed TEXT ("" when there was nothing), so a caller can report
+    the truth. Two shapes, in this order:
+
+    1. a byte-level pause: the parked play loop replays the remainder from its
+       cursor and the stream speaker's queue carries on. The text snapshot is
+       deliberately NOT re-spoken here — every queued sentence would then exist
+       twice (once in the snapshot, once in the speaker's queue);
+    2. nothing parked (nothing was mid-playback): the legacy path, which
+       re-speaks the stored remainder.
     """
+    audio_resumed = resume_local_playback()
     remaining = listener_state.pop_remaining()
+    if audio_resumed:
+        if remaining:
+            print(f"[VOICE] Resumed unplayed audio — {len(remaining)} chars still queued")
+        return remaining
     if not remaining:
         return ""
     print(f"[VOICE] Resuming {len(remaining)} chars of unplayed speech")
@@ -420,6 +479,25 @@ def _playback_is_active():
     """True while any engine in this process is playing audio."""
     with _state_lock:
         return bool(is_speaking)
+
+
+# ── [P1-07] pause / resume of the ONE playback owner ───────────────────
+#
+# The actor is a module singleton, so these are resolved lazily by name rather
+# than captured at import time (the same reason the TTS engines are resolved per
+# call): a test that patches the actor's pause keeps working, and a hoisted
+# reference cannot silently drive the real device.
+
+def _pause_actor_playback():
+    """Cut the device and park the play loop, keeping the cursor. None if idle."""
+    from backend.services.audio_actor import get_actor
+    return get_actor().pause()
+
+
+def _resume_actor_playback():
+    """Replay a paused utterance's unplayed tail. True when audio resumed."""
+    from backend.services.audio_actor import get_actor
+    return get_actor().resume_playback()
 
 
 def _prefetch_implementations():
@@ -647,6 +725,19 @@ class StreamSpeaker:
         self._first_chunk_enqueued = False
         self._worker = None
         self._queue = queue.Queue()
+        # [P1-07] A TRUE pause, distinct from ``close()``. Setting ``_paused``
+        # parks the worker before it starts the next chunk, so the queued and
+        # buffered sentences keep their place and the reply carries on from the
+        # same utterance when "continue" arrives. It is deliberately NOT a
+        # generation bump: that is what made the old pause behave like a stop.
+        self._paused = False
+        self._pause_cv = threading.Condition()
+        self._pause_cursor = None
+        #: [P1-07] The chunk the worker is HOLDING at the pause gate. It has
+        #: already left the queue, so a paused reply has to remember it here:
+        #: ``pending_text`` must not pretend the queue is empty, and "continue"
+        #: must play this exact chunk.
+        self._held_chunk = None
         # F31: the reasoning channel of this turn, preserved verbatim and
         # never handed to TTS (only final-answer text is narrated).
         self._reasoning = ""
@@ -805,6 +896,12 @@ class StreamSpeaker:
         pausing only takes away the DEVICE, it does not drop the text.
         """
         parts = []
+        with self._pause_cv:
+            held = self._held_chunk
+        if held:
+            # [P1-07] The chunk mid-playback (or held at the pause gate) has
+            # already left the queue but has not been spoken.
+            parts.append(str(held))
         with self._buffer_lock:
             buffered = self._buffer.strip()
         if buffered:
@@ -900,6 +997,84 @@ class StreamSpeaker:
         with self._queue.mutex:
             return any(item is not _STREAM_STOP for item in self._queue.queue)
 
+    # ── [P1-07] pause / resume ─────────────────────────────────────────
+
+    @property
+    def paused(self):
+        """True while this speaker is parked in a resumable pause."""
+        with self._pause_cv:
+            return self._paused
+
+    def pause(self):
+        """Pause this reply: keep the queue AND the playback position.
+
+        Returns True when there was something to resume. Distinct from
+        ``close()``/``stop_speaking()``: nothing is discarded and the generation
+        is not bumped, so the sentences already queued keep their place. The
+        actor is paused too, which cuts the device and parks its play loop at
+        the exact byte it had reached.
+        """
+        with self._pause_cv:
+            self._paused = True
+            self._pause_cv.notify_all()
+        cursor = None
+        try:
+            cursor = _pause_actor_playback()
+        except Exception:
+            cursor = None
+        with self._buffer_lock:
+            buffered = bool(self._buffer.strip())
+        queued = self._queue_has_audio()
+        with self._pause_cv:
+            self._pause_cursor = cursor
+        return bool(cursor is not None or buffered or queued)
+
+    def resume(self):
+        """Release a pause so the worker may start the next chunk.
+
+        The AUDIO is resumed by :func:`resume_local_playback` (the actor owns
+        the parked play loop); this only opens the worker's gate. Safe no-op
+        when nothing was paused.
+        """
+        with self._pause_cv:
+            if not self._paused:
+                return False
+            self._paused = False
+            self._pause_cv.notify_all()
+        return True
+
+    def _await_resume(self):
+        """Park while paused. Returns False when the reply must NOT continue.
+
+        False means a real STOP (not a resume) superseded the pause — the stop
+        bumped the generation, so the remainder must never be replayed and the
+        worker must not start the held chunk.
+        """
+        with self._pause_cv:
+            while (self._paused
+                   and not self._closed
+                   and _is_current_generation(self._generation)):
+                self._pause_cv.wait(0.05)
+            if not self._paused:
+                return True
+            # Still paused but this reply is gone (stopped or closed): drop the
+            # pause so a stale gate can never park the worker for good.
+            self._paused = False
+            return False
+
+    def _pass_pause_gate(self, sentence):
+        """Park at the pause gate while holding *sentence*. True when it may play.
+
+        [P1-07] The chunk has already left the queue, so it is remembered as the
+        HELD chunk: ``pending_text`` must be able to report it while paused.
+        """
+        with self._pause_cv:
+            self._held_chunk = sentence
+        allowed = self._await_resume()
+        with self._pause_cv:
+            self._held_chunk = None
+        return allowed
+
     def _reply_session_over(self):
         """True once this reply is COMPLETE and nothing is left to speak.
 
@@ -965,6 +1140,13 @@ class StreamSpeaker:
                     _current_text = sentence
                     listener_state.set_remaining("")
                     set_speaking_state(True)
+                # [P1-07] A paused reply starts no new chunk: the gate parks here
+                # until "continue", so the queue keeps its place and the next
+                # sentence never plays over the pause. A real STOP opens the gate
+                # with False (the generation moved on), and that chunk is
+                # deliberately dropped — a stop discards, a pause preserves.
+                if not self._pass_pause_gate(sentence):
+                    continue
                 _speak_chunk(sentence, self._generation, is_first_chunk=not self._played_first)
                 self._played_first = True
                 # [P1-06] The speaking flag means "Jarvis is mid-reply" for the
