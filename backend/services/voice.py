@@ -298,18 +298,57 @@ def warm_up_selected_tts():
         warm_up_fish_tts()
 
 
-def _prefetch_tts_audio(text):
+def _playback_is_active():
+    """True while any engine in this process is playing audio."""
+    with _state_lock:
+        return bool(is_speaking)
+
+
+def _prefetch_implementations():
+    """Engines that can warm themselves ahead of playback, by provider string.
+
+    Built per call, like `_cloud_tts_ladder`: the engine functions are resolved
+    from the module namespace when the prefetch happens, not captured at import.
+
+    A provider that is NOT in this map has no prefetch implementation, and the
+    correct behaviour then is to do nothing. Warming a different provider would
+    spend a metered call (Fish) and still leave the selected engine cold, so
+    "no-op" is the only safe fallback.
+    """
+    return {
+        "fish": prefetch_fish_audio,
+        "gtts": prefetch_google_tts,
+    }
+
+
+def _prefetch_tts_audio(text, plays_next=False):
     """Warm the engine that will actually speak the NEXT sentence.
 
     Prefetching the wrong engine wastes a synthesis call and leaves the real
-    one cold, so this follows the same selection as `_cloud_tts_ladder`.
+    one cold, so this follows the same selection as `_cloud_tts_ladder`. The
+    selection is resolved EXACTLY ONCE per call, so a settings change landing
+    mid-call cannot warm a different engine than the one that was chosen.
+
+    Every prefetch in this module goes through here (P1-09). A direct
+    ``prefetch_fish_audio`` call spends metered Fish credits even when Google
+    is the selected engine, and leaves the selected engine cold — so the only
+    Fish call this helper can make is the one the user asked for.
+
+    ``plays_next`` (P0-05) marks *text* as the sentence that will play as soon
+    as the worker is free. While nothing is playing that sentence must NOT be
+    prefetched: racing its own playback is what made the first sentence wait
+    for a full synthesis instead of streaming. Both halves of the rule live
+    here so that every caller inherits it, rather than each call site having
+    to remember it.
     """
     if not text or not str(text).strip():
         return
-    if _resolve_tts_provider() == "gtts":
-        prefetch_google_tts(text)
-    else:
-        prefetch_fish_audio(text)
+    if plays_next and not _playback_is_active():
+        return
+    warm = _prefetch_implementations().get(_resolve_tts_provider())
+    if warm is None:
+        return
+    warm(text)
 
 
 def _speak_chunk(chunk, generation, is_first_chunk=False):
@@ -397,7 +436,9 @@ def speak(text):
                 if not _is_current_generation(generation):
                     return
                 if index + 1 < len(chunks):
-                    prefetch_fish_audio(chunks[index + 1])
+                    # chunks[index] plays first, so the next chunk is never the
+                    # sentence about to play and is always safe to warm.
+                    _prefetch_tts_audio(chunks[index + 1])
                 _speak_chunk(chunk, generation, is_first_chunk=is_first_chunk)
                 is_first_chunk = False
 
@@ -635,25 +676,6 @@ class StreamSpeaker:
         parts.extend(str(item) for item in items if item)
         return " ".join(part for part in parts if part).strip()
 
-    def _prefetch_allowed(self, pending_ahead):
-        """[P0-05] True only when prefetching cannot delay the next sentence.
-
-        Prefetching the sentence that is ABOUT to play is what cost sentence 1
-        its streaming playback: if the prefetch thread claimed the in-flight
-        slot first, the playback thread became a waiter and could not start
-        until synthesis had FINISHED. So a sentence is only safe to prefetch
-        when it cannot be the next thing spoken — something is already playing,
-        or an earlier sentence is still queued ahead of it.
-
-        This is belt-and-braces: the joinable in-flight entry means losing the
-        race is no longer a penalty, but not starting the race at all is both
-        cheaper and obviously correct.
-        """
-        with _state_lock:
-            if self._active:
-                return True
-        return pending_ahead > 0
-
     def _enqueue(self, sentence):
         # Short first chunk optimization: cap first enqueued chunk to ~120 chars
         # Protect flag check+set under _buffer_lock for thread-safety
@@ -688,8 +710,7 @@ class StreamSpeaker:
                 pending_ahead = self._queue.qsize()
                 self._queue.put(first)
                 self._start_worker()
-                if self._prefetch_allowed(pending_ahead):
-                    _prefetch_tts_audio(first)
+                _prefetch_tts_audio(first, plays_next=(pending_ahead == 0))
             if remainder:
                 self._enqueue(remainder)
             return
@@ -704,11 +725,10 @@ class StreamSpeaker:
         self._start_worker()
         # Start synthesising this sentence now so the playback loop (which is
         # still speaking the previous one) finds it ready when its turn comes.
-        # [P0-05] ...but never while the worker is idle: this sentence is then
-        # the one about to play, and a prefetch racing its own playback is
-        # exactly what made sentence 1 wait for full synthesis.
-        if self._prefetch_allowed(pending_ahead):
-            prefetch_fish_audio(sentence)
+        # [P0-05] The "is this the sentence about to play?" half of the rule is
+        # passed in; `_prefetch_tts_audio` owns the decision, so the engine
+        # choice and the timing rule cannot drift apart.
+        _prefetch_tts_audio(sentence, plays_next=(pending_ahead == 0))
 
     def _start_worker(self):
         with _state_lock:

@@ -207,15 +207,34 @@ class PrefetchRaceRegressionTests(unittest.TestCase):
                          "the whole sentence must reach the device, once")
 
     def test_only_one_synthesis_is_requested_for_the_joined_sentence(self):
-        """Losing the race must still not buy a second TTS call."""
-        response = _StreamedResponse([PCM_A, PCM_B])
-        with _Harness(response) as harness:
-            fish_mod.prefetch_fish_audio(TEXT)
-            self.assertTrue(_wait_until(
-                lambda: fish_mod._pcm_cache_key(TEXT) in fish_mod._in_flight))
-            result = fish_mod._do_pcm_stream(TEXT, play=True)
+        """Losing the race must still not buy a second TTS call.
 
-        self.assertTrue(result)
+        The synthesis is gated open only after the player has already started,
+        so "the prefetch is in flight when the player arrives" is deterministic
+        rather than a race the test can lose.
+        """
+        release = threading.Event()
+        response = _StreamedResponse([PCM_A, PCM_B], release, gate_after=1)
+        played = {}
+        try:
+            with _Harness(response) as harness:
+                fish_mod.prefetch_fish_audio(TEXT)
+                self.assertTrue(_wait_until(
+                    lambda: fish_mod._pcm_cache_key(TEXT) in fish_mod._in_flight))
+
+                def _play():
+                    played["result"] = fish_mod._do_pcm_stream(TEXT, play=True)
+
+                player = threading.Thread(target=_play, daemon=True)
+                player.start()
+                self.assertTrue(_wait_until(lambda: bool(harness.writes)),
+                                "the joined sentence must start playing")
+                release.set()
+                player.join(5.0)
+        finally:
+            release.set()
+
+        self.assertTrue(played.get("result"))
         self.assertEqual(harness.posts, 1,
                          "the prefetch and the player must share one synthesis")
 
@@ -323,7 +342,12 @@ class JoinableInflightTests(unittest.TestCase):
 
 
 class StreamingPrefetchRuleTests(unittest.TestCase):
-    """Rule (1): never prefetch the sentence that will play next, while idle."""
+    """Rule (1): never prefetch the sentence that will play next, while idle.
+
+    [P1-09] The rule now lives in `_prefetch_tts_audio`, so these tests let the
+    REAL helper run and intercept at the engine level: what is asserted is that
+    no engine synthesis is started, not which wrapper was called.
+    """
 
     def _speaker(self):
         speaker = voice_mod.StreamSpeaker()
@@ -333,41 +357,46 @@ class StreamingPrefetchRuleTests(unittest.TestCase):
 
     def test_the_first_sentence_is_never_prefetched_while_the_worker_is_idle(self):
         speaker = self._speaker()
-        with patch.object(voice_mod, "prefetch_fish_audio") as prefetch, \
-                patch.object(voice_mod, "_prefetch_tts_audio") as engine_prefetch:
+        with patch.object(voice_mod, "_resolve_tts_provider", return_value="fish"), \
+                patch.object(voice_mod, "prefetch_fish_audio") as fish_prefetch:
             speaker._enqueue("Sentence one.")
-            prefetch.assert_not_called()
-            engine_prefetch.assert_not_called()
+            fish_prefetch.assert_not_called()
 
             # The worker is now speaking sentence one, so sentence two cannot
             # be the next thing heard and is safe to synthesise ahead.
-            with voice_mod._state_lock:
-                speaker._active = True
-            speaker._enqueue("Sentence two.")
+            with patch.object(voice_mod, "is_speaking", True):
+                speaker._enqueue("Sentence two.")
 
-        prefetch.assert_called_once_with("Sentence two.")
+        fish_prefetch.assert_called_once_with("Sentence two.")
 
     def test_a_sentence_with_one_queued_ahead_is_still_prefetched(self):
         speaker = self._speaker()
-        with patch.object(voice_mod, "prefetch_fish_audio") as prefetch:
+        with patch.object(voice_mod, "_resolve_tts_provider", return_value="fish"), \
+                patch.object(voice_mod, "prefetch_fish_audio") as fish_prefetch:
             speaker._queue.put("already queued")
             speaker._enqueue("Sentence two.")
 
-        prefetch.assert_called_once_with("Sentence two.")
+        fish_prefetch.assert_called_once_with("Sentence two.")
 
-    def test_the_first_chunk_split_path_uses_the_same_rule(self):
+    def test_the_first_chunk_split_path_never_prefetches_the_piece_that_plays_first(self):
+        """The split path has two layers of "next", and the rule must hold.
+
+        The first piece plays immediately, so it must not be raced by a
+        prefetch. The remainder is enqueued *behind* it, so warming those chunks
+        is both safe and the point of the prefetch.
+        """
         speaker = self._speaker()
-        long_first = "First clause, " + ("filler words " * 12) + "and the end."
-        with patch.object(voice_mod, "prefetch_fish_audio") as prefetch, \
-                patch.object(voice_mod, "_prefetch_tts_audio") as engine_prefetch:
-            speaker._enqueue(long_first)
-            engine_prefetch.assert_not_called()
-            with voice_mod._state_lock:
-                speaker._active = True
-            speaker._enqueue("Second part, " + ("filler words " * 12) + "end.")
+        long_text = "First clause, " + ("filler words " * 12) + "and the end."
+        with patch.object(voice_mod, "_resolve_tts_provider", return_value="fish"), \
+                patch.object(voice_mod, "prefetch_fish_audio") as fish_prefetch:
+            speaker._enqueue(long_text)
 
-        self.assertTrue(engine_prefetch.called or prefetch.called,
-                        "a sentence that cannot play next is still prefetched")
+        first_piece = speaker._queue.queue[0]
+        warmed = [call.args[0] for call in fish_prefetch.call_args_list]
+        self.assertNotIn(first_piece, warmed,
+                         "the piece about to play must not be prefetched")
+        self.assertTrue(warmed,
+                        "chunks queued BEHIND the first piece are still warmed")
 
 
 if __name__ == "__main__":
