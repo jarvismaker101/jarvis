@@ -79,11 +79,15 @@ class PartialWindowTests(unittest.TestCase):
         if isinstance(transcript, (list, tuple)):
             remaining = list(transcript)
 
-            def local_whisper(_audio):
+            def local_whisper(_audio, timeout=None):
+                # [P0-04] The partial engine is called WITH a deadline: the
+                # no-deadline TypeError fallback was removed so an engine that
+                # cannot express one is never handed work it can hang on. The
+                # assertions in this file are unchanged.
                 text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
                 return text, "en"
         else:
-            def local_whisper(_audio):
+            def local_whisper(_audio, timeout=None):
                 return transcript, "en"
 
         class _Source:

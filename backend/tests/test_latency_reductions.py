@@ -13,6 +13,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import speech_recognition as sr
+
 from backend.core import brain
 from backend.services import echo_cancel, listener
 
@@ -167,14 +169,39 @@ class PartialWindowBoundTests(unittest.TestCase):
                          listener.PARTIAL_STT_TIMEOUT_SECONDS)
         self.assertLess(listener.PARTIAL_STT_TIMEOUT_SECONDS, 15.0)
 
-    def test_a_stub_without_a_timeout_kwarg_still_works(self):
-        """Many tests stub the engine with one arg; a partial must not error."""
-        def _one_arg(audio):
-            return "hello", "en"
+    def test_a_deadline_less_engine_is_never_called_without_one(self):
+        """[P0-04] CHANGED DELIBERATELY - this used to pin the opposite.
 
-        with patch.object(listener, "recognize_local_whisper", _one_arg):
-            self.assertEqual(listener._transcribe_partial(object()),
-                             ("hello", "en"))
+        The old code retried a ``TypeError`` with NO deadline ("many tests stub
+        the engine with one argument"), which is exactly what the audit orders
+        removed: an engine that cannot express a deadline must not be handed
+        work it can hang on. The partial is dropped instead, and the engine is
+        called exactly ONCE - with the deadline.
+        """
+        seen = []
+
+        def _engine(audio, timeout=None):
+            seen.append(timeout)
+            if timeout is None:
+                raise AssertionError("engine was called without a deadline")
+            raise TypeError("this engine cannot express a deadline")
+
+        with patch.object(listener, "recognize_local_whisper", _engine):
+            with self.assertRaises(TypeError):
+                listener._transcribe_partial(object())
+        # One call, and it carried the partial deadline: never a second,
+        # unbounded attempt.
+        self.assertEqual(seen, [listener.PARTIAL_STT_TIMEOUT_SECONDS])
+
+    def test_a_deadline_less_engine_does_not_break_the_partial_path(self):
+        """A partial that cannot be given a deadline is simply skipped."""
+        def _engine(audio, timeout=None):
+            raise TypeError("this engine cannot express a deadline")
+
+        with patch.object(listener, "recognize_local_whisper", _engine):
+            window = listener._emit_partial_window(
+                [sr.AudioData(b"\x00" * 320, 16000, 2)], "1", 1, 1500)
+        self.assertIsNone(window)
 
 
 class _Resp:
