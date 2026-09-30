@@ -43,9 +43,11 @@ import os
 import threading
 import time
 from collections import deque, namedtuple
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from backend.config import AEC_ENABLED
+from backend.services import local_auth
 
 try:  # pragma: no cover - config always provides these, but stay importable
     from backend.config import AEC_REMOTE_ENABLED, AEC_REMOTE_TIMEOUT
@@ -68,7 +70,22 @@ AEC_CACHE_TTL_SECONDS = float(os.getenv("JARVIS_AEC_CACHE_TTL", "0.25"))
 #: skipped without a request. This is the IDLE case, which is the common one:
 #: the transport is consulted per frame, so probing while Jarvis is silent
 #: costs a round trip per frame to learn "nothing is playing".
+#:
+#: [P1-04] The same interval now also bounds the idle RECOVERY probe (see
+#: ``RemoteAecTransport._idle_probe_due``). The old skip was a one-way latch:
+#: ``_last_fetch_ok_at`` only advanced on a successful NON-EMPTY fetch, and the
+#: skip is decided without a request, so once latched the transport could never
+#: ask again. A state that only the suppressed thing can exit is a dead
+#: transport - a backend-spoken reply (typed UI, async announcement) stayed
+#: uncancelled for the rest of the session. Idle is now a hint with a bounded
+#: re-check, not a gate.
 AEC_IDLE_SKIP_SECONDS = float(os.getenv("JARVIS_AEC_IDLE_SKIP", "1.5"))
+#: [P1-04] Circuit breaker. After this many consecutive failed fetches the
+#: transport stops dialling for the cooldown instead of paying a failing round
+#: trip on every captured frame.
+AEC_BREAKER_FAILURES = int(os.getenv("JARVIS_AEC_BREAKER_FAILURES", "3"))
+AEC_BREAKER_COOLDOWN_SECONDS = float(
+    os.getenv("JARVIS_AEC_BREAKER_COOLDOWN", "15"))
 
 
 class CaptureFrame(namedtuple("CaptureFrame",
@@ -349,7 +366,8 @@ class RemoteAecTransport:
     """
 
     def __init__(self, base_url=None, timeout=None, cache_seconds=None,
-                 idle_skip_seconds=None):
+                 idle_skip_seconds=None, breaker_failures=None,
+                 breaker_cooldown_seconds=None):
         if base_url is None:
             try:
                 from backend.config import BACKEND_PORT
@@ -358,26 +376,77 @@ class RemoteAecTransport:
                 base_url = "http://127.0.0.1:9999"
         self.base_url = base_url.rstrip("/")
         self.timeout = float(timeout or AEC_REMOTE_TIMEOUT)
+        # Existing keys are kept verbatim for backward compatibility; P1-04
+        # only ADDS keys (never renames or removes one).
         self.stats = {"fetches": 0, "hits": 0, "errors": 0,
                       "cache_hits": 0, "skipped_idle": 0,
-                      "last_age_seconds": None, "last_error": None}
+                      "last_age_seconds": None, "last_error": None,
+                      # [P1-04] additions
+                      "idle_reprobes": 0, "auth_failures": 0,
+                      "last_status": None, "circuit_skips": 0,
+                      "consecutive_failures": 0}
         # [PERF] This transport is consulted once per captured mic frame from
-        # inside the real-time capture loop. Two guards keep it from turning
-        # into a per-frame HTTP round trip (see _remote_is_idle):
-        #   * a short TTL cache - consecutive frames overlap the same rendered
-        #     audio, so one fetch can serve many frames;
+        # inside the real-time capture loop. Three guards keep it from turning
+        # into a per-frame HTTP round trip:
+        #   * a short TTL cache keyed on the mic window - consecutive frames
+        #     overlap the same rendered audio, so one fetch serves many frames;
         #   * an idle early-out - when nothing has been rendered recently there
-        #     is provably no reference to fetch, so the request is skipped.
+        #     is provably no reference to fetch, so the request is skipped;
+        #   * a circuit breaker - a failing endpoint is not re-dialled per frame.
+        #
+        # [P1-04] RESIDUAL RISK: the fetch is still SYNCHRONOUS on the capture
+        # hot path (AecSignalPath._cancel_once), so one request can cost up to
+        # ``AEC_REMOTE_TIMEOUT`` inside a real-time frame. Moving it off-thread
+        # interacts with P0-06 / P0-04 and the capture/playback ordering is not
+        # settled, so it is deliberately NOT done here. Instead the guards above
+        # make the fetch strictly rarer (bounded re-probe + windowed cache +
+        # breaker). Revisit when that ordering work lands.
         self._cache_ttl = float(
             cache_seconds if cache_seconds is not None else AEC_CACHE_TTL_SECONDS)
         self._idle_skip = float(
             idle_skip_seconds if idle_skip_seconds is not None
             else AEC_IDLE_SKIP_SECONDS)
+        self._breaker_limit = max(
+            1, int(breaker_failures if breaker_failures is not None
+                   else AEC_BREAKER_FAILURES))
+        self._breaker_cooldown = float(
+            breaker_cooldown_seconds if breaker_cooldown_seconds is not None
+            else AEC_BREAKER_COOLDOWN_SECONDS)
         self._cache_lock = threading.Lock()
         self._cache_pcm = b""
         self._cache_age = None
         self._cache_at = 0.0
+        #: [P1-04] The mic window the cached span was fetched FOR. Without this
+        #: the cache keyed on time alone and could serve a span rendered for one
+        #: mic window to a window at a different point on the timeline.
+        self._cache_mic_t_end = None
         self._last_fetch_ok_at = None
+        #: [P1-04] When the last idle recovery probe was issued.
+        self._last_idle_probe_at = None
+        #: [P1-04] Monotonic time the breaker reopens at, plus the last reason
+        #: reported through state().
+        self._breaker_open_until = 0.0
+        self._reason = "never_fetched"
+
+    # ── circuit breaker ─────────────────────────────────────────────────
+    def _breaker_open(self, now):
+        return now < self._breaker_open_until
+
+    def _note_failure(self, reason, status=None):
+        """Record a failed fetch; open the breaker once it trips."""
+        with self._cache_lock:
+            self._reason = reason
+            if status is not None:
+                self.stats["last_status"] = status
+            self.stats["consecutive_failures"] += 1
+            if self.stats["consecutive_failures"] >= self._breaker_limit:
+                self._breaker_open_until = (time.monotonic() +
+                                            self._breaker_cooldown)
+
+    def _note_success(self):
+        with self._cache_lock:
+            self.stats["consecutive_failures"] = 0
+            self._breaker_open_until = 0.0
 
     def _remote_is_idle(self, mic_t_end=None):
         """True when no rendered audio exists near *mic_t_end* to cancel against.
@@ -387,6 +456,14 @@ class RemoteAecTransport:
         window the answer is necessarily empty. Probing costs a round trip on
         every frame, so the last successful non-empty fetch ages out into
         "idle" instead.
+
+        [P1-04] This is now only a HINT, never a gate: the caller still
+        re-probes on a bounded cadence (see :meth:`_idle_probe_due`). The old
+        behaviour was a one-way latch - ``_last_fetch_ok_at`` advanced only on
+        a successful NON-EMPTY fetch, while the skip is decided WITHOUT a
+        request, so once latched nothing could ever clear it. The transport
+        could not recover on its own and a backend-spoken reply (typed UI,
+        async announcement) stayed uncancelled for the rest of the session.
         """
         with self._cache_lock:
             last_ok = self._last_fetch_ok_at
@@ -397,54 +474,169 @@ class RemoteAecTransport:
             return False
         return (time.monotonic() - last_ok) > self._idle_skip
 
-    def fetch_reference(self, duration_seconds, mic_t_end=None):
-        """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``."""
-        now = time.monotonic()
+    def _idle_probe_due(self, now):
+        """At most ONE recovery probe per ``_idle_skip`` window while idle.
+
+        This is what makes the latch recoverable. The early-out still does the
+        bulk of the work (frames arrive every ~32ms, so most calls skip without
+        a request), but the transport always re-checks the renderer on its own
+        rather than waiting for playback that only it could detect.
+        """
         with self._cache_lock:
-            fresh = (self._cache_pcm
-                     and (now - self._cache_at) < self._cache_ttl)
-            if fresh:
+            last_probe = self._last_idle_probe_at
+        return last_probe is None or (now - last_probe) >= self._idle_skip
+
+    def _cache_is_usable(self, now, mic_t_end):
+        """Is the cached span still valid FOR THIS MIC WINDOW?
+
+        Three independent conditions. [P1-04] The cache used to key on time
+        since the fetch alone, so a span fetched for one mic window could be
+        served to a window at a different point on the timeline - a span must
+        never be replayed onto a different window.
+        """
+        with self._cache_lock:
+            if not self._cache_pcm:
+                return False
+            if (now - self._cache_at) >= self._cache_ttl:
+                return False
+            age, at, cached_window = (self._cache_age, self._cache_at,
+                                      self._cache_mic_t_end)
+        if age is not None:
+            # A span keeps ageing after it was fetched, so compare the age it
+            # will have NOW against the same drift bound that decides whether a
+            # reference is usable at all.
+            if (float(age) + (now - at)) > REFERENCE_MAX_DRIFT_SECONDS:
+                return False
+        if mic_t_end is not None and cached_window is not None:
+            if abs(float(mic_t_end) - float(cached_window)) > REFERENCE_MAX_DRIFT_SECONDS:
+                return False
+        return True
+
+    def fetch_reference(self, duration_seconds, mic_t_end=None):
+        """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``.
+
+        Never raises: any failure means "no reference", which the caller
+        reports as ``had_reference=False`` (an explicitly degraded state the
+        listener already handles).
+        """
+        try:
+            return self._fetch_reference(duration_seconds, mic_t_end)
+        except Exception as exc:  # pragma: no cover - last-resort guard
+            with self._cache_lock:
+                self.stats["errors"] += 1
+                self.stats["last_error"] = str(exc)
+                self._reason = "exception"
+            return b"", None
+
+    def _fetch_reference(self, duration_seconds, mic_t_end):
+        now = time.monotonic()
+        if self._cache_is_usable(now, mic_t_end):
+            with self._cache_lock:
                 self.stats["cache_hits"] += 1
                 return self._cache_pcm, self._cache_age
-        if self._remote_is_idle(mic_t_end):
+        if self._breaker_open(now):
             with self._cache_lock:
-                self.stats["skipped_idle"] += 1
+                self.stats["circuit_skips"] += 1
+                self._reason = "circuit_open"
             return b"", None
-        self.stats["fetches"] += 1
+        if self._remote_is_idle(mic_t_end):
+            # [P1-04] Bounded recovery probe. A latched "idle" must never be a
+            # state only the suppressed request could exit, so we re-check the
+            # renderer at most once per idle window.
+            if not self._idle_probe_due(now):
+                with self._cache_lock:
+                    self.stats["skipped_idle"] += 1
+                return b"", None
+            with self._cache_lock:
+                self._last_idle_probe_at = now
+                self.stats["idle_reprobes"] += 1
+        with self._cache_lock:
+            self.stats["fetches"] += 1
         url = (f"{self.base_url}/aec/reference"
                f"?seconds={max(0.0, float(duration_seconds or 0.0)):.3f}")
         try:
-            request = Request(url, method="GET")
+            # [P1-04] Auth. Every endpoint except GET /health is fail-closed
+            # behind X-Jarvis-Token (local_auth), so an unauthenticated fetch
+            # 401s, returns b"" and silently leaves every backend-spoken reply
+            # uncancelled. auth_headers() is the ONE authenticated client header
+            # set (F51) - the same call listener.py makes for POST /speak/stop.
+            request = Request(url, method="GET",
+                              headers=local_auth.auth_headers())
             with urlopen(request, timeout=self.timeout) as response:
+                status = (getattr(response, "status", None)
+                          or getattr(response, "code", None))
                 payload = json.loads(response.read().decode("utf-8") or "{}")
-        except Exception as exc:
-            self.stats["errors"] += 1
-            self.stats["last_error"] = str(exc)
+        except HTTPError as exc:
+            status = getattr(exc, "code", None)
+            with self._cache_lock:
+                self.stats["errors"] += 1
+                self.stats["last_error"] = f"HTTP {status}: {exc}"
+            if status in (401, 403):
+                # Never silently swallow an auth failure: it means the whole
+                # transport is dead, not that the reference is absent.
+                with self._cache_lock:
+                    self.stats["auth_failures"] += 1
+                self._note_failure("auth_failed", status=status)
+            else:
+                self._note_failure(f"http_{status}", status=status)
             return b"", None
+        except Exception as exc:
+            with self._cache_lock:
+                self.stats["errors"] += 1
+                self.stats["last_error"] = str(exc)
+            self._note_failure("transport_error")
+            return b"", None
+        # A well-formed answer proves the endpoint is reachable even when the
+        # span is empty ("nothing is playing"), so it clears the breaker.
+        self._note_success()
         pcm = payload.get("pcm_b64") or ""
         age = payload.get("age_seconds")
         if not pcm:
+            with self._cache_lock:
+                self._reason = "no_reference"
             return b"", None
         try:
             data = base64.b64decode(pcm)
         except Exception as exc:
-            self.stats["errors"] += 1
-            self.stats["last_error"] = str(exc)
+            with self._cache_lock:
+                self.stats["errors"] += 1
+                self.stats["last_error"] = str(exc)
+            self._note_failure("bad_payload")
             return b"", None
-        self.stats["hits"] += 1
-        self.stats["last_age_seconds"] = age
-        # [PERF] Only a NON-EMPTY span refreshes the cache and the idle timer:
-        # an empty answer means "nothing is playing", which is exactly the
-        # state the idle early-out is allowed to assume without asking.
+        try:
+            age = (None if age is None else float(age))
+        except Exception:
+            age = None
         with self._cache_lock:
+            self.stats["hits"] += 1
+            self.stats["last_age_seconds"] = age
+            self.stats["last_status"] = status
+            self._reason = "ok"
+            # Only a NON-EMPTY span refreshes the cache and the idle timer: an
+            # empty answer means "nothing is playing", which is exactly the
+            # state the idle early-out is allowed to assume without asking.
             self._cache_pcm = data
-            self._cache_age = (None if age is None else float(age))
+            self._cache_age = age
             self._cache_at = now
+            self._cache_mic_t_end = mic_t_end
             self._last_fetch_ok_at = now
-        return data, (None if age is None else float(age))
+        return data, age
 
     def state(self):
+        now = time.monotonic()
+        with self._cache_lock:
+            open_for = max(0.0, self._breaker_open_until - now)
+            reason = ("circuit_open" if open_for > 0.0 else self._reason)
+            consecutive = self.stats["consecutive_failures"]
         return {"url": self.base_url, "timeout": self.timeout,
+                # [P1-04] A distinct reason instead of pretending the reference
+                # is simply absent, so a dead transport is diagnosable from
+                # /aec/state alone.
+                "reason": reason,
+                "breaker": {"open": open_for > 0.0,
+                            "consecutive_failures": consecutive,
+                            "threshold": self._breaker_limit,
+                            "cooldown_remaining_seconds": round(open_for, 3)},
                 "stats": dict(self.stats)}
 
 

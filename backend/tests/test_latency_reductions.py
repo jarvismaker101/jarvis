@@ -9,6 +9,7 @@ No microphone, TTS engine, provider or subprocess is opened here.
 """
 
 import os
+import time
 import unittest
 from unittest.mock import patch
 
@@ -216,7 +217,18 @@ class AecTransportCacheTests(unittest.TestCase):
                          "one fetch should serve three overlapping frames")
         self.assertEqual(t.stats["cache_hits"], 2)
 
-    def test_idle_period_skips_the_request_entirely(self):
+    def test_idle_latch_is_recoverable_not_permanent(self):
+        """[P1-04] Idle is a hint with a bounded re-probe, NOT a one-way latch.
+
+        This assertion deliberately CHANGED. It used to pin the buggy
+        behaviour ("idle -> no request at all", asserted with
+        ``idle_skip_seconds=0.0``). That latch was unrecoverable by
+        construction: ``_last_fetch_ok_at`` only advanced on a successful
+        NON-EMPTY fetch, while the skip was decided without a request, so once
+        latched the transport could never ask again and a backend-spoken reply
+        stayed uncancelled for the rest of the session. See the PERF intent
+        preserved in test_idle_burst_costs_at_most_one_recovery_probe.
+        """
         t = self._transport(cache_seconds=0.0, idle_skip_seconds=0.0)
         calls = []
 
@@ -227,7 +239,38 @@ class AecTransportCacheTests(unittest.TestCase):
         with patch.object(echo_cancel, "urlopen", _fake_urlopen):
             t.fetch_reference(0.03)      # first probe: playback still unknown
             t._last_fetch_ok_at -= 10.0  # pretend it went quiet long ago
-            t.fetch_reference(0.03)      # idle -> no request at all
-        self.assertEqual(len(calls), 1,
-                         "an idle window must not cost a round trip")
-        self.assertEqual(t.stats["skipped_idle"], 1)
+            t.fetch_reference(0.03)      # idle, but MUST re-probe eventually
+        self.assertEqual(len(calls), 2,
+                         "a latched idle must still recover by itself")
+        self.assertEqual(t.stats["idle_reprobes"], 1)
+        self.assertEqual(t.stats["skipped_idle"], 0)
+
+    def test_idle_burst_costs_at_most_one_recovery_probe(self):
+        """[P1-04] The PERF intent the old test was really about.
+
+        Recovery must not turn the hot path back into a per-frame round trip:
+        an idle BURST of frames costs at most one probe per idle window, and
+        the frames in between are still skipped without a request.
+        """
+        t = self._transport(cache_seconds=0.0, idle_skip_seconds=1.5)
+        calls = []
+        playing = {"on": True}
+
+        def _fake_urlopen(request, timeout=None):
+            calls.append(1)
+            # Only a NON-EMPTY span refreshes _last_fetch_ok_at, so playback
+            # must be observed once before idle can ever latch.
+            return _Resp({"pcm_b64": "QUJD" if playing["on"] else "",
+                          "age_seconds": 0.0 if playing["on"] else None})
+
+        with patch.object(echo_cancel, "urlopen", _fake_urlopen):
+            t.fetch_reference(0.03)              # playback observed
+            playing["on"] = False                # playback stops
+            t._last_fetch_ok_at = time.monotonic() - 10.0   # latched idle
+            for _ in range(30):           # a burst of captured frames
+                t.fetch_reference(0.03)
+        # 1 first probe + exactly 1 recovery probe, not 1 per frame.
+        self.assertEqual(len(calls), 2,
+                         "an idle burst must not cost a round trip per frame")
+        self.assertEqual(t.stats["idle_reprobes"], 1)
+        self.assertEqual(t.stats["skipped_idle"], 29)
