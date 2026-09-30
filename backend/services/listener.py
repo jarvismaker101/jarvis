@@ -10,10 +10,13 @@ import webrtcvad
 from backend import listener_state
 from backend.services import model_registry
 from backend.services.audio_input import (
+    AEC_CAPTURE_RATE as _AEC_CAPTURE_RATE,
     FIXED_IDLE_ENERGY_THRESHOLD,
     calibrate_recognizer,
     create_microphone,
     list_microphone_names,
+    mic_rate_state,
+    open_microphone_at_preferred_rate,
     resolve_microphone,
     resolve_working_microphone_index,
 )
@@ -29,6 +32,7 @@ from backend.services.transcription import (
 from backend.services.echo_cancel import (
     AEC_SAMPLE_RATE as _AEC_RATE,
     AEC_SAMPLE_WIDTH as _AEC_WIDTH,
+    StatefulResampler as _StatefulResampler,
     aec_state as _aec_state,
     begin_capture as _aec_begin_capture,
     cancelled_capture_frame as _aec_capture_frame,
@@ -160,15 +164,19 @@ def _get_microphone_source():
         if source is not None and getattr(source, "stream", None) is not None:
             return source
 
-        source = create_microphone(MIC_DEVICE_INDEX)
-        source.__enter__()
-        if source.stream is None:
+        # [P1-05] Open AT the AEC rate so a captured frame and an
+        # echo-cancelled frame share one rate and no join can mix them. A device
+        # that refuses it falls back to its native rate inside the helper - the
+        # capture must never be lost over a preferred rate, and
+        # ``_combine_audio_chunks`` guarantees one rate either way.
+        mic = open_microphone_at_preferred_rate(MIC_DEVICE_INDEX)
+        if mic is None or getattr(mic, "stream", None) is None:
             raise OSError(
                 f"Failed to open microphone (device index {MIC_DEVICE_INDEX}). "
                 "The device may be unavailable, disabled, or already in use."
             )
-        _microphone_source = source
-        return source
+        _microphone_source = mic
+        return mic
 
 
 def _reset_microphone_source():
@@ -416,10 +424,11 @@ def recognize_multilingual(audio):
     engine is the only engine tried, and if it fails the utterance simply
     returns no transcript — nothing is transmitted externally.
     """
-    # Selected listening engine (settings UI): resolved PER CALL from the
+    # [P1-05] Selected listening engine (settings UI): resolved PER CALL from the
     # registry so a switch takes effect on the very next phrase, no
     # restart. Any registry hiccup degrades to the shipped default
     # (Inworld first).
+    assert_single_rate_audio(audio)
     try:
         selected = model_registry.get_model_for_role("listening").get(
             "provider", "inworld"
@@ -519,16 +528,158 @@ def recognize_multilingual(audio):
     return None, None, None
 
 
+#: [P1-05] Counters so a mixed-rate capture is visible instead of silent.
+_rate_mismatch_reported = False
+_rate_mismatch_count = 0
+
+
+def assert_single_rate_audio(audio):
+    """[P1-05] THE single-point invariant for STT input.
+
+    Asserted in exactly one place - the front door of
+    ``recognize_multilingual`` - because that is where every engine is reached:
+    ``recognize_inworld`` builds its WAV from ``audio.sample_rate`` +
+    ``audio.get_wav_data()``, so a wrong label here silently corrupts the
+    upload (48 kHz PCM announced as 16 kHz plays back at a third of the speed).
+
+    Checks that the AudioData has one non-zero ``sample_rate``/``sample_width``
+    and that the duration implied by the byte length at that rate is finite and
+    non-negative - i.e. the label actually describes the bytes. Returns True /
+    False; never raises, because a capture must not die on a diagnostic.
+    """
+    try:
+        rate = int(getattr(audio, "sample_rate", 0) or 0)
+        width = int(getattr(audio, "sample_width", 0) or 0)
+        data = getattr(audio, "frame_data", b"") or b""
+    except Exception:
+        return False
+    if rate <= 0 or width <= 0:
+        print(f"[LISTENER] STT input has no usable rate (rate={rate} width={width})")
+        return False
+    if len(data) % width:
+        print(
+            f"[LISTENER] STT input is {len(data)} bytes, not a whole number of "
+            f"{width}-byte samples at {rate} Hz"
+        )
+        return False
+    return True
+
+
+def rate_mismatch_stats():
+    """[P1-05] Observability: how many joins have seen mixed rates."""
+    return {
+        "mixed_rate_joins": _rate_mismatch_count,
+        "mic_rate": mic_rate_state(),
+    }
+
+
+def _chunk_rates(chunks):
+    """Distinct ``(sample_rate, sample_width)`` pairs present in *chunks*."""
+    return {
+        (int(chunk.sample_rate or 0), int(chunk.sample_width or 0))
+        for chunk in chunks
+        if chunk and chunk.frame_data
+    }
+
+
 def _combine_audio_chunks(chunks):
+    """Join capture chunks into ONE ``sr.AudioData`` at a single known rate.
+
+    [P1-05] This used to ``b"".join`` whatever it was given and label the result
+    with the FIRST chunk's rate. That list is not homogeneous: ``_aec_filter_chunk``
+    returns an echo-cancelled frame at ``AEC_SAMPLE_RATE`` (16 kHz) when playback
+    overlapped it, but the ORIGINAL native-rate frame when it did not. Joining
+    16 kHz and 48 kHz bytes concatenates 1 second of audio with 1/3 second of
+    audio under one label - time-warped speech, and a duration wrong by up to 3x
+    that can make the transcript stabiliser treat the final transcript as stale.
+
+    Invariant enforced here, in the ONE place every STT call goes through: the
+    returned ``AudioData`` carries a single ``sample_rate`` that describes every
+    byte in it. Two layers uphold it:
+
+    1. The mic is opened at 16 kHz (route (a), ``audio_input``), so in practice
+       native and AEC rates coincide and this is a no-op join.
+    2. If a device refused that rate, non-16 kHz chunks are resampled up with the
+       SAME ``StatefulResampler`` the AEC already uses for the mic side - reused,
+       not reimplemented.
+
+    If a chunk cannot be converted, this returns None rather than returning
+    audio it cannot describe correctly; callers already treat None as "no audio"
+    and fall back (e.g. the unfiltered ``chunks`` list).
+    """
+    global _rate_mismatch_reported, _rate_mismatch_count
+
     if not chunks:
         return None
 
-    first = chunks[0]
-    frame_data = b"".join(chunk.frame_data for chunk in chunks if chunk and chunk.frame_data)
-    if not frame_data:
+    usable = [chunk for chunk in chunks if chunk and chunk.frame_data]
+    if not usable:
         return None
 
-    return sr.AudioData(frame_data, first.sample_rate, first.sample_width)
+    rates = _chunk_rates(usable)
+    first = usable[0]
+    target_rate = int(first.sample_rate or 0)
+    target_width = int(first.sample_width or 0)
+    if target_rate <= 0 or target_width <= 0:
+        return None
+
+    if len(rates) == 1:
+        # Homogeneous: the original fast path, unchanged.
+        frame_data = b"".join(chunk.frame_data for chunk in usable)
+        return sr.AudioData(frame_data, target_rate, target_width) if frame_data else None
+
+    # Mixed rates (P1-05). Normalise everything to the AEC rate, which is what
+    # every STT engine here expects and what the AEC frames already are.
+    _rate_mismatch_count += 1
+    if not _rate_mismatch_reported:
+        _rate_mismatch_reported = True
+        print(
+            f"[LISTENER] Mixed capture rates {sorted(rates)} (further ones "
+            f"reported by count only) - normalising to {_AEC_RATE} Hz. The mic "
+            f"could not open at {_AEC_RATE} Hz."
+        )
+
+    try:
+        # One resampler PER SOURCE RATE, each streaming 48k->16k, so a stream
+        # split at any boundary is the whole-stream resample (seam-free). A
+        # single resampler built from the first chunk's rate would be wrong:
+        # if the first chunk is already 16 kHz it is a passthrough and would
+        # relabel 48 kHz bytes as 16 kHz - exactly the bug being fixed.
+        resamplers = {}
+        parts = []
+        for chunk in usable:
+            rate = int(chunk.sample_rate or 0)
+            width = int(chunk.sample_width or 0)
+            if rate <= 0 or width != _AEC_WIDTH:
+                # Cannot describe this chunk as AEC-format PCM: refuse rather
+                # than return audio whose label is a lie (P1-05 route (c)).
+                return None
+            if rate == _AEC_RATE:
+                parts.append(bytes(chunk.frame_data))
+                continue
+            resampler = resamplers.get(rate)
+            if resampler is None:
+                resampler = resamplers[rate] = _StatefulResampler(
+                    source_rate=rate,
+                    target_rate=_AEC_RATE,
+                    channels=1,
+                    sample_width=width,
+                )
+            converted = resampler.resample(bytes(chunk.frame_data))
+            if not converted:
+                # Too short to emit an output sample yet (the resampler needs
+                # its interpolation tail). Not an error - just no bytes.
+                continue
+            parts.append(converted)
+        frame_data = b"".join(parts)
+    except Exception as exc:
+        # Never fail a capture over telemetry-grade repair of the audio.
+        print(f"[LISTENER] Rate normalisation failed: {exc}")
+        return None
+
+    if not frame_data:
+        return None
+    return sr.AudioData(frame_data, _AEC_RATE, _AEC_WIDTH)
 
 
 def _audio_duration_seconds(audio):

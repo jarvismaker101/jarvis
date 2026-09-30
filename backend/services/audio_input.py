@@ -109,10 +109,36 @@ def resolve_microphone():
     return None, "system default", "implicit-default"
 
 
-def create_microphone(device_index=None):
-    if device_index is None:
-        return sr.Microphone()
-    return sr.Microphone(device_index=device_index)
+#: [P1-05] The mic is opened AT the AEC rate so a captured frame and an
+#: echo-cancelled frame are the same rate and ``_combine_audio_chunks`` can
+#: never be handed a mix (joining two rates time-warps the audio - bad STT and
+#: a wrong duration). 16 kHz is also what every STT engine downstream wants,
+#: so this removes a resample instead of adding one.
+#:
+#: Some Windows devices REFUSE a requested rate. That must never lose the mic,
+#: so every open falls back to the device's native rate and the rate-safe join
+#: in the listener becomes the safety net (the two layers are complementary,
+#: not either/or).
+try:
+    from backend.services.echo_cancel import AEC_SAMPLE_RATE as AEC_CAPTURE_RATE
+except Exception:  # pragma: no cover - keep audio_input importable standalone
+    AEC_CAPTURE_RATE = 16000
+
+#: What the last successful open actually got. Observability for the P1-05
+#: fallback: a device that refuses 16 kHz is visible here instead of silently
+#: reintroducing mixed-rate chunks.
+_MIC_RATE = {"requested": AEC_CAPTURE_RATE, "granted": None, "refused": False}
+
+
+def mic_rate_state():
+    """Snapshot of the capture rate: requested, granted, and whether refused."""
+    return dict(_MIC_RATE)
+
+
+def create_microphone(device_index=None, sample_rate=None):
+    if sample_rate is None:
+        return sr.Microphone(device_index=device_index)
+    return sr.Microphone(device_index=device_index, sample_rate=int(sample_rate))
 
 
 _CANDIDATES_CACHE = None
@@ -165,6 +191,47 @@ def _device_label(index, names=None):
     return "default input device"
 
 
+def open_microphone_at_preferred_rate(device_index=None):
+    """Open (and ENTER) a microphone AT ``AEC_CAPTURE_RATE``.
+
+    Falls back to the device's native rate if the preferred rate is refused.
+    Returns the ENTERED ``sr.Microphone`` (``stream`` is non-None) or None on
+    failure. Callers must NOT call ``__enter__`` again - ``sr.Microphone``
+    asserts it is not already inside a context manager.
+
+    ``sr.Microphone.__enter__`` swallows the open failure and leaves
+    ``stream is None``, so a device that refuses 16 kHz is detected here, not
+    raised. Falling back keeps the capture alive - P1-05's rate-safe join then
+    guarantees correctness at the native rate instead.
+    """
+    native = None
+    preferred = create_microphone(device_index, sample_rate=AEC_CAPTURE_RATE)
+    try:
+        preferred.__enter__()
+    except Exception:
+        preferred = None
+    if preferred is not None and getattr(preferred, "stream", None) is not None:
+        _MIC_RATE["granted"] = getattr(preferred, "SAMPLE_RATE", AEC_CAPTURE_RATE)
+        _MIC_RATE["refused"] = False
+        return preferred
+
+    # Refused (or raised): never lose the mic over a preferred rate.
+    _MIC_RATE["refused"] = True
+    print(
+        f"[MIC] Device refused {AEC_CAPTURE_RATE} Hz - capturing at its native "
+        f"rate; mixed-rate audio is resampled per frame instead"
+    )
+    try:
+        native = create_microphone(device_index)
+        native.__enter__()
+    except Exception:
+        return None
+    if getattr(native, "stream", None) is None:
+        return None
+    _MIC_RATE["granted"] = getattr(native, "SAMPLE_RATE", None)
+    return native
+
+
 def _enter_microphone(preferred_index, fallback):
     """Open the first usable microphone; returns (microphone, source)."""
     now = time.monotonic()
@@ -180,8 +247,15 @@ def _enter_microphone(preferred_index, fallback):
 
     names = list_microphone_names()
     for index in candidates:
-        microphone = create_microphone(index)
-        source = microphone.__enter__()
+        # [P1-05] Try the AEC rate FIRST so native and AEC rates coincide; a
+        # device that refuses it falls back to native inside the helper. The
+        # mic is returned ALREADY ENTERED, so it is used as-is here.
+        microphone = open_microphone_at_preferred_rate(index)
+        if microphone is None:
+            if preferred_index is not None and index == preferred_index:
+                _PREFERRED_BLOCKED_UNTIL[preferred_index] = now + _PREFERRED_BLOCKED_SECONDS
+            continue
+        source = microphone
         if source is not None and source.stream is not None:
             if index != preferred_index and _REPORTED_FALLBACK_SWITCH.get(
                 preferred_index
