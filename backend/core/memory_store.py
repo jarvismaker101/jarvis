@@ -49,6 +49,9 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
+import atexit
+from collections import deque
 
 try:
     from backend import config as _config
@@ -144,6 +147,29 @@ _ownership_declared = False
 COMMITMENT_MAX_ATTEMPTS = 4
 COMMITMENT_RETRY_BACKOFF = 30.0  # seconds; doubles per attempt
 COMMITMENT_CLAIM_TIMEOUT = 300.0  # a claim older than this is re-armed
+
+# ── P0-11: the bookkeeping write queue ───────────────────────────────────
+# The turn's F07 bookkeeping (open the request, record the event, record the
+# result) used to run its SQLite commits on the REQUEST thread, before the
+# first delta reached the user. It now runs on ONE background writer thread.
+#
+# The queue is a strictly ordered FIFO of callables and it is BOUNDED: when it
+# is full the write runs on the calling thread instead. That is deliberate
+# backpressure — a slow disk must never silently discard a record, so the
+# caller pays rather than the store losing data.
+_WRITE_QUEUE_LIMIT = 512
+_write_queue = deque()
+_write_cv = threading.Condition()
+_write_pending = 0          # enqueued but not yet executed
+_writer_thread = None
+_writer_stop = threading.Event()
+_write_local = threading.local()
+#: Visibility for the audit: how the queue has behaved since process start.
+_write_failures = 0         # a write raised (logged, never surfaced)
+_write_refusals = 0         # F50 ownership refusal (write skipped, no raise)
+_write_inline = 0           # ran on the caller because the queue was full
+#: How long a reader waits for the queue to drain before draining it itself.
+_WRITE_BARRIER_TIMEOUT = 2.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -291,9 +317,217 @@ def assert_writer(owner="backend"):
     return True
 
 
+# ── P0-11: the write queue ───────────────────────────────────────────────
+def _writer_allowed(owner="backend"):
+    """F50 ownership check that can NEVER raise at the caller.
+
+    The lease is a real safety property (a second live surface must not write
+    the store), but it is BOOKKEEPING: a refusal has to skip the write and be
+    counted, not turn a user turn into an error. The authoritative re-check
+    happens on the writer thread, inside its own try (``_run_write``), which is
+    what actually protects the file.
+    """
+    global _write_refusals
+    try:
+        return bool(assert_writer(owner))
+    except Exception as exc:
+        _write_refusals += 1
+        logging.warning("[MEMORY] write refused (not the designated writer): %s",
+                        exc)
+        return False
+
+
+def _ensure_writer():
+    """Start the single bookkeeping writer thread on first use."""
+    global _writer_thread
+    if _writer_thread is not None and _writer_thread.is_alive():
+        return _writer_thread
+    with _write_cv:
+        if _writer_thread is None or not _writer_thread.is_alive():
+            _writer_stop.clear()
+            _writer_thread = threading.Thread(
+                target=_writer_loop, name="memory-writer", daemon=True)
+            _writer_thread.start()
+        return _writer_thread
+
+
+def _run_write(label, fn, args, kwargs):
+    """Execute one queued write. Never raises into the caller or the worker."""
+    global _write_failures
+    previous = getattr(_write_local, "in_write", False)
+    _write_local.in_write = True
+    try:
+        fn(*args, **kwargs)
+        return True
+    except Exception as exc:
+        _write_failures += 1
+        logging.warning("[MEMORY] %s write failed: %s", label, exc)
+        return False
+    finally:
+        _write_local.in_write = previous
+
+
+def _writer_loop():
+    """The single writer: strictly FIFO, so records can never be reordered."""
+    global _write_pending
+    while True:
+        with _write_cv:
+            while not _write_queue and not _writer_stop.is_set():
+                _write_cv.wait(0.25)
+            if not _write_queue:
+                if _writer_stop.is_set():
+                    return
+                continue
+            label, fn, args, kwargs = _write_queue.popleft()
+        # The ownership check runs HERE, on the thread that actually writes.
+        if _writer_allowed():
+            _run_write(label, fn, args, kwargs)
+        with _write_cv:
+            _write_pending -= 1
+            _write_cv.notify_all()
+
+
+def _enqueue_write(label, fn, *args, **kwargs):
+    """Queue one bookkeeping write. Blocks only when the queue is FULL."""
+    global _write_pending, _write_inline
+    if getattr(_write_local, "in_write", False):
+        # A queued write that queues another write (record_result -> event +
+        # close_request) runs inline: it is already on the writer thread.
+        return bool(_run_write(label, fn, args, kwargs))
+    _ensure_writer()
+    with _write_cv:
+        if len(_write_queue) >= _WRITE_QUEUE_LIMIT:
+            full = True
+        else:
+            _write_queue.append((label, fn, args, kwargs))
+            _write_pending += 1
+            _write_cv.notify()
+            full = False
+    if full:
+        # Bounded queue full: apply backpressure on the caller instead of
+        # dropping the record (silent data loss is not acceptable).
+        _write_inline += 1
+        return bool(_run_write(label, fn, args, kwargs))
+    return True
+
+
+def flush_writes(timeout=None):
+    """Block until every queued write has executed. Returns True when drained.
+
+    Called by readers (see ``_write_barrier``), by ``configure``/``close`` — a
+    queued write must never land in the NEXT database — and at exit.
+    """
+    deadline = None if timeout is None else (time.monotonic() + timeout)
+    with _write_cv:
+        while _write_pending > 0:
+            if deadline is None:
+                _write_cv.wait(0.25)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _write_cv.wait(remaining)
+    return True
+
+
+def drain_pending_writes():
+    """Run everything still queued on THIS thread (shutdown / queue stalled).
+
+    Ordered, so the tail of the conversation is never written out of order.
+    Never raises.
+    """
+    global _write_pending
+    drained = 0
+    while True:
+        with _write_cv:
+            if not _write_queue:
+                return drained
+            label, fn, args, kwargs = _write_queue.popleft()
+        if _writer_allowed():
+            _run_write(label, fn, args, kwargs)
+        drained += 1
+        with _write_cv:
+            _write_pending = max(0, _write_pending - 1)
+            _write_cv.notify_all()
+
+
+def _write_barrier():
+    """Make a direct SQLite access wait for the queue to land first.
+
+    Every non-writer thread passes through here before touching the store, so
+    the store behaves as if the queue were synchronous for anything that reads
+    or writes it directly — the ordering guarantee (F07 links a result to the
+    request it belongs to) is preserved without putting the queue's own writes
+    on the request thread.
+    """
+    if _writer_thread is None:
+        return
+    if threading.current_thread() is _writer_thread:
+        return
+    if getattr(_write_local, "barrier", False):
+        return
+    if _write_pending <= 0:
+        return
+    _write_local.barrier = True
+    try:
+        if not flush_writes(timeout=_WRITE_BARRIER_TIMEOUT):
+            # The writer thread is gone or wedged: finish the work here rather
+            # than hanging the caller or dropping the record.
+            drain_pending_writes()
+    finally:
+        _write_local.barrier = False
+
+
+def write_queue_stats():
+    """P0-11 — the queue's counters, for telemetry and tests."""
+    with _write_cv:
+        pending = _write_pending
+    return {
+        "pending": pending,
+        "failures": _write_failures,
+        "refusals": _write_refusals,
+        "inline": _write_inline,
+        "writer_alive": bool(_writer_thread and _writer_thread.is_alive()),
+    }
+
+
+class read_without_barrier:
+    """P0-11 — read committed state WITHOUT draining the write queue.
+
+    Building the model prompt must not put a SQLite write back between
+    "message received" and "first delta": a prompt that is one turn behind on
+    BOOKKEEPING is correct (the recent-chat projection and the follow-up
+    context come from earlier, already-durable turns), while the delay would be
+    user-visible. Everything outside this block keeps read-your-writes.
+    """
+
+    def __enter__(self):
+        self._previous = getattr(_write_local, "barrier", False)
+        _write_local.barrier = True
+        return self
+
+    def __exit__(self, *_exc):
+        _write_local.barrier = self._previous
+        return False
+
+
+def _flush_at_exit():
+    """P0-11 — the tail of the turn must not die with the process."""
+    try:
+        if not flush_writes(timeout=1.0):
+            drain_pending_writes()
+    except Exception:
+        pass
+
+
+atexit.register(_flush_at_exit)
+
+
 def configure(path):
     """Point the store at *path* (tests use a tmp file). Reopens lazily."""
     global _db_path, _db_gen, _fts_ok, _ownership_declared
+    # P0-11: queued bookkeeping belongs to the database it was written against,
+    # so it is drained BEFORE the path is swapped.
     close()
     with _db_lock:
         _db_path = str(path)
@@ -308,8 +542,29 @@ def configure(path):
 
 
 def close():
-    """Close the current thread's cached connection (test teardown hook —
-    releases the SQLite file lock on Windows)."""
+    """Close the store's connections (test teardown hook — releases the SQLite
+    file lock on Windows).
+
+    P0-11: the writer thread owns a connection of its own, so closing only the
+    caller's would leave the database file locked (a tmp-file test could not
+    delete it). The writer is asked to close its own connection — through its
+    own queue, so it can never race one of its writes — after the queue has
+    been drained.
+    """
+    try:
+        if not flush_writes(timeout=_WRITE_BARRIER_TIMEOUT):
+            drain_pending_writes()
+        if _writer_thread is not None and _writer_thread.is_alive():
+            # Runs ON the writer thread: closes the connection it opened.
+            _enqueue_write("close_connection", _close_local_connection)
+            flush_writes(timeout=_WRITE_BARRIER_TIMEOUT)
+    except Exception:
+        pass
+    _close_local_connection()
+
+
+def _close_local_connection():
+    """Release THIS thread's cached connection (never raises)."""
     conn = getattr(_local, "conn", None)
     if conn is not None:
         try:
@@ -334,6 +589,11 @@ def default_db_path():
 
 def _conn():
     global _ownership_declared
+    # P0-11: read-your-writes — queued bookkeeping that precedes this access
+    # has to land first, whether this thread already holds a connection or is
+    # about to open one. Exempt: the writer thread itself (it IS the queue)
+    # and any call made while holding the queue open on this thread.
+    _write_barrier()
     if getattr(_local, "gen", None) != _db_gen or getattr(_local, "conn", None) is None:
         path = default_db_path()
         parent = os.path.dirname(path)
@@ -346,6 +606,13 @@ def _conn():
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        # P0-11: WAL + NORMAL is the durable-enough/fast pair — the journal is
+        # still written for a crash, only the per-commit fsync of FULL goes
+        # away, and this store is bookkeeping, not a ledger of record.
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
         except Exception:
             pass
         conn.execute("PRAGMA busy_timeout=5000")
@@ -1227,50 +1494,102 @@ def lookup_entity(key):
 
 
 # ── F07: work-event store ────────────────────────────────────────────────
+def _next_event_id():
+    """P0-11 — allocate an event id IN MEMORY so the write can be deferred.
+
+    The row still carries this id (``events.id`` is an INTEGER PRIMARY KEY, and
+    AUTOINCREMENT keeps ``sqlite_sequence`` at the high-water mark), so ids stay
+    monotonic and ordered exactly as before — the id is simply known one write
+    earlier. Cross-process collisions are impossible because only the
+    designated writer may write the store at all (F50).
+    """
+    global _event_id_seq
+    if _event_id_seq is None:
+        base = 0
+        try:
+            row = _conn().execute("SELECT MAX(id) FROM events").fetchone()
+            base = int(row[0] or 0) if row else 0
+        except Exception:
+            base = 0
+        _event_id_seq = itertools.count(base + 1)
+    return next(_event_id_seq)
+
+
+#: P0-11 — the in-memory event-id sequence (see ``_next_event_id``).
+_event_id_seq = None
+
+
+def _write_event_row(event_id, ts, kind, summary, detail_json, refs_json,
+                     request_id):
+    """Insert one event and its FTS mirror in ONE transaction (P0-11)."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO events (id, ts, kind, summary, detail, refs, "
+            "request_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, ts, kind, summary, detail_json, refs_json,
+             request_id),
+        )
+        _fts_insert(conn, "events", event_id, {"summary": summary})
+        # ONE commit for the row and its index (was two).
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def record_event(kind, summary, request_id=None, detail=None, refs=None):
     """Record one bounded, secret-masked event. *detail* may be any
     JSON-serialisable dict (stored redacted and clipped); *refs* is a
-    short list of artifact references. Returns the event id."""
+    short list of artifact references. Returns the event id.
+
+    P0-11: the masking and the id happen here (cheap, in memory); the SQLite
+    commit is queued to the store's single writer thread, so this never blocks
+    the request that is producing the user's answer.
+    """
     if not MEMORY_ENABLED:
         return None
-    # F50: only the designated writer of the store may add durable state.
-    assert_writer()
+    # F50: only the designated writer of the store may add durable state. A
+    # refusal skips the write and is counted — it must never fail the turn.
+    if not _writer_allowed():
+        return None
     kind = str(kind or "event").strip()[:40] or "event"
     summary = mask_secrets(str(summary or "").strip())[:EVENT_SUMMARY_MAX]
     if not summary:
         return None
-    try:
-        detail_json = None
-        if isinstance(detail, dict):
-            # F21: redact by KEY as well as by shape, and at any depth, before
-            # the detail is serialised. Text-shape masking alone let a
-            # {"password": "hunter2"} through into permanent memory.
+    detail_json = None
+    if isinstance(detail, dict):
+        # F21: redact by KEY as well as by shape, and at any depth, before
+        # the detail is serialised. Text-shape masking alone let a
+        # {"password": "hunter2"} through into permanent memory.
+        try:
             detail_json = mask_secrets(json.dumps(
                 redact_for_egress(detail), ensure_ascii=False,
                 default=str))[:EVENT_DETAIL_MAX]
-        elif detail:
-            detail_json = mask_secrets(str(detail))[:EVENT_DETAIL_MAX]
-        refs_json = None
-        if refs:
-            # F21: artifact references are stored verbatim by design, and a
-            # reference is exactly where a token gets smuggled into a URL.
-            refs_json = json.dumps(
-                [mask_secrets(str(r))[:160] for r in refs][:8],
-                ensure_ascii=False)
-        conn = _conn()
-        cur = conn.execute(
-            "INSERT INTO events (ts, kind, summary, detail, refs, "
-            "request_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), kind, summary, detail_json, refs_json,
-             str(request_id or "")[:60] or None),
-        )
-        conn.commit()
-        _fts_insert(conn, "events", cur.lastrowid, {"summary": summary})
-        conn.commit()
-        return cur.lastrowid
+        except Exception as exc:
+            logging.debug("[MEMORY] event detail dropped: %s", exc)
+            detail_json = None
+    elif detail:
+        detail_json = mask_secrets(str(detail))[:EVENT_DETAIL_MAX]
+    refs_json = None
+    if refs:
+        # F21: artifact references are stored verbatim by design, and a
+        # reference is exactly where a token gets smuggled into a URL.
+        refs_json = json.dumps(
+            [mask_secrets(str(r))[:160] for r in refs][:8],
+            ensure_ascii=False)
+    try:
+        event_id = _next_event_id()
     except Exception as exc:
-        logging.debug("[MEMORY] record_event failed: %s", exc)
+        logging.debug("[MEMORY] event id allocation failed: %s", exc)
         return None
+    _enqueue_write(
+        "record_event", _write_event_row, event_id, time.time(), kind, summary,
+        detail_json, refs_json, str(request_id or "")[:60] or None)
+    return event_id
 
 
 def recent_events(limit=20, kind=None):
@@ -2524,9 +2843,15 @@ _REQUEST_SEQ = itertools.count(1)
 
 
 def new_request_id(prefix="req"):
+    """P0-11 — request identity is generated IN MEMORY (pid + time + uuid).
+
+    It must never need a database round trip: the id is returned to the caller
+    before any durable write happens.
+    """
     digest = hashlib.sha1(
-        ("%s|%s|%s|%s" % (prefix, os.getpid(), time.time_ns(),
-                          next(_REQUEST_SEQ))).encode(
+        ("%s|%s|%s|%s|%s" % (prefix, os.getpid(), time.time_ns(),
+                             uuid.uuid4().hex,
+                             next(_REQUEST_SEQ))).encode(
             "utf-8", "replace")).hexdigest()
     return "%s-%s" % (prefix, digest[:12])
 
@@ -2569,27 +2894,45 @@ def _json_artifact_rows(artifacts):
                       ensure_ascii=False, default=str)
 
 
-def record_request(text, route=None, request_id=None, provenance=None,
-                   source="chat"):
-    """Record one IDENTIFIED request (F07). Returns its request_id."""
-    if not MEMORY_ENABLED:
-        return request_id
-    # F50: only the designated writer of the store may add durable state.
-    assert_writer()
-    rid = str(request_id or new_request_id())[:60]
-    body = mask_secrets(str(text or "").strip())[:EVENT_SUMMARY_MAX]
+def _write_request_row(rid, ts, route, body, provenance):
+    """P0-11 — the work_requests INSERT, on the writer thread."""
+    conn = _conn()
     try:
-        conn = _conn()
         conn.execute(
             "INSERT OR REPLACE INTO work_requests (request_id, ts, route, "
             "text, status, provenance, updated_at) VALUES (?, ?, ?, ?, "
             "'open', ?, ?)",
-            (rid, time.time(), str(route or "")[:60] or None, body,
-             mask_secrets(str(provenance or source))[:120], time.time()),
+            (rid, ts, str(route or "")[:60] or None, body,
+             mask_secrets(str(provenance or "chat"))[:120], ts),
         )
         conn.commit()
-    except Exception as exc:
-        logging.debug("[MEMORY] record_request failed: %s", exc)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def record_request(text, route=None, request_id=None, provenance=None,
+                   source="chat"):
+    """Record one IDENTIFIED request (F07). Returns its request_id.
+
+    P0-11: the identity is generated in memory and returned immediately; the
+    row and its work_request event are queued behind the turn's answer.
+    """
+    if not MEMORY_ENABLED:
+        return request_id
+    rid = str(request_id or new_request_id())[:60]
+    body = mask_secrets(str(text or "").strip())[:EVENT_SUMMARY_MAX]
+    # F50: only the designated writer of the store may add durable state. A
+    # refusal skips the write (counted), it never fails the turn — and the
+    # in-memory identity is still handed back, so the caller's flow is whole.
+    if not _writer_allowed():
+        _work_local.request_id = rid
+        return rid
+    _enqueue_write("record_request", _write_request_row, rid, time.time(),
+                   route, body, provenance or source)
     record_event("work_request", body or "(empty request)", request_id=rid,
                  detail={"route": route, "provenance": provenance,
                          "source": source})
@@ -2603,9 +2946,12 @@ def current_request_id():
 
 
 def begin_request(text, route=None, provenance=None):
-    """Start an identified request for the current thread (F07)."""
-    # F50: only the designated writer of the store may add durable state.
-    assert_writer()
+    """Start an identified request for the current thread (F07).
+
+    P0-11: this is the ONE bookkeeping call on the hot path — it runs before
+    the reply's first delta — so it does no SQLite work at all: the id is
+    generated in memory and the row/event are queued.
+    """
     return record_request(text, route=route, provenance=provenance)
 
 
@@ -2632,6 +2978,22 @@ def record_result(request_id, status, summary="", artifacts=None,
     return event_id
 
 
+def _write_suspension(rid, question, ts):
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE work_requests SET status = 'suspended', "
+            "summary = ?, updated_at = ? WHERE request_id = ?",
+            (mask_secrets(str(question or ""))[:300], ts, rid))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def record_suspension(request_id, question, checkpoint_id=None):
     """Record a SUSPENSION: the request stays open, waiting for the user (F07)."""
     if not MEMORY_ENABLED:
@@ -2642,30 +3004,21 @@ def record_suspension(request_id, question, checkpoint_id=None):
         request_id=rid,
         detail={"checkpoint_id": checkpoint_id, "status": "needs_input"})
     if rid:
-        try:
-            conn = _conn()
-            conn.execute(
-                "UPDATE work_requests SET status = 'suspended', "
-                "summary = ?, updated_at = ? WHERE request_id = ?",
-                (mask_secrets(str(question or ""))[:300], time.time(), rid))
-            conn.commit()
-        except Exception as exc:
-            logging.debug("[MEMORY] record_suspension failed: %s", exc)
+        # P0-11: queued, so it still lands AFTER the request row and its event.
+        _enqueue_write("record_suspension", _write_suspension, rid, question,
+                       time.time())
     return event_id
 
 
-def close_request(request_id, status, summary="", evidence=None,
-                  artifacts=None, engine=None, provenance=None):
-    """Mark a request terminal and store its structured artifacts (F07).
+def _write_close_request(rid, status, summary, evidence, artifacts, engine,
+                         provenance, ts):
+    """P0-11 — merge artifacts and close the request, on the writer thread.
 
-    Artifacts are merged, not overwritten: a run can report its report path
-    first and its sources later, and a follow-up needs both.
+    Runs as ONE queued step so the read-merge-write against ``work_requests``
+    cannot interleave with another queued write to the same row.
     """
-    rid = str(request_id or "")[:60]
-    if not rid or not MEMORY_ENABLED:
-        return False
+    conn = _conn()
     try:
-        conn = _conn()
         existing = conn.execute(
             "SELECT artifacts FROM work_requests WHERE request_id = ?",
             (rid,)).fetchone()
@@ -2685,7 +3038,7 @@ def close_request(request_id, status, summary="", evidence=None,
             "UPDATE work_requests SET status = ?, closed_at = ?, summary = ?, "
             "artifacts = ?, evidence = ?, provenance = ?, updated_at = ? "
             "WHERE request_id = ?",
-            (str(status or "unknown")[:40], time.time(),
+            (str(status or "unknown")[:40], ts,
              mask_secrets(str(summary or ""))[:600],
              json.dumps(merged[:_ARTIFACT_MAX], ensure_ascii=False,
                         default=str) if merged else None,
@@ -2693,13 +3046,32 @@ def close_request(request_id, status, summary="", evidence=None,
                          for e in (evidence or [])][:8], ensure_ascii=False)
              if evidence else None,
              mask_secrets(str(provenance or engine or ""))[:120] or None,
-             time.time(), rid),
+             ts, rid),
         )
         conn.commit()
-        return True
-    except Exception as exc:
-        logging.debug("[MEMORY] close_request failed: %s", exc)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def close_request(request_id, status, summary="", evidence=None,
+                  artifacts=None, engine=None, provenance=None):
+    """Mark a request terminal and store its structured artifacts (F07).
+
+    Artifacts are merged, not overwritten: a run can report its report path
+    first and its sources later, and a follow-up needs both.
+    """
+    rid = str(request_id or "")[:60]
+    if not rid or not MEMORY_ENABLED:
         return False
+    # P0-11: queued. The caller gets True for "accepted" — the merge happens on
+    # the writer thread, in order, right behind this request's own writes.
+    return _enqueue_write("close_request", _write_close_request, rid, status,
+                          summary, evidence, artifacts, engine, provenance,
+                          time.time())
 
 
 def _work_row(row):

@@ -73,3 +73,24 @@ def _warm_up_ollama_background():
         warm_up_ollama()
     except Exception as exc:
         logging.debug("Ollama warm-up skipped: %s", exc)
+
+
+@app.on_event("shutdown")
+def _flush_durable_state():
+    """P0-11 — a clean shutdown writes out what the background writers hold.
+
+    The debounced history snapshot and the bookkeeping queue are both flushed
+    here as well as from their ``atexit`` hooks: depending on how the process
+    is stopped, only one of the two paths is guaranteed to run.
+    """
+    try:
+        from backend.core import memory
+        memory.flush_history()
+    except Exception as exc:
+        logging.warning("[MEMORY] shutdown flush failed: %s", exc)
+    try:
+        from backend.core import memory_store
+        if not memory_store.flush_writes(timeout=2.0):
+            memory_store.drain_pending_writes()
+    except Exception as exc:
+        logging.warning("[MEMORY] shutdown write-queue flush failed: %s", exc)

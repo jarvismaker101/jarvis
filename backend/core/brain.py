@@ -1,3 +1,4 @@
+import contextlib
 import json
 import itertools
 import logging
@@ -1084,17 +1085,26 @@ def _memory_context_cached(user_message):
             return hit[1], hit[2]
     # Read OUTSIDE the lock: these are SQLite queries and must not serialise
     # two concurrent turns behind one another.
-    try:
-        mem_block = memory_store.memory_context(user_message)
-    except Exception:
-        mem_block = ""
-    # F07: a follow-up about EARLIER WORK gets the identified request's real
-    # outcome plus its artifact paths and sources — read from the persisted
-    # work-event store, so it survives a restart.
-    try:
-        work_block = memory_store.work_context(user_message)
-    except Exception:
-        work_block = ""
+    #
+    # [PERF] P0-11 — building the prompt happens on the way to the first delta,
+    # so it must not wait for the store's queued BOOKKEEPING writes (the open
+    # work_request row for THIS turn). A prompt one turn behind on bookkeeping
+    # is correct; a SQLite write between "message received" and "first delta"
+    # is not. Everything else keeps read-your-writes. A store stand-in without
+    # the guard (tests) simply reads normally.
+    _guard = getattr(memory_store, "read_without_barrier", None)
+    with (_guard() if callable(_guard) else contextlib.nullcontext()):
+        try:
+            mem_block = memory_store.memory_context(user_message)
+        except Exception:
+            mem_block = ""
+        # F07: a follow-up about EARLIER WORK gets the identified request's real
+        # outcome plus its artifact paths and sources — read from the persisted
+        # work-event store, so it survives a restart.
+        try:
+            work_block = memory_store.work_context(user_message)
+        except Exception:
+            work_block = ""
     with _memory_context_lock:
         if len(_memory_context_cache) > 64:
             _memory_context_cache.clear()

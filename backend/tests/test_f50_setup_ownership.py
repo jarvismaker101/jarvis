@@ -51,13 +51,26 @@ class MemoryOwnershipTests(unittest.TestCase):
                          "backend")
 
     def test_a_foreign_live_owner_blocks_writes(self):
+        """P0-11 — the refusal still blocks the write, but never the turn.
+
+        The lease protects the FILE; it is bookkeeping, so a refusal skips the
+        record and is counted instead of raising into the caller's turn (the
+        authoritative re-check now runs on the writer thread).
+        """
         istate.durable.claim(istate.RESOURCE_MEMORY, "voice-io")
         memory_store.configure(os.path.join(self._tmp.name, "mem.db"))
-        with self.assertRaises(istate.NotDurableOwner):
-            memory_store.record_event("kind", "a summary")
+        before = memory_store.write_queue_stats()["refusals"]
+        self.assertIsNone(memory_store.record_event("kind", "a summary"))
         # …and the refusal is not a transient state the store writes around.
-        with self.assertRaises(istate.NotDurableOwner):
-            memory_store.begin_request("hello")
+        rid = memory_store.begin_request("hello")
+        memory_store.flush_writes(timeout=2.0)
+        rows = memory_store._conn().execute(
+            "SELECT COUNT(*) FROM events").fetchone()[0]
+        self.assertEqual(rows, 0, "a refused write must not reach the store")
+        self.assertGreater(memory_store.write_queue_stats()["refusals"], before)
+        # The id is still handed back: identity is generated in memory, so a
+        # refused bookkeeping write cannot break the caller either.
+        self.assertTrue(str(rid or "").startswith("req-"))
 
 
 class SetupLaunchTests(unittest.TestCase):
