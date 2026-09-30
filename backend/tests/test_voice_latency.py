@@ -309,12 +309,18 @@ class VoiceLatencyTests(unittest.TestCase):
             fish_mod._in_flight.clear()
             result = fish_mod._do_pcm_stream("prebuf-test", play=True)
             self.assertTrue(result)
-            # blocksize and latency
-            self.assertEqual(captured_kwargs.get('blocksize'), 4096, "blocksize should be 4096")
-            self.assertEqual(captured_kwargs.get('latency'), 'high', "latency should be high")
+            # [P0-07] The default device is now ONE long-lived stream, shaped
+            # for low latency. blocksize 1024 / latency "low" measured ~10ms
+            # per sentence against a ~400ms hole with the old per-sentence
+            # 4096 / "high" device (which paid 25ms open + ~180ms warm-up
+            # before every sentence's first write).
+            self.assertEqual(captured_kwargs.get('blocksize'), 1024,
+                             "blocksize should be 1024")
+            self.assertEqual(captured_kwargs.get('latency'), 'low',
+                             "latency should be low")
             # every produced chunk was written by the actor
             self.assertEqual(events.count('write'), len(chunks), f"events={events}")
-            # also ensure samplerate/channels correct
+            # the PCM FORMAT is untouched by P0-07
             self.assertEqual(captured_kwargs.get('samplerate'), 44100)
             self.assertEqual(captured_kwargs.get('channels'), 1)
             self.assertEqual(captured_kwargs.get('dtype'), 'int16')
@@ -629,14 +635,18 @@ class VoiceLatencyTests(unittest.TestCase):
             fish_mod._in_flight.clear()
             result = fish_mod._do_pcm_stream("prebuf-test", play=True)
             self.assertTrue(result)
-            # blocksize and latency
-            self.assertEqual(captured_kwargs.get('blocksize'), 4096, "blocksize should be 4096")
-            self.assertEqual(captured_kwargs.get('latency'), 'high', "latency should be high")
+            # [P0-07] The default device is ONE long-lived stream shaped for
+            # low latency: 1024 / "low" instead of the per-sentence 4096 /
+            # "high" that paid 25ms open + ~180ms warm-up per sentence.
+            self.assertEqual(captured_kwargs.get('blocksize'), 1024,
+                             "blocksize should be 1024")
+            self.assertEqual(captured_kwargs.get('latency'), 'low',
+                             "latency should be low")
             # every produced chunk was written BY THE ACTOR (one owner): the
             # "2 writes before start()" dance is gone — pre-buffering is the
             # actor's bounded ring, and the stream is active from creation.
             self.assertEqual(events.count('write'), len(chunks), f"events={events}")
-            # also ensure samplerate/channels correct
+            # the PCM format is untouched by P0-07
             self.assertEqual(captured_kwargs.get('samplerate'), 44100)
             self.assertEqual(captured_kwargs.get('channels'), 1)
             self.assertEqual(captured_kwargs.get('dtype'), 'int16')

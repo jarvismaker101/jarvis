@@ -506,15 +506,44 @@ class StreamStartContractTests(unittest.TestCase):
                            "the format-specific factory must start its stream too")
         self.assertEqual(created[0].played(), pcm)
 
-    def test_the_device_is_released_after_the_utterance(self):
+    def test_a_caller_supplied_device_is_released_after_the_utterance(self):
+        """A device handed TO the actor is still torn down (F32).
+
+        [P0-07] The process-wide default device is deliberately long-lived now
+        and is covered by the test below. What must NOT change is that a device
+        the caller owns is released the moment the utterance ends.
+        """
         created = []
         actor = audio_actor.AudioActor()
 
         with patch.dict(sys.modules, {"sounddevice": _fake_sounddevice(created)}):
-            self._play(actor, b"\x00\x10" * 256)
+            self._play(actor, b"\x00\x10" * 256,
+                       stream_factory=audio_actor.make_sounddevice_factory())
 
         self.assertTrue(created[0].stopped and created[0].closed,
                         "a stream that is opened must also be stopped and closed")
+
+    def test_the_process_device_is_opened_once_and_released_by_shutdown(self):
+        """[P0-07] ONE device per process, not one per sentence or reply.
+
+        This is the P0-07 assertion that replaces the old per-sentence teardown
+        check for the default device: opening the speaker per sentence cost a
+        measured ~400ms hole between sentences of a reply.
+        """
+        created = []
+        actor = audio_actor.AudioActor()
+
+        with patch.dict(sys.modules, {"sounddevice": _fake_sounddevice(created)}):
+            for _ in range(3):                 # three sentences, one reply
+                self._play(actor, b"\x00\x10" * 256)
+            self.assertEqual(len(created), 1,
+                             "the device must be opened once, not per sentence")
+            self.assertFalse(created[0].closed,
+                             "the process device must outlive the sentence")
+            actor.shutdown()
+
+        self.assertTrue(created[0].closed,
+                        "shutdown must release the long-lived device")
 
     def test_a_write_lost_to_an_abort_is_not_reported_as_an_error(self):
         # Barge-in: the stop lands between the generation check and the write,

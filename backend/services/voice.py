@@ -158,14 +158,24 @@ def stop_speaking():
     except Exception:
         pass
 
+    # [P0-07] stop_fish_audio() already aborted the ONE shared playback actor.
+    # stop_google_tts drives that same actor, so asking it to abort again would
+    # cut the same device twice on every stop.
     try:
-        stop_google_tts()
+        stop_google_tts(abort_actor=False)
     except Exception:
         pass
 
+    # [P0-07] pyttsx3 owns its event loop on whichever thread called
+    # runAndWait(). Calling stop() from this (different) thread while no loop
+    # is running just queues a stale stop command that the NEXT utterance
+    # would consume - silencing a reply nobody asked to cancel. So only
+    # interrupt it when it is genuinely mid-loop. ``_inLoop`` is pyttsx3's own
+    # documented "running an event loop" flag.
     try:
-        if _engine is not None:
-            _engine.stop()
+        engine = _engine
+        if engine is not None and getattr(engine, "_inLoop", False):
+            engine.stop()
     except Exception:
         pass
 

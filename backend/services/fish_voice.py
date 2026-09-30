@@ -942,11 +942,16 @@ def speak_fish_audio(text, before_playback=None):
         return False
 
 
-def stop_fish_audio():
+def stop_fish_audio(abort_actor=True):
     global _current_playback
     # [F32] abort the single playback owner: stops THIS stream, drops its
     # ring and discards stale-generation PCM (never sd.stop() for everyone).
-    actor_abort()
+    #
+    # [P0-07] Both this and ``stop_google_tts`` drive the SAME actor, so
+    # ``voice.stop_speaking`` passes abort_actor=False for one of them rather
+    # than cutting the actor twice on every stop.
+    if abort_actor:
+        actor_abort()
     with _playback_lock:
         playback = _current_playback
 

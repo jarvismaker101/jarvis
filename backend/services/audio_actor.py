@@ -30,6 +30,7 @@ The module is hardware-free by construction: tests inject a recording
 [Fable-5 F32] "Give Playback One Real Owner".
 """
 
+import atexit
 import threading
 import time
 from collections import deque, namedtuple
@@ -58,6 +59,19 @@ FEED_TIMEOUT = 30.0
 #: sleep so an idle ring is never perceptible.
 PLAY_WAIT_FLOOR_SECONDS = 0.05
 
+#: [P0-07] Shape of the ONE long-lived output device.
+#:
+#: Measured on the machine's default output (a Bluetooth headset on MME,
+#: ``high_latency`` 0.18s): a per-sentence device open cost 25ms p50 and the
+#: first write paid a further ~180ms of warm-up, so every sentence boundary in
+#: a reply left an audible ~400ms hole. A stream that outlives a sentence
+#: removes the hole entirely (per-sentence cost fell to ~10ms p50).
+#:
+#: ``blocksize=1024`` with ``latency="low"`` is the shape that measured clean;
+#: measured alternatives are recorded in the P0-07 notes rather than guessed at.
+OUTPUT_BLOCKSIZE = 1024
+OUTPUT_LATENCY = "low"
+
 #: One immutable, generation-tagged chunk (F32). The generation travels with
 #: the bytes so a chunk produced for an old answer can never be written into a
 #: newer one, no matter how the ring is drained.
@@ -79,7 +93,8 @@ class SoundDeviceStream:
     """
 
     def __init__(self, samplerate=DEFAULT_SAMPLE_RATE, channels=DEFAULT_CHANNELS,
-                 device=None, blocksize=4096):
+                 device=None, blocksize=OUTPUT_BLOCKSIZE,
+                 latency=OUTPUT_LATENCY):
         import sounddevice as sd
 
         self._stream = sd.OutputStream(
@@ -88,7 +103,7 @@ class SoundDeviceStream:
             dtype="int16",
             device=device,
             blocksize=blocksize,
-            latency="high",
+            latency=latency,
         )
         # A blocking PortAudio output stream is opened in the STOPPED state,
         # and ``Pa_WriteStream`` rejects writes until it is started
@@ -97,10 +112,25 @@ class SoundDeviceStream:
         # be done explicitly here. Without this every ``write()`` raises and
         # NO audio is ever heard, whatever engine produced the PCM.
         self._stream.start()
+        #: [P0-07] A long-lived device is *aborted* on every barge-in, and
+        #: abort() leaves a PortAudio stream stopped - so the next utterance
+        #: must start it again before it can write. Tracking it here means the
+        #: reused stream can never be left in paStreamIsStopped.
+        self._started = True
+
+    def ensure_started(self):
+        """Start the stream if an abort left it stopped. Idempotent."""
+        if not self._started:
+            self._stream.start()
+            self._started = True
 
     def write(self, pcm_bytes):
         import numpy as np
 
+        # Defensive: a write to a stopped PortAudio stream is the one mistake
+        # that means NO audio at all, so never rely on the caller having
+        # restarted a reused device.
+        self.ensure_started()
         arr = np.frombuffer(pcm_bytes, dtype=np.int16)
         if arr.size:
             self._stream.write(arr)
@@ -110,12 +140,32 @@ class SoundDeviceStream:
             self._stream.stop()
         except Exception:
             pass
+        self._started = False
+
+    def abort(self):
+        """Discard buffered audio NOW instead of draining it.
+
+        ``stop()`` asks PortAudio to finish what is already buffered, so the
+        listener keeps hearing the tail of the sentence for as long as that
+        takes (measured at 221ms p50 on the default device - 270ms in an
+        earlier pass). ``abort()`` drops that buffer instead, which is what a
+        barge-in actually wants; the same device measured 10.7ms.
+        """
+        try:
+            self._stream.abort()
+        except Exception:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+        self._started = False
 
     def close(self):
         try:
             self._stream.close()
         except Exception:
             pass
+        self._started = False
 
 
 class RawPcmStream:
@@ -130,10 +180,20 @@ class RawPcmStream:
     def __init__(self, stream, channels=DEFAULT_CHANNELS):
         self._stream = stream
         self._channels = max(1, int(channels))
+        # The caller has already started this stream (see
+        # ``make_sounddevice_factory``); tracking it lets an abort be undone.
+        self._started = True
+
+    def ensure_started(self):
+        """Start the stream if an abort left it stopped. Idempotent."""
+        if not self._started:
+            self._stream.start()
+            self._started = True
 
     def write(self, pcm_bytes):
         import numpy as np
 
+        self.ensure_started()
         arr = np.frombuffer(pcm_bytes, dtype=np.int16)
         if self._channels > 1:
             usable = (arr.size // self._channels) * self._channels
@@ -149,12 +209,34 @@ class RawPcmStream:
             self._stream.stop()
         except Exception:
             pass
+        self._started = False
+
+    def abort(self):
+        """Discard buffered audio NOW instead of draining it (P0-07).
+
+        Same contract as :meth:`SoundDeviceStream.abort`: a barge-in must cut
+        the tail rather than wait for it to play out. Falls back to ``stop()``
+        when the wrapped stream has no ``abort()``.
+        """
+        cut = getattr(self._stream, "abort", None)
+        try:
+            if callable(cut):
+                cut()
+            else:
+                self._stream.stop()
+        except Exception:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+        self._started = False
 
     def close(self):
         try:
             self._stream.close()
         except Exception:
             pass
+        self._started = False
 
 
 def make_sounddevice_factory(device=None, samplerate=DEFAULT_SAMPLE_RATE,
@@ -187,6 +269,19 @@ def set_stream_factory(factory):
 
 def _default_stream_factory():
     return SoundDeviceStream()
+
+
+def _output_stream_binding():
+    """The callable ``sounddevice`` would create the device with right now.
+
+    Read per call rather than captured at import: a reloaded binding, or a test
+    injecting a fake, is a different device factory, and a stream opened by one
+    cannot be written through another.
+    """
+    import sys
+
+    module = sys.modules.get("sounddevice")
+    return getattr(module, "OutputStream", None)
 
 
 def get_stream_factory():
@@ -227,6 +322,24 @@ class AudioActor:
         self._chunk_wait = threading.Event()
         self._stop = threading.Event()
         self._stream = None
+
+        #: [P0-07] The ONE long-lived output device for this actor, opened
+        #: lazily on first playback and reused across sentences AND replies.
+        #: The production path uses the module singleton below, so this is one
+        #: device per process.
+        self._persistent = None
+        self._reopened = False
+        #: [P0-07] The ``sounddevice.OutputStream`` binding the cached device
+        #: came from. A device can only be written through the binding that
+        #: created it, so a swapped binding invalidates the cache rather than
+        #: being silently reused.
+        self._persistent_sd = None
+        #: [P0-07] Persistence applies only to the REAL default device. A
+        #: caller that injects a factory (or hands ``play()`` a stream) owns
+        #: that device's lifecycle, exactly as before - which is also what
+        #: keeps every existing test fake working unchanged.
+        self._owns_device = (stream_factory is None
+                             and self._factory is _default_stream_factory)
 
     # ── lifecycle ──────────────────────────────────────────────────────
     def begin(self, key):
@@ -342,6 +455,66 @@ class AudioActor:
         with self._ring_lock:
             return self._last_error
 
+    # ── the one long-lived device (P0-07) ──────────────────────────────
+    def _acquire_persistent_stream(self):
+        """Open the process device once, then hand back the same one forever.
+
+        Opened lazily on first playback so importing the module (or serving a
+        request that never speaks) never holds the speaker. A device that was
+        aborted by a barge-in is restarted here rather than reopened: a warm
+        restart measured ~10ms against ~25ms open + ~180ms first-write
+        warm-up, which is the whole point of keeping it.
+        """
+        binding = _output_stream_binding()
+        if self._persistent is not None and self._persistent_sd is not binding:
+            # The binding changed underneath the cached device, so it cannot be
+            # written through any more. Reopen against the current one rather
+            # than handing back a device from the previous binding.
+            self.shutdown()
+        stream = self._persistent
+        if stream is None:
+            stream = self._factory()
+            self._persistent = stream
+            self._persistent_sd = binding
+        stream.ensure_started()
+        return stream
+
+    def _reopen_persistent_stream(self):
+        """Replace a dead device exactly once. Returns None when it fails."""
+        old = self._persistent
+        self._persistent = None
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        try:
+            stream = self._factory()
+            stream.ensure_started()
+            self._persistent = stream
+            self._persistent_sd = _output_stream_binding()
+            return stream
+        except Exception as exc:
+            with self._ring_lock:
+                self._last_error = "output device reopen failed: %s" % (exc,)
+            return None
+
+    def shutdown(self):
+        """Release the long-lived device. Safe to call more than once."""
+        stream = self._persistent
+        self._persistent = None
+        self._persistent_sd = None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
     def play(self, on_chunk=None, stream=None, stream_factory=None):
         """Blocking play loop: drain arriving prefetched chunks in order.
 
@@ -352,17 +525,30 @@ class AudioActor:
         *stream_factory* is called HERE (on the playing thread) when no stream
         is supplied, so a caller with a specific format keeps its own device
         while the actor still owns the loop, the abort and the cursor.
+
+        [P0-07] When nobody supplies a device, the actor uses ONE long-lived
+        stream for the process instead of opening and closing the speaker per
+        sentence. A supplied *stream*/*stream_factory* still takes precedence
+        and is closed here exactly as before: the caller owns that device.
         """
+        owns_sentence_stream = stream is not None or stream_factory is not None
         if stream is not None:
             pass
         elif stream_factory is not None:
             stream = stream_factory()
+        elif self._owns_device:
+            stream = self._acquire_persistent_stream()
         else:
             stream = self._factory()
+        #: A reused device must outlive this call; only a per-sentence device
+        #: (a caller's, or the test-injected factory) is torn down in finally.
+        persistent = self._owns_device and not owns_sentence_stream
         self._stream = stream
         written = 0
         # [PERF] P1-19 — allow one first-write mark for THIS play loop.
         self._played_once = False
+        # [P0-07] One lazy device reopen is allowed per play loop.
+        self._reopened = False
         try:
             while True:
                 if self._play_state not in ("playing", "ended"):
@@ -415,7 +601,20 @@ class AudioActor:
                     # error for a stop the user asked for.
                     if self._play_state not in ("playing", "ended"):
                         break
-                    raise
+                    # [P0-07] On a reused device a write failure means the
+                    # device itself went away (headset unplugged, driver
+                    # reset). Reopen it ONCE and retry this chunk; anything
+                    # beyond that is surfaced rather than looped on.
+                    if persistent and not self._reopened:
+                        self._reopened = True
+                        fresh = self._reopen_persistent_stream()
+                        if fresh is None:
+                            raise
+                        stream = fresh
+                        self._stream = fresh
+                        stream.write(chunk.pcm)
+                    else:
+                        raise
                 written += len(chunk.pcm)
                 with self._ring_lock:
                     # Consumed-frame accounting: the cursor is where the
@@ -433,14 +632,19 @@ class AudioActor:
                 if callable(on_chunk):
                     on_chunk(chunk.pcm)
         finally:
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
+            # [P0-07] The long-lived device is deliberately NOT torn down here:
+            # that per-sentence open/close is exactly the ~400ms hole between
+            # sentences of one reply. It is released by shutdown() instead.
+            # Every caller-supplied device is still stopped and closed.
+            if not persistent:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             if self._stream is stream:
                 self._stream = None
         return written
@@ -451,6 +655,12 @@ class AudioActor:
         Never calls ``sd.stop()`` - other audio (earcons, other owners) is
         untouched. Returns the byte position the utterance reached before
         the abort, i.e. the spoken cursor for an accurate resume.
+
+        [P0-07] This CUTS rather than drains: ``stop()`` waits for PortAudio to
+        finish everything already buffered, so a barge-in kept playing the tail
+        of the sentence for ~221ms (measured) and blocked the caller for that
+        whole time. ``abort()`` discards the buffer (measured 10.7ms). Streams
+        without ``abort()`` - the test fakes - fall back to ``stop()``.
         """
         with self._gen_lock:
             self._play_state = "aborted"
@@ -458,10 +668,17 @@ class AudioActor:
         self._chunk_wait.set()
         stream = self._stream
         if stream is not None:
+            cut = getattr(stream, "abort", None)
             try:
-                stream.stop()
+                if callable(cut):
+                    cut()
+                else:
+                    stream.stop()
             except Exception:
-                pass
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
         with self._ring_cv:
             self._ring.clear()
             cursor = self._spoken_bytes
@@ -558,3 +775,18 @@ def actor_is_current(key, generation):
     return _actor._is_current(key, generation)
 
 
+def shutdown_actor():
+    """Release the process-wide output device (P0-07).
+
+    The device is held open for the life of the process on purpose, so it is
+    freed here rather than by the play loop. Never raises: this runs at
+    interpreter exit, where a raised exception is worse than a leaked handle
+    the OS is about to reclaim anyway.
+    """
+    try:
+        _actor.shutdown()
+    except Exception:
+        pass
+
+
+atexit.register(shutdown_actor)

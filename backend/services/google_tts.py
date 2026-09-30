@@ -420,13 +420,18 @@ def prefetch_google_tts(text):
     threading.Thread(target=synthesise_pcm, args=(text,), daemon=True).start()
 
 
-def stop_google_tts():
+def stop_google_tts(abort_actor=True):
     """Abort playback.
 
     Same single owner as Fish, so this is literally the same abort — the
     call exists so ``voice.stop_speaking`` reads symmetrically across
     engines rather than reaching into the Fish module for a Google stream.
+
+    [P0-07] ``abort_actor=False`` lets ``stop_speaking`` issue the one abort
+    that covers both engines instead of aborting the same actor twice.
     """
+    if not abort_actor:
+        return
     try:
         actor_abort()
     except Exception:
