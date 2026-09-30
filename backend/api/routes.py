@@ -116,7 +116,13 @@ def get_last_reply_interrupted():
 # (one snapshot, newest state_seq wins); /voice-state and /ui-state serve it
 # instead of this process's unrelated listener_state module copy.
 _published_voice: dict = {}
+#: [P1-15] The high-water mark of the publisher named by
+#: ``_published_voice_publisher``. A bare counter cannot be compared across
+#: publishers: the voice worker's sequence restarts at 1 on every launch, so a
+#: restarted worker's updates were all discarded as "old" and the UI stayed
+#: frozen. The mark is reset whenever the publisher identity changes.
 _published_voice_seq = 0
+_published_voice_publisher = ""
 _published_voice_lock = threading.Lock()
 
 # ── Screen answer state (for overlay) ──────────────
@@ -794,6 +800,27 @@ def get_voice_state():
     return state
 
 
+def _voice_state_publisher(payload: dict) -> str:
+    """[P1-15] Who is publishing this state stream?
+
+    The per-launch ``publisher_id`` is authoritative (a pid can be recycled);
+    ``owner`` (the F50 incarnation) and the pid are the fallbacks, and a
+    publisher that identifies itself in NO way keeps the legacy behaviour of
+    one global counter.
+    """
+    for key in ("publisher_id", "launch_id", "incarnation", "owner"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    pid = payload.get("publisher_pid") or payload.get("pid")
+    try:
+        if int(pid or 0):
+            return "pid:%d" % int(pid)
+    except (TypeError, ValueError):
+        pass
+    return ""
+
+
 @router.post("/voice-state/publish")
 def publish_voice_state(payload: dict):
     """G11 / F50 — the voice I/O worker publishes its real listening state.
@@ -803,10 +830,15 @@ def publish_voice_state(payload: dict):
     module copy. Publishing goes through the ONE intelligence-state registry
     (F50): the payload must name its owner incarnation, a stale generation's
     publish is REJECTED (never merged), and an expired snapshot is not served.
+
+    [P1-15] The out-of-order guard is scoped to ONE publisher: a slow update
+    from the same publisher is still refused, but a NEW publisher (a restarted
+    worker, whose counter starts again at 1) is accepted and resets the
+    baseline instead of being ignored forever.
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="state payload must be an object")
-    global _published_voice_seq
+    global _published_voice_seq, _published_voice_publisher
     owner = str(payload.get("owner") or payload.get("incarnation") or "").strip()
     generation = int(payload.get("generation") or 0)
     try:
@@ -817,7 +849,7 @@ def publish_voice_state(payload: dict):
             role, owner, {k: v for k, v in payload.items()
                           if k not in ("owner", "incarnation", "role",
                                        "generation", "state_seq")},
-            pid=int(payload.get("pid") or 0),
+            pid=int(payload.get("pid") or payload.get("publisher_pid") or 0),
             generation=generation or None,
         )
         if getattr(outcome, "accepted", True) is False:
@@ -827,7 +859,15 @@ def publish_voice_state(payload: dict):
         logging.debug("[VOICE-STATE] registry publish skipped: %s", exc)
     with _published_voice_lock:
         seq = int(payload.get("state_seq") or 0)
-        if seq and seq <= _published_voice_seq:
+        publisher = _voice_state_publisher(payload)
+        if publisher and publisher != _published_voice_publisher:
+            # A different publisher: its counters mean nothing here, so accept
+            # the update and start the ordering guard over from ITS baseline.
+            _published_voice_seq = 0
+            _published_voice_publisher = publisher
+        elif seq and seq <= _published_voice_seq:
+            # Same publisher, older (or repeated) frame: a slow update must
+            # never overwrite a newer one.
             return {"ok": True, "stale": True}
         _published_voice.clear()
         for key, value in payload.items():
@@ -839,6 +879,8 @@ def publish_voice_state(payload: dict):
             _published_voice_seq = seq
         if owner:
             _published_voice["owner"] = owner
+        if publisher:
+            _published_voice["publisher_id"] = publisher
     return {"ok": True}
 
 

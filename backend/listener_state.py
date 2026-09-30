@@ -22,6 +22,46 @@ _state_lock = threading.Lock()
 _last_user_started_at = 0.0
 _last_user_finished_at = 0.0
 
+#: [P1-15] Observers told that the listening state CHANGED. The voice worker
+#: registers one so a transition (listening -> thinking -> speaking) is
+#: published the moment it happens instead of waiting for its 1s heartbeat —
+#: that lag is what made the UI indicator feel untruthful.
+#:
+#: Hooks run OUTSIDE ``_state_lock`` and must be cheap and non-raising: the
+#: capture thread calls these setters, so a hook that blocks (a network POST)
+#: would put network latency directly on the audio path. The worker's hook only
+#: sets an event.
+_state_hooks = []
+
+
+def register_state_hook(hook):
+    """Register ``hook()`` for every state change. Returns the hook."""
+    if hook is None:
+        return None
+    with _state_lock:
+        if hook not in _state_hooks:
+            _state_hooks.append(hook)
+    return hook
+
+
+def unregister_state_hook(hook):
+    with _state_lock:
+        try:
+            _state_hooks.remove(hook)
+        except ValueError:
+            pass
+
+
+def _notify_state_hooks():
+    """Tell observers the state changed. Never raises, never holds the lock."""
+    with _state_lock:
+        hooks = list(_state_hooks)
+    for hook in hooks:
+        try:
+            hook()
+        except Exception:
+            pass
+
 
 def _clamp_threshold(value, minimum=80, maximum=_MAX_THRESHOLD):
     return max(minimum, min(int(value), maximum))
@@ -69,6 +109,8 @@ def set_speaking(speaking):
         _done_speaking.set()
         _apply_threshold(normal_threshold)
         print("[VOICE] Listening")
+    # [P1-15] Outside the lock: the publisher must see the new state at once.
+    _notify_state_hooks()
 
 
 def is_speaking():
@@ -79,7 +121,10 @@ def is_speaking():
 def set_thinking(thinking):
     global _thinking
     with _state_lock:
+        changed = _thinking != thinking
         _thinking = thinking
+    if changed:
+        _notify_state_hooks()
 
 
 def is_thinking():
@@ -99,7 +144,11 @@ def mark_user_speaking(speaking):
             _last_user_finished_at = now
             print("[TURN] User finished speaking")
 
+        changed = _user_speaking != speaking
         _user_speaking = speaking
+    if changed:
+        # [P1-15] "hearing" is a transition too: publish it immediately.
+        _notify_state_hooks()
 
 
 def is_user_speaking():
@@ -134,8 +183,12 @@ def get_voice_state():
 def set_voice_input_enabled(enabled):
     global _voice_input_enabled
     with _state_lock:
+        changed = _voice_input_enabled != bool(enabled)
         _voice_input_enabled = bool(enabled)
-        return _voice_input_enabled
+    if changed:
+        # [P1-15] A mute toggle is a visible state change: publish it now.
+        _notify_state_hooks()
+    return _voice_input_enabled
 
 
 def is_voice_input_enabled():

@@ -9,6 +9,7 @@ import re
 import glob
 import json
 import itertools
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -134,6 +135,24 @@ def backend_task_running():
 # ── Voice-state publisher (F50: publish, don't expose a module copy) ────────
 _voice_state_seq = 0
 
+#: [P1-15] A per-LAUNCH identity for this worker's state stream. The sequence
+#: counter restarts at 1 on every launch, so the backend cannot compare a new
+#: worker's numbers with the previous worker's high-water mark — it keyed on a
+#: bare integer, discarded everything from a restarted worker as "old", and the
+#: UI showed a frozen voice state until the counter climbed back past it. A
+#: fresh id makes the backend reset the baseline instead. (A pid alone is not
+#: enough: pids are recycled.)
+_VOICE_LAUNCH_ID = uuid.uuid4().hex
+
+#: [P1-15] Set whenever the listening state CHANGES (see listener_state's state
+#: hooks). The publisher waits on it, so a transition reaches the backend in
+#: milliseconds instead of up to a second — and the hook itself only sets an
+#: event, so nothing blocks the capture thread.
+_VOICE_STATE_DIRTY = threading.Event()
+#: The keep-alive cadence: still published every second when nothing changes, so
+#: a dead worker remains detectable.
+_VOICE_STATE_HEARTBEAT_SECONDS = 1.0
+
 #: [PERF] P1-19 — the voice turn whose marks are still being shipped to the
 #: backend. The submission carries the capture/STT marks; the playback
 #: boundaries land AFTER it (playback is still running when the request
@@ -198,28 +217,58 @@ def _ship_turn_marks():
             _latency.set_local_turn(None)
 
 
-def _publish_voice_state_loop():
-    """Publish this worker's real listening state to the backend every ~1s.
+def _on_voice_state_change():
+    """[P1-15] listener_state hook: wake the publisher NOW.
+
+    Runs on whatever thread changed the state — usually the capture thread —
+    so it must never do more than set an event. Publishing happens on the
+    publisher thread (see :func:`_publish_voice_state_loop`), which keeps the
+    HTTP round-trip off the audio path.
+    """
+    try:
+        _VOICE_STATE_DIRTY.set()
+    except Exception:
+        pass
+
+
+def _publish_voice_state_loop(stop_event=None):
+    """Publish this worker's real listening state to the backend.
+
+    [P1-15] A state CHANGE is published immediately (the hook above wakes this
+    loop), and the 1s tick remains as a keep-alive so a dead worker is still
+    detectable. Transitions used to wait for the tick, so the UI indicator
+    lagged real state by up to a second.
 
     [PERF] P1-19: the same cadence ships the current turn's late latency marks,
     and the snapshot carries the listener's AEC error count — that counter lives
     in THIS process (which owns the microphone), so the backend's /latency
     endpoint reads it from here instead of importing the listener module.
+
+    *stop_event* exists for tests (production runs it forever).
     """
     global _voice_state_seq
+    listener_state.register_state_hook(_on_voice_state_change)
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        # Clear BEFORE publishing: a change that lands during the POST then
+        # wakes the next iteration immediately instead of being lost.
+        _VOICE_STATE_DIRTY.clear()
         try:
             snapshot = listener_state.get_voice_state()
             _voice_state_seq += 1
             snapshot["state_seq"] = _voice_state_seq
             snapshot["publisher_pid"] = os.getpid()
+            # [P1-15] per-launch identity, so a RESTARTED worker is not judged
+            # against the previous worker's high-water mark.
+            snapshot["publisher_id"] = _VOICE_LAUNCH_ID
             snapshot["aec_errors"] = int(
                 getattr(_listener_module, "_aec_error_count", 0) or 0)
             _post_backend("/voice-state/publish", snapshot, timeout=1.0)
             _ship_turn_marks()
         except Exception:
             pass
-        time.sleep(1.0)
+        _VOICE_STATE_DIRTY.wait(_VOICE_STATE_HEARTBEAT_SECONDS)
 
 
 # ── Backend submission (F50: the utterance goes to the ONE runtime) ─────────
