@@ -1079,6 +1079,7 @@ function _renderModelsForRole(bodyEl, providerId, models, role) {
   else if (role === "browser_tool") cm = activeBrowserToolModel || {};
   else if (role === "listening") cm = activeListeningModel || {};
   else if (role === "planner") cm = activePlannerModel || {};
+  else if (role === "intent") cm = activeIntentModel || {};
   bodyEl.innerHTML = "";
   if (!models || !models.length) {
     const label = role === "chat" ? "no chat models available" : "no models available";
