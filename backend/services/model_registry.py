@@ -47,9 +47,17 @@ from urllib3.util.retry import Retry
 from backend.config import BASE_DIR, FIREWORKS_API_KEY, GEMINI_API_KEY
 from backend.config import FISH_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY
 from backend.services.gemini_client import GEMINI_CHAT_MODEL, GEMINI_MODEL
+# [F56] The local Ollama endpoint has ONE owner (ollama_client, the native
+# /api client the accessibility agent uses); this registry only appends the
+# /v1 suffix the generic OpenAI-compatible adapter speaks.
+from backend.services.ollama_client import OLLAMA_BASE_URL as _OLLAMA_BASE_URL
 from backend import config as _config
 
 SETTINGS_FILE = BASE_DIR / "data" / "jarvis_settings.json"
+
+#: [F56] Ollama's OpenAI-compatible surface — what the generic chat adapter
+#: (and the intent classifier's local hop) talk to.
+OLLAMA_OPENAI_BASE_URL = str(_OLLAMA_BASE_URL or "").rstrip("/") + "/v1"
 
 # Providers wired through environment keys (.env), not the settings file.
 ENV_PROVIDERS = {
@@ -61,6 +69,11 @@ ENV_PROVIDERS = {
     "openrouter": {"name": "OpenRouter"},
     "whisper": {"name": "Local Whisper"},
     "inworld": {"name": "Inworld STT"},
+    # [F56] The local Ollama server: models run on THIS machine. It needs no
+    # .env entry and no account, so it is registered as an env-style provider
+    # whose credential is a placeholder (see _credentials_from) and whose
+    # model list is whatever the local daemon reports.
+    "ollama": {"name": "Ollama (local)"},
 }
 
 # Per-role allowlist (env providers). Custom providers are allowed for every
@@ -74,7 +87,9 @@ _ROLE_ALLOWED_ENV = {
     # returning 7-45s+ (often >45s read timeouts) through the user's VPN relay
     # while openrouter answered the same model in ~1.4s, and the chat chain's
     # other leg (fireworks) is suspended. vision/browser_tool already allowed it.
-    "chat": {"gemini", "fireworks", "openrouter"},
+    # [F56] ollama: fully local chat (llama3.2 3B / qwen3 1.7B) — no key, no
+    # network, no cost, and immune to every cloud outage in this list.
+    "chat": {"gemini", "fireworks", "openrouter", "ollama"},
     # Two interchangeable voice engines: Fish (metered, high quality) and
     # Google Translate TTS (free, key-less) as the zero-cost fallback.
     "tts": {"fish", "gtts"},
@@ -85,6 +100,13 @@ _ROLE_ALLOWED_ENV = {
     # MUST be a model with native tool calling + structured output, so the
     # allowlist is narrow and capability-validated below.
     "planner": {"fireworks"},
+    # [F56] The intent classifier. Every message on the critical path goes
+    # through it, so it is the one role where a LOCAL model is a real win:
+    # these are the providers the router can already dispatch, plus ollama.
+    # Deliberately NOT custom-provider capable: a user-added gateway has no
+    # business on the first hop of every message, and the shipped cloud chain
+    # (see services/intent.py) stays as the fallback either way.
+    "intent": {"gemini", "fireworks", "groq", "openrouter", "ollama"},
 }
 _ROLE_ALLOWS_CUSTOM = {"chat", "vision", "browser_tool", "planner"}
 
@@ -103,7 +125,8 @@ _FISH_TTS_STATIC_MODELS = [
 ]
 
 # Roles that can be switched at runtime
-VALID_ROLES = {"chat", "tts", "vision", "browser_tool", "listening", "planner"}
+VALID_ROLES = {"chat", "tts", "vision", "browser_tool", "listening", "planner",
+               "intent"}
 
 _ROLE_STORAGE_KEY = {
     "chat": "chat_model",
@@ -112,6 +135,7 @@ _ROLE_STORAGE_KEY = {
     "browser_tool": "browser_tool_model",
     "listening": "listening_model",
     "planner": "planner_model",
+    "intent": "intent_model",
 }
 
 # ── F49 (G8): capability-aware selection ───────────────────────────────────
@@ -127,6 +151,10 @@ ROLE_CAPABILITIES = {
                                "vision_input")),
     "listening": frozenset(("speech_input",)),
     "planner": frozenset(("tool_calling", "structured_output", "streaming")),
+    # [F56] The classifier's verdict IS a JSON object the router parses, so
+    # structured output is the hard requirement. Streaming is deliberately NOT
+    # required: classification is one short non-streaming call.
+    "intent": frozenset(("structured_output",)),
 }
 
 # Capability names this module can reason about (used to validate explicit
@@ -160,6 +188,14 @@ PROVIDER_CAPABILITIES = {
     "gtts": frozenset(("audio_output",)),
     "whisper": frozenset(("speech_input",)),
     "inworld": frozenset(("speech_input",)),
+    # [F56] The local Ollama server speaks the OpenAI-compatible dialect, so
+    # the generic adapter carries it: streaming text, native tool calls and
+    # JSON structured output are adapter facts. VISION is deliberately NOT
+    # part of this floor — every model installed here today (llama3.2 3B,
+    # qwen3 1.7B, deepseek-coder) is text-only, and the ollama provider is not
+    # in the vision role's allowlist either, so a local text model can never
+    # be selected to answer a screen question.
+    "ollama": frozenset(("tool_calling", "structured_output", "streaming")),
 }
 
 # The capability set recorded with a user-added OpenAI-compatible provider
@@ -415,6 +451,18 @@ def _env_default_for_role(role):
         except Exception:
             mod = "accounts/fireworks/models/qwen3p7-plus"
         return {"provider": "fireworks", "model": mod}
+    if role == "intent":
+        # [F56] The registry default for the classifier must be the SHIPPED
+        # router's first hop (see services/intent.py), otherwise an install
+        # that never touched the new selector would start routing through a
+        # different hop. Imported lazily: intent.py reads this module.
+        try:
+            from backend.services.intent import DEFAULT_OPENROUTER_MODEL as _m
+            mod = str(_m or "").strip()
+        except Exception:
+            mod = ""
+        return {"provider": "openrouter",
+                "model": mod or "google/gemini-2.5-flash-lite"}
     return {"provider": "gemini", "model": GEMINI_CHAT_MODEL}
 
 
@@ -576,12 +624,24 @@ def _limits_for(provider, model, settings):
 def _reasoning_for(provider, model, capabilities):
     """Whether a reasoning control may be sent to this model, and which one.
 
-    Only the Fireworks adapter understands reasoning_effort today, and some
+    Two adapters understand ``reasoning_effort``: Fireworks, and the generic
+    OpenAI-compatible path when it points at a LOCAL Ollama server. Some
     Fireworks models (MiniMax / GLM) run their own default reasoning and
     reject the field — the same carve-out the browser agent ships.
     """
     pid = str(provider or "").strip().lower()
     model_id = str(model or "").lower()
+    if pid == "ollama":
+        # [F56] Measured on Ollama 0.34.4: the OpenAI-compatible surface
+        # IGNORES the native ``think`` field (and a ``/no_think`` marker) but
+        # honours reasoning_effort — "none" disables thinking (qwen3 1.7B:
+        # 2.2s -> 0.4s, and the first ANSWER token goes 1.41s -> 0.06s),
+        # while any enabling value turns it on. A model that cannot think
+        # (llama3.2) ACCEPTS "none" and 400s on every enabling value, so
+        # "none" is the only value that is safe for every installed model.
+        return {"supported": True, "param": "reasoning_effort", "effort": "none",
+                "reason": "local Ollama endpoint: reasoning_effort=none "
+                          "disables thinking"}
     if pid != "fireworks":
         return {"supported": False, "param": None, "effort": None,
                 "reason": "adapter does not carry reasoning controls"}
@@ -622,6 +682,10 @@ def _base_url_for(provider, settings):
     the provider has no OpenAI-compatible HTTP endpoint (native gemini, local
     whisper, fish/inworld audio APIs)."""
     pid = str(provider or "").strip()
+    if pid == "ollama":
+        # [F56] Local server, fixed endpoint (OLLAMA_OPENAI_BASE_URL derives
+        # from ollama_client's single source of truth).
+        return OLLAMA_OPENAI_BASE_URL
     if pid in _ENV_CHAT_URL_ATTRS:
         raw = str(getattr(_config, _ENV_CHAT_URL_ATTRS[pid], "") or "").strip()
         if raw.endswith("/chat/completions"):
@@ -660,6 +724,14 @@ def _credentials_from(provider, settings):
         return (None, None)
     if pid == "inworld":
         return (os.getenv("INWORLD_STT_API_KEY") or None, None)
+    if pid == "ollama":
+        # [F56] The local Ollama server has NO credential — but the generic
+        # OpenAI-compatible adapter (and brain's "a provider with no usable
+        # credentials fails closed" rule) needs a truthy key to send the
+        # request at all. Ollama ignores the Authorization value, so a
+        # placeholder keeps every other invariant intact instead of punching
+        # a keyless special case through the chat path.
+        return ("ollama-local", None)
     for p in _custom_providers_from(settings):
         if str(p.get("id") or "").strip() == pid:
             return (p.get("api_key") or None, _base_url_for(pid, settings))
@@ -1019,15 +1091,17 @@ def set_default_chat_model(provider, model):
 
 #: Canonical OpenAI-compatible chat endpoints for env providers that have
 #: one AND whose calls ride the generic openai-compat dispatch (openrouter,
-#: groq). The dedicated clients know their URLs privately; exposing them here
-#: lets the brain chat / browser tool carry an env-provider selection too —
-#: without moving the key out of .env into a custom provider record. Fireworks
-#: keeps base_url=None deliberately: it has its own full client and its tests
-#: pin that contract. [added 2026-09-23: chat via openrouter after the direct
-#: Gemini API became unusably slow behind the user's VPN relay]
+#: groq, ollama). The dedicated clients know their URLs privately; exposing
+#: them here lets the brain chat / browser tool carry an env-provider
+#: selection too — without moving the key out of .env into a custom provider
+#: record. Fireworks keeps base_url=None deliberately: it has its own full
+#: client and its tests pin that contract. [added 2026-09-23: chat via
+#: openrouter after the direct Gemini API became unusably slow behind the
+#: user's VPN relay; ollama added 2026-10-01 for local models]
 _ENV_PROVIDER_BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     "groq": "https://api.groq.com/openai/v1",
+    "ollama": OLLAMA_OPENAI_BASE_URL,
 }
 
 
@@ -1422,6 +1496,35 @@ def _list_openrouter_models(api_key):
     return models
 
 
+def _list_ollama_models():
+    """Models installed in the LOCAL Ollama daemon (GET /api/tags).
+
+    [F56] The list is what this machine actually has — the UI's promise is
+    "pick a model that will run", and this is the only honest source. Models
+    the daemon reports but that cannot answer a chat/intent call are dropped
+    (an embedding model may well be installed for another Jarvis feature; it
+    must not appear as a selectable brain). No key, no cloud call: a stopped
+    Ollama server raises a clean ModelRegistryError instead of an empty list.
+    """
+    from backend.services.ollama_client import OLLAMA_BASE_URL
+    data = _http_get_json(
+        str(OLLAMA_BASE_URL).rstrip("/") + "/api/tags", timeout=(2, 5))
+    models = []
+    for item in data.get("models", []) or []:
+        mid = str(item.get("name") or item.get("model") or "").strip()
+        if not mid:
+            continue
+        usable = model_capabilities_for("ollama", mid) & {
+            "streaming", "structured_output", "tool_calling"}
+        if not usable:
+            continue
+        models.append({"id": mid, "display": mid})
+    if not models:
+        raise ModelRegistryError(
+            "the local Ollama server reports no chat-capable models installed")
+    return models
+
+
 def _list_groq_models(api_key):
     """Groq models — static known list (no public list API)."""
     if not api_key:
@@ -1485,6 +1588,9 @@ def list_provider_models(provider_id):
         # UI gates selectability on the masked has_key flag.
         m = str(os.getenv("INWORLD_STT_MODEL", "") or "").strip() or "inworld/inworld-stt-1"
         return [{"id": m, "display": m}]
+    if pid == "ollama":
+        # [F56] Local, key-less, live: whatever is installed right now.
+        return _list_ollama_models()
     for p in _custom_providers():
         if p.get("id") == pid:
             if not p.get("api_key") or not p.get("base_url"):

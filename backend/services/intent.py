@@ -12,6 +12,13 @@ Hinglish — and routes it to exactly one handler:
                 (headed, so captchas are solvable) with a summarized report
     task     -> opencode agent (file/folder ops, code, shell, automation…)
 
+[F56] WHICH model classifies is a normal registry role ("intent"), so it is
+selectable from the UI like every other model — including the LOCAL Ollama
+models, which is what makes the classifier free, offline and fast enough for
+the voice budget. The selected (provider, model) is hop 1; the shipped chain
+below (OpenRouter Lite → Gemini Flash Lite → Qwen on Groq) stays as the
+fallback, so nothing about routing can be broken by a bad selection.
+
 Gemini (Flash Lite) classifies first; if it is unavailable, the same Lite
 model over OpenRouter is tried next, then Qwen on Groq. Any hard failure just
 routes to chat rather than stalling.
@@ -24,8 +31,16 @@ import re
 import time
 
 from backend.config import GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
+from backend.services import model_registry
 from backend.services.gemini_client import ask_gemini_chat
 from backend.services.grok_client import _strip_think_blocks, ask_grok
+
+#: [F56] The shipped FIRST hop and the registry's env default for the intent
+#: role (model_registry._env_default_for_role reads this constant), so an
+#: install that never opened the intent selector classifies through exactly
+#: the hop it used before the selector existed.
+DEFAULT_OPENROUTER_MODEL = os.getenv(
+    "INTENT_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
 
 _INTENT_PROMPT = (
     "You are Jarvis intent router. Understand MEANING across English, Hindi and Hinglish, not keywords.\n\n"
@@ -115,7 +130,7 @@ def _parse_intent_json(content, message):
     return result
 
 
-def _classify_with_groq(message, timeout=(3, 3)):
+def _classify_with_groq(message, timeout=(3, 3), model=None):
     """Ask Qwen via the Groq API. Returns raw JSON text or "" on any failure."""
     if not GROQ_API_KEY:
         return ""
@@ -132,7 +147,7 @@ def _classify_with_groq(message, timeout=(3, 3)):
         ],
         temperature=0.0,
         max_tokens=320,
-        model=os.getenv(
+        model=model or os.getenv(
             "GROQ_INTENT_MODEL",
             os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"),
         ),
@@ -146,7 +161,87 @@ def _classify_with_groq(message, timeout=(3, 3)):
     return _strip_think_blocks(content)
 
 
-def _classify_with_gemini(message, timeout=(3, 3)):
+def _classify_with_fireworks(message, timeout=(3, 3), model=None):
+    """Ask Fireworks. Returns raw JSON text or "" on any failure.
+
+    [F56] Only reachable when Fireworks is selected for the intent role (the
+    shipped chain never used it); its account has been suspended since the
+    2026-09 audit, so this hop fails and the caller moves on.
+    """
+    from backend.services.fireworks_client import ask_fireworks
+
+    response = ask_fireworks(
+        [
+            {
+                "role": "system",
+                "content": "Return strict JSON only. No markdown, no extra text.",
+            },
+            {
+                "role": "user",
+                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
+            },
+        ],
+        temperature=0.0,
+        max_tokens=500,
+        model=model or None,
+        timeout=timeout,
+    )
+    if not response or not response.get("choices"):
+        return ""
+    return response["choices"][0].get("message", {}).get("content", "")
+
+
+def _classify_with_openai_compat(provider, model, message, timeout):
+    """One classifier hop over the OpenAI-compatible adapter.
+
+    [F56] Carries every provider whose calls ride that adapter: OpenRouter,
+    Groq and the LOCAL Ollama server. Returns "" (never raises) when the
+    provider has no usable endpoint or the call fails, so the caller simply
+    moves to the next hop.
+    """
+    from backend.services.openai_compat_client import ask_openai_compat
+
+    api_key, base_url = model_registry.get_provider_credentials(provider)
+    if not api_key or not base_url:
+        return ""
+    kwargs = {}
+    if provider == "ollama":
+        # Local models emit a clean JSON object in the endpoint's
+        # structured-output mode. Cloud gateways are deliberately left alone:
+        # several of them reject the field outright.
+        kwargs["response_format"] = {"type": "json_object"}
+    response = ask_openai_compat(
+        [
+            {
+                "role": "system",
+                "content": "Return strict JSON only. No markdown, no extra text.",
+            },
+            {
+                "role": "user",
+                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
+            },
+        ],
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=0.0,
+        max_tokens=500,
+        timeout=timeout,
+        # [F56] One attempt per hop: this call owns one slice of the shared
+        # classifier deadline, so a read timeout must END it (the next hop is
+        # the retry) instead of being replayed under a budget already spent.
+        single_attempt=True,
+        # [F56] Thinking is switched off for a local endpoint inside the
+        # client (reasoning_effort=none), never by a prompt marker: the
+        # OpenAI-compatible surface ignores those.
+        **kwargs,
+    )
+    if not response or not response.get("choices"):
+        return ""
+    return response["choices"][0].get("message", {}).get("content", "")
+
+
+def _classify_with_gemini(message, timeout=(3, 3), model=None):
     """Ask Gemini Flash Lite. Returns raw JSON text or "" on any failure.
 
     Uses a short timeout + no_retry so a slow/hanging Gemini falls back to
@@ -167,7 +262,7 @@ def _classify_with_gemini(message, timeout=(3, 3)):
         ],
         temperature=0.0,
         max_tokens=300,
-        model=os.getenv(
+        model=model or os.getenv(
             "GEMINI_INTENT_MODEL",
             os.getenv("GEMINI_BRAIN_MODEL", "gemini-3.5-flash-lite"),
         ),
@@ -190,7 +285,7 @@ def _budget_timeout(remaining):
     return (connect, read)
 
 
-def _classify_with_openrouter(message, timeout=(2, 2.5)):
+def _classify_with_openrouter(message, timeout=(2, 2.5), model=None):
     """Ask the Lite brain model over OpenRouter. Returns raw JSON text or "".
 
     First hop since the 2026-09-23 incident: the Cloudflare-fronted openrouter
@@ -212,34 +307,89 @@ def _classify_with_openrouter(message, timeout=(2, 2.5)):
                 "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
             },
         ],
-        model=os.getenv(
-            "INTENT_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"),
+        model=model or DEFAULT_OPENROUTER_MODEL,
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
         temperature=0.0,
         max_tokens=500,
         timeout=timeout,
+        # [F56] One attempt: the same no-retry-under-a-spent-budget rule the
+        # generic hop follows (openrouter answers in ~1.5s, and a read timeout
+        # here means the budget is gone, not that a replay would fit).
+        single_attempt=True,
     )
     if not response or not response.get("choices"):
         return ""
     return response["choices"][0].get("message", {}).get("content", "")
 
 
+#: [F56] The shipped fallback chain, in order. Each entry is a hop label plus
+#: the dispatcher that knows that provider's adapter. ``None`` model means
+#: "the hop's own configured default" (exactly what shipped before the intent
+#: role existed), so an untouched install behaves identically.
+_SHIPPED_CHAIN = (
+    ("openrouter", None),
+    ("gemini", None),
+    ("groq", None),
+)
+
+
+def _selected_intent_model():
+    """(provider, model) the UI selected for the intent role, or None.
+
+    [F56] The intent role is a normal registry role, so the selection is
+    validated exactly like every other role (registered provider, allowlist,
+    capabilities) and a selection that stops validating is dropped here
+    instead of breaking routing: the shipped chain below still runs.
+    """
+    try:
+        selection = model_registry.get_model_for_role("intent")
+    except Exception as exc:
+        logging.warning("[INTENT] intent model selection unusable: %s", exc)
+        return None
+    provider = str((selection or {}).get("provider") or "").strip()
+    model = str((selection or {}).get("model") or "").strip()
+    if not provider or not model:
+        return None
+    return (provider, model)
+
+
+def _classify_with_provider(provider, model, message, timeout):
+    """One classifier hop against an explicit (provider, model).
+
+    Dispatch is explicit per provider because three of them have a dedicated
+    adapter (Gemini's native client, Fireworks' client, Groq's client); every
+    other provider rides the generic OpenAI-compatible path.
+    """
+    if provider == "gemini":
+        return _classify_with_gemini(message, timeout=timeout, model=model)
+    if provider == "groq":
+        return _classify_with_groq(message, timeout=timeout, model=model)
+    if provider == "fireworks":
+        return _classify_with_fireworks(message, timeout=timeout, model=model)
+    if provider == "openrouter":
+        return _classify_with_openrouter(message, timeout=timeout, model=model)
+    return _classify_with_openai_compat(provider, model, message, timeout)
+
+
 def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
     """Route *message* to chat/tool/screen/region/task.
 
-    Every message is classified — no keyword pre-check — fastest cloud
-    classifier first (the Lite brain model over OpenRouter), then Gemini
-    direct, then Qwen on Groq. Any remaining failure just lands on chat.
+    Every message is classified — no keyword pre-check. [F56] The (provider,
+    model) selected for the "intent" role in the UI goes FIRST; the shipped
+    chain (OpenRouter Lite → Gemini Flash Lite → Qwen on Groq) follows as the
+    fallback. A provider already tried as the explicit selection is skipped in
+    the chain — the same endpoint that just failed is not retried with another
+    model inside one budget. Any remaining failure just lands on chat.
 
     A single monotonic deadline (timeout_ms) spans the whole classification:
     primary and fallbacks share the remaining budget, so fast-fail never
     exceeds the advertised window.
 
     [PERF] P1-19: the verdict carries ``_source`` — the hop that answered
-    (openrouter | gemini | groq | none). Which hop won is invisible in a single
-    "classify" duration, and it is the first thing to check when a turn is
-    slow.
+    (the provider id: openrouter | gemini | groq | ollama | …, or "none" when
+    every hop failed). Which hop won is invisible in a single "classify"
+    duration, and it is the first thing to check when a turn is slow.
     """
     fallback = {
         "intent": "chat",
@@ -256,44 +406,30 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
 
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
 
-    # 1) Fastest hop first (2026-09-23): OpenRouter stays ~1.4s even when the
-    #    direct Gemini API degrades behind a VPN relay, so routing survives.
-    timeout = _budget_timeout(deadline - time.monotonic())
-    if timeout:
+    selected = _selected_intent_model()
+    hops = []
+    if selected:
+        hops.append(selected)
+    for provider, model in _SHIPPED_CHAIN:
+        if selected and provider == selected[0]:
+            # Already this turn's explicit choice — retrying the provider that
+            # just failed costs the rest of the budget for no new information.
+            continue
+        hops.append((provider, model))
+
+    for provider, model in hops:
+        timeout = _budget_timeout(deadline - time.monotonic())
+        if not timeout:
+            break
         try:
-            content = _classify_with_openrouter(message, timeout=timeout)
+            content = _classify_with_provider(provider, model, message, timeout)
             result = _parse_intent_json(content, message)
             if result["intent"] != "chat" or content:
                 # Even a chat verdict from the model is a deliberate answer.
-                result["_source"] = "openrouter"   # [PERF] P1-19 (hop label)
+                result["_source"] = provider      # [PERF] P1-19 (hop label)
                 return result
         except Exception as exc:
-            logging.warning("[INTENT] OpenRouter classifier unavailable: %s", exc)
+            logging.warning("[INTENT] %s classifier unavailable: %s", provider, exc)
 
-    # 2) Cloud classifier (Gemini 3.5 Flash Lite direct).
-    timeout = _budget_timeout(deadline - time.monotonic())
-    if timeout:
-        try:
-            content = _classify_with_gemini(message, timeout=timeout)
-            result = _parse_intent_json(content, message)
-            if result["intent"] != "chat" or content:
-                # Even a chat verdict from the model is a deliberate answer.
-                result["_source"] = "gemini"       # [PERF] P1-19 (hop label)
-                return result
-        except Exception as exc:
-            logging.warning("[INTENT] Gemini classifier unavailable: %s", exc)
-
-    # 3) Single fallback: Qwen 3.6 27B on Groq — only with budget left.
-    timeout = _budget_timeout(deadline - time.monotonic())
-    if timeout:
-        try:
-            content = _classify_with_groq(message, timeout=timeout)
-            result = _parse_intent_json(content, message)
-            if result["intent"] != "chat" or content:
-                result["_source"] = "groq"         # [PERF] P1-19 (hop label)
-                return result
-        except Exception as exc:
-            logging.warning("[INTENT] Groq Qwen classifier unavailable: %s", exc)
-
-    # 3) Never break chat.
+    # Never break chat.
     return fallback

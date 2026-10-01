@@ -755,7 +755,7 @@ if (!document.body.dataset.mode) document.body.dataset.mode = 'chat';
 if (!document.body.dataset.state) document.body.dataset.state = 'idle';
 
 /* ═══════════════════════════════════════════════════════
-    Model sidebar — per-role switchers (chat / TTS / listening / vision / browser_tool).
+    Model sidebar — per-role switchers (chat / intent / TTS / listening / vision / browser_tool / planner).
    Hamburger opens it; providers render from GET /settings,
    models lazy-load from GET /providers/{id}/models, a click
    POSTs /settings/model (or /settings/chat-model for compat) and
@@ -770,6 +770,7 @@ let activeVisionModel = null;
 let activeBrowserToolModel = null;
 let activeListeningModel = null; // GET /settings -> .listening_model
 let activePlannerModel = null;   // GET /settings -> .planner_model
+let activeIntentModel = null;    // GET /settings -> .intent_model (F56)
 const modelsCache = {};      // providerId -> { models, ts }
 const expandedProviders = new Set();
 const expandedTtsProviders = new Set();
@@ -777,9 +778,10 @@ const expandedVisionProviders = new Set();
 const expandedListeningProviders = new Set();
 const expandedBrowserProviders = new Set();
 const expandedPlannerProviders = new Set();
+const expandedIntentProviders = new Set();
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
-const filterState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {} };
-const showAllState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {} };
+const filterState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {}, intent: {} };
+const showAllState = { chat: {}, tts: {}, vision: {}, listening: {}, browser_tool: {}, planner: {}, intent: {} };
 let roleAllowedCache = null; // {role: [provider ids]} for every registry role
 let customProviderRoles = null; // roles that accept a user-added provider
 let lastFallback = null;
@@ -837,7 +839,9 @@ async function loadProviders() {
     activeBrowserToolModel = data.browser_tool_model || null;
     activeListeningModel = data.listening_model || null;
     activePlannerModel = data.planner_model || null;
+    activeIntentModel = data.intent_model || null;
     renderProviders();
+    renderIntentProviders();
     renderTtsProviders();
     renderListeningProviders();
     renderVisionProviders();
@@ -873,11 +877,19 @@ function renderChatFallbackWarning() {
 
 // Providers that legitimately need no credential. Their has_key=false is
 // the normal state, not a misconfiguration, so they render with a live dot
-// and a "no key needed" label instead of a grey "no key" row.
+// and a "no key needed" label instead of a grey "no key" row. The local
+// Ollama server (F56) is the same idea with the opposite polarity: it
+// reports a placeholder credential, so it is listed here to be LABELLED
+// "local · no key needed" rather than "key ok".
 const KEYLESS_PROVIDERS_BY_ROLE = {
   listening: ["whisper"],
   tts: ["gtts"],
+  chat: ["ollama"],
+  intent: ["ollama"],
 };
+
+// Providers that run on THIS machine — labelled "local" instead of "free".
+const LOCAL_PROVIDERS = ["whisper", "ollama"];
 
 function _isKeylessProvider(role, providerId) {
   const ids = KEYLESS_PROVIDERS_BY_ROLE[role];
@@ -921,7 +933,7 @@ function _renderProvidersForRole(listId, activeModel, expandedSet, role) {
       (keyGated ? " disabled" : "");
     let metaText;
     if (keyGated) metaText = "(API key missing)";
-    else if (keyless) metaText = (p.id === "whisper" ? "local" : "free") + " · no key needed";
+    else if (keyless) metaText = (LOCAL_PROVIDERS.indexOf(p.id) !== -1 ? "local" : "free") + " · no key needed";
     else metaText = (p.has_key ? "key ok" : "no key") + (p.source === "custom" ? " · custom" : "");
     const dotOk = p.has_key || keyless;
     head.innerHTML =
@@ -975,6 +987,12 @@ function _renderProvidersForRole(listId, activeModel, expandedSet, role) {
 
 function renderProviders() {
   _renderProvidersForRole("model-provider-list", activeChatModel, expandedProviders, "chat");
+}
+function renderIntentProviders() {
+  // F56 — the model that classifies every message (services/intent.py). Same
+  // provider → model list as every other role; picking one here changes what
+  // routes chat / tool / screen / region / research / task.
+  _renderProvidersForRole("intent-provider-list", activeIntentModel, expandedIntentProviders, "intent");
 }
 function renderTtsProviders() {
   _renderProvidersForRole("tts-provider-list", activeTtsModel, expandedTtsProviders, "tts");
@@ -1177,6 +1195,10 @@ async function _selectModelForRole(role, providerId, modelId) {
       activePlannerModel = data.planner_model || data.model || { provider: providerId, model: modelId };
       renderPlannerProviders();
       flashSidebarConfirm("✓ planner model: " + (activePlannerModel.model || modelId));
+    } else if (role === "intent") {
+      activeIntentModel = data.intent_model || data.model || { provider: providerId, model: modelId };
+      renderIntentProviders();
+      flashSidebarConfirm("✓ intent classifier: " + (activeIntentModel.model || modelId));
     }
   } catch (err) {
     flashSidebarConfirm("✗ " + (err.message || err), true);

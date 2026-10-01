@@ -9,6 +9,7 @@ chain. The API key travels in the Authorization header only.
 
 import json
 import logging
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -19,6 +20,65 @@ from backend.core.deadline import resolve
 # Persistent session with automatic retries on low-level connection errors
 # (same pattern as gemini_client / fireworks_client).
 _MAX_RETRIES = 2
+
+# ── F56: thinking control for a LOCAL Ollama endpoint ───────────────────────
+# The local Ollama server is a first-class provider for chat and for intent
+# classification (see model_registry's "ollama" provider), and its thinking
+# default is ON for the qwen3 family. Measured against Ollama 0.34.4:
+#
+#   * the native ``think`` field and a ``/no_think`` prompt marker are BOTH
+#     ignored by the OpenAI-compatible surface — sending either changes
+#     nothing and looks like it worked;
+#   * ``reasoning_effort`` IS honoured: "none" disables thinking, any enabling
+#     value turns it on;
+#   * a model that cannot think at all (llama3.2) ACCEPTS "none" and rejects
+#     every enabling value with a 400.
+#
+# So "none" is the one value that is correct for every installed model, and
+# it is a latency default rather than a preference: with thinking on, qwen3
+# 1.7B took 2.2s per classification and 1.41s to reach the first ANSWER token
+# (0.4s / 0.06s with it off) while burning the token budget on text the chat
+# and classifier channels discard.
+LOCAL_THINKING_HOSTS = frozenset((
+    "localhost:11434", "127.0.0.1:11434", "[::1]:11434",
+))
+LOCAL_REASONING_EFFORT = "none"
+
+
+def _is_local_thinking_host(base_url):
+    """True when *base_url* is a local Ollama server's /v1 surface.
+
+    Matched on host:port (the default Ollama port on the loopback interface),
+    so a remote gateway that merely mentions ollama is NOT treated as local.
+    """
+    try:
+        return urlsplit(str(base_url or "")).netloc.lower() in LOCAL_THINKING_HOSTS
+    except Exception:
+        return False
+
+
+def _mentions_reasoning(text):
+    """True when an error body references the reasoning/thinking setting.
+
+    The same deliberately substring-based test fireworks_client uses (no
+    model-name list to maintain; a false positive only costs one extra
+    attempt). Kept local rather than imported: fireworks_client imports THIS
+    module, so importing back would be a cycle.
+    """
+    lowered = str(text or "").lower()
+    return any(w in lowered for w in (
+        "reasoning", "thinking", "effort",
+        "unsupported", "extra fields", "extra field", "unknown field",
+        "invalid reasoning", "invalid parameter",
+    ))
+
+
+def _response_text(response):
+    """A response body as text ('' when it cannot be read). Never raises."""
+    try:
+        return response.text or ""
+    except Exception:
+        return ""
 
 # ── F31: typed answer channels ───────────────────────────────────────────────
 # Every streaming adapter speaks ONE channel contract, defined here once:
@@ -145,6 +205,28 @@ try:
     _session.mount("https://", _KeepAliveAdapter(max_retries=_retry_strategy))
 except Exception:  # pragma: no cover - never lose the plain adapter
     _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+
+# ── F56: a BUDGETED caller gets exactly one attempt per hop ─────────────────
+# The intent classifier splits ONE shared deadline across its hops, and that
+# slice has to be real: urllib3's Retry(total=N) retries READ timeouts too, so
+# a 3.5s hop could silently cost ~3 x 3.5s plus backoff (measured on a local
+# model that missed its slice: a 3.5s budget produced a 5.6s classification —
+# exactly the "the advertised window is real" promise the router makes).
+# A caller that passes ``single_attempt=True`` gets ONE request: for the
+# classifier the NEXT HOP is its retry, and that is a better retry than
+# repeating the endpoint that just timed out.
+_single_attempt_retry = Retry(total=0, allowed_methods=["POST"])
+_single_attempt_session = requests.Session()
+try:  # pragma: no cover - same keepalive pool as the main session
+    from backend.services.prewarm import KeepAliveAdapter as _KeepAliveAdapter
+
+    _single_attempt_session.mount(
+        "https://", _KeepAliveAdapter(max_retries=_single_attempt_retry))
+except Exception:
+    _single_attempt_session.mount(
+        "https://", HTTPAdapter(max_retries=_single_attempt_retry))
+_single_attempt_session.mount(
+    "http://", HTTPAdapter(max_retries=_single_attempt_retry))
 
 
 def _mark_headers(provider, model=None):
@@ -284,7 +366,7 @@ def _headers(api_key):
 def ask_openai_compat(
     messages, model, base_url, api_key, temperature=0.7, max_tokens=None,
     tools=None, tool_choice=None, reasoning_effort=None, timeout=None,
-    response_format=None,
+    response_format=None, single_attempt=False,
 ):
     """Non-stream chat completion; {} on any failure (fireworks pattern).
 
@@ -302,6 +384,15 @@ def ask_openai_compat(
 
     *timeout*: optional (connect, read) override — latency-critical callers
     (the intent classifier) pass a tight slice of their own deadline.
+
+    *reasoning_effort* (F56): when the caller passes none and *base_url* is a
+    LOCAL Ollama endpoint, it defaults to ``"none"`` — thinking off. See
+    LOCAL_REASONING_EFFORT for why that is the only safe value there.
+
+    *single_attempt* (F56): skip the session's retries entirely. For a caller
+    that budgets one hop of a shared deadline (the intent classifier) a read
+    timeout must END the attempt, not be replayed under a budget it already
+    spent. See _single_attempt_session.
     """
     data = {
         "model": model,
@@ -314,22 +405,42 @@ def ask_openai_compat(
         data["tools"] = tools
         if tool_choice is not None:
             data["tool_choice"] = tool_choice
+    if reasoning_effort is None and _is_local_thinking_host(base_url):
+        reasoning_effort = LOCAL_REASONING_EFFORT
     if reasoning_effort:
         data["reasoning_effort"] = reasoning_effort
     if response_format:
         data["response_format"] = response_format
-    try:
-        response = _session.post(
+
+    def _post(payload):
+        return (_single_attempt_session if single_attempt else _session).post(
             _chat_url(base_url),
             headers=_headers(api_key),
-            json=data,
+            json=payload,
             timeout=timeout or (5.05, 60),
         )
+
+    try:
+        response = _post(data)
     except Exception as exc:
         print("[OPENAI-COMPAT] Request error:", exc)
         return {}
+    if (response.status_code != 200 and "reasoning_effort" in data
+            and _mentions_reasoning(_response_text(response))):
+        # F56: the reasoning control is a latency DEFAULT, not a demand — an
+        # endpoint/model that rejects the field is asked again without it
+        # (the fireworks_client pattern) instead of losing the whole call.
+        print("[OPENAI-COMPAT] Retrying without reasoning_effort "
+              "(model rejected the reasoning setting)")
+        data.pop("reasoning_effort", None)
+        try:
+            response = _post(data)
+        except Exception as exc:
+            print("[OPENAI-COMPAT] Request error:", exc)
+            return {}
     if response.status_code != 200:
-        print("[OPENAI-COMPAT] Error:", response.status_code, response.text[:300])
+        print("[OPENAI-COMPAT] Error:", response.status_code,
+              _response_text(response)[:300])
         return {}
     try:
         return response.json()
@@ -370,8 +481,8 @@ def ask_openai_compat_vision(
 
 def ask_openai_compat_stream(
     messages, model, base_url, api_key, temperature=0.7, max_tokens=None,
-    cancel=None, include_reasoning=False, typed=False, timeout=None,
-    deadline=None, first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
+    reasoning_effort=None, cancel=None, include_reasoning=False, typed=False,
+    timeout=None, deadline=None, first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
     idle_timeout=DEFAULT_STREAM_IDLE_TIMEOUT, outcome=None,
 ):
     """Stream chat-completion text deltas (SSE) — mirrors fireworks_client.
@@ -402,6 +513,13 @@ def ask_openai_compat_stream(
     *include_reasoning* (or *typed*) to receive :class:`StreamDelta` events
     instead, each tagged ``final`` or ``reasoning`` — reasoning is preserved
     but can never be mistaken for an answer by an untyped consumer.
+
+    *reasoning_effort* (F56): when the caller passes none and *base_url* is a
+    LOCAL Ollama endpoint, it defaults to ``"none"`` (thinking off — the
+    measured difference is 1.41s vs 0.06s to the first ANSWER token on qwen3
+    1.7B). See LOCAL_REASONING_EFFORT. A 4xx that names the reasoning setting
+    is replayed once without it, so a model that rejects the control streams
+    anyway.
     """
     typed_output = bool(typed or include_reasoning)
     handle = resolve(deadline)
@@ -419,6 +537,10 @@ def ask_openai_compat_stream(
     }
     if max_tokens is not None:
         data["max_tokens"] = max_tokens
+    if reasoning_effort is None and _is_local_thinking_host(base_url):
+        reasoning_effort = LOCAL_REASONING_EFFORT
+    if reasoning_effort:
+        data["reasoning_effort"] = reasoning_effort
     if timeout is None:
         timeout = (STREAM_CONNECT_TIMEOUT,
                    max(float(first_token_timeout or 0), 0.1))
@@ -441,6 +563,30 @@ def ask_openai_compat_stream(
         logging.warning("[OPENAI-COMPAT] Stream request error: %s", exc)
         _finish_outcome(outcome, STREAM_ERRORED, exc)
         return
+    if (response.status_code != 200 and "reasoning_effort" in data
+            and _mentions_reasoning(_response_text(response))):
+        # F56: same one-shot replay as the non-stream path — the reasoning
+        # control is a latency default, and refusing it must not cost the
+        # whole stream.
+        logging.warning("[OPENAI-COMPAT] stream retrying without "
+                        "reasoning_effort (model rejected the reasoning setting)")
+        data.pop("reasoning_effort", None)
+        try:
+            response.close()
+        except Exception:
+            pass
+        try:
+            response = _session.post(
+                _chat_url(base_url),
+                headers=_headers(api_key),
+                json=data,
+                stream=True,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logging.warning("[OPENAI-COMPAT] Stream request error: %s", exc)
+            _finish_outcome(outcome, STREAM_ERRORED, exc)
+            return
     if response.status_code != 200:
         detail = ""
         try:

@@ -1,12 +1,32 @@
 # Jarvis Assistant Project Map
 
-This document gives another model enough context to work on the repo without re-discovering the architecture from scratch. **Refreshed 2026-09-30.**
+This document gives another model enough context to work on the repo without re-discovering the architecture from scratch. **Refreshed 2026-10-01.**
 
 State as of this refresh:
 
 - The **Fable-5 audit remediation** (G0–G11, F01–F55) is landed except the **G8 classifier-retirement step**, which remains open.
 - The **CODE_REVIEW_REPORT hardening wave** is landed for **C1–C3** and **H1–H9**, plus the **STT-hallucination gate**. The review's M/L/structural items are still open.
 - A **responsiveness audit** (43 findings, P0-01…P1-19) was completed 2026-09-29 and triaged by the owner. **13 of its items are now implemented** — the 2026-09-30 wave, commits `f37a519`…`6c89095`. Per-item detail is in "Responsiveness audit implementation state" below; the remaining items are still open, and `AUDIT_IMPLEMENTATION_PROMPTS.html` holds the per-item implementation prompts.
+- **F56 (landed, tag `local-models`)** — the LOCAL Ollama server is a first-class model provider, and the intent classifier is a selectable role. `chat` and the new `intent` role accept `ollama/<installed model>` from the Electron model switcher; `intent` gets a whole new sidebar section. See "Local models as selectable brains (F56)" below — including the MEASURED latency numbers, which are the reason this is a selection and not a new default.
+
+## Local models as selectable brains (F56)
+
+The user asked for the locally-installed Ollama models to be selectable like any
+other model — one for replies and one for routing — and that is exactly what
+landed. Nothing about the shipped defaults changed: with no selection made, chat
+still answers with `gemini/gemini-3.5-flash-lite` and the router still starts on
+OpenRouter Lite.
+
+- **`ollama` is an ENV provider, not a custom provider** (`model_registry.ENV_PROVIDERS`): key-less, endpoint from `ollama_client.OLLAMA_BASE_URL` + `/v1` (ONE source of truth for the local port), model list read live from `GET /api/tags`. Its credential is the constant placeholder `ollama-local`, because the generic OpenAI-compatible adapter and brain's "no credentials → fail closed" rule both require a truthy key; Ollama ignores the header, and no API surface ever returns it.
+- **Roles**: `chat` and the NEW `intent` role accept `ollama`. `vision`, `tts`, `listening`, `planner` and `browser_tool` do NOT — the provider floor declares `tool_calling`/`structured_output`/`streaming` and deliberately NO `vision_input`, so a local text model can never be selected to answer a screen question.
+- **The model list is filtered, not dumped**: whatever the daemon reports minus models that cannot answer a chat/intent call (an installed embedder such as `nomic-embed-text` must not appear as a selectable brain). A stopped daemon is a clean 400 in the picker, not an empty list.
+- **Thinking is OFF for a local endpoint, inside the client** (`openai_compat_client.LOCAL_REASONING_EFFORT`). Measured against Ollama 0.34.4, the OpenAI-compatible surface IGNORES the native `think` field AND a `/no_think` marker, but honours `reasoning_effort`: `none` disables thinking, any enabling value enables it, and a non-thinking model (llama3.2) ACCEPTS `none` while rejecting every enabling value with a 400. With thinking on, qwen3 1.7B took 1.41s to its first ANSWER token and 2.2s per classification; with it off, 0.06s / 0.4s. A 4xx that names the reasoning setting is replayed once without it (the `fireworks_client` pattern).
+- **A budgeted hop gets exactly ONE attempt** (`ask_openai_compat(single_attempt=True)`, `_single_attempt_session`): the classifier splits one shared deadline across hops, and urllib3's `Retry(total=N)` also retries READ timeouts, so a 3.5s hop could cost ~3×3.5s plus backoff (measured: a 3.5s budget produced a 5.6s classification). The classifier's next hop IS its retry.
+- **The intent role is hop 1; the shipped chain is the fallback** (`intent._SHIPPED_CHAIN`): selected `(provider, model)` first, then OpenRouter Lite → Gemini Flash Lite → Qwen on Groq, with the selected provider skipped in the chain (never pay the same endpoint twice inside one budget). The registry's env default for `intent` resolves to the SAME first hop as before (`intent.DEFAULT_OPENROUTER_MODEL`, read by `model_registry._env_default_for_role`), so an untouched install routes identically. A selection that stops validating is dropped by the registry and the chain runs.
+- **UI**: a new `INTENT CLASSIFIER MODEL` section in the model switcher (`intent-provider-list`, `activeIntentModel`), rendered by the same provider→model list as every other role; `GET /settings` gained `intent_model` + `role_allowed["intent"]`; `POST /settings/model` accepts `role: "intent"` and answers `intent_model`. The Ollama provider shows as `local · no key needed` (`KEYLESS_PROVIDERS_BY_ROLE` / `LOCAL_PROVIDERS`).
+- **MEASURED, on this machine (i5-13420H / RTX 3050 6GB), full 1866-char production classifier prompt**: qwen3:1.7b thinking-off **0.4–0.7s warm (prompt-cache hit)**, 2.7–3.3s on the first call of a burst (prefill) and up to 5.6s on a cold model load; llama3.2 same shape; OpenRouter `google/gemini-2.5-flash-lite` **1.5s** (1.48–1.78). So steady-state local routing is FASTER than the cloud, but the first call after idle is slower — and the voice classifier budget (`INTENT_BUDGET_VOICE_MS = 1200`) cannot fit a cold local prefill at all, in which case the turn pays that budget and still falls back to the cloud. Keep that in mind before selecting a local model for `intent` while using voice.
+- **Accuracy, same 8 labelled queries through the real `classify_intent`** (production prompt, temp settings file, real daemon): qwen3:1.7b reached the cloud baseline's verdicts including the Hinglish `deepseek kya hai, dhundho → research` and the multi-step `1hd.to … play it → task`, and missed the same two hard cases the cloud misses (`capital of france → research`, `google python decorators → research`). llama3.2's early 2/8 was timeout contamination from cold loads, not accuracy — once resident it matched on the same cases.
+- Tests: `backend/tests/test_f56_local_models.py` (34 cases) — provider/credential/allowlist/capability contract, model-list filtering, thinking-off on both wire paths plus the one-shot replay, single-attempt budgeting, hop-1 selection + fallback + no-duplicate-provider, and both settings routes.
 
 ## What This Project Is
 
@@ -255,7 +275,7 @@ This subsystem is off by default and must be enabled by saying or typing a phras
 
 - `frontend/index.html`
   - Single-window shell for the desktop app.
-  - Shows status, chat history, a text input with chat/command modes, and the model-switcher sidebar.
+  - Shows status, chat history, a text input with chat/command modes, and the model-switcher sidebar (per-role sections: TEXT CHAT, INTENT CLASSIFIER MODEL, VOICE MODEL (TTS), LISTENING MODEL (STT), VISION MODEL, BROWSER TOOL, PLANNER — the intent section is F56).
 
 - `frontend/renderer.js`
   - Sends `/ask` requests.
@@ -355,8 +375,9 @@ Important command behavior:
 
 - `backend/services/intent.py`
   - `classify_intent(message, timeout_ms=3500)` routes every message to chat/tool/screen/region/research/task â€” no keyword pre-check.
-  - Chain: Gemini 3.5 Flash Lite primary (`GEMINI_INTENT_MODEL` / `GEMINI_BRAIN_MODEL`, 3s timeout, `no_retry`) -> single fallback Qwen 3.6 27B on Groq (`GROQ_INTENT_MODEL` / `GROQ_VISION_MODEL`) -> `chat` verdict on total failure. Chat is therefore never broken, but classifier throttles silently degrade to chat verdicts â€” which is exactly why the deterministic nets in `brain.py` exist.
-  - The prompt is length-capped (test asserts <2000 chars) and covers English/Hindi/Hinglish meaning, not keywords.
+  - Hop 1 since F56 is the `(provider, model)` selected for the registry's `intent` role (UI model switcher) — including the local Ollama models, which is what makes routing free/offline and fast enough for the typed budget. The shipped chain follows as the fallback: OpenRouter `google/gemini-2.5-flash-lite` (fastest cloud hop since 2026-09-23) -> Gemini 3.5 Flash Lite direct (`GEMINI_INTENT_MODEL` / `GEMINI_BRAIN_MODEL`, 3s timeout, `no_retry`) -> Qwen 3.6 27B on Groq (`GROQ_INTENT_MODEL` / `GROQ_VISION_MODEL`) -> `chat` verdict on total failure. The selected provider is skipped in the chain, and the registry's env default for `intent` IS the OpenRouter hop, so an untouched install routes exactly as before. Chat is therefore never broken, but classifier throttles silently degrade to chat verdicts â€” which is exactly why the deterministic nets in `brain.py` exist.
+  - Each hop gets a slice of ONE monotonic deadline and is dispatched explicitly (`_classify_with_provider`: gemini/fireworks/groq have dedicated clients, everything else rides the generic OpenAI-compatible adapter with `single_attempt=True`, so a read timeout cannot be replayed under a spent budget). The prompt is length-capped (test asserts <2000 chars) and covers English/Hindi/Hinglish meaning, not keywords.
+  - Note the practical limit F56 measured: a hop is bounded by its socket read timeout, not by a wall clock, so an endpoint that sends headers then stalls can take up to ~2x its slice.
 
 - `backend/services/web_task_routing.py`
   - `is_web_shaped_task(text)`: web hint (`website|chrome|edge|.com|.to|httpâ€¦`) AND interaction verb (`search|play|click|loginâ€¦`) AND no local hint (`file|folder|vscode|pythonâ€¦`). Feeds the brain's web-task routing net.
@@ -412,11 +433,12 @@ Important command behavior:
 ### LLM clients and model registry
 
 - `backend/services/model_registry.py`
-  - The single runtime source of truth for model selection across SIX roles: `chat`, `tts`, `vision`, `browser_tool`, `listening`, `planner` (`VALID_ROLES`).
+  - The single runtime source of truth for model selection across SEVEN roles: `chat`, `tts`, `vision`, `browser_tool`, `listening`, `planner`, `intent` (`VALID_ROLES`). The `intent` role (F56) is what `services/intent.py` classifies with.
   - Persisted overrides live in `data/jarvis_settings.json` (set from the UI model switcher, immediate effect, no restart); missing/corrupt settings degrade to env defaults.
-  - Env providers: `gemini`, `fireworks`, `groq`, `fish`, `gtts` (Google Translate TTS), `openrouter`, `whisper` (local), `inworld` (STT). Custom OpenAI-compatible providers are allowed for `chat` and `browser_tool` only.
-  - Per-role allowlists: chat `{gemini, fireworks, openrouter}`; tts `{fish, gtts}`; vision and browser_tool `{gemini, fireworks, groq, openrouter}`; listening `{whisper, inworld}`; planner `{fireworks}` only.
-  - **F49 capability-aware selection**: every role declares what it REQUIRES (`chat` streaming, `tts` audio_output, `vision` vision_input, `browser_tool` tool_calling + structured_output + vision_input, `listening` speech_input, `planner` tool_calling + structured_output + streaming) and a (provider, model) pair is only usable when those capabilities are positively established from the adapter floor, the provider record, model-family name rules, or capability metadata the provider published. Anything unknown FAILS CLOSED, resolution is validated at use time from one locked snapshot, and a persisted selection that stops validating surfaces as a `model_errors` entry in `GET /settings` instead of running.
+  - Env providers: `gemini`, `fireworks`, `groq`, `fish`, `gtts` (Google Translate TTS), `openrouter`, `whisper` (local), `inworld` (STT), `ollama` (the LOCAL server, F56 — key-less, base URL from `ollama_client`, model list live from `/api/tags`). Custom OpenAI-compatible providers are allowed for `chat`, `vision`, `browser_tool` and `planner` only (`intent` deliberately excluded: a user gateway should not sit on the first hop of every message).
+  - Per-role allowlists: chat `{gemini, fireworks, openrouter, ollama}`; tts `{fish, gtts}`; vision and browser_tool `{gemini, fireworks, groq, openrouter}`; listening `{whisper, inworld}`; planner `{fireworks}` only; intent `{gemini, fireworks, groq, openrouter, ollama}`.
+  - **F49 capability-aware selection**: every role declares what it REQUIRES (`chat` streaming, `tts` audio_output, `vision` vision_input, `browser_tool` tool_calling + structured_output + vision_input, `listening` speech_input, `planner` tool_calling + structured_output + streaming, `intent` structured_output) and a (provider, model) pair is only usable when those capabilities are positively established from the adapter floor, the provider record, model-family name rules, or capability metadata the provider published. Anything unknown FAILS CLOSED, resolution is validated at use time from one locked snapshot, and a persisted selection that stops validating surfaces as a `model_errors` entry in `GET /settings` instead of running.
+  - The `ollama` provider floor advertises `tool_calling` + `structured_output` + `streaming` and NO `vision_input` (the installed local models are text-only), and its `_reasoning_for` entry declares `reasoning_effort="none"` — the one value that turns thinking off for a thinking model and is accepted by a non-thinking one (F56, measured).
   - API keys never leave the module — everything the routes return is masked (`has_key` booleans), and log lines are scrubbed.
   - Current live selections (verified 2026-09-30, `revision` 16): chat `gemini`/`gemini-3.5-flash-lite`; tts `fish`/`s2.1-pro-free`; vision `openrouter`/`google/gemini-2.5-flash-lite`; browser_tool `openrouter`/`google/gemini-2.5-flash-lite`; listening `whisper`/`whisper-local`; no `planner` override (so the planner falls back to its env default). The file also carries an `observed_capabilities` map populated from live provider probes. Backup copies sit next to it (`*.bak-*`).
 
@@ -438,14 +460,14 @@ Important command behavior:
   - OpenRouter client. It is now a first-class env provider rather than just a free-vision helper: the `chat` role allowlist includes it (added after the 2026-09-23 VPN incident), `get_provider_credentials` returns its canonical OpenAI-compatible base URL, and it also appears in the vision and browser_tool allowlists.
 
 - `backend/services/openai_compat_client.py`
-  - Chat client for user-added custom providers (any /v1-compatible endpoint).
+  - Chat client for user-added custom providers (any /v1-compatible endpoint) — and, since F56, the carrier for the LOCAL Ollama provider and the intent classifier's generic hops. It defaults `reasoning_effort="none"` for a local Ollama endpoint (thinking off; the native `think` field is ignored there) and replays once without the field if an endpoint rejects it, and it offers `single_attempt=True` for callers that own one slice of a shared deadline (see "Local models as selectable brains (F56)").
 
 - `backend/services/transcription.py`
   - Shared speech-to-text ladder: Google STT primary, Groq Whisper-style (`whisper-large-v3-turbo`) network fallback, local Whisper over the persistent `whisper_daemon` (`JARVIS_WHISPER_PORT`, default 8767), and Inworld STT (`INWORLD_STT_*`).
   - Hosts the STT hallucination gate (`is_hallucinated_transcript`) that every transcript-commit path consults — see the 2026-09 review wave above.
 
 - `backend/services/ollama_client.py`
-  - Local inference to the `llama3.2` model on port `11434` for the accessibility screen-control planner.
+  - Local inference to the `llama3.2` model on port `11434` for the accessibility screen-control planner. Its `OLLAMA_BASE_URL` is the ONE source of truth for the local endpoint — `model_registry` appends `/v1` to it for the generic chat/intent adapter (F56) rather than hardcoding the port a second time.
 
 ### Modules added by the Fable-5 remediation wave
 
@@ -610,8 +632,9 @@ Location: `backend/core/memory.py`
 
 Location: `data/jarvis_settings.json`
 
-- Persisted model-registry overrides for the `chat`, `tts`, `vision`, `browser_tool` roles plus any user-added custom providers.
+- Persisted model-registry overrides for the `chat`, `tts`, `vision`, `browser_tool`, `listening`, `planner` and `intent` roles plus any user-added custom providers.
 - Read per message/per call â€” changes take effect immediately, no restart.
+- Since F56 the `intent` role is durable here too (`intent_model`): it is what the classifier's hop 1 resolves to, and deleting the key restores the shipped OpenRouter-first chain.
 
 ### Voice UI mirror state
 

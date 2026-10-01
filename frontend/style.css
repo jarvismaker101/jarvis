@@ -681,6 +681,12 @@ body.sidebar-open .model-sidebar{ transform:translateX(0) translateZ(40px); }
   font-family:"JetBrains Mono",monospace; font-size:9px; font-weight:700; letter-spacing:1.6px;
   color:var(--accent); opacity:0.9; padding:8px 12px 4px;
 }
+/* [F56] One-line explanation under a section title (the intent classifier
+   section says which messages it routes, so the choice is not a mystery). */
+.sidebar-hint{
+  font-family:"JetBrains Mono",monospace; font-size:9px; line-height:1.5;
+  letter-spacing:0.4px; color:rgba(255,255,255,0.42); padding:0 12px 6px;
+}
 .browser-tool-form{ display:flex; flex-direction:column; gap:6px; padding:6px 12px 8px; }
 .browser-tool-form input{
   padding:9px 11px; border-radius:9px; border:1px solid rgba(255,255,255,0.1);

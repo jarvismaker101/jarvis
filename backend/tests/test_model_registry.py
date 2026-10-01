@@ -202,7 +202,8 @@ class ListProvidersTests(ModelRegistryTestBase):
         blob = json.dumps(providers)
         self.assertNotIn("sk-secret-1", blob)
         self.assertNotIn("api_key", blob)
-        self.assertEqual([p["id"] for p in providers], ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter", "whisper", "inworld", "acme"])
+        # [F56] "ollama" (the local, key-less server) joined the env providers.
+        self.assertEqual([p["id"] for p in providers], ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter", "whisper", "inworld", "ollama", "acme"])
         by_id = {p["id"]: p for p in providers}
         self.assertTrue(by_id["gemini"]["has_key"])
         self.assertTrue(by_id["fireworks"]["has_key"])

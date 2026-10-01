@@ -47,7 +47,8 @@ class SettingsRoutesTests(SettingsRoutesTestBase):
         self.assertEqual(resp["chat_model"], model_registry.get_default_chat_model())
         self.assertEqual(
             [p["id"] for p in resp["providers"]],
-            ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter", "whisper", "inworld"],
+            ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter",
+             "whisper", "inworld", "ollama"],
         )
         self.assertIn("role_allowed", resp)
         self.assertIn("last_fallback", resp)

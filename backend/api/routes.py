@@ -1591,9 +1591,10 @@ def get_settings():
     # F49: every role the registry can resolve is reported, so a feature whose
     # model is selectable in the registry is also selectable from the UI. The
     # planner role drives the native tool-use orchestrator; omitting it here
-    # left its model with no way to be chosen.
+    # left its model with no way to be chosen. [F56] "intent" is the model that
+    # classifies every message (services/intent.py) — the same rule applies.
     for role in ("chat", "tts", "vision", "browser_tool", "listening",
-                 "planner"):
+                 "planner", "intent"):
         resolved[role], errors[role] = role_model(role)
     return {
         "chat_model": resolved["chat"],
@@ -1602,6 +1603,7 @@ def get_settings():
         "browser_tool_model": resolved["browser_tool"],
         "listening_model": resolved["listening"],
         "planner_model": resolved["planner"],
+        "intent_model": resolved["intent"],
         "model_errors": {r: e for r, e in errors.items() if e},
         "providers": model_registry.list_providers(),
         "role_allowed": role_allowed,
@@ -1631,7 +1633,8 @@ def set_chat_model(payload: ChatModelUpdate):
 
 @router.post("/settings/model")
 def set_model(payload: ModelUpdate):
-    """Generic per-role model switch: chat/tts/vision/browser_tool/listening."""
+    """Generic per-role model switch: chat/tts/vision/browser_tool/listening/
+    planner/intent."""
     try:
         result = model_registry.set_model_for_role(
             payload.role, payload.provider, payload.model
@@ -1646,6 +1649,8 @@ def set_model(payload: ModelUpdate):
         "browser_tool": "browser_tool_model",
         "listening": "listening_model",
         "planner": "planner_model",
+        # [F56] the classifier's model (services/intent.py)
+        "intent": "intent_model",
     }.get(str(payload.role).strip(), "model")
     return {"ok": True, key: result, "role": payload.role}
 
