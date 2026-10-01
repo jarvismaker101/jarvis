@@ -634,7 +634,6 @@ class ListenerMarkTests(_LatencyCase):
                           return_value=True), \
              patch.object(listener, "barge_in_on_speech_onset"), \
              patch.object(listener, "play_capture_complete_earcon"), \
-             patch.object(listener, "PARTIAL_TRANSCRIBE_MIN_SECONDS", 100.0), \
              patch.object(listener, "is_human_voice", return_value=True):
             audio = listener._capture_audio(turn)
         self.assertIsNotNone(audio)

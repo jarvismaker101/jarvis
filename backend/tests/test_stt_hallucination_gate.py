@@ -193,11 +193,17 @@ class WhisperDaemonWakeBiasTests(unittest.TestCase):
             self.model.kwargs["initial_prompt"], whisper_daemon.INITIAL_PROMPT
         )
 
+    def test_conversation_transcription_decodes_greedily(self):
+        """[PERF] One draft instead of a beam of five.
 
-def _fake_chunk():
-    return SimpleNamespace(
-        frame_data=b"\x00\x00" * 1600, sample_rate=16000, sample_width=2
-    )
+        The latency pass turned beam search off (temperature 0 keeps greedy
+        decode deterministic). Pinned here because a silent revert would cost
+        ~1.5-2x the decode time on every turn again.
+        """
+        payload = self._post()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.model.kwargs["beam_size"], 1)
+        self.assertEqual(self.model.kwargs["temperature"], 0.0)
 
 
 class ListenerCommitGateTests(unittest.TestCase):
@@ -206,19 +212,6 @@ class ListenerCommitGateTests(unittest.TestCase):
     def setUp(self):
         listener._turn_stabilizer.reset()
         self.addCleanup(listener._turn_stabilizer.reset)
-
-    def test_partial_windows_drop_hallucinations(self):
-        with patch.object(listener, "recognize_local_whisper",
-                          return_value=(LIVE_LOOP, "en")):
-            window = listener._emit_partial_window([_fake_chunk()], "1", 1, 1500)
-        self.assertIsNone(window)
-
-    def test_partial_windows_keep_real_text(self):
-        with patch.object(listener, "recognize_local_whisper",
-                          return_value=("open chrome", "en")):
-            window = listener._emit_partial_window([_fake_chunk()], "1", 1, 1500)
-        self.assertIsNotNone(window)
-        self.assertEqual(window.text, "open chrome")
 
     def test_listen_returns_none_for_a_hallucinated_final(self):
         audio = sr.AudioData(b"\x00" * 3200, 16000, 2)

@@ -90,7 +90,6 @@ class _CaptureHarness(unittest.TestCase):
             patch.object(listener, "play_capture_complete_earcon"),
             patch.object(listener, "_recalibrate_listener"),
             patch.object(listener, "_reset_microphone_source"),
-            patch.object(listener, "_emit_partial_window", return_value=None),
         ]
         for item in patches:
             item.start()

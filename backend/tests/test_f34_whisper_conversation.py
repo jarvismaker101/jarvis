@@ -1,19 +1,22 @@
 """F34 — reuse local Whisper for active conversation.
 
-Acceptance (audit report): "Partials arrive before utterance end;
-duplicates/reordering/contradiction/cross-turn windows never authorize
-unstable actions; local-only failure transmits nothing externally."
+Acceptance (audit report): "duplicates/reordering/contradiction/cross-turn
+windows never authorize unstable actions; local-only failure transmits nothing
+externally."
 
 The baseline defects pinned here:
-  * capture completed before the FIRST (and only) transcription, and the only
-    stabilizer window ever produced was the final one — there were no real
-    overlapping partial windows at all;
   * ``TranscriptWindow.overlaps`` returned True when timestamps were missing,
     so unverifiable windows counted as corroboration;
   * agreement counted any prior agreeing window (duplicates included, and
     non-consecutive agreement across a contradiction);
   * a local engine choice did not establish a local-only privacy policy — the
     conversation path still fell through to cloud STT on local failure.
+
+The audit's FIRST acceptance clause ("partials arrive before the utterance
+ends") is deliberately NOT pinned here any more: the partial-window layer was
+removed in the 2026-10 latency pass (tag ``simple-listening``), so one utterance
+now costs exactly one transcription of the complete audio. The stabilizer rules
+below are unchanged and still govern the final commit.
 
 No microphone, TTS engine, wake engine or subprocess is opened here.
 """
@@ -25,156 +28,10 @@ from unittest.mock import patch
 import speech_recognition as sr
 
 from backend.services import listener
-from backend.services import transcript_stabilizer
 from backend.services.transcript_stabilizer import (
     TranscriptStabilizer,
     TranscriptWindow,
 )
-
-
-def _chunk(seconds=0.5, rate=16000):
-    return sr.AudioData(b"\x00" * int(rate * seconds) * 2, rate, 2)
-
-
-class _ChunkStream:
-    """Iterable capture stream that records how many chunks were consumed."""
-
-    def __init__(self, chunks):
-        self.chunks = list(chunks)
-        self.consumed = 0
-
-    def __iter__(self):
-        for chunk in self.chunks:
-            self.consumed += 1
-            yield chunk
-
-
-class PartialWindowTests(unittest.TestCase):
-    """Acceptance: partials arrive BEFORE the utterance ends."""
-
-    def setUp(self):
-        listener._turn_stabilizer.reset()
-        self.stream = _ChunkStream([_chunk() for _ in range(4)])
-        self.observed = []
-        self._observer = None
-
-    def tearDown(self):
-        if self._observer is not None:
-            listener.unregister_partial_observer(self._observer)
-        listener._turn_stabilizer.reset()
-
-    def _run_capture(self, transcript="open chrome"):
-        def observer(window):
-            # TranscriptWindow is __slots__-based: record the observation
-            # around it rather than decorating the window itself.
-            self.observed.append({
-                "window": window,
-                "at_chunk": self.stream.consumed,
-                "committed_then": listener._turn_stabilizer.committed(),
-            })
-
-        listener.register_partial_observer(observer)
-        self._observer = observer
-
-        if isinstance(transcript, (list, tuple)):
-            remaining = list(transcript)
-
-            def local_whisper(_audio, timeout=None):
-                # [P0-04] The partial engine is called WITH a deadline: the
-                # no-deadline TypeError fallback was removed so an engine that
-                # cannot express one is never handed work it can hang on. The
-                # assertions in this file are unchanged.
-                text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
-                return text, "en"
-        else:
-            def local_whisper(_audio, timeout=None):
-                return transcript, "en"
-
-        class _Source:
-            stream = object()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        patches = [
-            patch.object(listener, "_get_microphone_source",
-                         return_value=_Source()),
-            patch.object(listener.recognizer, "listen",
-                         return_value=self.stream),
-            patch.object(listener, "_aec_filter_chunk",
-                         side_effect=lambda chunk, fid, t: (chunk, False,
-                                                            False)),
-            patch.object(listener, "_should_confirm_speech_start",
-                         return_value=True),
-            patch.object(listener, "barge_in_on_speech_onset"),
-            patch.object(listener, "play_capture_complete_earcon"),
-            patch.object(listener, "_recalibrate_listener"),
-            patch.object(listener, "is_human_voice", return_value=True),
-            patch.object(listener, "PARTIAL_TRANSCRIBE_MIN_SECONDS", 0.5),
-            patch.object(listener, "recognize_local_whisper",
-                         side_effect=local_whisper),
-        ]
-        for p in patches:
-            p.start()
-        try:
-            return listener._capture_audio()
-        finally:
-            for p in reversed(patches):
-                p.stop()
-
-    @property
-    def windows(self):
-        return [item["window"] for item in self.observed]
-
-    def test_partial_windows_are_produced_during_capture(self):
-        self._run_capture()
-        self.assertGreaterEqual(len(self.observed), 2,
-                                "capture produced no real partial windows")
-        self.assertTrue(all(not w.final for w in self.windows))
-
-    def test_the_first_partial_arrives_before_the_utterance_ends(self):
-        self._run_capture()
-        total = len(self.stream.chunks)
-        self.assertLess(self.observed[0]["at_chunk"], total,
-                        "the first partial only appeared at utterance end")
-
-    def test_partial_windows_are_identified_timestamped_and_turn_scoped(self):
-        self._run_capture()
-        windows = self.windows
-        wids = [w.wid for w in windows]
-        self.assertEqual(len(wids), len(set(wids)), "window ids are not unique")
-        ends = [w.end_ms for w in windows]
-        self.assertEqual(ends, sorted(ends), "window ranges do not advance")
-        self.assertEqual(len({w.turn for w in windows}), 1,
-                         "partial windows span more than one turn")
-        self.assertIsNotNone(windows[0].turn)
-
-    def test_agreeing_partials_commit_before_the_utterance_ends(self):
-        self._run_capture(transcript="open chrome")
-        self.assertTrue(self.observed)
-        self.assertEqual(self.observed[-1]["committed_then"], "open chrome",
-                         "local agreement did not commit during capture")
-
-    def test_disagreeing_partials_never_commit_the_contradicted_text(self):
-        self._run_capture(["open chrome", "open browser", "play music",
-                           "play music"])
-        self.assertEqual(listener._turn_stabilizer.committed(), "play music")
-        committed_seen = [item["committed_then"] for item in self.observed]
-        self.assertNotIn("open chrome", committed_seen)
-
-    def test_partial_only_text_never_becomes_committed_text(self):
-        # A single partial (no corroboration) can never authorize an action.
-        listener._turn_stabilizer.begin_turn()
-        listener._turn_stabilizer.push(TranscriptWindow(
-            "p1", "delete everything", final=False, start_ms=0, end_ms=1000))
-        self.assertEqual(listener._turn_stabilizer.committed(), "")
-        self.assertFalse(listener._turn_stabilizer.is_committed(
-            "delete everything"))
-        self.assertEqual(listener._turn_stabilizer.unstable(),
-                         "delete everything")
 
 
 class StabilizerRuleTests(unittest.TestCase):

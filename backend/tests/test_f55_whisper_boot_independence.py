@@ -149,17 +149,34 @@ class BindsBeforeModelLoadTests(_ServingDaemon):
 
 
 class TranscribeWaitsForTheModelTests(_ServingDaemon):
+    """``/transcribe`` across the model's loading window.
+
+    [simple-listening] Every test here must keep the REAL ``load_model`` out of
+    the process. It used to be slow enough (``medium``, ~3.7s on this machine)
+    that a real load could neither beat the 0.4s stub below nor finish inside a
+    0.3s wait, so the tests passed while silently depending on load duration.
+    Swapping the shipped model to ``base`` (~0.5s cold, faster warm) turned that
+    into a 500 - the real model was handed a fake ``RIFFxxxx`` body. The loader
+    is now stubbed explicitly, so these pin the WAITING behaviour and not how
+    fast a model happens to load.
+    """
+
+    def _parked_loader(self):
+        """A loader that never finishes until the test releases it."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        return release
+
     def test_transcribe_waits_for_a_loading_model_and_then_answers(self):
         whisper_daemon.TRANSCRIBE_MODEL_WAIT = 10.0
 
-        def finish_load():
+        def slow_load():
             time.sleep(0.4)
             whisper_daemon.model = _FakeModel()
             whisper_daemon._model_load_finished.set()
 
-        threading.Thread(target=finish_load, daemon=True).start()
-
-        status, payload = self._post("/transcribe")
+        with patch.object(whisper_daemon, "load_model", side_effect=slow_load):
+            status, payload = self._post("/transcribe")
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
@@ -167,8 +184,13 @@ class TranscribeWaitsForTheModelTests(_ServingDaemon):
 
     def test_transcribe_reports_loading_when_the_wait_expires(self):
         whisper_daemon.TRANSCRIBE_MODEL_WAIT = 0.3
+        release = self._parked_loader()
 
-        status, payload = self._post("/transcribe")
+        def slow_load():
+            release.wait(timeout=5)
+
+        with patch.object(whisper_daemon, "load_model", side_effect=slow_load):
+            status, payload = self._post("/transcribe")
 
         self.assertEqual(status, 503)
         self.assertFalse(payload["ok"])
@@ -177,6 +199,8 @@ class TranscribeWaitsForTheModelTests(_ServingDaemon):
     def test_transcribe_reports_a_model_load_failure(self):
         whisper_daemon._model_error = "cuda missing"
         whisper_daemon._model_load_finished.set()
+        # The failure is what is under test: do not also start a real load.
+        whisper_daemon._model_load_started = True
 
         status, payload = self._post("/transcribe")
 

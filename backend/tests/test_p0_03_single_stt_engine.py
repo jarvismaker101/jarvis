@@ -340,11 +340,6 @@ class TimeoutBudgetTests(unittest.TestCase):
         self.assertLessEqual(listener.FINAL_STT_TIMEOUT_SECONDS, 10.0)
         self.assertGreater(listener.FINAL_STT_TIMEOUT_SECONDS, 0)
 
-    def test_the_partial_budget_is_unchanged_and_smaller(self):
-        self.assertEqual(listener.PARTIAL_STT_TIMEOUT_SECONDS, 4.0)
-        self.assertLess(listener.PARTIAL_STT_TIMEOUT_SECONDS,
-                        listener.FINAL_STT_TIMEOUT_SECONDS)
-
     def test_inworld_has_explicit_connect_and_read_budgets(self):
         connect, read = transcription.INWORLD_STT_TIMEOUT
         self.assertLessEqual(connect, 5)

@@ -1,6 +1,5 @@
 import atexit
 import os
-import queue
 import re
 import threading
 import time
@@ -23,7 +22,6 @@ from backend.services.audio_input import (
 )
 from backend.services.earcons import play_capture_complete_earcon
 from backend.services.transcription import (
-    LOCAL_WHISPER_URL,
     is_hallucinated_transcript,
     recognize_google_or_groq,
     recognize_inworld,
@@ -145,7 +143,6 @@ def _mark_turn(marks, name, meta=None):
         marks.mark(name, meta)
     except Exception:
         pass
-
 
 
 def _close_microphone_source():
@@ -280,107 +277,13 @@ def is_human_voice(audio, minimum_ratio=FINAL_SPEECH_VAD_RATIO):
     )
 
 
-# ── F34: local-only partial windows during capture ─────────────────────────
-# Active conversation must produce REAL overlapping partial windows BEFORE
-# the utterance ends, so local agreement can commit a transcript early and
-# unstable text never has to authorize an action. Partials are produced by
-# the LOCAL whisper engine only (never a cloud STT), at most every
-# JARVIS_PARTIAL_TRANSCRIBE_SECONDS and at most
-# JARVIS_MAX_PARTIAL_WINDOWS per utterance, so a long phrase stays bounded.
-PARTIAL_TRANSCRIBE_MIN_SECONDS = float(
-    os.getenv("JARVIS_PARTIAL_TRANSCRIBE_SECONDS", "1.5"))
-MAX_PARTIAL_WINDOWS_PER_UTTERANCE = int(
-    os.getenv("JARVIS_MAX_PARTIAL_WINDOWS", "8"))
-#: [PERF] Trailing audio ceiling for ONE partial window. Transcribing the whole
-#: accumulated utterance every window is quadratic (window k re-sends ~1.5k
-#: seconds) and it happens inside the real-time capture loop. Only the tail can
-#: change the newest transcript, so older audio is dropped. The stabiliser's
-#: end_ms is still absolute, so window ranges keep advancing exactly as before.
-#:
-#: [P0-04] The default was 20, i.e. LARGER than MAX_PHRASE_SECONDS (15), so the
-#: cap could never apply - every window re-sent the entire utterance. It is now
-#: 6s: genuinely below the phrase cap, and only the last few seconds of audio
-#: can change the newest transcript anyway.
-PARTIAL_MAX_AUDIO_SECONDS = float(
-    os.getenv("JARVIS_PARTIAL_MAX_AUDIO_SECONDS", "6"))
-#: [PERF] A partial window is an early hint, never the committed answer, so it
-#: must not be able to stall the capture loop for the daemon's full 15s budget.
-PARTIAL_STT_TIMEOUT_SECONDS = float(
-    os.getenv("JARVIS_PARTIAL_STT_TIMEOUT", "4"))
-#: [P0-03] The FINAL commit is the answer, but it is no longer one rung of a
-#: ladder that could add a local 15s wait to a 20s cloud wait and then two
-#: 35s Groq attempts (117s worst case). With exactly one engine per turn the
-#: budget IS this number, so it is explicit and env-tunable instead of falling
-#: through to ``recognize_local_whisper``'s generic 15s default.
+#: [P0-03] The turn's WHOLE speech-to-text budget. With exactly one engine per
+#: turn the budget IS this number - explicit and env-tunable - instead of
+#: falling through to ``recognize_local_whisper``'s generic 15s default. The
+#: separate partial-window deadline that used to sit beside this constant went
+#: with the partial layer (tag ``simple-listening``).
 FINAL_STT_TIMEOUT_SECONDS = float(
     os.getenv("JARVIS_STT_FINAL_TIMEOUT", "10"))
-#: [P0-04] Trailing VAD silence that must follow two AGREEING partials before
-#: the capture may end early with the agreed text. This is NOT an end-of-speech
-#: rule: the normal path still waits the full PAUSE_THRESHOLD_SECONDS (1.2s) of
-#: silence, and this one only applies when the stabiliser has ALREADY committed
-#: two independently-agreeing partial windows.
-PARTIAL_AGREEMENT_SILENCE_SECONDS = float(
-    os.getenv("JARVIS_PARTIAL_AGREEMENT_SILENCE", "0.25"))
-#: [P0-04] How long the capture loop may wait for the worker to finish a
-#: partial it has just handed over. This is a SCHEDULING handoff, not a wait on
-#: the transcription: it is a constant, never derived from the engine's own
-#: budget, and it is skipped entirely whenever the worker is already behind (so
-#: a slow daemon can never accumulate these). It exists so a FAST engine's
-#: window lands while the utterance is still being captured - which is what
-#: makes an early commit (and the F34 "partials arrive before the utterance
-#: ends" contract) possible at all without ever blocking on transcription.
-PARTIAL_DELIVERY_GRACE_SECONDS = float(
-    os.getenv("JARVIS_PARTIAL_DELIVERY_GRACE", "0.05"))
-
-
-def _bounded_audio_tail(chunks, max_seconds):
-    """Return the trailing ``chunks`` covering at most *max_seconds* of audio.
-
-    Returns the list unchanged when the whole capture already fits, so the
-    common short-utterance case is untouched.
-    """
-    if not chunks or not max_seconds or max_seconds <= 0:
-        return chunks
-    keep = 0
-    total = 0.0
-    for chunk in reversed(chunks):
-        total += _audio_duration_seconds(chunk)
-        keep += 1
-        if total >= max_seconds:
-            break
-    if keep >= len(chunks):
-        return chunks
-    return chunks[len(chunks) - keep:]
-
-
-_partial_observers = []
-_partial_observer_lock = threading.Lock()
-
-
-def register_partial_observer(callback):
-    """Observe every PARTIAL transcript window as it is produced (F34)."""
-    with _partial_observer_lock:
-        if callback not in _partial_observers:
-            _partial_observers.append(callback)
-    return callback
-
-
-def unregister_partial_observer(callback):
-    with _partial_observer_lock:
-        try:
-            _partial_observers.remove(callback)
-        except ValueError:
-            pass
-
-
-def _notify_partial(window):
-    with _partial_observer_lock:
-        observers = list(_partial_observers)
-    for callback in observers:
-        try:
-            callback(window)
-        except Exception:
-            pass
 
 
 def _cloud_stt_policy():
@@ -391,369 +294,6 @@ def _cloud_stt_policy():
         return cloud_stt_policy()
     except Exception:
         return "on"
-
-
-def _transcribe_partial(audio):
-    """Transcribe one partial window with the PARTIAL (short) deadline.
-
-    A partial window is an early hint, not the answer, so it must not be able
-    to hold anything for the daemon's full 15s budget.
-
-    [P0-04] This used to fall back to a NO-DEADLINE call on ``TypeError`` ("many
-    tests stub the engine with one argument"). That fallback is gone: an engine
-    that cannot express a deadline must not be handed work it can hang on, so a
-    caller without the keyword gets a dropped partial instead of an unbounded
-    call. (The call now runs on the partial worker, not the capture loop, so
-    even a hung engine cannot stall capture — see ``_PartialWorker``.)
-    """
-    return recognize_local_whisper(
-        audio, timeout=PARTIAL_STT_TIMEOUT_SECONDS)
-
-
-def _emit_partial_window(chunks, turn_id, index, duration_ms,
-                         on_commit=None):
-    """Transcribe the accumulated LOCAL audio and push one partial window.
-
-    Returns the :class:`TranscriptWindow` (or None). Never raises, and never
-    contacts anything but the local whisper engine.
-
-    [P0-04] Two changes:
-
-    * the stabilizer's ``push()`` return value is no longer thrown away. When
-      the push COMMITS (two consecutive agreeing partial windows), *on_commit*
-      is called with the committed text so the capture loop can end the
-      utterance early on it.
-    * the push happens BEFORE the observer notification. An observer is told
-      "this window is now in the stabilizer", so ``committed()`` read inside an
-      observer already includes the window it was just handed - previously a
-      commit made by the newest window was invisible to the observer of that
-      same window.
-    """
-    audio = _combine_audio_chunks(chunks)
-    if audio is None:
-        return None
-    try:
-        transcript, language = _transcribe_partial(audio)
-    except Exception as exc:
-        print(f"[LISTENER] Partial transcription unavailable: {exc}")
-        return None
-    text = (transcript or "").strip()
-    if not text:
-        return None
-    if is_hallucinated_transcript(text):
-        # STT degeneracy over noise / TTS-echo audio (looped token, prompt
-        # echo, memorised silence phrase): never becomes a partial window and
-        # never reaches the stabilizer.
-        return None
-    window = TranscriptWindow(
-        wid="partial-%s-%d" % (turn_id, index),
-        text=text,
-        final=False,
-        language=language,
-        start_ms=0,
-        end_ms=int(duration_ms),
-        turn=turn_id,
-    )
-    stable = None
-    try:
-        stable = _turn_stabilizer.push(window)
-    except Exception as exc:
-        print(f"[LISTENER] Stabilizer error: {exc}")
-    print(
-        f"[LISTENER] Partial window {window.wid} "
-        f"({int(duration_ms)}ms): {_normalize_text(window.text)}"
-    )
-    _notify_partial(window)
-    if stable is not None and on_commit is not None:
-        try:
-            on_commit(stable.text, stable.language)
-        except Exception:
-            pass
-    return window
-
-
-_daemon_ready_cache = {"at": 0.0, "ready": True}
-_DAEMON_READY_TTL_SECONDS = 5.0
-_daemon_probe_inflight = threading.Event()
-
-
-def probe_whisper_daemon(timeout=0.5):
-    """[P0-04] ONE /health probe. True / False / None (None = no report).
-
-    The daemon serialises every request behind one lock, so a partial sent to a
-    daemon that is still loading its model, or that fell back to CPU, queues
-    behind work that can take many seconds. A partial is only worth having when
-    the engine is warm and on a GPU.
-
-    Returns None when the daemon cannot be reached at all: that is "no report",
-    not "not ready" (see :func:`whisper_daemon_ready`). Never raises.
-    """
-    try:
-        from urllib.request import urlopen
-
-        with urlopen(f"{LOCAL_WHISPER_URL}/health", timeout=timeout) as resp:
-            import json as _json
-
-            payload = _json.loads(resp.read().decode("utf-8"))
-        # A definite report: loaded and not on CPU.
-        return bool(payload.get("ready")) and payload.get("device") != "cpu"
-    except Exception:
-        return None
-
-
-def _refresh_daemon_ready():
-    """Refresh the cached readiness in the BACKGROUND.
-
-    The probe is an HTTP round trip, so it must never sit in the path of a job:
-    it runs on a throwaway daemon thread and only a definite report updates the
-    cache. At most one probe is in flight at a time.
-    """
-    if _daemon_probe_inflight.is_set():
-        return
-    _daemon_probe_inflight.set()
-
-    def _probe():
-        try:
-            report = probe_whisper_daemon()
-            if report is not None:
-                _daemon_ready_cache["ready"] = report
-            _daemon_ready_cache["at"] = time.monotonic()
-        except Exception:
-            pass
-        finally:
-            _daemon_probe_inflight.clear()
-
-    try:
-        threading.Thread(target=_probe, name="partial-health",
-                         daemon=True).start()
-    except Exception:
-        _daemon_probe_inflight.clear()
-
-
-def whisper_daemon_ready():
-    """[P0-04] Is the whisper daemon worth sending a partial to right now?
-
-    Returns the CACHED verdict and refreshes it in the background when it goes
-    stale, so this is a dict read on the hot path - it never blocks, never
-    raises, and never adds a round trip to a partial.
-
-    Fails OPEN when the daemon has never been reached: a down daemon fails the
-    transcription immediately and is already handled, whereas refusing to try
-    would silently disable partials - and with them the early-commit path - for
-    every caller that stubs the engine out (all of the F34/STT tests do).
-    A DEFINITE report always wins: ``ready: false`` or ``device: cpu`` means
-    skip the partial entirely.
-    """
-    try:
-        if time.monotonic() - _daemon_ready_cache["at"] \
-                >= _DAEMON_READY_TTL_SECONDS:
-            _refresh_daemon_ready()
-        return bool(_daemon_ready_cache["ready"])
-    except Exception:
-        return True
-
-
-def partial_daemon_state():
-    """[P0-04] Observability for the readiness gate."""
-    return dict(_daemon_ready_cache)
-
-
-class _PartialWorker:
-    """[P0-04] Runs partial transcription OFF the real-time capture loop.
-
-    The capture loop used to call the whisper daemon inline, so every partial
-    window blocked frame consumption for up to PARTIAL_STT_TIMEOUT seconds -
-    delaying onset detection, barge-in and the end of the utterance itself.
-
-    Shape: one daemon thread fed by ``queue.Queue(maxsize=1)``.
-
-    * ``submit()`` NEVER blocks. When the single pending slot is occupied the
-      OLDEST pending partial is dropped for the newest: only the freshest audio
-      can change the newest transcript, so older requests are worthless.
-    * a job in flight is never dropped - only the pending slot is.
-    * jobs run one at a time, in submission order, so partial windows reach the
-      stabilizer in the order they were produced (F34's ordering rules depend
-      on that).
-    * every failure is swallowed: a partial is never allowed to break capture.
-    """
-
-    def __init__(self):
-        self._jobs = queue.Queue(maxsize=1)
-        self._shutdown = threading.Event()
-        self._lock = threading.Lock()
-        self._thread = None
-        self._busy = threading.Event()
-        self.stats = {
-            "submitted": 0,
-            "dropped": 0,
-            "completed": 0,
-            "failed": 0,
-            "skipped_not_ready": 0,
-            "commits": 0,
-        }
-
-    # -- producer side -----------------------------------------------------
-
-    def submit(self, chunks, turn_id, index, duration_ms, on_commit=None):
-        """Hand a partial over. Returns the job (never blocks, never raises)."""
-        job = {
-            "chunks": list(chunks),
-            "turn_id": turn_id,
-            "index": index,
-            "duration_ms": duration_ms,
-            "on_commit": on_commit,
-            "done": threading.Event(),
-        }
-        try:
-            with self._lock:
-                self.stats["submitted"] += 1
-                if self._shutdown.is_set():
-                    return None
-                if self._thread is None or not self._thread.is_alive():
-                    self._thread = threading.Thread(
-                        target=self._run, name="partial-stt", daemon=True)
-                    self._thread.start()
-            try:
-                self._jobs.put_nowait(job)
-            except queue.Full:
-                # Drop the oldest PENDING job; the newest audio is the only
-                # audio worth transcribing.
-                try:
-                    self._jobs.get_nowait()
-                    with self._lock:
-                        self.stats["dropped"] += 1
-                except queue.Empty:
-                    pass
-                try:
-                    self._jobs.put_nowait(job)
-                except queue.Full:
-                    return None
-            return job
-        except Exception:
-            return None
-    def backlogged(self):
-        """True while a job is running or waiting (the worker is behind)."""
-        return self._busy.is_set() or not self._jobs.empty()
-
-    def drain(self, timeout=0.0):
-        """Wait up to *timeout* for queued/in-flight work to finish."""
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while True:
-            if not self.backlogged():
-                return True
-            if time.monotonic() >= deadline:
-                return not self.backlogged()
-            time.sleep(0.005)
-
-    def shutdown(self, timeout=1.0):
-        """Stop the worker and drop anything pending (listener exit)."""
-        try:
-            with self._lock:
-                self._shutdown.set()
-            thread = self._thread
-            if thread is not None:
-                thread.join(timeout=timeout)
-        except Exception:
-            pass
-
-    # -- worker side -------------------------------------------------------
-
-    def _run(self):
-        while True:
-            try:
-                job = self._jobs.get(timeout=0.1)
-            except queue.Empty:
-                if self._shutdown.is_set():
-                    return
-                continue
-            if self._shutdown.is_set():
-                job["done"].set()
-                return
-            self._busy.set()
-            try:
-                self._run_job(job)
-            except Exception:
-                pass
-            finally:
-                self._busy.clear()
-                job["done"].set()
-
-    def _run_job(self, job):
-        # [P0-04] Gate on daemon readiness BEFORE sending work: a partial sent
-        # to a loading or CPU-bound daemon would queue behind slow work.
-        if not whisper_daemon_ready():
-            with self._lock:
-                self.stats["skipped_not_ready"] += 1
-            return
-        committed = {}
-
-        def _on_commit(text, language):
-            committed["text"] = text
-            committed["language"] = language
-            with self._lock:
-                self.stats["commits"] += 1
-            # Forward to the capture loop's callback: this is what lets a turn
-            # end early on the agreed text (P0-04 part B).
-            callback = job.get("on_commit")
-            if callback is not None:
-                try:
-                    callback(text, language)
-                except Exception:
-                    pass
-
-        window = _emit_partial_window(
-            job["chunks"], job["turn_id"], job["index"],
-            job["duration_ms"], on_commit=_on_commit)
-        if window is None:
-            with self._lock:
-                self.stats["failed"] += 1
-            return
-        with self._lock:
-            self.stats["completed"] += 1
-        job["committed"] = committed or None
-
-
-#: [P0-04] The one partial worker for this process (thread starts lazily).
-_partial_worker = _PartialWorker()
-atexit.register(_partial_worker.shutdown)
-
-
-def partial_worker_stats():
-    """[P0-04] Snapshot of the partial worker's counters."""
-    with _partial_worker._lock:
-        stats = dict(_partial_worker.stats)
-    stats["backlogged"] = _partial_worker.backlogged()
-    return stats
-
-
-def _submit_partial(chunks, turn_id, index, duration_ms, on_commit=None):
-    """Hand a partial window to the worker and let a FAST engine deliver it.
-
-    [P0-04] The handover itself never blocks. The bounded wait below is a
-    SCHEDULING grace, deliberately unrelated to the engine's own deadline: it
-    gives a fast engine the chance to produce its window while the utterance is
-    still being captured (which is what makes an early commit possible at all),
-    and it is SKIPPED whenever the worker is already behind - so a slow daemon
-    can never accumulate these. It is a fixed constant, never the engine's
-    budget, so it cannot grow with transcription time.
-    """
-    _partial_worker_had_backlog = _partial_worker.backlogged()
-    job = _partial_worker.submit(chunks, turn_id, index, duration_ms,
-                                 on_commit=on_commit)
-    if job is None:
-        return None
-    # Sampled BEFORE the submit: "was the worker already behind?" - if it was,
-    # a slow engine must not get a grace window on top of the wait it is
-    # already causing.
-    if not _partial_worker_had_backlog:
-        try:
-            job["done"].wait(PARTIAL_DELIVERY_GRACE_SECONDS)
-        except Exception:
-            pass
-    return job
-
-
-
 
 
 #: [P0-03] The single-engine map. The registry offers exactly these providers
@@ -1486,7 +1026,7 @@ def _report_aec_degraded_once(during):
               f"overlapped playback")
 
 
-def _capture_audio(marks=None, early=None):
+def _capture_audio(marks=None):
     """Capture one utterance (streaming) and return its combined audio.
 
     *marks* is the optional [PERF] P1-19 telemetry sink for this turn: the two
@@ -1494,12 +1034,11 @@ def _capture_audio(marks=None, early=None):
     = the audio was assembled and handed on) are recorded on it. Optional so a
     caller without a turn (a test, a probe) is unaffected.
 
-    *early* is the optional [P0-04] out-parameter for the early-commit path.
-    When two partial windows have independently AGREED and VAD has then seen
-    PARTIAL_AGREEMENT_SILENCE_SECONDS of trailing silence, the capture stops
-    early and ``early["text"]`` / ``early["language"]`` carry the already
-    committed transcript, so :func:`listen` can return it WITHOUT the final STT
-    round trip. Optional, so every existing caller is unchanged.
+    Plain capture: frames are consumed until the pause threshold ends the
+    utterance and NOTHING is transcribed here. The partial-window layer that
+    used to run a background whisper pass over the trailing audio (and could end
+    the capture early on two agreeing windows) is deliberately gone - one
+    utterance now costs exactly ONE transcription, after the audio is complete.
     """
     global empty_listen_count
 
@@ -1521,8 +1060,8 @@ def _capture_audio(marks=None, early=None):
         onset_chunks = []
         aec_during = {"frames": 0, "reported": False}
         aec_suppressed = {"frames": 0, "other": 0}
-        # [F34] One conversation turn per capture: partial windows produced
-        # here can only ever agree with windows of THIS utterance.
+        # [F34] One conversation turn per capture: the final window committed
+        # for this utterance can never combine with another turn's.
         try:
             turn_id = _turn_stabilizer.begin_turn()
         except Exception:
@@ -1539,23 +1078,6 @@ def _capture_audio(marks=None, early=None):
         except Exception:
             capture_token = turn_id
         frame_index = 0
-        partial_state = {"seconds": 0.0, "emitted": 0, "duration_ms": 0.0}
-        # [P0-04] The worker fills ``early_state`` from its own thread the
-        # moment two partials agree; the loop only ever reads it. Python's dict
-        # item assignment is atomic under the GIL, and the worst case of a race
-        # is that this frame misses it and the next one sees it.
-        early_state = {}
-        # [P0-04] Trailing VAD silence, updated per NON-suppressed frame.
-        # ``saw_speech`` is what makes it TRAILING silence: 250ms of quiet is
-        # only meaningful after the user was actually speaking, which also
-        # keeps an all-silent capture from short-circuiting.
-        silence_state = {"seconds": 0.0, "saw_speech": False,
-                         "agreed": False}
-
-        def _on_partial_commit(text, language):
-            # Called on the worker thread when the stabilizer commits.
-            early_state["text"] = text
-            early_state["language"] = language
 
         for chunk in audio_stream:
             if not chunk or not chunk.frame_data:
@@ -1571,8 +1093,6 @@ def _capture_audio(marks=None, early=None):
                 chunk, (capture_token, frame_index), time.monotonic())
             frame_index += 1
             filtered_chunks.append(filtered_chunk)
-            frame_duration = _audio_duration_seconds(filtered_chunk)
-            partial_state["duration_ms"] += frame_duration * 1000.0
             if had_reference:
                 aec_during["frames"] += 1
             if suppressed:
@@ -1583,25 +1103,11 @@ def _capture_audio(marks=None, early=None):
                 # contribute to onset detection: a barge-in must be the user,
                 # never Jarvis's own voice leaking into the mic path.
                 onset_chunks.append(filtered_chunk)
-                partial_state["seconds"] += frame_duration
-                # [P0-04] ...and only those frames count towards trailing
-                # silence: while Jarvis is talking, quiet is not the user
-                # having finished.
-                try:
-                    if is_human_voice(filtered_chunk, SPEECH_START_VAD_RATIO):
-                        silence_state["seconds"] = 0.0
-                        silence_state["saw_speech"] = True
-                    else:
-                        silence_state["seconds"] += frame_duration
-                except Exception:
-                    pass
 
-            # [PERF] Onset / barge-in is evaluated BEFORE any partial-window
-            # transcription. Transcribing a partial window is a blocking call
-            # into the local whisper engine, so doing it first delayed the
-            # moment the user is recognised as having started speaking - i.e.
-            # it delayed barge-in by the whole transcription. Onset must never
-            # queue behind transcription.
+            # [PERF] Onset / barge-in is the only per-frame decision left in
+            # this loop: nothing transcribes here, so the moment the user is
+            # recognised as having started speaking is never delayed by an
+            # engine call.
             if not speech_started and _should_confirm_speech_start(onset_chunks):
                 speech_started = True
                 listener_state.mark_user_speaking(True)
@@ -1609,63 +1115,6 @@ def _capture_audio(marks=None, early=None):
                 # Barge-in: cut ANY in-progress TTS the instant the user
                 # starts speaking (VAD-gated above, not phrase-gated).
                 barge_in_on_speech_onset()
-
-            # [F34] overlapping partial windows DURING capture: locally
-            # transcribed, bounded, and never produced from echo-only
-            # audio. They arrive before the utterance ends, which is what
-            # lets local agreement commit (or refuse) early.
-            #
-            # [P0-04] Two changes from the blocking original:
-            #
-            # * partials only START once speech onset is confirmed. Before
-            #   onset there is nothing worth transcribing, so any window
-            #   produced then was pure cost (and could only ever be a
-            #   hallucination over background noise).
-            # * the transcription runs on the partial WORKER thread. The
-            #   loop hands the audio over and moves on: no frame, no onset
-            #   decision and no barge-in ever queues behind the engine again.
-            #   The audio is still capped to a trailing window, and the
-            #   engine's own deadline is unchanged.
-            if speech_started and not suppressed and (
-                partial_state["seconds"] >= PARTIAL_TRANSCRIBE_MIN_SECONDS
-                and partial_state["emitted"]
-                < MAX_PARTIAL_WINDOWS_PER_UTTERANCE
-            ):
-                partial_state["seconds"] = 0.0
-                partial_state["emitted"] += 1
-                _submit_partial(
-                    _bounded_audio_tail(
-                        filtered_chunks, PARTIAL_MAX_AUDIO_SECONDS),
-                    turn_id, partial_state["emitted"],
-                    partial_state["duration_ms"],
-                    on_commit=_on_partial_commit,
-                )
-
-            # [P0-04] The early end-of-utterance: two independently AGREEING
-            # partials (the stabilizer already committed them) plus 250ms of
-            # trailing VAD silence. This is NOT a new end-of-speech rule - the
-            # normal path still waits the full pause threshold - it only fires
-            # when the transcript is ALREADY settled, which is precisely the
-            # case where waiting for the rest of the silence buys nothing.
-            committed = early_state.get("text")
-            if (committed and not silence_state["agreed"]
-                    and silence_state["saw_speech"]
-                    and silence_state["seconds"]
-                    >= PARTIAL_AGREEMENT_SILENCE_SECONDS):
-                silence_state["agreed"] = True
-                if early is not None:
-                    early["text"] = committed
-                    early["language"] = early_state.get("language")
-                _mark_turn(marks, "partial_commit", {
-                    "text": committed,
-                    "silence_ms": int(silence_state["seconds"] * 1000),
-                    "windows": partial_state["emitted"],
-                })
-                print(
-                    f"[LISTENER] Partial agreement - ending capture early: "
-                    f"{_normalize_text(committed)}"
-                )
-                break
 
         # [PERF] P1-19 — the streaming capture ended: the user stopped talking
         # and this is the last frame of the utterance. Everything from here on
@@ -1745,45 +1194,21 @@ def listen(marks=None):
     :func:`_capture_audio`); the STT boundaries are recorded on it, including
     WHICH engine produced the transcript.
 
-    [P0-04] When the capture ended early on two AGREEING partials, the text is
-    already committed and the final STT round trip is skipped entirely - that
-    is the latency win. The transcript still goes through the same
-    hallucination belt as a final, because it is about to be acted on.
+    One utterance, one transcription: the capture returns the complete audio and
+    exactly ONE engine is asked to transcribe it. There is no partial-window
+    layer and no early commit any more, so the transcript always comes from the
+    selected engine over the WHOLE utterance instead of a trailing-window
+    approximation. It still goes through the hallucination belt, because it is
+    about to be acted on.
     """
     global empty_listen_count
 
-    early = {}
-    audio = _capture_audio(marks, early=early)
-    if audio is None and not early.get("text"):
+    audio = _capture_audio(marks)
+    if audio is None:
         return None
 
     listener_state.set_thinking(True)
     try:
-        if early.get("text"):
-            # [P0-04] Early commit from partial agreement: no final STT call.
-            # Only PARTIAL windows can commit here (a final commits through
-            # the stabilizer below), so unstable text still cannot be
-            # returned; the agreement condition is the stabilizer's.
-            spoken = early["text"]
-            _mark_turn(marks, "stt_start", {"early_commit": True})
-            global LAST_STT_ENGINE
-            LAST_STT_ENGINE = "local-whisper-partial"
-            _mark_turn(marks, "stt_done", {
-                "engine": LAST_STT_ENGINE,
-                "language": early.get("language"),
-                "early_commit": True,
-            })
-            # Same belt as the normal commit boundary: an STT hallucination is
-            # never committed as user speech, however it was produced.
-            if is_hallucinated_transcript(spoken):
-                print(f"[LISTENER] Ignoring STT hallucination: "
-                      f"{_normalize_text(spoken)}")
-                _record_empty_listen("hallucination")
-                return None
-            empty_listen_count = 0
-            print(f"[HEARD:partial-agreement] {_normalize_text(spoken)}")
-            return spoken
-
         print("[LISTENER] Processing speech...")
         _mark_turn(marks, "stt_start")
         raw, text, language = recognize_multilingual(audio)
@@ -1806,10 +1231,10 @@ def listen(marks=None):
         # survive into the planner/tool boundary unchanged; the normalized
         # copy (above) is for matching/logging only.
         spoken = raw if raw else text
-        # [F34] The returned utterance is a COMMITTED transcript: finals
-        # commit immediately, agreeing overlapping partials would too, and a
-        # partial-only/unstable transcript is never returned - so no
-        # downstream action can fire on unstable text.
+        # [F34] The returned utterance is a COMMITTED transcript: the final
+        # window commits immediately, and there is no partial-window path left
+        # that could return unstable text - so no downstream action can fire on
+        # a transcript the stabilizer never committed.
         try:
             stable = _turn_stabilizer.push(TranscriptWindow(
                 "conv-%d" % time.monotonic_ns(),

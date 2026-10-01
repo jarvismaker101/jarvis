@@ -489,10 +489,10 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - Active conversation microphone capture.
   - Uses `speech_recognition` with `stream=True`.
   - Uses `webrtcvad` to reject obvious noise and low-confidence captures.
-  - Uses multilingual recognition across `JARVIS_STT_LANGUAGES`, default `en-IN,hi-IN`.
-  - Engine order comes from `transcription.recognize_multilingual` (`listener.py:746`): the registry-selected `listening`-role engine is tried first — **Inworld by default**, with local Whisper as the alternative, and Google STT then Groq as further fallbacks (one call per language in `RECOGNITION_LANGUAGES`). The live setting is currently `whisper`/`whisper-local`, so the local daemon is primary in practice. A hallucinated result falls through to the next engine. This is the order the code actually does; older notes that say "Google STT first" are stale. (P0-03, which reduces this to ONE engine, is still open.)
-  - Commits a transcript only through the F34 stabiliser and the STT hallucination gate (partial windows are filtered too).
-  - **Nothing blocking in the capture loop** (P1-03/P0-04): the `/speak/stop` POST goes through the `_SpeakStopWorker` daemon thread, partial transcription goes through `_PartialWorker`, and barge-in onset only notifies observers (`register_barge_in_hook`) on a daemon thread. Do not add a synchronous HTTP call or a blocking engine call back into `_capture_audio`/`barge_in_on_speech_onset`.
+  - `JARVIS_STT_LANGUAGES` (default `en-IN,hi-IN`) is only iterated by the `google-or-groq` engine; the local whisper daemon passes no `language=` at all (whisper auto-detects) and Inworld gets an English hint.
+  - Engine order comes from `transcription.recognize_multilingual`: exactly ONE engine per turn — the registry-selected `listening`-role engine (P0-03, landed). The live setting is `whisper`/`whisper-local`, so the local daemon answers. A failed/hallucinated result is a failed turn; there is no fall-through to another engine.
+  - Commits a transcript only through the F34 stabilizer (final window) and the STT hallucination gate. Since tag `simple-listening` the partial-window layer is gone: one utterance costs exactly one transcription of the complete audio.
+  - **Nothing blocking in the capture loop** (P1-03): the `/speak/stop` POST goes through the `_SpeakStopWorker` daemon thread and barge-in onset only notifies observers (`register_barge_in_hook`) on a daemon thread. The capture loop makes no transcription call at all. Do not add a synchronous HTTP call or a blocking engine call back into `_capture_audio`/`barge_in_on_speech_onset`.
   - The capture loop normalises everything to one sample rate (P1-05, `assert_single_rate_audio` at the STT entry) and frame ids are `(capture_token, index)` with `AecSignalPath.begin_capture()` clearing the cache per capture (P0-13).
   - Registers its recognizer with `backend/listener_state.py` so speaking/listening thresholds can be adjusted globally.
 
@@ -1180,6 +1180,84 @@ The activity-tail console is retitled "jarvis - task activity" (was "opencode"),
 This change lives in the brave-control MCP server (`server.mjs`). It was originally made only in the external copy at `C:\Users\mayan\mcp-servers\brave-control`, but a copy is now vendored in-tree at `integrations/brave-control/` — check `BRAVE_MCP_SERVER_DIR` to see which one the app actually spawns. A `settlePage(page, opts)` helper replaced the slow `networkidle` waits in `navigate`/`new_tab` (now `waitForEvent('load', 3s)` with a catch, then settle 300ms) and added a 200ms settle after `click_element`. It resolves on a main-frame `framenavigated` event or DOM-mutation quiescence (200ms debounce, 2500ms hard cap), disconnects its MutationObserver cleanly, and is wrapped in try/catch so settling can never fail a tool call. `ask_chat` polls every 300ms instead of 1500ms, and `copy_code_block` switched to a 100ms clipboard poll capped at 2000ms. Measured navigate ~390-406ms (was 2-4s+) and click ~16ms; that repo's node tests pass 18/18.
 
 ## Recent Improvements (2026-09)
+
+### Simple listening: partials removed, base Whisper + greedy decode (simple-listening, 2026-10-01)
+
+Owner-requested latency pass on the speech-to-text path, made after **measuring**
+the real cost on the target laptop (RTX 3050 6 GB + i5-13420H), one 7.24 s English
+utterance, using the daemon's own transcribe flags:
+
+| configuration | model load | decode | speed |
+| --- | --- | --- | --- |
+| medium cuda float16 (previous default) | 3.66 s | 1.53 s | 0.21× realtime |
+| **base cuda float16 (new default)** | **0.53 s** | **0.42 s** | **0.06× realtime** |
+| tiny cuda float16 | 0.37 s | 0.37 s | 0.05× realtime |
+| medium cpu int8 (the fallback path) | 6.92 s | 27.65 s | 3.82× realtime |
+
+The perceived "speech → text" gap was three things stacked, and only one of them
+was STT: the fixed **1.2 s pause threshold** (`PAUSE_THRESHOLD_SECONDS`, paid on
+every turn before STT even starts), the decode itself, and **queueing behind the
+live partials** (they shared the daemon's single `_lock` with the final request).
+Three changes, all reversible:
+
+1. **The partial-window layer is GONE** (`backend/services/listener.py`, −468
+   lines). Removed: `_PartialWorker`/`_partial_worker`/`_submit_partial`,
+   `_emit_partial_window`/`_transcribe_partial`,
+   `register_partial_observer`/`unregister_partial_observer`/`_notify_partial`,
+   `probe_whisper_daemon`/`whisper_daemon_ready`/`partial_daemon_state`,
+   `partial_worker_stats`, `_bounded_audio_tail`, all six `PARTIAL_*` env
+   constants, the per-frame trailing-silence accounting, and the early-commit
+   path (two agreeing partial windows + 250 ms of silence ending a capture
+   early). `_capture_audio` takes no `early` out-parameter and transcribes
+   nothing; `listen()` is now simply *capture the whole utterance, then ask
+   exactly ONE engine to transcribe it*. This deliberately reverses P0-04's
+   "partials are actually used" behaviour above (that work stays in history at
+   `e491c40`). The reason: with a warm GPU the partials' only latency win was
+   the early commit, while their cost was a second consumer of the daemon's one
+   `_lock`, so the final transcription could sit behind an in-flight partial
+   (0–1.2 s, felt as random jitter). Accuracy improves too — the committed text
+   is now always the FULL-utterance transcription, never a trailing-window
+   (≤6 s) approximation of it.
+   - **Deliberately KEPT:** AEC + echo-only rejection, onset/barge-in (now the
+     only per-frame decision), the 1.2 s pause threshold, the human-voice gate,
+     the capture-complete earcon, the `speech_end`/`capture_end`/`stt_start`/
+     `stt_done` marks, `LAST_STT_ENGINE`/`LAST_STT_FAILURE`, one engine per turn
+     (P0-03) and the F34 final-window commit through `_turn_stabilizer`
+     (`begin_turn()` per capture is also what scopes the AEC frame token,
+     P0-13). Do **not** add a blocking engine call back into `_capture_audio`.
+2. **Model default `medium` → `base`** (`backend/whisper_daemon.py::MODEL_SIZE`,
+   and `watcher.WHISPER_MODEL_SIZE` for the in-process fallback). Still one env
+   var — `JARVIS_WHISPER_MODEL=medium` restores the old behaviour exactly, and
+   both models are already cached on disk. The cost is accuracy: base is weaker
+   on Hindi/Hinglish, names and numbers. On the owner's question of whether
+   dropping multilingual support would help: **the language list was never the
+   cost.** `RECOGNITION_LANGUAGES` (`en-IN,hi-IN`) is read only by the
+   `google-or-groq` engine, which is not the selected one on this machine
+   (`data/jarvis_settings.json` → `listening = whisper/whisper-local`), and the
+   local daemon passes **no** `language=` at all, so whisper auto-detects
+   internally. Model size is the lever that moves the clock.
+3. **Greedy decode**: `beam_size=1` added to the daemon's
+   `model.transcribe(...)` — faster-whisper defaults to a beam of 5 plus a
+   re-rank, measured at roughly 1.5–2× the decode cost. Deterministic at
+   `temperature=0.0`; delete the line to restore beam search.
+
+**Tests:** `test_p0_04_async_partials.py` was **deleted** (its entire subject no
+longer exists) and the partial-only contracts were removed from
+`test_f34_whisper_conversation.py` (its docstring records exactly why the audit's
+first acceptance clause is no longer pinned), `test_latency_reductions.py`,
+`test_p0_03_single_stt_engine.py`, `test_p0_13_aec_frame_cache.py`,
+`test_p1_19_latency_waterfall.py` and `test_stt_hallucination_gate.py`.
+`test_f55_whisper_boot_independence.py` also had to be made hermetic: three of
+its `/transcribe` tests let the REAL `load_model` run in-process and passed only
+because `medium` was slow enough to lose the race — with `base` the real model
+was handed a fake `RIFFxxxx` body and answered 500, so the loader is now stubbed
+explicitly (they pin the WAITING behaviour, not how fast a model loads). New
+`test_simple_listening.py` pins the replacement contract: one utterance → exactly
+one engine call over the whole audio, no engine call inside the capture loop, no
+early exit, no `early` parameter, and **the removed API staying removed** (a
+symbol list that fails the moment the layer is reintroduced), plus the shipped
+`base` default. `test_stt_hallucination_gate.py` gained a pin that conversation
+transcription decodes with `beam_size=1` at temperature 0.
 
 ### Per-functionality custom providers from the Electron UI (custom-provider-ui, 2026-10-01)
 

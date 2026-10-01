@@ -792,19 +792,26 @@ def ensure_whisper_daemon():
         time.sleep(0.25)
 
 
+#: [PERF] The in-process model is only the daemon-failure fallback, but it must
+#: not silently keep a different size than the daemon: ONE env var drives both
+#: (see backend/whisper_daemon.py, which ships "base" and decodes greedily).
+WHISPER_MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "base")
+
+
 def _load_in_process_whisper():
     global whisper_model
     # Imported lazily: faster-whisper/ctranslate2 pulls ~2-4s of CUDA libs at
     # import, and the in-process model is only a daemon-failure fallback.
     from faster_whisper import WhisperModel
-    print("[WATCHER] Initializing local faster-whisper (medium) model on CUDA GPU...")
+    print(f"[WATCHER] Initializing local faster-whisper ({WHISPER_MODEL_SIZE}) "
+          "model on CUDA GPU...")
     try:
-        whisper_model = WhisperModel("medium", device="cuda", compute_type="float16", local_files_only=True)
+        whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16", local_files_only=True)
         print("[WATCHER] Local Whisper model loaded on GPU (CUDA).")
     except Exception as exc:
         print(f"[WATCHER] CUDA load failed: {exc}. Trying CPU fallback...")
         try:
-            whisper_model = WhisperModel("medium", device="cpu", compute_type="int8", local_files_only=True)
+            whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", local_files_only=True)
             print("[WATCHER] Local Whisper model loaded on CPU.")
         except Exception as exc_cpu:
             print(f"[WATCHER] Local Whisper model fallback failed: {exc_cpu}. Using API transcription only.")

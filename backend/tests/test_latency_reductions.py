@@ -1,4 +1,4 @@
-﻿"""Latency regressions â€” the fixed per-turn costs in the conversation path.
+"""Latency regressions â€” the fixed per-turn costs in the conversation path.
 
 Each test here pins a PERF invariant that a later refactor could silently undo.
 The point is not that the code is fast in absolute terms; it is that these
@@ -13,10 +13,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-import speech_recognition as sr
-
 from backend.core import brain
-from backend.services import echo_cancel, listener
+from backend.services import echo_cancel
 
 
 class ChatFastPathTests(unittest.TestCase):
@@ -130,78 +128,6 @@ class SearchBudgetTests(unittest.TestCase):
         expired = budget_mod.Deadline(time.monotonic() - 10.0)
         self.assertIsNone(
             brain.search_internet("anything", deadline=expired))
-
-
-class PartialWindowBoundTests(unittest.TestCase):
-    """[PERF] a partial window cannot stall the capture loop."""
-
-    def test_audio_tail_is_capped(self):
-        class _C:
-            frame_data = b"\x00" * 100
-            sample_rate = 16000
-            sample_width = 2
-
-        chunks = [_C() for _ in range(50)]
-        with patch.object(listener, "_audio_duration_seconds",
-                          return_value=1.0):
-            tail = listener._bounded_audio_tail(chunks, 5.0)
-        self.assertLess(len(tail), len(chunks),
-                        "a long capture was not trimmed")
-
-    def test_short_capture_is_returned_untouched(self):
-        chunks = ["a", "b", "c"]
-        with patch.object(listener, "_audio_duration_seconds",
-                          return_value=0.1):
-            self.assertEqual(listener._bounded_audio_tail(chunks, 20.0),
-                             chunks)
-
-    def test_partial_stt_uses_the_short_deadline(self):
-        """A partial is a hint; it must not hold the loop for the full budget."""
-        seen = {}
-
-        def _fake(audio, timeout=None):
-            seen["timeout"] = timeout
-            return "hello", "en"
-
-        with patch.object(listener, "recognize_local_whisper", _fake):
-            listener._transcribe_partial(object())
-        self.assertEqual(seen["timeout"],
-                         listener.PARTIAL_STT_TIMEOUT_SECONDS)
-        self.assertLess(listener.PARTIAL_STT_TIMEOUT_SECONDS, 15.0)
-
-    def test_a_deadline_less_engine_is_never_called_without_one(self):
-        """[P0-04] CHANGED DELIBERATELY - this used to pin the opposite.
-
-        The old code retried a ``TypeError`` with NO deadline ("many tests stub
-        the engine with one argument"), which is exactly what the audit orders
-        removed: an engine that cannot express a deadline must not be handed
-        work it can hang on. The partial is dropped instead, and the engine is
-        called exactly ONCE - with the deadline.
-        """
-        seen = []
-
-        def _engine(audio, timeout=None):
-            seen.append(timeout)
-            if timeout is None:
-                raise AssertionError("engine was called without a deadline")
-            raise TypeError("this engine cannot express a deadline")
-
-        with patch.object(listener, "recognize_local_whisper", _engine):
-            with self.assertRaises(TypeError):
-                listener._transcribe_partial(object())
-        # One call, and it carried the partial deadline: never a second,
-        # unbounded attempt.
-        self.assertEqual(seen, [listener.PARTIAL_STT_TIMEOUT_SECONDS])
-
-    def test_a_deadline_less_engine_does_not_break_the_partial_path(self):
-        """A partial that cannot be given a deadline is simply skipped."""
-        def _engine(audio, timeout=None):
-            raise TypeError("this engine cannot express a deadline")
-
-        with patch.object(listener, "recognize_local_whisper", _engine):
-            window = listener._emit_partial_window(
-                [sr.AudioData(b"\x00" * 320, 16000, 2)], "1", 1, 1500)
-        self.assertIsNone(window)
 
 
 class _Resp:
