@@ -311,6 +311,16 @@ def _notify_async_reply(text, spoken=None):
     except Exception as exc:
         logging.warning("[NOTIFY] async reply callback failed: %s", exc)
         return False
+    # [S13] A delivered background result is now part of the conversation:
+    # follow-ups like "what was the second point?" or "open that" ground in
+    # history instead of pointing at something the model never saw. The
+    # marker rides in-band (the prompt shows it as a background result, not
+    # a turn answer); only DELIVERED results are remembered.
+    try:
+        add_message("assistant", "[background result] %s" % text)
+    except Exception as exc:
+        logging.warning("[NOTIFY] background result history write failed: %s",
+                        exc)
     return True
 
 
