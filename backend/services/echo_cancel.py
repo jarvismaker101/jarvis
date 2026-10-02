@@ -86,6 +86,29 @@ AEC_IDLE_SKIP_SECONDS = float(os.getenv("JARVIS_AEC_IDLE_SKIP", "1.5"))
 AEC_BREAKER_FAILURES = int(os.getenv("JARVIS_AEC_BREAKER_FAILURES", "3"))
 AEC_BREAKER_COOLDOWN_SECONDS = float(
     os.getenv("JARVIS_AEC_BREAKER_COOLDOWN", "15"))
+# [S28] Echo alignment. The reference timestamp is recorded when the audio
+# actor's blocking write() RETURNS - with latency="high" the sound actually
+# leaves the speaker tens to hundreds of ms later, plus the room's acoustic
+# delay. A zero-lag comparison over a single 32 ms frame cannot survive that,
+# so the degraded path now:
+#   * estimates the lag while the first replies play, by cross-correlating the
+#     mic against the reference over 0..AEC_MAX_LAG_SECONDS, and locks to the
+#     median of a few consistent votes;
+#   * fits the gate over the last few frames jointly (~100-200 ms) instead of
+#     one 32 ms frame;
+#   * keeps the remote reference fresh from a background thread so the
+#     capture loop stops paying the fetch inside a real-time frame.
+AEC_MAX_LAG_SECONDS = float(os.getenv("JARVIS_AEC_MAX_LAG", "0.4"))
+AEC_LAG_CONFIRMATIONS = int(os.getenv("JARVIS_AEC_LAG_CONFIRMATIONS", "3"))
+#: A vote below this correlation is noise, not a timing opinion.
+AEC_LAG_MIN_CORRELATION = 0.30
+#: Votes must agree within this spread (about one frame) to lock.
+AEC_LAG_SPREAD_SECONDS = 0.04
+#: Frames the gate fits jointly (5 x ~32 ms = ~160 ms of compare window).
+AEC_GATE_HISTORY_FRAMES = int(os.getenv("JARVIS_AEC_GATE_HISTORY", "5"))
+#: Keep the remote reference prefetching this long after capture activity.
+AEC_PREFETCH_SECONDS = float(os.getenv("JARVIS_AEC_PREFETCH", "2.0"))
+AEC_PREFETCH_INTERVAL_SECONDS = max(0.05, AEC_CACHE_TTL_SECONDS / 2.0)
 
 
 class CaptureFrame(namedtuple("CaptureFrame",
@@ -267,6 +290,93 @@ class WebRtcAec3Canceller(EchoCanceller):
         return self._aec.run(mic_pcm)
 
 
+class DelayEstimator:
+    """Cross-correlation lag fit between the mic and the reference (S28).
+
+    The reference span is fetched so that it covers
+    ``[window_end - window - max_lag, window_end]``. The mic window is slid
+    against the tail of that span and the lag with the best normalised
+    correlation wins. A vote is only cast when the best correlation is real
+    (:data:`AEC_LAG_MIN_CORRELATION`) so room noise cannot move the estimate,
+    and the lock takes :data:`AEC_LAG_CONFIRMATIONS` votes that agree within
+    one frame of each other. The lag is a property of the audio path, so it
+    is estimated once per session and then simply applied.
+    """
+
+    name = "delay-estimator"
+
+    def __init__(self, max_lag_seconds=AEC_MAX_LAG_SECONDS,
+                 min_correlation=AEC_LAG_MIN_CORRELATION):
+        self.max_lag_seconds = max(0.0, float(max_lag_seconds))
+        self.min_correlation = float(min_correlation)
+        self.votes = []
+        self.locked_lag_seconds = None
+
+    @property
+    def locked(self):
+        return self.locked_lag_seconds is not None
+
+    def reset(self):
+        self.votes = []
+        self.locked_lag_seconds = None
+
+    def estimate(self, mic_pcm, ref_pcm):
+        """The best lag in seconds for one frame, or None (no usable vote).
+
+        *ref_pcm* must be at least as long as the mic window; anything
+        beyond it widens the searchable lag range.
+        """
+        if self.locked or self.max_lag_seconds <= 0.0:
+            return None
+        if not mic_pcm or not ref_pcm:
+            return None
+        import numpy as np
+
+        def as_float(data):
+            usable = (len(data) // 2) * 2
+            return np.frombuffer(data[:usable], dtype="<i2").astype(np.float64)
+
+        mic = as_float(mic_pcm)
+        ref = as_float(ref_pcm)
+        mic_size = mic.size
+        if mic_size == 0 or ref.size <= mic_size:
+            return None
+        mic_energy = float(np.dot(mic, mic))
+        if mic_energy <= 0.0:
+            return None
+        # dots[i] = <mic, ref[i:i+mic_size]>; the window at position i ends at
+        # ref index i + mic_size - 1, so the lag it represents is
+        # (ref.size - mic_size - i) samples, i in [0, ref.size - mic_size].
+        dots = np.correlate(ref, mic, mode="valid")
+        positions = dots.size
+        if positions <= 0:
+            return None
+        squared = np.square(ref)
+        cumulative = np.concatenate(([0.0], np.cumsum(squared)))
+        starts = np.arange(positions)
+        ref_energies = (cumulative[starts + mic_size] - cumulative[starts])
+        correlations = np.zeros(positions)
+        usable = ref_energies > (mic_energy * 1e-6)
+        correlations[usable] = np.abs(dots[usable]) / np.sqrt(
+            mic_energy * ref_energies[usable])
+        best = int(np.argmax(correlations))
+        if correlations[best] < self.min_correlation:
+            return None
+        lag_seconds = (positions - 1 - best) / float(AEC_SAMPLE_RATE)
+        self.votes.append(lag_seconds)
+        if len(self.votes) > 24:
+            self.votes.pop(0)
+        if len(self.votes) >= max(1, AEC_LAG_CONFIRMATIONS):
+            spread = max(self.votes) - min(self.votes)
+            if spread <= AEC_LAG_SPREAD_SECONDS:
+                ordered = sorted(self.votes)
+                middle = len(ordered) // 2
+                self.locked_lag_seconds = (
+                    ordered[middle] if len(ordered) % 2
+                    else (ordered[middle - 1] + ordered[middle]) / 2.0)
+        return lag_seconds
+
+
 class ReferenceEchoGate:
     """Decide whether a mic window IS our own playback (degraded path).
 
@@ -293,8 +403,16 @@ class ReferenceEchoGate:
         self.min_suppression_db = float(min_suppression_db)
         self.residual_floor = float(residual_floor)
 
-    def analyse(self, mic_pcm, ref_pcm):
-        """Return ``(is_echo, residual_pcm, metrics)``."""
+    def analyse(self, mic_pcm, ref_pcm, history_mic=b"", history_ref=b""):
+        """Return ``(is_echo, residual_pcm, metrics)``.
+
+        When *history_mic*/*history_ref* carry the immediately preceding
+        frames and their aligned references (S28), the least-squares fit runs
+        on the concatenation - about 100-200 ms - because a single 32 ms
+        window cannot tolerate residual timing jitter. The decision is made
+        on the joint fit, but the residual still covers ONLY the current
+        frame, which is what the caller returns downstream.
+        """
         metrics = {"correlation": 0.0, "suppression_db": 0.0, "is_echo": False}
         if not mic_pcm or not ref_pcm:
             return False, mic_pcm, metrics
@@ -303,6 +421,14 @@ class ReferenceEchoGate:
         def as_float(data):
             usable = (len(data) // 2) * 2
             return np.frombuffer(data[:usable], dtype="<i2").astype(np.float64)
+
+        def as_pair(data, size):
+            arr = as_float(data)
+            if arr.size < size:
+                arr = np.concatenate((np.zeros(size - arr.size), arr))
+            elif arr.size > size:
+                arr = arr[arr.size - size:]
+            return arr
 
         mic = as_float(mic_pcm)
         ref = as_float(ref_pcm)
@@ -314,16 +440,25 @@ class ReferenceEchoGate:
             ref = np.concatenate((np.zeros(mic.size - ref.size), ref))
         elif ref.size > mic.size:
             ref = ref[ref.size - mic.size:]
+        # [S28] Joint compare window: the past frames join the fit, the
+        # current frame keeps its own residual.
+        fit_mic, fit_ref = mic, ref
+        if history_mic and history_ref:
+            size = mic.size
+            past_mic = as_pair(history_mic, size)
+            past_ref = as_pair(history_ref, size)
+            fit_mic = np.concatenate((past_mic, mic))
+            fit_ref = np.concatenate((past_ref, ref))
 
-        mic_energy = float(np.dot(mic, mic))
-        ref_energy = float(np.dot(ref, ref))
+        mic_energy = float(np.dot(fit_mic, fit_mic))
+        ref_energy = float(np.dot(fit_ref, fit_ref))
         if mic_energy <= 0.0 or ref_energy <= 0.0:
             return False, mic_pcm, metrics
-        cross = float(np.dot(mic, ref))
+        cross = float(np.dot(fit_mic, fit_ref))
         correlation = abs(cross) / math.sqrt(mic_energy * ref_energy)
         gain = cross / ref_energy
-        residual = mic - gain * ref
-        residual_energy = float(np.dot(residual, residual))
+        fit_residual = fit_mic - gain * fit_ref
+        residual_energy = float(np.dot(fit_residual, fit_residual))
         if residual_energy <= 0.0:
             suppression = 120.0
         else:
@@ -336,6 +471,7 @@ class ReferenceEchoGate:
                         "is_echo": is_echo})
         if not is_echo:
             return False, mic_pcm, metrics
+        residual = mic - gain * ref
         return True, np.clip(residual, -32768, 32767).astype(np.int16).tobytes(), metrics
 
 
@@ -384,7 +520,9 @@ class RemoteAecTransport:
                       # [P1-04] additions
                       "idle_reprobes": 0, "auth_failures": 0,
                       "last_status": None, "circuit_skips": 0,
-                      "consecutive_failures": 0}
+                      "consecutive_failures": 0,
+                      # [S28] background prefetcher
+                      "prefetch_polls": 0, "prefetch_fetches": 0}
         # [PERF] This transport is consulted once per captured mic frame from
         # inside the real-time capture loop. Three guards keep it from turning
         # into a per-frame HTTP round trip:
@@ -394,13 +532,13 @@ class RemoteAecTransport:
         #     is provably no reference to fetch, so the request is skipped;
         #   * a circuit breaker - a failing endpoint is not re-dialled per frame.
         #
-        # [P1-04] RESIDUAL RISK: the fetch is still SYNCHRONOUS on the capture
-        # hot path (AecSignalPath._cancel_once), so one request can cost up to
-        # ``AEC_REMOTE_TIMEOUT`` inside a real-time frame. Moving it off-thread
-        # interacts with P0-06 / P0-04 and the capture/playback ordering is not
-        # settled, so it is deliberately NOT done here. Instead the guards above
-        # make the fetch strictly rarer (bounded re-probe + windowed cache +
-        # breaker). Revisit when that ordering work lands.
+        # [S28] RESOLVED (was the P1-04 residual risk): the fetch no longer
+        # runs ON the capture hot path. A background daemon keeps the latest
+        # reference span fetched while captures are live (see
+        # ``note_capture_activity``/``_prefetch_loop``), so the capture loop's
+        # own ``fetch_reference`` is a cache hit except in the rare gap where
+        # the prefetcher has not landed yet - the guards above still bound
+        # that fallback the same way they always did.
         self._cache_ttl = float(
             cache_seconds if cache_seconds is not None else AEC_CACHE_TTL_SECONDS)
         self._idle_skip = float(
@@ -427,6 +565,79 @@ class RemoteAecTransport:
         #: reported through state().
         self._breaker_open_until = 0.0
         self._reason = "never_fetched"
+        # [S28] Background prefetch state. The capture loop only notes that it
+        # is live; the daemon below keeps the cache fresh so the loop itself
+        # never blocks on the network.
+        self._prefetch_until = 0.0
+        self._prefetch_duration = 0.1
+        self._prefetch_thread = None
+
+    # ── [S28] background prefetch ──────────────────────────────────────
+    def note_capture_activity(self, duration_seconds=None):
+        """Mark the capture loop as live; (re)arm the prefetch daemon.
+
+        Cheap and lock-only: called from ``fetch_reference`` and from
+        ``AecSignalPath.begin_capture``, never from the audio thread's
+        blocking work.
+        """
+        with self._cache_lock:
+            if duration_seconds is not None:
+                try:
+                    self._prefetch_duration = max(
+                        0.05, min(2.0, float(duration_seconds)))
+                except Exception:
+                    pass
+            self._prefetch_until = time.monotonic() + AEC_PREFETCH_SECONDS
+            if self._prefetch_thread is None or \
+                    not self._prefetch_thread.is_alive():
+                thread = threading.Thread(
+                    target=self._prefetch_loop, name="aec-refetch",
+                    daemon=True)
+                self._prefetch_thread = thread
+                thread.start()
+
+    def _prefetch_loop(self):
+        """Keep the latest reference span fetched while captures are live.
+
+        Runs the SAME guarded fetch path (cache, idle skip, breaker) as the
+        capture loop would - it only ever replaces a blocking fetch with a
+        background one, never widens what may be requested.
+        """
+        while True:
+            time.sleep(AEC_PREFETCH_INTERVAL_SECONDS)
+            with self._cache_lock:
+                active_until = self._prefetch_until
+                duration = self._prefetch_duration
+            if time.monotonic() > active_until:
+                continue
+            with self._cache_lock:
+                self.stats["prefetch_polls"] += 1
+            try:
+                fetched = self._fetch_reference(duration, None)
+            except Exception:  # pragma: no cover - guarded upstream too
+                continue
+            if fetched[0]:
+                with self._cache_lock:
+                    self.stats["prefetch_fetches"] += 1
+
+    def fetch_reference(self, duration_seconds, mic_t_end=None):
+        """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``.
+
+        Never raises: any failure means "no reference", which the caller
+        reports as ``had_reference=False`` (an explicitly degraded state the
+        listener already handles). [S28] Every live call also re-arms the
+        background prefetch, so a cache miss inside the capture loop gets
+        rarer the longer the capture runs.
+        """
+        self.note_capture_activity(duration_seconds)
+        try:
+            return self._fetch_reference(duration_seconds, mic_t_end)
+        except Exception as exc:  # pragma: no cover - last-resort guard
+            with self._cache_lock:
+                self.stats["errors"] += 1
+                self.stats["last_error"] = str(exc)
+                self._reason = "exception"
+            return b"", None
 
     # ── circuit breaker ─────────────────────────────────────────────────
     def _breaker_open(self, now):
@@ -511,22 +722,6 @@ class RemoteAecTransport:
             if abs(float(mic_t_end) - float(cached_window)) > REFERENCE_MAX_DRIFT_SECONDS:
                 return False
         return True
-
-    def fetch_reference(self, duration_seconds, mic_t_end=None):
-        """Return ``(pcm_16k_mono, age_seconds)`` or ``(b"", None)``.
-
-        Never raises: any failure means "no reference", which the caller
-        reports as ``had_reference=False`` (an explicitly degraded state the
-        listener already handles).
-        """
-        try:
-            return self._fetch_reference(duration_seconds, mic_t_end)
-        except Exception as exc:  # pragma: no cover - last-resort guard
-            with self._cache_lock:
-                self.stats["errors"] += 1
-                self.stats["last_error"] = str(exc)
-                self._reason = "exception"
-            return b"", None
 
     def _fetch_reference(self, duration_seconds, mic_t_end):
         now = time.monotonic()
@@ -749,10 +944,13 @@ class ReferencePcmBuffer:
             # Playback did not overlap this window (or the clock is skewed).
             return b""
         # Walk backwards from the window end, keeping chunks whose span
-        # overlaps [mic_t_end - duration, mic_t_end].
+        # overlaps [mic_t_end - duration, mic_t_end]. [S28] A chunk that
+        # extends BEYOND mic_t_end is kept only up to the window end: the
+        # span must not contain audio the mic window has not heard yet.
         bytes_per_second = float(self.sample_rate * self.sample_width)
         window_start = mic_t_end - (duration_bytes / bytes_per_second)
         kept = []
+        newest_kept_t_end = None
         for t_end, chunk in reversed(chunks):
             span = len(chunk) / bytes_per_second
             t_start = t_end - span
@@ -761,7 +959,18 @@ class ReferencePcmBuffer:
             if t_start >= mic_t_end:
                 continue
             kept.append(chunk)
+            if newest_kept_t_end is None:
+                newest_kept_t_end = t_end
         joined = b"".join(reversed(kept))
+        if not joined:
+            return b""
+        if newest_kept_t_end is not None and newest_kept_t_end > mic_t_end:
+            # Floor, with a nudge for float jitter around an exact sample
+            # boundary (639.999... must become 640, a genuine 639.5 stays 639).
+            overflow = int((newest_kept_t_end - mic_t_end) *
+                           bytes_per_second + 1e-3)
+            if overflow > 0:
+                joined = joined[:max(0, len(joined) - overflow)]
         if not joined:
             return b""
         if len(joined) <= duration_bytes:
@@ -849,6 +1058,14 @@ class AecSignalPath:
         self._mic_resampler = None
         self._mic_rate = None
         self.mic_sample_rate = AEC_SAMPLE_RATE
+        # [S28] Speaker-delay alignment: the lag between "reference recorded"
+        # and "sound actually heard", estimated once per session on the
+        # degraded (echo-gate) path - a real AEC3 model has its own delay
+        # estimator. Plus the joint compare-window history for the gate.
+        self._lag_estimator = DelayEstimator()
+        self._gate_history = deque(maxlen=max(0, AEC_GATE_HISTORY_FRAMES - 1))
+        self.stats["lag_estimates"] = 0
+        self.stats["lag_locked_seconds"] = None
 
     # ── reference side ─────────────────────────────────────────────────
     def feed_reference(self, pcm_bytes, sample_rate=None, sample_width=None,
@@ -886,6 +1103,10 @@ class AecSignalPath:
             token = (next(self._capture_counter), turn_id)
             self._capture_token = token
             self.stats["captures_started"] += 1
+        # [S28] a live capture re-arms the background reference prefetch.
+        note = getattr(self.transport, "note_capture_activity", None)
+        if callable(note):
+            note()
         return token
 
     def frame_id(self, index, token=None):
@@ -993,7 +1214,21 @@ class AecSignalPath:
                 duration_seconds = duration_bytes / float(
                     AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
         want = int(duration_seconds * AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
-        ref_pcm = self.reference.aligned_reference(want, mic_t_end=mic_t_end)
+        # [S28] The lag-corrected reference end: the sound left the speaker
+        # this much after the reference timeline says it did, so the span the
+        # mic actually heard ended EARLIER on the reference clock. Until the
+        # estimate locks, the degraded path fetches a span long enough to
+        # search the whole lag range by cross-correlation.
+        lag = self._lag_estimator.locked_lag_seconds or 0.0
+        estimating = (getattr(self.canceller, "degraded", False)
+                      and not self._lag_estimator.locked
+                      and self._lag_estimator.max_lag_seconds > 0.0)
+        lag_bytes = (int(self._lag_estimator.max_lag_seconds *
+                         AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
+                     if estimating else 0)
+        fetch_t_end = (mic_t_end - lag) if mic_t_end is not None else None
+        ref_pcm = self.reference.aligned_reference(
+            want + lag_bytes, mic_t_end=fetch_t_end)
         source = "local" if ref_pcm else "none"
         local_age = self.reference.age_seconds() if ref_pcm else None
         # The API process voices replies while this process owns the mic, so
@@ -1002,7 +1237,9 @@ class AecSignalPath:
         if self.transport is not None and (not ref_pcm or
                                            (local_age or 0.0) > 0.25):
             remote, remote_age = self.transport.fetch_reference(
-                duration_seconds, mic_t_end=mic_t_end)
+                duration_seconds + (self._lag_estimator.max_lag_seconds
+                                    if estimating else 0.0),
+                mic_t_end=fetch_t_end)
             if remote and (remote_age is None or
                            remote_age <= REFERENCE_MAX_DRIFT_SECONDS):
                 fresher = (not ref_pcm or remote_age is None or
@@ -1016,19 +1253,51 @@ class AecSignalPath:
         sources = self.stats.setdefault("reference_sources",
                                         {"local": 0, "remote": 0, "none": 0})
         sources[source] = sources.get(source, 0) + 1
+        # The span the gate compares against: exactly one mic window long,
+        # ending at the lag-corrected point (an estimation fetch asked for
+        # window + search range, so trim the tail window out of it).
+        ref_frame = ref_pcm
+        if ref_pcm and len(ref_pcm) > want:
+            ref_frame = ref_pcm[len(ref_pcm) - want:]
+        # [S28] First votes of the session: correlate the mic against the
+        # long span. Once locked, every later fetch already carries the lag.
+        if estimating and ref_pcm:
+            estimate = self._lag_estimator.estimate(mic_16k, ref_pcm)
+            if estimate is not None:
+                self.stats["lag_estimates"] += 1
+            if self._lag_estimator.locked:
+                self.stats["lag_locked_seconds"] = \
+                    self._lag_estimator.locked_lag_seconds
+                self._gate_history.clear()
         suppressed = False
         if had_reference and getattr(self.canceller, "degraded", False):
             # No real AEC: the canceller returns the mic untouched, so decide
             # explicitly whether this window IS the playback echo. If it is,
             # hand back the residual (near silence for assistant-only audio)
             # and mark the frame so no downstream VAD can commit it.
-            suppressed, residual, _metrics = self.echo_gate.analyse(mic_16k,
-                                                                    ref_pcm)
+            # [S28] The fit runs on the last few frames jointly (~100-200 ms);
+            # a single 32 ms window cannot tolerate residual timing jitter.
+            hist_mic = b"".join(m for m, _ in self._gate_history)
+            hist_ref = b"".join(r for _, r in self._gate_history)
+            if not hist_mic or not hist_ref:
+                hist_mic = hist_ref = b""
+            suppressed, residual, _metrics = self.echo_gate.analyse(
+                mic_16k, ref_frame, history_mic=hist_mic,
+                history_ref=hist_ref)
+            # [S28] Only a lag-corrected span may join the joint window: a
+            # pre-lock frame's reference is misaligned by the very offset we
+            # are still measuring, and would poison the next fit.
+            if ref_frame and not estimating:
+                self._gate_history.append((mic_16k, ref_frame))
             if suppressed:
                 self.stats["echo_suppressed"] += 1
                 return residual, True, True
-            filtered = self.canceller.cancel(mic_16k, ref_pcm)
+            filtered = self.canceller.cancel(mic_16k, ref_frame)
             return filtered, True, False
+        if not had_reference:
+            # A playback gap invalidates the joint window; the next reference
+            # span must build a fresh history.
+            self._gate_history.clear()
         filtered = self.canceller.cancel(mic_16k, ref_pcm)
         return filtered, had_reference, suppressed
 
@@ -1063,6 +1332,13 @@ class AecSignalPath:
             "transport": (self.transport.state()
                           if self.transport is not None else None),
             "counters": dict(self.stats),
+            # [S28] speaker-delay alignment (degraded/gate path only)
+            "lag": {
+                "locked_seconds": self._lag_estimator.locked_lag_seconds,
+                "locked": self._lag_estimator.locked,
+                "votes": len(self._lag_estimator.votes),
+                "gate_history_frames": len(self._gate_history),
+            },
         }
         return snapshot
 

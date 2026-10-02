@@ -207,7 +207,10 @@ class CrossProcessTransportTests(unittest.TestCase):
 
         def fake_urlopen(request, timeout=None):
             self.assertIn("/aec/reference", request.full_url)
-            self.assertIn("seconds=0.100", request.full_url)
+            # [S28] while the speaker lag is still being estimated the span
+            # asks for window + search range (0.1 + 0.4); after the lock it
+            # asks for the window alone again.
+            self.assertRegex(request.full_url, r"seconds=0\.(100|500)")
             return _Response(self._payload(pcm, 0.05))
 
         path = echo_cancel.AecSignalPath(
