@@ -2351,6 +2351,65 @@ def opencode_task_in_progress():
 def set_opencode_task_running(running):
     global _opencode_task_running
     _opencode_task_running = bool(running)
+    # [S18] The tools are free again — anything the user asked for mid-task
+    # that needed them is run now, in order, on its own thread.
+    if not _opencode_task_running:
+        _drain_queued_actions()
+
+
+# ── [S18] chat-through-task: actions queue, conversation continues ─────────
+# While a task runs the user may keep TALKING (chat turns answer normally);
+# only requests that need the executor/task machinery are held until the
+# running task releases it. Echo safety is the AEC gate's job (S28), not a
+# full-channel mute.
+_action_queue_lock = threading.Lock()
+_pending_action_requests = []
+MAX_QUEUED_ACTIONS = 3
+
+ACTION_QUEUE_FULL_REPLY = ("Sir, the action queue is full — ask me again "
+                           "when the current task finishes.")
+ACTION_QUEUED_REPLY = ("Sir, I'll run that as soon as the current task "
+                       "finishes — it's queued.")
+
+
+def _queue_action_request(msg, from_voice):
+    """Hold an action request made while a task runs.
+
+    Returns the polite hold reply when the request was queued (or the queue
+    is full), or None when no task is running and the caller must proceed
+    with the normal dispatch.
+    """
+    if not _opencode_task_running:
+        return None
+    with _action_queue_lock:
+        if len(_pending_action_requests) >= MAX_QUEUED_ACTIONS:
+            return ACTION_QUEUE_FULL_REPLY
+        _pending_action_requests.append(
+            {"message": msg, "from_voice": bool(from_voice)})
+    return ACTION_QUEUED_REPLY
+
+
+def _drain_queued_actions():
+    with _action_queue_lock:
+        pending = list(_pending_action_requests)
+        _pending_action_requests.clear()
+    if not pending:
+        return
+
+    def _run():
+        for item in pending:
+            try:
+                reply = process_message(item["message"],
+                                        from_voice=item["from_voice"])
+            except Exception as exc:
+                logging.warning("[TASK] queued action failed: %s", exc)
+                continue
+            if item["from_voice"] and reply:
+                # F10 surface: UI log + speech (+ [S13] history).
+                _notify_async_reply(reply)
+
+    threading.Thread(target=_run, name="queued-action-drain",
+                     daemon=True).start()
 
 
 def _execute_deferred_opencode(task_description, original_message,
@@ -4049,6 +4108,13 @@ def _process_message_inner(
 
         # ── Complex task — hand off to opencode agent ──
         if intent_name == "task":
+            # [S18] a task-class request made WHILE a task runs cannot take
+            # the machinery — it waits in the action queue instead.
+            held = _queue_action_request(msg, from_voice)
+            if held is not None:
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, held)
+                return held
             description = intent.get("task_description") or msg
             print("[INTENT] task intent:", description)
             response = handle_opencode_task(
@@ -4066,6 +4132,18 @@ def _process_message_inner(
     # routing so simple commands like "open youtube in chrome" are executed
     # by the executor, not swallowed by the task agent's planning reply.
     if not msg.lower().startswith("command") and is_task_request(msg):
+        # [S18] same hold as the intent-task branch above: task-shaped
+        # requests queue while the machinery is busy.
+        held = _queue_action_request(msg, from_voice)
+        if held is not None:
+            if racer is not None:
+                try:
+                    racer.cancel()
+                except Exception:
+                    pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, held)
+            return held
         if racer is not None:
             try:
                 racer.cancel()

@@ -1729,13 +1729,12 @@ def listener_thread():
                 _deliver_stop_research()
                 continue
 
-            # While an opencode task runs, only opencode speaks. The agent's
-            # narration is heard by the mic; queueing it here would echo it
-            # back as a Jarvis reply — drop it instead. The flag is the
-            # BACKEND's published task state (F50) — never a module copy.
-            if backend_task_running():
-                print("[TASK] backend task running — listener muted.")
-                continue
+            # [S18] The task no longer mutes conversation: committed
+            # utterances are submitted while a task runs and the BACKEND
+            # decides — chat turns answer normally, action requests queue
+            # until the task releases the machinery. Echo safety is the
+            # AEC gate's job now (S28): the task's own narration reaching
+            # the mic is suppressed as echo, not by dropping everything.
 
             # [P1-06] A COMMITTED transcript is never silently discarded. It has
             # already passed the VAD, the human-voice gate and the hallucination
@@ -1785,9 +1784,9 @@ def _respond_to_utterance(text, turn=None):
     copy. The utterance is submitted to the ONE backend task runtime
     (authenticated /ask/stream, ``speak=False``); streamed deltas feed the
     same StreamSpeaker the in-process path used, and the terminal frame's
-    reply is authoritative. While a backend task runs, ONLY the task
-    speaks — the utterance is dropped so a pre-queued one can never produce
-    Jarvis speech mid-task.
+    reply is authoritative. [S18] This runs while a backend task is in
+    progress too: the utterance is submitted either way and the backend
+    queues action-shaped requests while answering chat normally.
 
     [PERF] P1-19: *turn* is this utterance's mark timeline from the capture
     thread. Its marks ride the submission under the request_id below and are
@@ -1802,9 +1801,6 @@ def _respond_to_utterance(text, turn=None):
     makes a barge-in that lands mid-submission able to cancel this turn, and
     starting the turn is what pre-empts the previous one.
     """
-    if backend_task_running():
-        print("[TASK] backend task running — voice reply suppressed.")
-        return
     if turn is None:
         turn = _latency.new_local_turn()
     request_id = _new_turn_request_id()
@@ -1975,12 +1971,9 @@ def handle_queued_item(text, turn=None):
         dispatch_control(control)
         return False
 
-    # While a backend task runs, only the task speaks — drop
-    # anything queued before the mute took effect. (Shutdown stays
-    # available as a deliberate kill switch.)
-    if backend_task_running():
-        print("[TASK] backend task running — utterance dropped.")
-        return False
+    # [S18] Queued utterances no longer die at task start: they are
+    # submitted and the backend answers chat / queues actions. (Shutdown
+    # stays available above as a deliberate kill switch.)
 
     # ── NORMAL SETUP ──
     if is_normal_setup(text):

@@ -101,17 +101,26 @@ class OpencodeTaskRunningFlagTests(unittest.TestCase):
         self.assertIn("folder has been created", text.lower())
 
 
-class VoiceMuteWhileTaskRunningTests(unittest.TestCase):
-    """The voice I/O worker must never reach the backend runtime mid-task."""
+class VoiceTurnTestsWhileTaskRunning(unittest.TestCase):
+    """[S18] The task mute is gone from the voice I/O path: utterances are
+    submitted during a task; the backend answers chat and queues actions."""
 
-    def test_utterance_processing_skipped_while_flag_true(self):
-        # G11 / F50 — the flag is the backend's published task state, and the
-        # utterance is submitted (not executed in-process); both are patched.
+    def test_utterance_processing_continues_while_flag_true(self):
+        stream = SimpleNamespace(
+            feed=lambda t: None, spoken_any=False,
+            finish=lambda: None, close=lambda: None,
+        )
         with patch.object(voice_mode, "backend_task_running",
                           return_value=True), \
-             patch.object(voice_mode, "_ask_backend") as fake_submit:
+             patch.object(voice_mode, "_ask_backend",
+                          return_value="hi sir") as fake_submit, \
+             patch.object(voice_mode, "StreamSpeaker", return_value=stream), \
+             patch.object(voice_mode, "speak") as fake_speak:
             voice_mode._respond_to_utterance("hello there")
-        fake_submit.assert_not_called()
+            self.assertTrue(_wait_until(lambda: fake_submit.called),
+                            "the utterance was never submitted")
+            self.assertTrue(_wait_until(lambda: fake_speak.called))
+        fake_submit.assert_called_once()
 
     def test_utterance_processing_runs_while_flag_false(self):
         stream = SimpleNamespace(
