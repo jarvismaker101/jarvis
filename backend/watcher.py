@@ -66,6 +66,7 @@ from backend.services.audio_input import (
 from backend.services.transcription import (
     is_hallucinated_transcript,
     recognize_google_or_groq,
+    recognize_inworld,
 )
 
 LISTEN_TIMEOUT_SECONDS = 8
@@ -862,29 +863,48 @@ def _cloud_stt_allowed():
         return True
 
 
-def recognize_candidates(audio):
-    candidates = []
-    seen = set()
+def _selected_engine():
+    """[S5] The ONE engine the wake path uses.
 
-    # 1. Try the persistent whisper daemon first (always local, always allowed)
+    It is the same selection the conversation path uses
+    (``listener.selected_stt_engine()``: the settings model, clamped by the
+    shared cloud policy), so the transcript that detects "Jarvis" and the
+    transcript that becomes the command come from the SAME model the user
+    picked. Resolution failure degrades to local whisper - never to a cloud
+    engine the user did not select.
+    """
+    try:
+        from backend.services import listener
+
+        return listener.selected_stt_engine()
+    except Exception as exc:
+        print(f"[WATCHER] Engine resolution failed ({exc}) - using local whisper")
+        return "whisper"
+
+
+def _transcribe_local_once(audio):
+    """Local whisper, ONE model, asked exactly once per utterance.
+
+    The persistent daemon is the transport; the in-process model is the SAME
+    model (same size, greedy decode) used only when that daemon cannot answer.
+    It is not a different engine and never changes which model was selected.
+    Returns the transcript text, or None when the selected engine produced
+    nothing - the caller then reports no transcript instead of asking another
+    engine.
+    """
     if whisper_daemon_ok:
         try:
-            wav_bytes = audio.get_wav_data()
-            transcribed = _transcribe_with_daemon(wav_bytes)
+            transcribed = _transcribe_with_daemon(audio.get_wav_data())
             if transcribed:
                 text, info = transcribed
                 if text:
-                    print(f"[HEARD:local-whisper] {text} (lang: {info.get('language')}, prob: {info.get('language_probability')})")
-                    transcripts = extract_transcripts(text)
-                    _add_candidates(candidates, seen, transcripts)
-
-                    wake_match = find_wake_match(transcripts)
-                    if wake_match:
-                        return candidates, wake_match
+                    print(f"[HEARD:local-whisper] {text} "
+                          f"(lang: {info.get('language')}, "
+                          f"prob: {info.get('language_probability')})")
+                    return text
         except Exception as exc:
             print(f"[WATCHER] Whisper daemon transcription error: {exc}")
 
-    # 2. Fallback to the in-process Whisper model (only loaded if daemon failed)
     if whisper_model:
         try:
             wav_bytes = audio.get_wav_data()
@@ -897,64 +917,78 @@ def recognize_candidates(audio):
             )
             text = "".join(seg.text for seg in segments).strip()
             if text:
-                print(f"[HEARD:local-whisper] {text} (lang: {info.language}, prob: {info.language_probability:.2f})")
-                transcripts = extract_transcripts(text)
-                _add_candidates(candidates, seen, transcripts)
-
-                wake_match = find_wake_match(transcripts)
-                if wake_match:
-                    return candidates, wake_match
+                print(f"[HEARD:local-whisper] {text} "
+                      f"(lang: {info.language}, prob: {info.language_probability:.2f})")
+                return text
         except Exception as exc:
             print(f"[WATCHER] Local Whisper transcription error: {exc}")
 
-    # 3. Fallback to online/external STT — ONLY when the cloud policy allows
-    # it. A disabled policy produces ZERO online calls: no audio is uploaded,
-    # so non-wake speech cannot reach a cloud engine "regardless of intent".
-    if not _cloud_stt_allowed():
-        print("[WATCHER] Cloud STT disabled by policy - no online transcription")
-        return candidates, None
+    return None
 
-    for language in RECOGNITION_LANGUAGES:
+
+def recognize_candidates(audio):
+    """[S5] ONE engine, ONE pass, and its output IS the transcript.
+
+    The old code ran a serial ladder - whisper daemon, then the in-process
+    model, then an online engine over every configured language, calling the
+    online engine TWICE per language when the "show all" variant came back
+    empty. Whichever rung happened to answer decided both the wake verdict and
+    the transcript the rest of the system saw, so the model actually used was
+    decided by a race between engines rather than by the user's selection.
+
+    Now the engine is the one selected in settings (clamped by the cloud
+    policy), it is asked once, and whatever it says is final. No other engine
+    is contacted, so a selected cloud engine cannot be preceded by a local
+    guess and a selected local engine cannot be followed by an upload.
+    """
+    candidates = []
+    seen = set()
+
+    engine = _selected_engine()
+    text = None
+    if engine == "whisper":
+        text = _transcribe_local_once(audio)
+    elif engine == "inworld":
         try:
-            raw = recognize_google_or_groq(
+            text = recognize_inworld(audio, language="en")
+        except sr.UnknownValueError:
+            text = None
+        except Exception as exc:
+            print(f"[WATCHER] Inworld recognition error: {exc}")
+            text = None
+        if text:
+            print(f"[HEARD:inworld] {text}")
+    else:
+        # google-or-groq, when it is ever offered for the listening role: ONE
+        # call on the configured language. No "show all" probe, no second call
+        # per language - the same double-pass this path used to make.
+        try:
+            text = recognize_google_or_groq(
                 recognizer,
                 audio,
-                language,
-                show_all=True,
+                RECOGNITION_LANGUAGES[0],
                 log_prefix="WATCHER",
             )
-            transcripts = extract_transcripts(raw)
-            if not transcripts:
-                try:
-                    transcript = recognize_google_or_groq(
-                        recognizer,
-                        audio,
-                        language,
-                        log_prefix="WATCHER",
-                    )
-                    transcripts = extract_transcripts(transcript)
-                except sr.UnknownValueError:
-                    transcripts = []
-
-            if transcripts:
-                print(f"[HEARD:{language}] {transcripts[0]}")
-
-            _add_candidates(candidates, seen, transcripts)
-
-            wake_match = find_wake_match(transcripts)
-            if wake_match:
-                return candidates, wake_match
-
         except sr.UnknownValueError:
-            continue
+            text = None
         except sr.RequestError as exc:
-            print(f"[WATCHER] Recognition request failed [{language}]: {exc}")
-            continue
+            print(f"[WATCHER] Recognition request failed: {exc}")
+            text = None
         except Exception as exc:
-            print(f"[WATCHER] Recognition error [{language}]: {exc}")
-            continue
+            print(f"[WATCHER] Recognition error: {exc}")
+            text = None
+        if text:
+            print(f"[HEARD:{RECOGNITION_LANGUAGES[0]}] {text}")
 
-    return candidates, None
+    if not text:
+        # The SELECTED engine produced nothing. That is a failed turn, not an
+        # invitation to ask a different model (which is what produced wake
+        # verdicts and commands from an engine the user never selected).
+        return candidates, None
+
+    transcripts = extract_transcripts(text)
+    _add_candidates(candidates, seen, transcripts)
+    return candidates, find_wake_match(transcripts)
 
 
 def listen_once():

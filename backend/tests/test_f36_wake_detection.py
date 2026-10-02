@@ -75,13 +75,38 @@ class CloudPolicyTests(unittest.TestCase):
         self.assertFalse(wake_engine.cloud_stt_allowed())
         self.assertEqual(wake_engine.cloud_stt_policy(), "off")
 
-    def test_default_policy_allows_the_online_fallback(self):
-        self.mock_daemon.return_value = None
-        self.mock_online.return_value = "hello there"
-        candidates, _wake = watcher.recognize_candidates(_audio())
+    def test_default_policy_still_allows_a_cloud_selection(self):
+        # [S5] The policy gates whether a cloud engine MAY be used; it does not
+        # decide WHICH engine runs. With a cloud engine selected, that engine is
+        # the one used.
         self.assertTrue(wake_engine.cloud_stt_allowed())
-        self.mock_online.assert_called()
+
+    def test_a_local_selection_is_never_followed_by_an_online_engine(self):
+        # [S5] The old ladder asked the online engine when the daemon came back
+        # empty, so the transcript that produced the wake verdict could come
+        # from a model the user never selected. A failed SELECTED engine is now
+        # a failed turn: no candidates, and zero online calls.
+        with patch.object(watcher, "_selected_engine", return_value="whisper"), \
+             patch.object(watcher, "recognize_inworld") as inworld:
+            self.mock_daemon.return_value = None
+            candidates, wake_match = watcher.recognize_candidates(_audio())
+        self.assertEqual(candidates, [])
+        self.assertIsNone(wake_match)
+        self.mock_online.assert_not_called()
+        inworld.assert_not_called()
+
+    def test_the_selected_cloud_engine_is_the_only_engine_asked(self):
+        # [S5] ...and symmetrically: a selected cloud engine is not preceded by
+        # a local guess, so the transcript IS that engine's output.
+        with patch.object(watcher, "_selected_engine", return_value="inworld"), \
+             patch.object(watcher, "recognize_inworld",
+                          return_value="hello there") as inworld:
+            candidates, wake = watcher.recognize_candidates(_audio())
+        inworld.assert_called_once()
+        self.mock_daemon.assert_not_called()
+        self.mock_online.assert_not_called()
         self.assertEqual(candidates, ["hello there"])
+        self.assertIsNone(wake)
 
 
 class WakeOnlyPhraseTests(unittest.TestCase):

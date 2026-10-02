@@ -420,6 +420,26 @@ def _transcribe_with_engine(engine, audio):
     return (text, normalized, "auto"), label, None
 
 
+def selected_stt_engine():
+    """[S5] THE engine for this turn: the one selected in settings, clamped by
+    the shared cloud-egress policy.
+
+    One resolution, shared by the conversation path (:func:`recognize_multilingual`)
+    and the wake path (``watcher.recognize_candidates``), so the model that
+    decides "Jarvis" and the model that transcribes the command are always the
+    SAME one the user picked. A local-only policy clamps a cloud selection to
+    local whisper rather than silently uploading audio.
+    """
+    engine = _engine_for_listening_role()
+    if _cloud_stt_policy() != "on":
+        # F34: local-only. Inworld and Google/Groq are cloud engines; with the
+        # policy off they are never called - a local failure produces no
+        # transcript instead of an upload.
+        print("[LISTENER] Cloud STT disabled by policy - local whisper only")
+        engine = LOCAL_STT_ENGINE
+    return engine
+
+
 def recognize_multilingual(audio):
     """Recognize one utterance with the SINGLE engine this turn selected.
 
@@ -444,14 +464,7 @@ def recognize_multilingual(audio):
     LAST_STT_FAILURE = None
     assert_single_rate_audio(audio)
 
-    engine = _engine_for_listening_role()
-
-    if _cloud_stt_policy() != "on":
-        # F34: local-only. Inworld and Google/Groq are cloud engines; with
-        # the policy off they are never called — a local failure produces no
-        # transcript instead of an upload.
-        print("[LISTENER] Cloud STT disabled by policy - local whisper only")
-        engine = LOCAL_STT_ENGINE
+    engine = selected_stt_engine()
 
     result, label, reason = _transcribe_with_engine(engine, audio)
     if result:
