@@ -21,6 +21,7 @@ from backend.services.audio_input import (
     resolve_working_microphone_index,
 )
 from backend.services.earcons import play_capture_complete_earcon
+from backend.services.neural_vad import make_speech_endpoint
 from backend.services.transcription import (
     is_hallucinated_transcript,
     recognize_google_or_groq,
@@ -1078,6 +1079,14 @@ def _capture_audio(marks=None):
         except Exception:
             capture_token = turn_id
         frame_index = 0
+        # [S29] The utterance END is decided by a neural VAD (Silero) over
+        # the echo-cancelled frames - not by the fixed energy threshold,
+        # which a fan/AC outruns (capture runs to the phrase limit) and a
+        # soft voice falls under (trailing words cut off). The endpoint
+        # fires "ended" after ~200 ms of trusted silence following voiced
+        # speech; until then speech_recognition's own pause logic is the
+        # unchanged backstop.
+        endpoint = make_speech_endpoint()
 
         for chunk in audio_stream:
             if not chunk or not chunk.frame_data:
@@ -1115,6 +1124,24 @@ def _capture_audio(marks=None):
                 # Barge-in: cut ANY in-progress TTS the instant the user
                 # starts speaking (VAD-gated above, not phrase-gated).
                 barge_in_on_speech_onset()
+
+            # [S29] End the capture on trusted silence: the neural VAD saw
+            # voiced speech and has now seen ~200 ms of quiet. A failing or
+            # unavailable endpoint just never fires - the sr pause logic
+            # remains the backstop.
+            if endpoint is not None:
+                try:
+                    if endpoint.feed(filtered_chunk.frame_data,
+                                     sample_rate=filtered_chunk.sample_rate,
+                                     sample_width=filtered_chunk.sample_width,
+                                     ) == "ended" and speech_started:
+                        _mark_turn(marks, "neural_speech_end",
+                                   {"frames": frame_index})
+                        break
+                except Exception as exc:
+                    print(f"[LISTENER] neural endpoint error (disabled this "
+                          f"capture): {exc}")
+                    endpoint = None
 
         # [PERF] P1-19 — the streaming capture ended: the user stopped talking
         # and this is the last frame of the utterance. Everything from here on
