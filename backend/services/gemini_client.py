@@ -40,6 +40,46 @@ from backend.services.openai_compat_client import (
 GEMINI_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
 GEMINI_CHAT_MODEL = os.getenv("GEMINI_BRAIN_MODEL", "gemini-3.5-flash-lite")
 
+# S27 — explicit thinking budget for the voice-path chat calls ("auto" =
+# model-aware). Thinking text is stripped (F31), but the TIME it costs is
+# not — a voice reply waits for it. Explicit beats default:
+#   * flash-lite (the deployed chat model) thinks 0 — fastest first token
+#   * a bigger Flash model gets a small budget (a quality floor, "low" effort)
+#   * Pro models cannot disable thinking (API floor is 128)
+#   * an unknown family sends nothing — the model default is the safe choice
+GEMINI_THINKING_BUDGET = os.getenv("GEMINI_THINKING_BUDGET", "auto")
+_FLASH_LITE_THINKING_BUDGET = 0
+_FLASH_THINKING_BUDGET = 512
+_PRO_THINKING_FLOOR = 128
+
+
+def _thinking_config(model=None):
+    """The ``generationConfig.thinkingConfig`` for one chat call, or None.
+
+    None/missing env -> "auto" (model family decides); "" or "none" opts
+    out entirely; an integer string pins the budget for every model.
+    """
+    raw = GEMINI_THINKING_BUDGET
+    raw = "auto" if raw is None else str(raw).strip().lower()
+    if raw in ("", "none"):
+        return None
+    if raw == "auto":
+        name = str(model or GEMINI_CHAT_MODEL or "").lower()
+        if "pro" in name:
+            budget = _PRO_THINKING_FLOOR
+        elif "flash-lite" in name or "flash_lite" in name:
+            budget = _FLASH_LITE_THINKING_BUDGET
+        elif "flash" in name:
+            budget = _FLASH_THINKING_BUDGET
+        else:
+            return None
+    else:
+        try:
+            budget = int(raw)
+        except ValueError:
+            return None
+    return {"thinkingBudget": budget}
+
 _GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
@@ -112,6 +152,17 @@ try:
     _session.mount("https://", _KeepAliveAdapter(max_retries=_retry_strategy))
 except Exception:  # pragma: no cover - never lose the plain adapter
     _session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+
+# S26: the classifier's *no_retry* leg wants the pooled keepalive socket but
+# NOT the hidden adapter retries ``_session`` carries — "fast fail" must stay
+# exactly one POST. This session is pooled yet retry-free, so the classifier
+# no longer pays a fresh TCP + TLS handshake on every call.
+try:
+    from backend.services.prewarm import pooled_session as _pooled_session
+
+    _no_retry_session = _pooled_session()
+except Exception:  # pragma: no cover - the plain session still works
+    _no_retry_session = requests.Session()
 
 
 def is_available():
@@ -308,7 +359,7 @@ def ask_gemini_vision(
 # Text chat (Jarvis brain) — gemini-3.5-flash-lite
 # ---------------------------------------------------------------------------
 
-def _build_chat_body(messages, temperature, max_tokens):
+def _build_chat_body(messages, temperature, max_tokens, model=None):
     """Convert OpenAI-style messages to a Gemini generateContent body.
 
     The first ``system`` message becomes ``systemInstruction``; user and
@@ -335,6 +386,11 @@ def _build_chat_body(messages, temperature, max_tokens):
         body["systemInstruction"] = {"parts": [{"text": system_text.strip()}]}
     if max_tokens is not None:
         body["generationConfig"]["maxOutputTokens"] = max_tokens
+    # S27: thinking off/small by model family — chat and the classifier both
+    # ride this builder, so both are covered.
+    thinking = _thinking_config(model)
+    if thinking is not None:
+        body["generationConfig"]["thinkingConfig"] = thinking
     return body
 
 
@@ -352,7 +408,8 @@ def ask_gemini_chat(messages, temperature=0.7, max_tokens=None, model=None, time
     if not GEMINI_API_KEY:
         return {}
 
-    body = _build_chat_body(messages, temperature, max_tokens)
+    body = _build_chat_body(messages, temperature, max_tokens,
+                            model or GEMINI_CHAT_MODEL)
     url = _GEMINI_URL.format(model=model or GEMINI_CHAT_MODEL)
     handle = resolve(deadline)
     _timeout = handle.timeout(timeout or (8, 45)) if handle is not None else (timeout or (8, 45))
@@ -361,7 +418,7 @@ def ask_gemini_chat(messages, temperature=0.7, max_tokens=None, model=None, time
 
     if no_retry:
         try:
-            resp = requests.post(
+            resp = _no_retry_session.post(
                 url,
                 params={"key": GEMINI_API_KEY},
                 json=body,
@@ -483,7 +540,8 @@ def ask_gemini_chat_stream(messages, temperature=0.7, max_tokens=None, model=Non
     if handle is not None and handle.stopped():
         return
 
-    body = _build_chat_body(messages, temperature, max_tokens)
+    body = _build_chat_body(messages, temperature, max_tokens,
+                            model or GEMINI_CHAT_MODEL)
     m = model or GEMINI_CHAT_MODEL
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"

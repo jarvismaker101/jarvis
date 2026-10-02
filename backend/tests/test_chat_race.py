@@ -392,9 +392,11 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         msgs = racer.built()["messages"]
         self.assertTrue(msgs, "messages must not be empty")
         self.assertEqual(msgs[-1]["role"], "user")
-        self.assertEqual(msgs[-1]["content"], "tell me a joke")
+        # [S12] the latest user turn also carries the current date/time note.
+        self.assertTrue(msgs[-1]["content"].startswith("tell me a joke"))
         self.assertEqual(captured["messages"][-1]["role"], "user")
-        self.assertEqual(captured["messages"][-1]["content"], "tell me a joke")
+        self.assertTrue(
+            captured["messages"][-1]["content"].startswith("tell me a joke"))
 
     def test_racer_appends_user_turn_when_history_ends_with_assistant(self):
         # Regression: history ending in an assistant turn made Gemini reject
@@ -419,7 +421,7 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
 
         msgs = racer.built()["messages"]
         self.assertEqual(msgs[-1]["role"], "user")
-        self.assertEqual(msgs[-1]["content"], "tell me a joke")
+        self.assertTrue(msgs[-1]["content"].startswith("tell me a joke"))
 
     def test_racer_no_duplicate_user_turn_when_already_present(self):
         # Search branch already ends with the user turn (msg + search info):

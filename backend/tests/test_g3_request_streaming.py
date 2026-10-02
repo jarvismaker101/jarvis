@@ -223,7 +223,8 @@ class SpeculationPurityTests(unittest.TestCase):
         msgs = racer.built()["messages"]
         self.assertIn({"role": "user", "content": "earlier question"}, msgs)
         # the new turn is appended by the racer, not read from live history
-        self.assertEqual(msgs[-1]["content"], "new question")
+        # (the [S12] current date/time note rides along with it)
+        self.assertTrue(msgs[-1]["content"].startswith("new question"))
 
     def test_racer_queue_is_bounded(self):
         racer = brain._ChatRacer("hi", voice_compact=False)

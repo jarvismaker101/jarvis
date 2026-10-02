@@ -384,8 +384,35 @@ def _fetch_audio(text):
         done.set()
 
 
+# S23 — the PCM boost is a *smoothed limiter*, not a per-chunk normaliser.
+# The old gain was recomputed from every 46 ms chunk's own peak, so quiet
+# fragments (breaths, word endings) got the full boost while loud vowels got
+# almost none: the voice's dynamics flattened and the gain stepped at every
+# chunk boundary, which is audible as pumping. The applied gain now attacks
+# quickly (so a transient can never clip) and releases over a few hundred ms
+# (so it moves like a limiter instead of jittering).
+_PCM_ATTACK_PER_CHUNK = 0.5
+_PCM_RELEASE_PER_CHUNK = 0.15
+
+# The smoothed gain is per-stream state. It lives in thread-local storage so
+# `_boost_pcm_chunk` keeps its single-argument seam (callers/tests patch it as
+# ``_boost_pcm_chunk(chunk)``) while still smoothing across the chunks of one
+# stream. Each capture stream is consumed by one thread, and
+# `_pcm_chunks_from_response` resets the state when it starts.
+_PCM_GAIN_STATE = threading.local()
+
+
+def _reset_pcm_gain_state():
+    _PCM_GAIN_STATE.gain = None
+
+
 def _boost_pcm_chunk(chunk_bytes):
-    """Apply FISH_VOLUME_BOOST_DB to a PCM s16le chunk (mono, 44100)."""
+    """Apply FISH_VOLUME_BOOST_DB to a PCM s16le chunk (mono, 44100).
+
+    The gain is smoothed across the chunks of the current stream (thread-local
+    state reset by `_pcm_chunks_from_response`); a per-chunk cap guarantees the
+    chunk itself can never clip.
+    """
     if FISH_VOLUME_BOOST_DB <= 0 or not chunk_bytes:
         return chunk_bytes
     try:
@@ -398,11 +425,26 @@ def _boost_pcm_chunk(chunk_bytes):
         if peak == 0:
             return chunk_bytes
         amp = 32767
-        gain_db = min(FISH_VOLUME_BOOST_DB, 20 * math.log10(0.9 * amp / peak)) if peak > 0 else FISH_VOLUME_BOOST_DB
-        if gain_db <= 0:
+        # Gain that leaves 10% headroom for THIS chunk's peak; never attenuate
+        # (the old behaviour only ever boosted, and attenuation would be a
+        # separate loudness decision).
+        headroom_db = 20 * math.log10(0.9 * amp / peak)
+        target_db = min(FISH_VOLUME_BOOST_DB, headroom_db)
+        target = 10 ** (max(0.0, target_db) / 20.0)
+        prev = getattr(_PCM_GAIN_STATE, "gain", None)
+        if prev is None:
+            gain = target
+        elif target < prev:
+            gain = prev + _PCM_ATTACK_PER_CHUNK * (target - prev)
+        else:
+            gain = prev + _PCM_RELEASE_PER_CHUNK * (target - prev)
+        _PCM_GAIN_STATE.gain = gain
+        # Limiter safety: cap the applied gain to the current chunk's headroom
+        # so a sudden transient cannot wrap/clip even mid-release.
+        gain = min(gain, amp / peak * 0.98)
+        if gain <= 1.0:
             return chunk_bytes
-        linear = 10 ** (gain_db / 20.0)
-        boosted = np.clip(arr.astype(np.float32) * linear, -32768, 32767).astype(np.int16)
+        boosted = np.clip(arr.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
         return boosted.tobytes()
     except Exception:
         return chunk_bytes
@@ -545,6 +587,7 @@ def _pcm_chunks_from_response(response):
     sample is ever half-written to the device.
     """
     residual = b""
+    _reset_pcm_gain_state()
     for chunk in response.iter_content(chunk_size=4096):
         if not chunk:
             continue

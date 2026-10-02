@@ -107,6 +107,21 @@ def pooled_session(pool_connections=4, pool_maxsize=8):
 _session = pooled_session()
 
 
+def _client_session(module_name, attr="_session"):
+    """A client module's pooled session, or None (never raises).
+
+    S26: warming prewarm's own pool while the real call runs on the client's
+    pool would pre-connect a socket nobody uses. The warm must open the
+    connection in the SAME pool the request will draw from.
+    """
+    try:
+        import importlib
+
+        return getattr(importlib.import_module(module_name), attr)
+    except Exception:
+        return None
+
+
 def _classifier_targets():
     """The classifier's ladder — the hottest sessions after the chat provider."""
     targets = []
@@ -115,17 +130,22 @@ def _classifier_targets():
     except Exception:
         GEMINI_API_KEY = GROQ_API_KEY = ""
     if GEMINI_API_KEY:
+        # The classifier calls Gemini through ask_gemini_chat(no_retry=True),
+        # whose pooled socket lives in _no_retry_session (S26).
         targets.append({
             "name": "gemini",
             "url": ("https://generativelanguage.googleapis.com/v1beta/models"
                     "?key=%s" % GEMINI_API_KEY),
             "headers": {},
+            "session": _client_session(
+                "backend.services.gemini_client", "_no_retry_session"),
         })
     if GROQ_API_KEY:
         targets.append({
             "name": "groq",
             "url": "https://api.groq.com/openai/v1/models",
             "headers": {"Authorization": "Bearer %s" % GROQ_API_KEY},
+            "session": _client_session("backend.services.grok_client"),
         })
     return targets
 
@@ -152,6 +172,7 @@ def _chat_target():
             "url": ("https://generativelanguage.googleapis.com/v1beta/models"
                     "?key=%s" % api_key),
             "headers": {},
+            "session": _client_session("backend.services.gemini_client"),
         }
     if provider == "fireworks":
         if not api_key:
@@ -160,6 +181,16 @@ def _chat_target():
             "name": "fireworks",
             "url": "https://api.fireworks.ai/inference/v1/models",
             "headers": {"Authorization": "Bearer %s" % api_key},
+            "session": _client_session("backend.services.fireworks_client"),
+        }
+    if provider == "groq":
+        if not api_key:
+            return None
+        return {
+            "name": "groq",
+            "url": "https://api.groq.com/openai/v1/models",
+            "headers": {"Authorization": "Bearer %s" % api_key},
+            "session": _client_session("backend.services.grok_client"),
         }
     if not base_url:
         # native/adapter providers without a cheap authenticated GET (whisper,
@@ -170,7 +201,8 @@ def _chat_target():
     if api_key:
         headers["Authorization"] = "Bearer %s" % api_key
     return {"name": provider, "url": str(base_url).rstrip("/") + "/models",
-            "headers": headers}
+            "headers": headers,
+            "session": _client_session("backend.services.openai_compat_client")}
 
 
 def targets():
@@ -197,9 +229,13 @@ def targets():
     unique = []
     for target in found:
         url = target.get("url")
-        if not url or url in seen:
+        # S26: the same URL may be served by two different pools (Gemini chat
+        # vs the classifier's no_retry leg) — each pool needs its own warm, so
+        # the dedup key is (url, session).
+        key = (url, id(target.get("session")))
+        if not url or key in seen:
             continue
-        seen.add(url)
+        seen.add(key)
         unique.append(target)
     return unique
 
@@ -223,10 +259,17 @@ def read_fully(response):
 
 
 def _warm_one(target):
-    """Open (or reuse) the pooled connection for one target. Never raises."""
+    """Open (or reuse) the pooled connection for one target. Never raises.
+
+    S26: the warm must land in the CLIENT's pool (``target["session"]``) — a
+    socket opened in prewarm's own pool would never be drawn on by the real
+    call. Targets without a session (tests, exotic providers) use this
+    module's pool as before.
+    """
     name = str(target.get("name") or "unknown")
+    session = target.get("session") or _session
     try:
-        response = _session.get(
+        response = session.get(
             target["url"],
             headers=target.get("headers") or None,
             timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),

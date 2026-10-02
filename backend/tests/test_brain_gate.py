@@ -382,6 +382,35 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
             brain.should_search("whats the pricing for claude fable 5.1 model")
         )
 
+    def test_should_search_ignores_substring_false_positives(self):
+        # S1 — whole-word matching. These must stay plain chat, not research.
+        for msg in (
+            "what do you know about the roman empire",
+            "how do you feel today",
+            "i feel tired",
+            "do you know me",
+            "is my costume ready",
+            "he scored a goal",
+            "it matches the description",
+        ):
+            self.assertFalse(brain.should_search(msg), msg)
+
+    def test_should_search_weak_recency_requires_fact_noun(self):
+        self.assertFalse(brain.should_search("what do you know now"))
+        self.assertFalse(brain.should_search("aaj kya karu"))
+        self.assertTrue(brain.should_search("whats the news today"))
+        self.assertTrue(brain.should_search("whats the score now"))
+        self.assertTrue(brain.should_search("aaj ka mausam"))
+
+    def test_should_search_strong_whole_words(self):
+        for msg in (
+            "whats the latest on the mars rover",
+            "whats the weather in delhi",
+            "how much does a ps5 cost",
+            "tell me the score",
+        ):
+            self.assertTrue(brain.should_search(msg), msg)
+
     def test_fresh_info_reroutes_chat_to_research(self):
         msg = "whats the pricing for claude fable 5.1 model"
         with patch.object(brain, "classify_intent", return_value=self._chat_verdict()), \

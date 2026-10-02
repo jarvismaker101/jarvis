@@ -101,7 +101,7 @@ class SplitWordTests(_SpeakerHarness):
         sp, captured = self._speaker()
         with patch.object(fireworks_client, "API_KEY", "test-key"), \
              patch.object(fireworks_client, "REASONING_EFFORT", ""), \
-             patch.object(fireworks_client.requests, "post",
+             patch.object(fireworks_client._session, "post",
                           return_value=_sse(lines)):
             deltas = list(fireworks_client.ask_fireworks_stream(MESSAGES))
             for delta in deltas:
@@ -131,7 +131,7 @@ class ReasoningChannelTests(_SpeakerHarness):
         ])
         with patch.object(fireworks_client, "API_KEY", "test-key"), \
              patch.object(fireworks_client, "REASONING_EFFORT", ""), \
-             patch.object(fireworks_client.requests, "post",
+             patch.object(fireworks_client._session, "post",
                           return_value=_sse(lines)):
             out = list(fireworks_client.ask_fireworks_stream(
                 MESSAGES, include_reasoning=True))
@@ -149,7 +149,7 @@ class ReasoningChannelTests(_SpeakerHarness):
         ])
         with patch.object(fireworks_client, "API_KEY", "test-key"), \
              patch.object(fireworks_client, "REASONING_EFFORT", ""), \
-             patch.object(fireworks_client.requests, "post",
+             patch.object(fireworks_client._session, "post",
                           return_value=_sse(lines)):
             out = list(fireworks_client.ask_fireworks_stream(MESSAGES))
         self.assertEqual(out, ["hel", "lo"])
@@ -202,8 +202,8 @@ class ReasoningChannelTests(_SpeakerHarness):
         resp.status_code = 200
         resp.json.return_value = body
         with patch.object(gemini_client, "GEMINI_API_KEY", "test-key"), \
-             patch.object(gemini_client, "requests") as requests_mod:
-            requests_mod.post.return_value = resp
+             patch.object(gemini_client._no_retry_session, "post",
+                          return_value=resp):
             result = gemini_client.ask_gemini_chat(MESSAGES, no_retry=True)
         self.assertEqual(result["choices"][0]["message"]["content"],
                          "the answer")

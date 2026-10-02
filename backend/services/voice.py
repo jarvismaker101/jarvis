@@ -146,7 +146,35 @@ def _stream_cut(text, first):
 
 
 
+# [S12] Markdown is for screens, not speakers: if a model slips one of these
+# past the voice prompt, strip it before the text reaches TTS.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]*)`")
+_MD_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
+_MD_BULLET_RE = re.compile(r"(?m)^\s{0,3}(?:[-*+]|\u2022)\s+")
+_MD_EMPHASIS_RE = re.compile(r"\*{1,3}|_{2,}")
+_MD_URL_RE = re.compile(r"https?://\S+|www\.\S+")
+
+
+def strip_markdown_for_speech(text):
+    """Remove markdown and bare URLs so TTS never reads formatting aloud (S12)."""
+    if not text:
+        return text
+    text = _MD_IMAGE_RE.sub("", text)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_CODE_FENCE_RE.sub("", text)
+    text = _MD_INLINE_CODE_RE.sub(r"\1", text)
+    text = _MD_HEADING_RE.sub("", text)
+    text = _MD_BULLET_RE.sub("", text)
+    text = _MD_EMPHASIS_RE.sub("", text)
+    text = _MD_URL_RE.sub("", text)
+    return text
+
+
 def clean_text(text):
+    text = strip_markdown_for_speech(text)
     text = text.replace("\n", ". ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -958,6 +986,9 @@ class StreamSpeaker:
         return " ".join(part for part in parts if part).strip()
 
     def _enqueue(self, sentence):
+        # [S12] Safety net: strip markdown/URLs from each finished chunk so the
+        # streaming path never voices formatting either.
+        sentence = strip_markdown_for_speech(sentence)
         # [P1-01] An empty utterance is never handed to TTS: it would either
         # error or leave a gap, and the contract is that every chunk contains a
         # complete word.

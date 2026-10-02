@@ -19,6 +19,33 @@ VISION_MODEL = os.getenv(
 print("LOADING ENV FROM:", ENV_PATH)
 print("API KEY FOUND:", API_KEY is not None)
 
+# S26 — pooled keepalive session: this is the classifier's Groq fallback, and a
+# bare ``requests.post`` paid a fresh TCP + TLS handshake on every classifier
+# call. No hidden adapter retries are added — the plain fast-fail semantics
+# (return {} on any error) are unchanged; only the connection is reused.
+try:
+    from backend.services.prewarm import pooled_session as _pooled_session
+except Exception:  # pragma: no cover - the plain session still works
+    _pooled_session = None
+try:
+    _session = _pooled_session()
+except Exception:  # pragma: no cover
+    _session = requests.Session()
+
+# S27 — thinking OFF for the qwen fallback. Gated to the qwen family: Groq
+# honours reasoning_effort on qwen3 models, and "none" is the value that
+# disables it; other Groq models must never see the field.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "none")
+
+
+def _reasoning_effort(model=None):
+    """The reasoning control for one call, or None (send nothing)."""
+    if not GROQ_REASONING_EFFORT:
+        return None
+    if "qwen" not in str(model or DEFAULT_MODEL).lower():
+        return None
+    return GROQ_REASONING_EFFORT
+
 
 def _post_chat_completion(data, timeout=(3.05, 18)):
     if not API_KEY:
@@ -31,7 +58,7 @@ def _post_chat_completion(data, timeout=(3.05, 18)):
         "Content-Type": "application/json",
     }
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        response = _session.post(url, headers=headers, json=data, timeout=timeout)
 
         print("[GROQ] Status:", response.status_code)
 
@@ -53,6 +80,15 @@ def ask_grok(messages, temperature=0.7, max_tokens=None, model=None, timeout=Non
     }
     if max_tokens is not None:
         data["max_tokens"] = max_tokens
+    # S27: the deployed Groq model (qwen3) writes a thinking block before the
+    # answer. The text is stripped afterwards (_strip_think_blocks), but the
+    # TIME is not — and inside the classifier's tight budget that thinking
+    # time is the difference between an answer and a timeout. "none"
+    # disables thinking on Groq; gated by model family so a non-reasoning
+    # Groq model never sees the field.
+    effort = _reasoning_effort(model)
+    if effort:
+        data["reasoning_effort"] = effort
 
     return _post_chat_completion(data, timeout=timeout or (3.05, 18))
 

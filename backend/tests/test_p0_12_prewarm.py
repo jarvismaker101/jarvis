@@ -220,11 +220,24 @@ class KeepAliveTests(unittest.TestCase):
                       adapter._socket_options)
 
     def test_the_provider_sessions_are_keepalive_sessions(self):
-        from backend.services import gemini_client, openai_compat_client
+        from backend.services import (
+            fireworks_client,
+            gemini_client,
+            grok_client,
+            openai_compat_client,
+        )
 
-        for session in (gemini_client._session, openai_compat_client._session):
+        for session in (gemini_client._session, openai_compat_client._session,
+                        fireworks_client._session, grok_client._session):
             adapter = session.get_adapter("https://api.example.com")
             self.assertIsInstance(adapter, prewarm.KeepAliveAdapter)
+
+    def test_the_gemini_no_retry_session_is_keepalive_too(self):
+        from backend.services import gemini_client
+
+        adapter = gemini_client._no_retry_session.get_adapter(
+            "https://generativelanguage.googleapis.com")
+        self.assertIsInstance(adapter, prewarm.KeepAliveAdapter)
 
 
 class SttPoolingTests(unittest.TestCase):
@@ -381,6 +394,40 @@ class PrewarmTargetTests(unittest.TestCase):
              patch("backend.services.model_registry.get_provider_credentials",
                    return_value=(None, None)):
             self.assertIsNone(prewarm._chat_target())
+
+    def test_the_warm_lands_in_the_client_pool_not_prewarms_pool(self):
+        """S26: a socket warmed in the wrong pool is a socket nobody draws on.
+
+        The chat target must carry the client's own session so the warm
+        pre-connects the pool the real request will use.
+        """
+        from backend.services import fireworks_client
+
+        with patch("backend.services.model_registry.get_model_for_role",
+                   return_value=("fireworks", "m")), \
+             patch("backend.services.model_registry.get_provider_credentials",
+                   return_value=("key", "")):
+            target = prewarm._chat_target()
+        self.assertEqual(target["name"], "fireworks")
+        self.assertIs(target["session"], fireworks_client._session)
+
+    def test_two_pools_for_one_url_are_not_deduped_together(self):
+        """Same URL, different pools => two warms (Gemini chat vs classifier)."""
+        session_a, session_b = prewarm.pooled_session(), prewarm.pooled_session()
+        with patch.object(prewarm, "_chat_target",
+                          return_value={"name": "gemini",
+                                        "url": "https://same/models",
+                                        "session": session_a}), \
+             patch.object(prewarm, "_classifier_targets",
+                          return_value=[{"name": "gemini",
+                                         "url": "https://same/models",
+                                         "session": session_b}]), \
+             patch("backend.services.transcription.prewarm_target",
+                   return_value=None), \
+             patch.object(prewarm, "_warm_one",
+                          return_value=("x", "warm", {})):
+            found = prewarm.targets()
+        self.assertEqual(len(found), 2)
 
 
 if __name__ == "__main__":

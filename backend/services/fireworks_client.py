@@ -41,6 +41,20 @@ _TRANSIENT_STATUSES = frozenset(
 #: One retry, never more: a manual loop on top of the classifier.
 _MAX_ATTEMPTS = 2
 
+# S26 â€” pooled keepalive session. Both streaming and non-streaming calls used
+# to go through bare ``requests.post``, paying a fresh TCP + TLS handshake on
+# EVERY call (several extra round trips on the VPN) before the first byte.
+# The manual deadline-aware retry logic above is unchanged; only the
+# connection is reused now (the adapter itself carries no hidden retries).
+try:
+    from backend.services.prewarm import pooled_session as _pooled_session
+except Exception:  # pragma: no cover - the plain session still works
+    _pooled_session = None
+try:
+    _session = _pooled_session()
+except Exception:  # pragma: no cover
+    _session = requests.Session()
+
 print("LOADING ENV FROM:", ENV_PATH)
 print("FIREWORKS API KEY FOUND:", API_KEY is not None)
 
@@ -53,7 +67,7 @@ def _exhausted(detail="budget exhausted before the request"):
 
 
 def _mentions_reasoning(text):
-    """True when an error body references the reasoning/thinking setting —
+    """True when an error body references the reasoning/thinking setting â€”
     the signature of a thinking-only model (e.g. GLM) rejecting
     reasoning_effort. Deliberately substring-based: no model-name list to
     maintain, and a false positive only costs one extra attempt.
@@ -84,9 +98,9 @@ def _post_chat_completion(data, timeout=(5.05, 60), deadline=None):
     try:
         if deadline is not None:
             with bound(deadline):
-                response = requests.post(API_URL, headers=headers, json=data, timeout=timeout)
+                response = _session.post(API_URL, headers=headers, json=data, timeout=timeout)
         else:
-            response = requests.post(API_URL, headers=headers, json=data, timeout=timeout)
+            response = _session.post(API_URL, headers=headers, json=data, timeout=timeout)
 
         print("[FIREWORKS] Status:", response.status_code)
 
@@ -139,7 +153,7 @@ def ask_fireworks(messages, temperature=0.7, max_tokens=None, model=None,
             return result
 
         # The one deliberate replay: a model that rejects the reasoning
-        # setting (e.g. a thinking-only GLM) is asked again without it — but
+        # setting (e.g. a thinking-only GLM) is asked again without it â€” but
         # only while there is budget to spend.
         if (
             isinstance(result, dict)
@@ -155,14 +169,14 @@ def ask_fireworks(messages, temperature=0.7, max_tokens=None, model=None,
 
         failure = failure_of(result)
         if failure is not None and retry_eligible(failure, handle, attempt, _MAX_ATTEMPTS):
-            print(f"[FIREWORKS] Transient HTTP {failure.status} — retrying once")
+            print(f"[FIREWORKS] Transient HTTP {failure.status} â€” retrying once")
             continue
         return result
     return result
 
 
 def ask_fireworks_vision(prompt, image_data_url, max_completion_tokens=800, model=None, response_format=None, deadline=None):
-    """Vision request to Fireworks (openai-compatible image_url) — for screen Q&A.
+    """Vision request to Fireworks (openai-compatible image_url) â€” for screen Q&A.
 
     Uses the same chat completions endpoint with a user message containing
     text + image_url parts. Non-stream, temperature 0. Vision models like
@@ -204,9 +218,9 @@ def ask_fireworks_vision(prompt, image_data_url, max_completion_tokens=800, mode
     try:
         if handle is not None:
             with bound(handle):
-                resp = requests.post(API_URL, headers=headers, json=data, timeout=request_timeout)
+                resp = _session.post(API_URL, headers=headers, json=data, timeout=request_timeout)
         else:
-            resp = requests.post(API_URL, headers=headers, json=data, timeout=request_timeout)
+            resp = _session.post(API_URL, headers=headers, json=data, timeout=request_timeout)
         if resp.status_code != 200:
             print(f"[FIREWORKS VISION] {effective_model} {resp.status_code} {resp.text[:300]}")
             return {}
@@ -227,11 +241,11 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
     live typewriter reply instead of waiting for the full response.
 
     F31 channels: the default stream yields ONLY final-answer content as
-    plain strings — reasoning deltas never reach chat, TTS or conversational
+    plain strings â€” reasoning deltas never reach chat, TTS or conversational
     memory, and "hel" + "lo" stays "hello" (the text is forwarded exactly as
     the model produced it, never re-joined or re-spaced). Pass
     *include_reasoning* (or *typed*) to receive :class:`StreamDelta` events
-    instead, each tagged ``final`` or ``reasoning`` — reasoning is preserved
+    instead, each tagged ``final`` or ``reasoning`` â€” reasoning is preserved
     verbatim in its own channel and can never be mistaken for an answer.
 
     *cancel* is an optional ``threading.Event`` (F25). When it is set the
@@ -241,7 +255,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
 
     *deadline* (F24) is the shared budget handle. A spent budget sends no
     request, the read timeout is sliced to the time left, and the read loop
-    stops between chunks — so a trickling stream cannot extend the deadline
+    stops between chunks â€” so a trickling stream cannot extend the deadline
     and the chunks already yielded survive as a partial result.
     """
     typed_output = bool(typed or include_reasoning)
@@ -275,7 +289,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
     try:
         if handle is not None:
             with bound(handle):
-                response = requests.post(
+                response = _session.post(
                     API_URL,
                     headers=headers,
                     json=data,
@@ -283,7 +297,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
                     timeout=request_timeout,
                 )
         else:
-            response = requests.post(
+            response = _session.post(
                 API_URL,
                 headers=headers,
                 json=data,
@@ -314,7 +328,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
             try:
                 if handle is not None:
                     with bound(handle):
-                        response = requests.post(
+                        response = _session.post(
                             API_URL,
                             headers=headers,
                             json=data,
@@ -322,7 +336,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
                             timeout=retry_timeout,
                         )
                 else:
-                    response = requests.post(
+                    response = _session.post(
                         API_URL,
                         headers=headers,
                         json=data,
@@ -338,7 +352,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
         else:
             return
 
-    # [PERF] P1-19 — response headers in: from here on the delay is generation.
+    # [PERF] P1-19 â€” response headers in: from here on the delay is generation.
     # After the optional reasoning_effort replay, so it marks the response the
     # stream actually reads.
     _mark_headers("fireworks", data.get("model"))
@@ -347,7 +361,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
         for line in response.iter_lines(decode_unicode=True):
             if cancel is not None and cancel.is_set():
                 break
-            # F24: checked between chunks — a trickling stream cannot extend
+            # F24: checked between chunks â€” a trickling stream cannot extend
             # the deadline, and what was already yielded stays delivered.
             if handle is not None and handle.stopped():
                 break
@@ -367,8 +381,8 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
             delta = choices[0].get("delta") or {}
             content = delta.get("content")
             if content:
-                # F31: exactly the model's text — no re-joining, no
-                # re-spacing — so 'hel' + 'lo' remains 'hello'.
+                # F31: exactly the model's text â€” no re-joining, no
+                # re-spacing â€” so 'hel' + 'lo' remains 'hello'.
                 yield (StreamDelta(content, FINAL_CHANNEL)
                        if typed_output else content)
             if include_reasoning or typed:
@@ -379,7 +393,7 @@ def ask_fireworks_stream(messages, temperature=0.7, max_tokens=None, model=None,
                 if reasoning:
                     yield StreamDelta(reasoning, REASONING_CHANNEL)
     finally:
-        # F25 — never leave the socket open behind a cancelled speculation.
+        # F25 â€” never leave the socket open behind a cancelled speculation.
         try:
             response.close()
         except Exception:

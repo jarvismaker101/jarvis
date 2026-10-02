@@ -347,7 +347,7 @@ class FireworksBudgetTests(unittest.TestCase):
     def setUp(self):
         self._key = patch.object(fireworks_client, "API_KEY", "test-key")
         self._effort = patch.object(fireworks_client, "REASONING_EFFORT", "none")
-        self._post = patch.object(fireworks_client.requests, "post")
+        self._post = patch.object(fireworks_client._session, "post")
         self._key.start()
         self._effort.start()
         self.post = self._post.start()

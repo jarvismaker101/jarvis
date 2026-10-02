@@ -66,7 +66,7 @@ class BroadenedReasoningGateTests(LiveBugfixBase):
             'data: [DONE]',
         ]
         with patch.object(fireworks_client, "API_KEY", "test-key"), \
-             patch.object(fireworks_client.requests, "post", side_effect=[first, second]) as post:
+             patch.object(fireworks_client._session, "post", side_effect=[first, second]) as post:
             deltas = list(fireworks_client.ask_fireworks_stream(messages, temperature=0.7, max_tokens=10, model="accounts/fireworks/models/deepseek-v4-flash-vision-exp"))
             self.assertEqual(deltas, ["ok"])
             self.assertEqual(post.call_count, 2)

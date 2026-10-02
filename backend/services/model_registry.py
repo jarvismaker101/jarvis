@@ -642,6 +642,22 @@ def _reasoning_for(provider, model, capabilities):
         return {"supported": True, "param": "reasoning_effort", "effort": "none",
                 "reason": "local Ollama endpoint: reasoning_effort=none "
                           "disables thinking"}
+    if pid == "groq":
+        # S27: the Groq chat/classifier model is qwen3 — thinking OFF, or the
+        # tight budget is spent on thought text that is stripped anyway.
+        return {"supported": True, "param": "reasoning_effort", "effort": "none",
+                "reason": "groq qwen3: reasoning_effort=none disables thinking"}
+    if pid == "openrouter":
+        # S27: OpenRouter normalizes reasoning controls across its models;
+        # a thinking model must be told not to think on the voice path.
+        # "" opts out entirely (the field is never sent).
+        effort = str(os.getenv("OPENROUTER_REASONING_EFFORT", "low")
+                     or "").strip().lower() or None
+        if effort is None:
+            return {"supported": False, "param": None, "effort": None,
+                    "reason": "OPENROUTER_REASONING_EFFORT is unset"}
+        return {"supported": True, "param": "reasoning_effort", "effort": effort,
+                "reason": "openrouter normalizes reasoning_effort"}
     if pid != "fireworks":
         return {"supported": False, "param": None, "effort": None,
                 "reason": "adapter does not carry reasoning controls"}

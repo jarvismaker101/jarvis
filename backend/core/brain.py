@@ -592,35 +592,88 @@ def detect_language(text):
     return "hindi" if hindi_count >= 2 or has_hindi_phrase else "english"
 
 
+# Fresh-info detection. Whole-word matching only: the old substring test
+# wrongly routed normal conversation to web research ("now" in "know", "fee"
+# in "feel", "cost" in "costume", "match" in "matches", "score" in "scored").
+_SEARCH_WORDS = frozenset({
+    "latest",
+    "current",
+    "price",
+    "pricing",
+    "priced",
+    "cost",
+    "costs",
+    "fee",
+    "fees",
+    "subscription",
+    "score",
+    "match",
+    "news",
+    "weather",
+    "taaza",
+    "taza",
+    "mausam",
+    "khabar",
+})
+
+# Recency words are *weak*: a bare "today"/"now" is not enough, so "how do you
+# feel today?", "what do you know now?" and "aaj kya karu" stay plain chat.
+_SEARCH_WEAK_WORDS = frozenset({"today", "now", "aaj", "abhi"})
+
+# Nouns that turn a weak recency word into a genuine lookup ("news today").
+_SEARCH_FACT_NOUNS = frozenset({
+    "news",
+    "price",
+    "pricing",
+    "cost",
+    "costs",
+    "fee",
+    "fees",
+    "subscription",
+    "score",
+    "match",
+    "weather",
+    "release",
+    "releases",
+    "rate",
+    "rates",
+    "stock",
+    "market",
+    "result",
+    "results",
+    "update",
+    "updates",
+    "version",
+    "schedule",
+    "forecast",
+    "temperature",
+    "headline",
+    "headlines",
+    "mausam",
+    "khabar",
+    "taaza",
+    "taza",
+})
+
+_SEARCH_HOW_MUCH_RE = re.compile(r"\bhow much (?:does|is)\b")
+_SEARCH_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
 def should_search(query):
+    """True when the query asks for fresh, current world information.
+
+    Matching is whole-word, and recency words only count when a world-fact
+    noun is also present, so conversational questions ("what do you know
+    about X", "how do you feel today?", "I feel tired", "do you know me")
+    are never mistaken for a request to search the web.
+    """
     q = query.lower()
-    keywords = [
-        "today",
-        "now",
-        "latest",
-        "current",
-        "price",
-        "pricing",
-        "priced",
-        "cost",
-        "costs",
-        "fee",
-        "fees",
-        "subscription",
-        "how much does",
-        "how much is",
-        "score",
-        "match",
-        "news",
-        "weather",
-        "aaj",
-        "abhi",
-        "taaza",
-        "taza",
-        "mausam",
-        "khabar",
-    ]
-    return any(keyword in q for keyword in keywords)
+    words = set(_SEARCH_WORD_RE.findall(q))
+    if words & _SEARCH_WORDS:
+        return True
+    if _SEARCH_HOW_MUCH_RE.search(q):
+        return True
+    return bool(words & _SEARCH_WEAK_WORDS and words & _SEARCH_FACT_NOUNS)
 
 
 # Greeting-like chat that must never auto-reroute to research.
@@ -1134,6 +1187,25 @@ def _memory_context_cached(user_message):
     return mem_block, work_block
 
 
+def _current_time_note():
+    """Spoken-friendly date/time line at minute precision (S12).
+
+    The model otherwise has no idea what "today" is, so "what day is it"
+    needed a web lookup. Rounded to the minute because the seconds are noise.
+    """
+    try:
+        return time.strftime(
+            "Current date and time: %A, %d %B %Y, %I:%M %p (local).",
+            time.localtime())
+    except Exception:
+        return ""
+
+
+def _append_time_note(text):
+    note = _current_time_note()
+    return f"{text}\n\n{note}" if note else text
+
+
 def _build_chat_messages(user_message, voice_compact=False, speculative=False, history=None):
     """Shared message-construction for chat (used by both streaming and plain paths).
 
@@ -1171,9 +1243,17 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
         )
 
     if voice_compact:
+        # [S12] A spoken reply must sound like speech, not like rendered text.
         system_prompt += (
+            " This reply is SPOKEN aloud: write only what should be read out."
+            " Never use markdown, headings, bullet or numbered lists, tables,"
+            " emojis, code blocks, or URLs."
+            " Say numbers, units, dates and times the way a person says them"
+            " (for example 'four thirty PM', 'twenty percent')."
+            " Vary how you open a reply; do not start every reply with 'Sir'."
             " Prioritize a fast spoken reply over a detailed one."
-            " Keep it natural, under 35 words, and within two short sentences unless detail is requested."
+            " Keep it natural, under 35 words, and within two short sentences"
+            " unless detail is requested."
         )
 
     # G9 (F06): bounded scoped-memory injection — a pure read (speculation
@@ -1233,13 +1313,23 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
         messages = [
             {"role": "system", "content": system_prompt},
             *tail,
-            {"role": "user", "content": f"{user_message}\n\nSearch info: {search_info}"},
+            {"role": "user", "content": _append_time_note(
+                f"{user_message}\n\nSearch info: {search_info}")},
         ]
     else:
         messages = [
             {"role": "system", "content": system_prompt},
             *history,
         ]
+        # [S12] Put the current date/time in the LATEST user turn — never the
+        # system prompt — so the cacheable prompt prefix is unchanged minute to
+        # minute (a timestamp at the top would bust prompt caching every turn).
+        # Only the current turn qualifies here; in a speculative build the new
+        # turn is appended later by the racer, which adds the note itself.
+        if (messages[-1].get("role") == "user"
+                and messages[-1].get("content") == user_message):
+            messages[-1] = dict(messages[-1],
+                                content=_append_time_note(user_message))
     return {
         "path": "llm",
         "system_prompt": system_prompt,
@@ -1396,6 +1486,22 @@ def get_last_chat_fallback():
         return dict(_last_chat_fallback) if _last_chat_fallback else None
 
 
+def _reasoning_effort_for_chat():
+    """S27 — the registry-validated reasoning control for the chat role.
+
+    A thinking model behind a generic gateway must be TOLD not to think on
+    the voice path: thought text is stripped, but the time it costs is not.
+    The snapshot decides which effort (if any) is safe; the client replays
+    once without the field if the model rejects it (F56).
+    """
+    try:
+        _reasoning = (model_registry.get_model_config("chat")
+                      or {}).get("reasoning") or {}
+    except Exception:
+        _reasoning = {}
+    return _reasoning.get("effort") if _reasoning.get("supported") else None
+
+
 def _stream_chat_deltas(messages, temperature, max_tokens, cancel=None):
     """Yield streaming deltas; the runtime-selected model is primary, the
     env-configured chain (Gemini → Fireworks) is the fallback.
@@ -1496,6 +1602,7 @@ def _stream_chat_deltas(messages, temperature, max_tokens, cancel=None):
         api_key, base_url = model_registry.get_provider_credentials(provider)
         if api_key and base_url:
             streamed = False
+            reasoning_effort = _reasoning_effort_for_chat()
             for delta in ask_openai_compat_stream(
                 messages,
                 model=model,
@@ -1503,6 +1610,7 @@ def _stream_chat_deltas(messages, temperature, max_tokens, cancel=None):
                 api_key=api_key,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
                 cancel=cancel,
                 # [P1-13] this client was the one stream with NO deadline: a
                 # provider that accepted the connection and went silent held
@@ -1776,7 +1884,8 @@ class _ChatRacer:
                 and last.get("role") == "user"
                 and str(last.get("content", "")).startswith(self._msg)
             ):
-                msgs.append({"role": "user", "content": self._msg})
+                msgs.append({"role": "user",
+                             "content": _append_time_note(self._msg)})
             temp = 0.45 if self._voice_compact else 0.7
             mx = 300 if self._voice_compact else 1400
             gen = _stream_chat_deltas(built["messages"], temp, mx,

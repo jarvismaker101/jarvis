@@ -29,7 +29,7 @@ class FireworksClientTestBase(unittest.TestCase):
     def setUp(self):
         self._api_key = patch.object(fireworks_client, "API_KEY", "test-key")
         self._effort = patch.object(fireworks_client, "REASONING_EFFORT", "none")
-        self._post = patch.object(fireworks_client.requests, "post")
+        self._post = patch.object(fireworks_client._session, "post")
         self._api_key.start()
         self._effort.start()
         self.post = self._post.start()
