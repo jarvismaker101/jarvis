@@ -11,10 +11,15 @@ from backend import listener_state
 from backend.services.earcons import play_ready_earcon, play_reply_start_earcon
 from backend.services.elevenlabs_voice import speak_elevenlabs, stop_elevenlabs
 from backend.services.fish_voice import (
+    fish_ws_begin_reply,
+    fish_ws_end_reply,
+    fish_ws_session,
+    play_ws_reply,
     prefetch_fish_audio,
     speak_fish_audio,
     stop_fish_audio,
     warm_up_fish_tts,
+    ws_audio_reached_device,
 )
 from backend.services.google_tts import (
     prefetch_google_tts,
@@ -298,6 +303,13 @@ def stop_speaking(signal_ready=True):
 
     try:
         stop_fish_audio()
+    except Exception:
+        pass
+
+    # [S7] A stop also closes the live Fish session, so its reader thread and
+    # socket do not outlive the reply they were synthesising for.
+    try:
+        fish_ws_end_reply()
     except Exception:
         pass
 
@@ -680,6 +692,29 @@ def speak(text):
             provider = _resolve_session_tts_provider()
             chunks = split_speech_chunks(clean)
             is_first_chunk = True
+
+            # [S7] ONE live Fish session per reply: every chunk is fed into a
+            # single WebSocket and the reply plays as one continuous utterance
+            # (earlier first audio, no per-sentence intonation reset). The
+            # per-sentence ladder below stays the fallback and runs only when
+            # the WS path produced NO audio at all.
+            fish_ws_begin_reply()
+            ws_session = fish_ws_session() if provider == "fish" else None
+            ws_spoke = False
+            try:
+                if ws_session is not None and chunks:
+                    for chunk in chunks:
+                        ws_session.feed(chunk)
+                    ws_session.finish_text()
+                    outcome = play_ws_reply(ws_session,
+                                            is_current=lambda: _is_current_generation(generation),
+                                            earcon=play_reply_start_earcon)
+                    ws_spoke = bool(outcome.get("audio_started"))
+                    if ws_spoke:
+                        return
+            finally:
+                fish_ws_end_reply()
+
             for index, chunk in enumerate(chunks):
                 if not _is_current_generation(generation):
                     return
@@ -803,6 +838,20 @@ class StreamSpeaker:
         #: times per chunk. The registry still re-stats its file per resolve, so
         #: a selection changed mid-reply lands on the next reply.
         self._tts_provider = None
+        # [S7] Live Fish WebSocket mode for THIS reply: sentences are fed into
+        # one session instead of being spoken one HTTP request at a time.
+        # `_ws_fed` remembers what the session consumed, so a session that
+        # failed BEFORE any audio can hand every sentence back to the ladder
+        # (a session that already spoke must never replay).
+        self._ws_mode = False
+        self._ws_fed = []
+        self._ws_thread = None
+        self._ws_outcome = None
+        #: [S7] ONE WebSocket per reply session. Once this reply's session is
+        #: finished (handed back or ended) the reply stays on the ladder: a
+        #: new session for the same reply would only re-consume its sentences.
+        self._ws_disabled = False
+        self._ws_ended = False
 
     def _tts_engine(self):
         """[P1-08] The tts provider for THIS reply session (resolved once)."""
@@ -1027,8 +1076,9 @@ class StreamSpeaker:
                 pending_ahead = self._queue.qsize()
                 self._queue.put(first)
                 self._start_worker()
-                _prefetch_tts_audio(first, plays_next=(pending_ahead == 0),
-                                    provider=self._tts_engine())
+                if not self._ws_mode:
+                    _prefetch_tts_audio(first, plays_next=(pending_ahead == 0),
+                                        provider=self._tts_engine())
             if remainder:
                 self._enqueue(remainder)
             return
@@ -1041,13 +1091,17 @@ class StreamSpeaker:
         pending_ahead = self._queue.qsize()
         self._queue.put(sentence)
         self._start_worker()
-        # Start synthesising this sentence now so the playback loop (which is
+# Start synthesising this sentence now so the playback loop (which is
         # still speaking the previous one) finds it ready when its turn comes.
         # [P0-05] The "is this the sentence about to play?" half of the rule is
         # passed in; `_prefetch_tts_audio` owns the decision, so the engine
         # choice and the timing rule cannot drift apart.
-        _prefetch_tts_audio(sentence, plays_next=(pending_ahead == 0),
-                            provider=self._tts_engine())
+        # [S7] Under the live WebSocket engine this sentence is fed to the
+        # session instead — an HTTP prefetch would synthesise the same audio
+        # a second time on the other transport.
+        if not self._ws_mode:
+            _prefetch_tts_audio(sentence, plays_next=(pending_ahead == 0),
+                                provider=self._tts_engine())
 
     def _start_worker(self):
         with _state_lock:
@@ -1160,6 +1214,81 @@ class StreamSpeaker:
         with self._buffer_lock:
             return not self._buffer.strip()
 
+    def _start_ws_playback(self, session):
+        """[S7] Start the one continuous playback stream for this reply."""
+        self._ws_mode = True
+
+        def _run():
+            try:
+                self._ws_outcome = play_ws_reply(
+                    session,
+                    is_current=lambda: _is_current_generation(self._generation),
+                    earcon=play_reply_start_earcon if not self._played_first
+                    else None)
+            except Exception:
+                print("Fish WS playback error:")
+                traceback.print_exc()
+                self._ws_outcome = {"audio_started": ws_audio_reached_device(),
+                                    "failed": True}
+
+        self._ws_thread = threading.Thread(target=_run,
+                                            name="fish-ws-playback",
+                                            daemon=True)
+        self._ws_thread.start()
+        return self._ws_thread
+
+    def _finish_ws_playback(self, timeout=8.0, handback_if_silent=True):
+        """[S7] Close the text stream, wait for the audio to finish playing
+        and close the session.
+
+        When the session produced NO audio at all and the reply is still
+        current, every sentence it consumed is put back on the queue so the
+        per-sentence ladder speaks the whole reply instead (a reply that
+        already spoke is never replayed; a stop never requeues anything).
+        """
+        session = fish_ws_session()
+        if session is not None:
+            try:
+                session.finish_text()
+            except Exception:
+                pass
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._ws_mode = False
+        self._ws_thread = None
+        try:
+            fish_ws_end_reply()
+        except Exception:
+            pass
+        outcome = self._ws_outcome or {"audio_started": ws_audio_reached_device(),
+                                       "failed": False}
+        fed = self._ws_fed
+        self._ws_fed = []
+        # ONE session per reply: whatever happened to it, this reply is done
+        # with the WebSocket engine and continues on the per-sentence ladder.
+        self._ws_disabled = True
+        if not handback_if_silent and ws_audio_reached_device():
+            # The session's audio reached the device and the stream then ended.
+            # Continuing the rest of the reply on another engine would switch
+            # voices mid-sentence and could repeat what was just spoken, so the
+            # reply ends here (FIX3: never resume or replay after playback).
+            self._ws_ended = True
+        if (handback_if_silent
+                and fed
+                and not ws_audio_reached_device()
+                and _is_current_generation(self._generation)
+                and not self._closed):
+            pending = []
+            while True:
+                try:
+                    pending.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            for text in fed + pending:
+                self._queue.put(text)
+        return outcome
+
     def _playback_loop(self):
         global is_speaking, _current_text
 
@@ -1198,9 +1327,16 @@ class StreamSpeaker:
                     # ends HERE as well, otherwise the speaking flag would stay
                     # set after the audio stopped.
                     if self._reply_session_over():
+                        # [S7] The reply's last audio can be streaming even
+                        # though the queue is empty, so the session is closed
+                        # (and its audio awaited) here before the flag clears.
+                        if self._ws_mode:
+                            self._finish_ws_playback()
                         set_speaking_state(False)
                     continue
                 if item is _STREAM_STOP:
+                    if self._ws_mode:
+                        self._finish_ws_playback(handback_if_silent=False)
                     break
                 if not _is_current_generation(self._generation):
                     continue
@@ -1215,6 +1351,59 @@ class StreamSpeaker:
                 # with False (the generation moved on), and that chunk is
                 # deliberately dropped — a stop discards, a pause preserves.
                 if not self._pass_pause_gate(sentence):
+                    continue
+
+                # [S7] Live Fish session: the first sentence opens ONE WebSocket
+                # for this reply and every following sentence is FED to it —
+                # the whole reply plays as a single continuous utterance
+                # instead of one HTTP request per sentence.
+                session = None
+                if self._ws_ended:
+                    continue
+                if not self._ws_mode and not self._ws_disabled:
+                    if self._tts_engine() == "fish":
+                        fish_ws_begin_reply()
+                        session = fish_ws_session()
+                    if session is not None:
+                        self._ws_fed = []
+                        self._start_ws_playback(session)
+                if self._ws_mode:
+                    if session is None:
+                        session = fish_ws_session()
+                    if session is not None and session.failed():
+                        if not ws_audio_reached_device():
+                            # Nothing was spoken: hand the whole reply
+                            # back to the per-sentence ladder, in order.
+                            self._ws_fed.append(sentence)
+                            self._finish_ws_playback()
+                            continue
+                        # Audio already reached the device — never replay.
+                        self._finish_ws_playback(handback_if_silent=False)
+                        if self._reply_session_over():
+                            set_speaking_state(False)
+                        continue
+                    if (session is not None
+                            and self._ws_thread is not None
+                            and not self._ws_thread.is_alive()):
+                        # The stream is over without a reported failure (the
+                        # server closed it). Whatever the session SPOKE must
+                        # never replay; what it never spoke goes back to the
+                        # ladder, this sentence first so the order holds.
+                        if ws_audio_reached_device():
+                            self._finish_ws_playback(handback_if_silent=False)
+                            if self._reply_session_over():
+                                set_speaking_state(False)
+                            continue
+                        self._ws_fed.append(sentence)
+                        self._finish_ws_playback()
+                        continue
+                if self._ws_mode:
+                    self._ws_fed.append(sentence)
+                    session.feed(sentence)
+                    self._played_first = True
+                    if self._reply_session_over():
+                        self._finish_ws_playback()
+                        set_speaking_state(False)
                     continue
                 _speak_chunk(sentence, self._generation,
                              is_first_chunk=not self._played_first,
@@ -1236,6 +1425,11 @@ class StreamSpeaker:
             print("Stream voice error:")
             traceback.print_exc()
         finally:
+            if self._ws_mode:
+                try:
+                    self._finish_ws_playback(handback_if_silent=False)
+                except Exception:
+                    pass
             should_signal_ready = False
             with _state_lock:
                 if self._active and _speech_generation == self._generation:

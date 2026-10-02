@@ -64,6 +64,285 @@ for _bin, _pref in (("ffmpeg", "converter"), ("ffprobe", "ffprobe")):
 
 TTS_URL = "https://api.fish.audio/v1/tts"
 
+# ── [S7] one bidirectional Fish TTS session per reply ──────────────────────
+# The HTTP path synthesises sentence-by-sentence: each sentence pays its own
+# request set-up and its intonation starts cold. The Fish LIVE WebSocket
+# takes the reply's text pieces as they arrive and returns ONE continuous
+# audio stream — earlier first audio and continuous prosody across sentences.
+# Live-measured (s2.1-pro-free): first audio ~0.6-1.2 s, synthesis ~1.9x
+# realtime, audio arrives as one unbroken flow with no per-sentence
+# boundaries — which is exactly what this consumes.
+#
+# The HTTP path below remains the fallback: any WS failure before audio
+# reached the device falls back to the per-sentence ladder untouched.
+FISH_WS_ENV = "JARVIS_FISH_WS"
+
+try:
+    from fish_audio_sdk import TTSRequest, WebSocketSession as _FishWSSession
+except Exception:  # pragma: no cover - SDK optional
+    _FishWSSession = None
+
+
+def fish_ws_enabled():
+    """True when the per-reply WebSocket engine may be used at all."""
+    if os.getenv(FISH_WS_ENV, "1").strip().lower() in ("0", "false", "off"):
+        return False
+    return _FishWSSession is not None and bool(FISH_API_KEY)
+
+
+class _FishReplySession:
+    """One LIVE session: text pieces in, one continuous PCM stream out.
+
+    A reader thread owns the SDK generator (its start performs the WS
+    connect); fed sentences queue for its sender, audio chunks queue for the
+    playback consumer. ``audio_chunks()`` ends only when the text is finished
+    AND the reader has drained — the reply's audio is one unbroken stream.
+    """
+
+    def __init__(self):
+        self._text_q = []
+        self._text_q_lock = threading.Lock()
+        self._text_arrived = threading.Event()
+        self._text_done = False
+        self._audio_q = []
+        self._audio_q_lock = threading.Lock()
+        self._audio_arrived = threading.Event()
+        self._reader = None
+        self._failed = False
+        self._error = None
+        self._closed = False
+
+    def failure(self):
+        return self._error
+
+    def failed(self):
+        return self._failed
+
+    def start_reader(self):
+        if self._reader is None:
+            self._reader = threading.Thread(target=self._read,
+                                            name="fish-ws-reader",
+                                            daemon=True)
+            self._reader.start()
+
+    def feed(self, text):
+        if self._closed or self._failed or not text or not str(text).strip():
+            return
+        with self._text_q_lock:
+            self._text_q.append(str(text))
+        self._text_arrived.set()
+        self.start_reader()
+
+    def finish_text(self):
+        """No more text is coming: the sender may send its CloseEvent once
+        the queue drains."""
+        self._text_done = True
+        self._text_arrived.set()
+        self.start_reader()
+
+    def _text_iter(self):
+        while True:
+            with self._text_q_lock:
+                if self._text_q:
+                    item = self._text_q.pop(0)
+                elif self._text_done or self._closed:
+                    return
+                else:
+                    item = _WS_TEXT_WAIT
+            if item is _WS_TEXT_WAIT:
+                self._text_arrived.wait(0.25)
+                self._text_arrived.clear()
+                continue
+            yield item
+
+    def _read(self):
+        try:
+            model = _resolve_tts_model()
+            request = TTSRequest(
+                text="", format="pcm", sample_rate=44100,
+                latency="balanced",
+                reference_id=FISH_REFERENCE_ID or None,
+                chunk_length=200,
+            )
+            session = _FishWSSession(FISH_API_KEY)
+            try:
+                for chunk in session.tts(request, self._text_iter(),
+                                         backend=model):
+                    if self._closed:
+                        return
+                    with self._audio_q_lock:
+                        self._audio_q.append(chunk)
+                    self._audio_arrived.set()
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._error = exc
+            self._failed = True
+        finally:
+            self._audio_arrived.set()
+
+    def audio_chunks(self):
+        """Yield the reply's continuous PCM audio until it is all consumed.
+
+        Ends when the reader thread is gone and the queue is drained (the
+        stream completed or failed), or when a completed text produces no
+        audio for a tail timeout (a server that never sends its finish).
+        """
+        last_progress = time.monotonic()
+        while True:
+            with self._audio_q_lock:
+                chunk = self._audio_q.pop(0) if self._audio_q else None
+            if chunk is not None:
+                last_progress = time.monotonic()
+                yield chunk
+                continue
+            if self._failed or self._closed:
+                return
+            if not self._reader or not self._reader.is_alive():
+                return
+            if (self._text_done
+                    and time.monotonic() - last_progress > _WS_TAIL_TIMEOUT):
+                return
+            self._audio_arrived.wait(0.1)
+            self._audio_arrived.clear()
+
+    def close(self):
+        self._closed = True
+        self._text_done = True
+        self._text_arrived.set()
+        self._audio_arrived.set()
+
+
+_WS_TEXT_WAIT = object()
+
+#: Completed text with no audio progress for this long ends the stream: a
+#: server that never delivers its finish event cannot hang playback forever.
+_WS_TAIL_TIMEOUT = 3.0
+
+_ws_reply_lock = threading.Lock()
+_ws_reply = None
+
+
+def fish_ws_begin_reply():
+    """Open (or replace) the per-reply WS session. Cheap no-op when the WS
+    engine is off or the selected provider is not Fish."""
+    global _ws_reply
+    if not fish_ws_enabled():
+        return
+    try:
+        from backend.services.voice import _resolve_session_tts_provider
+        if _resolve_session_tts_provider() != "fish":
+            return
+    except Exception:
+        pass
+    with _ws_reply_lock:
+        if _ws_reply is not None:
+            try:
+                _ws_reply.close()
+            except Exception:
+                pass
+        _ws_reply = _FishReplySession()
+
+
+def fish_ws_end_reply():
+    global _ws_reply
+    with _ws_reply_lock:
+        session, _ws_reply = _ws_reply, None
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def fish_ws_session():
+    with _ws_reply_lock:
+        return _ws_reply
+
+
+def _ws_boosted_chunks(session):
+    """The session's raw stream as device-ready PCM: odd-byte splits are
+    stitched (never a half-written sample) and the S23 limiter runs, exactly
+    like the HTTP response path."""
+    residual = b""
+    _reset_pcm_gain_state()
+    for chunk in session.audio_chunks():
+        if not chunk:
+            continue
+        chunk = residual + chunk
+        aligned_len = (len(chunk) // 2) * 2
+        if aligned_len < len(chunk):
+            residual = chunk[aligned_len:]
+            chunk = chunk[:aligned_len]
+        else:
+            residual = b""
+        if chunk:
+            boosted = _boost_pcm_chunk(chunk)
+            if boosted:
+                yield boosted
+    if residual:
+        boosted = _boost_pcm_chunk(residual + b"\x00")
+        if boosted:
+            yield boosted
+
+
+def ws_audio_reached_device():
+    """True once the WS reply path actually wrote audio to the device.
+
+    The playback-fallback contract (FIX3/F32): a session that produced NO
+    audio may be retried through the per-sentence ladder; one that already
+    spoke must never replay from the beginning.
+    """
+    return _actor_heard_audio()
+
+
+def play_ws_reply(session, is_current=None, earcon=None):
+    """Play one whole reply from *session* as a single continuous utterance.
+
+    Runs on its own thread: sentences are fed by the caller as they arrive,
+    and this reads the session's audio stream through the ONE playback owner
+    with the same stop/abort/drain contract as the HTTP path. Returns
+    ``{"audio_started", "failed"}`` — the caller may fall back to the
+    per-sentence ladder ONLY while ``audio_started`` is False.
+    """
+    if session is None:
+        return {"audio_started": False, "failed": True}
+    if earcon is not None:
+        try:
+            earcon()
+        except Exception:
+            pass
+    key = _stream_key("ws-reply-%d" % int(time.time() * 1000))
+    handle = _register_sounddevice_playback()
+    if handle is not None and handle.stopped:
+        if handle is not None:
+            _clear_sounddevice_playback(handle)
+        return {"audio_started": False, "failed": True}
+    opened = {}
+
+    def _chunks():
+        for chunk in _ws_boosted_chunks(session):
+            if is_current is not None and not is_current():
+                return
+            yield chunk
+
+    try:
+        full, failed = _stream_pcm_to_actor(
+            key, _chunks(), handle, out=opened)
+    except Exception as exc:
+        print("[FISH] ws reply stream error: %s" % exc)
+        return {"audio_started": bool(full) or _actor_heard_audio(),
+                "failed": True}
+    finally:
+        if handle is not None:
+            _clear_sounddevice_playback(handle)
+    return {"audio_started": bool(full) or _actor_heard_audio(),
+            "failed": bool(failed) or session.failed()}
+
+
 # Reused across every request — skips the TCP + TLS handshake that a fresh
 # `requests.post` pays on each TTS call (~100-300ms on Windows).
 _session = requests.Session()
