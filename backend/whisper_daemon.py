@@ -93,6 +93,13 @@ MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
 INITIAL_PROMPT = "Jarvis, wake up, jervis, utho, jago, chalu"
 # Bounded wait for a still-loading model on the transcription path (F55).
 TRANSCRIBE_MODEL_WAIT = float(os.getenv("JARVIS_WHISPER_TRANSCRIBE_WAIT", "20"))
+# [LANGUAGE] Whisper auto-detects when no language is given. On noisy or
+# TTS-echo audio the detector picks a random language and the model then
+# hallucinates a whole sentence in it - live, an English speaker got Telugu
+# gibberish ("మార్లు మార్లు ...") that the brain answered as if it were speech.
+# The owner wants English only, so pin it. JARVIS_WHISPER_LANGUAGE="" restores
+# auto-detect.
+TRANSCRIBE_LANGUAGE = os.getenv("JARVIS_WHISPER_LANGUAGE", "en")
 
 model = None
 device = "unknown"
@@ -237,6 +244,9 @@ class Handler(BaseHTTPRequestHandler):
                 segments, info = model.transcribe(
                     io.BytesIO(wav_bytes),
                     temperature=0.0,
+                    # [LANGUAGE] English only - never auto-detect (see
+                    # TRANSCRIBE_LANGUAGE above).
+                    language=TRANSCRIBE_LANGUAGE or None,
                     # [PERF] Greedy decode: write ONE draft and move on,
                     # instead of the default beam of 5 candidates plus a
                     # re-rank (measured ~1.5-2x the decode cost). Deterministic

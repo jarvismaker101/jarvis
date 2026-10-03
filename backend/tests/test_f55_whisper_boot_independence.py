@@ -182,6 +182,29 @@ class TranscribeWaitsForTheModelTests(_ServingDaemon):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["text"], "hello")
 
+    def test_transcribe_forces_english_and_never_auto_detects(self):
+        seen = {}
+
+        class _RecordingModel:
+            def transcribe(self, _audio, **kwargs):
+                seen.update(kwargs)
+                return [_FakeSegment(" hello")], SimpleNamespace(
+                    language="en", language_probability=0.91
+                )
+
+        whisper_daemon.TRANSCRIBE_MODEL_WAIT = 5.0
+
+        def load():
+            whisper_daemon.model = _RecordingModel()
+            whisper_daemon._model_load_finished.set()
+
+        with patch.object(whisper_daemon, "load_model", side_effect=load):
+            status, payload = self._post("/transcribe")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(seen.get("language"), "en",
+                         "whisper auto-detect hallucinates other languages")
+
     def test_transcribe_reports_loading_when_the_wait_expires(self):
         whisper_daemon.TRANSCRIBE_MODEL_WAIT = 0.3
         release = self._parked_loader()

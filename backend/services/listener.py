@@ -66,11 +66,11 @@ SPEECH_START_WINDOW_CHUNKS = 6
 FINAL_SPEECH_VAD_RATIO = float(os.getenv("JARVIS_FINAL_SPEECH_VAD_RATIO", "0.08"))
 RECOGNITION_LANGUAGES = tuple(
     language.strip()
-    for language in os.getenv("JARVIS_STT_LANGUAGES", "en-IN,hi-IN").split(",")
+    for language in os.getenv("JARVIS_STT_LANGUAGES", "en-IN").split(",")
     if language.strip()
 )
 if not RECOGNITION_LANGUAGES:
-    RECOGNITION_LANGUAGES = ("en-IN", "hi-IN")
+    RECOGNITION_LANGUAGES = ("en-IN",)
 
 recognizer = sr.Recognizer()
 recognizer.pause_threshold = PAUSE_THRESHOLD_SECONDS

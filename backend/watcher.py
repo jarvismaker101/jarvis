@@ -75,11 +75,11 @@ RECALIBRATE_AFTER_EMPTY_LISTENS = 12
 RECALIBRATE_COOLDOWN_SECONDS = 20
 RECOGNITION_LANGUAGES = tuple(
     language.strip()
-    for language in os.getenv("JARVIS_STT_LANGUAGES", "en-IN,hi-IN").split(",")
+    for language in os.getenv("JARVIS_STT_LANGUAGES", "en-IN").split(",")
     if language.strip()
 )
 if not RECOGNITION_LANGUAGES:
-    RECOGNITION_LANGUAGES = ("en-IN", "hi-IN")
+    RECOGNITION_LANGUAGES = ("en-IN",)
 WATCHER_ENERGY_THRESHOLD = max(
     40,
     min(
@@ -797,6 +797,10 @@ def ensure_whisper_daemon():
 #: must not silently keep a different size than the daemon: ONE env var drives
 #: both (see backend/whisper_daemon.py, which ships "medium" for accuracy).
 WHISPER_MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
+#: [LANGUAGE] English-only, matching the daemon (see whisper_daemon.
+#: TRANSCRIBE_LANGUAGE). Auto-detect hallucinates whole sentences in random
+#: languages on noisy/echo audio; empty restores auto-detect.
+WHISPER_LANGUAGE = os.getenv("JARVIS_WHISPER_LANGUAGE", "en")
 
 
 def _load_in_process_whisper():
@@ -911,6 +915,7 @@ def _transcribe_local_once(audio):
             segments, info = whisper_model.transcribe(
                 io.BytesIO(wav_bytes),
                 temperature=0.0,
+                language=WHISPER_LANGUAGE or None,
                 vad_filter=True,
                 condition_on_previous_text=False,
                 initial_prompt="Jarvis, wake up, jervis, utho, jago, chalu",

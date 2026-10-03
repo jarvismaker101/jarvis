@@ -1257,11 +1257,14 @@ Three changes, all reversible:
    var — `JARVIS_WHISPER_MODEL=base` (or `small`) restores the faster, weaker
    behaviour, and both models are already cached on disk. On the owner's
    question of whether dropping multilingual support would help: **the language
-   list was never the cost.** `RECOGNITION_LANGUAGES` (`en-IN,hi-IN`) is read
-   only by the `google-or-groq` engine, which is not the selected one on this
-   machine (`data/jarvis_settings.json` → `listening = whisper/whisper-local`),
-   and the local daemon passes **no** `language=` at all, so whisper
-   auto-detects internally. Model size is the lever that moves the clock.
+   list was never the latency cost** (it is read only by the `google-or-groq`
+   engine, which is not the selected one on this machine —
+   `data/jarvis_settings.json` → `listening = whisper/whisper-local`). As of the
+   2026-10 owner request the daemon is **English-only** (`TRANSCRIBE_LANGUAGE`,
+   `JARVIS_WHISPER_LANGUAGE`, default `en`), because whisper's auto-detect
+   hallucinated whole sentences in random languages on noisy/echo audio; the
+   recognition language list defaults to `en-IN`. Model size is the lever that
+   moves the clock.
 3. **Greedy decode**: `beam_size=1` added to the daemon's
    `model.transcribe(...)` — faster-whisper defaults to a beam of 5 plus a
    re-rank, measured at roughly 1.5–2× the decode cost. Deterministic at

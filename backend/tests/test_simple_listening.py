@@ -148,6 +148,11 @@ class WhisperLatencyDefaultTests(unittest.TestCase):
         self.assertEqual(whisper_daemon.MODEL_SIZE,
                          os.getenv("JARVIS_WHISPER_MODEL", "medium"))
 
+    def test_the_shipped_transcription_language_is_english_only(self):
+        # Auto-detect hallucinates whole sentences in random languages on
+        # noisy/echo audio; the owner wants English only.
+        self.assertEqual(whisper_daemon.TRANSCRIBE_LANGUAGE, "en")
+
     def test_the_default_is_read_from_the_same_env_var_as_before(self):
         # An override still wins: nothing about the knob's name changed.
         with patch.dict(os.environ, {}, clear=False):
