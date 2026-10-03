@@ -1939,6 +1939,16 @@ def _orchestrator_reply(outcome):
         # R13: the orchestrator's free-form answer travels the chat channel,
         # so it carries chat authority only — strip unverified action claims.
         return _strip_unverified_action_claims(reply, "chat")
+    if status == PROPOSAL:
+        # R17: a proposal goes nowhere unless the SAME shared confirmation
+        # gate was actually armed for it — both routes run the one gate.
+        try:
+            from backend.services.task_agent import agent as task_agent
+            if not task_agent.has_pending_task_confirmation():
+                return ("Sir, I could not arm that action for approval — "
+                        "nothing was started. Please ask again.")
+        except Exception:
+            pass
     # R14: suspension/error planner text travels the chat channel too — a
     # "navigating to..." planner line must never reach speech unexamined.
     return _strip_unverified_action_claims(reply, "chat")

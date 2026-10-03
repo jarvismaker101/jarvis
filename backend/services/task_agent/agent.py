@@ -142,6 +142,113 @@ _pending_task_action = None
 _task_confirm_lock = threading.Lock()
 TASK_CONFIRM_WINDOW_SECONDS = 45.0
 
+#: R11 — ONE bundled question per request, then stop. Every clarification a
+#: request asks (missing slots, unknown folder, inspect-vs-create, unclear
+#: answer) is counted under the plan's command text; the SECOND failed ask
+#: for the SAME request stops with a plain blocked line instead of another
+#: question. A new request (different command text) always starts fresh.
+#: R16 — one approval = one run, 45s to answer: the 45s pending window IS the
+#: expiry. A yes that arrives late finds nothing armed and asks again; a yes
+#: that ran once finds the record taken and asks again. Nothing here is
+#: persisted, so a restart clears every armed approval by construction.
+_CLARIFY_MAX_ASKS = 2
+_clarify_attempts = {}
+_clarify_lock = threading.Lock()
+
+
+def _clarify_key(command_text):
+    """R11: the identity one request's asks are counted under."""
+    return re.sub(r"\s+", " ", str(command_text or "").strip().lower())[:160]
+
+
+def _clarify_count(command_text):
+    with _clarify_lock:
+        return _clarify_attempts.get(_clarify_key(command_text), 0)
+
+
+def _clarify_note(command_text):
+    """R11: record one asked question; return its 1-based number."""
+    with _clarify_lock:
+        key = _clarify_key(command_text)
+        _clarify_attempts[key] = _clarify_attempts.get(key, 0) + 1
+        return _clarify_attempts[key]
+
+
+def _clarify_reset(command_text):
+    """R11: a answered/changed/completed request stops counting."""
+    with _clarify_lock:
+        _clarify_attempts.pop(_clarify_key(command_text), None)
+
+
+def _clarify_stop_line():
+    """R11/R18: what the second failed ask says — a stop, never a guess."""
+    return ("Sir, I am still not sure what you mean, so I am stopping "
+            "rather than guessing. Please say it afresh — folder, file "
+            "name, and what to write — and I will take it as a new "
+            "request. Nothing was started.")
+
+
+#: R18 — the deliberate refusal list. Each entry is (situation, honest line):
+#: the planner says plainly what blocked it instead of guessing. Callers ask
+#: should_refuse() BEFORE acting; a refusal returns the line as a completed
+#: (not failed-mysteriously) stop.
+_REFUSAL_VAGUE_NAVIGATE_RE = re.compile(
+    r"^\s*(?:navigate|go)\s+(?:there|to\s+it|there\s+now)\s*[.!\s]*$",
+    re.IGNORECASE,
+)
+_REFUSAL_BROWSER_STOPPED_CLAIM_RE = re.compile(
+    r"\bstopped\s+the\s+browser\b|\bbrowser\s+(?:is\s+)?stopped\b",
+    re.IGNORECASE,
+)
+_REFUSAL_UNDO_DONE_RE = re.compile(
+    r"\bundo\b.*\b(?:creat|writ|mad)e\b|\bdelete\s+(?:the\s+)?(?:file|it)\s+"
+    r"(?:back|again)\b|\brevert\b.*\bfile\b",
+    re.IGNORECASE,
+)
+
+
+def should_refuse(command, resolved_kind="", verification_age=None):
+    """R18: (refuse, honest line) — know what to refuse, say what blocked.
+
+    - vague "navigate there" with no tool/args: refuse, name the missing target.
+    - partial name that never resolved to an exact target: refuse, show the
+      candidates rule instead of picking.
+    - a "browser stopped" claim with no worker ack: refuse the claim.
+    - undo/revert of an already-done write on a mere correction: refuse the
+      rewrite of history (restore is a separate explicit request).
+    Anything else returns (False, "") — the normal path decides.
+    """
+    text = (command or "").strip()
+    if text and _REFUSAL_VAGUE_NAVIGATE_RE.match(text):
+        return True, ("Sir, I cannot navigate without a target — please "
+                      "name the folder or file. Nothing was started.")
+    if text and _REFUSAL_BROWSER_STOPPED_CLAIM_RE.search(text):
+        return True, ("Sir, I cannot claim the browser stopped until the "
+                      "worker confirms it. Nothing was assumed.")
+    if text and _REFUSAL_UNDO_DONE_RE.search(text):
+        return True, ("Sir, I cannot undo a finished write from a "
+                      "correction — what was made stays made. If you want "
+                      "it removed, please ask explicitly. Nothing was "
+                      "changed.")
+    if resolved_kind == "candidates":
+        return True, ("Sir, that name matches more than one folder, so I "
+                      "am not picking one — please say the full name. "
+                      "Nothing was started.")
+    if resolved_kind == "none":
+        return True, ("Sir, I could not find that folder, so I am not "
+                      "guessing one. Please say the full name. Nothing "
+                      "was started.")
+    if verification_age is not None:
+        try:
+            if float(verification_age) > 600:
+                return True, ("Sir, my last check of that is too old to "
+                              "prove anything now — I will check again "
+                              "fresh rather than rely on it. Nothing was "
+                              "assumed.")
+        except Exception:
+            pass
+    return False, ""
+
 _TASK_CONFIRM_YES_RE = re.compile(
     r"\b(yes|yeah|yep|yup|sure|okay|ok|alright|go ahead|do it|please do|"
     r"confirm|proceed|haan|ha|kar do|karo|kar de|continue)\b",
@@ -587,6 +694,20 @@ def _heuristic_plan(command, context):
     raw = (command or "").strip()
     normalized = _normalize(command)
 
+    # R18: deliberate refusals BEFORE any planning — vague navigation, a
+    # browser-stopped claim with no ack, or an undo-the-done-file correction
+    # stop honestly here instead of becoming a guessed plan.
+    _refuse18, _why18 = should_refuse(raw)
+    if _refuse18:
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "Refused, not guessing.",
+            "requires_confirmation": False,
+            "steps": [],
+            "response": _why18,
+        }
+
     if any(phrase in normalized for phrase in ("what can you do", "what is possible", "understand this window", "where am i")):
         return {
             "ok": True,
@@ -655,7 +776,7 @@ def _heuristic_plan(command, context):
                 "summary": "Need the folder.",
                 "requires_confirmation": False,
                 "steps": [],
-                "response": _folder_hint_clarification(inspect_hint),
+                "response": _folder_hint_clarification(inspect_hint, command),
             }
         return _code_tool_plan(
             "code.list_directory", {"path": resolved},
@@ -682,7 +803,7 @@ def _heuristic_plan(command, context):
                     "summary": "Need the folder.",
                     "requires_confirmation": False,
                     "steps": [],
-                    "response": _folder_hint_clarification(_r1_hint),
+                    "response": _folder_hint_clarification(_r1_hint, command),
                 }
             # R3: every slot bound before the plan exists — exact parent
             # path, explicit name (or the spoken default), name frozen at
@@ -694,7 +815,7 @@ def _heuristic_plan(command, context):
                 _r1_missing.append("what to write inside it")
             _r1_ask = _slot_complete_write_plan(
                 os.path.join(_r1_resolved, _r1_name), _r1_content,
-                _r1_missing)
+                _r1_missing, command)
             if _r1_ask is not None:
                 return _r1_ask
             return _code_tool_plan(
@@ -724,7 +845,7 @@ def _heuristic_plan(command, context):
                     "summary": "Need the folder.",
                     "requires_confirmation": False,
                     "steps": [],
-                    "response": _folder_hint_clarification(folder_hint),
+                    "response": _folder_hint_clarification(folder_hint, command),
                 }
             # R3: explicit "name it X" wins over the tail-derived name, and
             # the name is frozen here — a later yes cannot rename the file.
@@ -735,7 +856,7 @@ def _heuristic_plan(command, context):
             if not content:
                 missing.append("what to write inside %s" % name)
             ask = _slot_complete_write_plan(
-                os.path.join(resolved, name), content, missing)
+                os.path.join(resolved, name), content, missing, command)
             if ask is not None:
                 return ask
             return _code_tool_plan(
@@ -986,11 +1107,26 @@ def _explicit_file_name(raw):
     return stem if re.search(r"\.\w{1,5}$", stem) else stem + ".txt"
 
 
-def _slot_complete_write_plan(path, content, missing):
+def _slot_complete_write_plan(path, content, missing, command_text=""):
     """R3: a write plan whose slots are NOT all filled asks ONE bundled
     question (R11) instead of acting: exact missing slots named, nothing
-    vague, no run. Returns None when every slot is filled."""
+    vague, no run. Returns None when every slot is filled.
+
+    R11: the bundle is counted under the request — the SECOND failed ask
+    for the same request stops (a plain blocked line) instead of asking
+    again. A new request starts fresh.
+    """
     if missing:
+        if command_text and _clarify_note(command_text) > _CLARIFY_MAX_ASKS:
+            _clarify_reset(command_text)
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "Stopped, not guessing.",
+                "requires_confirmation": False,
+                "steps": [],
+                "response": _clarify_stop_line(),
+            }
         return {
             "ok": True,
             "confidence": 0.9,
@@ -1255,17 +1391,13 @@ def _resolve_folder_hint(hint):
         # R15: the spoken name is only a CANDIDATE lookup against the real
         # folders — an exact (case-insensitive) match resolves; ambiguity or
         # no match returns None so the caller asks once, never guesses.
+        # R18: a name that does not exist on disk is NOT auto-created under
+        # the request — return None so the planner asks (or refuses) rather
+        # than inventing "Desktop\<name>" as the target.
         kind15, value15 = resolve_folder_name(name)
         if kind15 == "exact":
             return value15
-        if kind15 == "candidates":
-            return None
-        desktop = folders.get("desktop") or ""
-        candidate = name if os.path.isabs(name) else (
-            os.path.join(desktop, name) if desktop else name)
-        if os.path.isdir(candidate):
-            return candidate
-        return os.path.normpath(candidate)
+        return None
     # Pronoun: the R2 notebook focus head first ("that folder" = most recent
     # compatible folder in the ACTIVE task, not the nearest noun — R10's
     # resolve_that_folder, the one resolver every pronoun route shares);
@@ -1324,8 +1456,15 @@ def _resolve_folder_hint(hint):
     return None
 
 
-def _folder_hint_clarification(hint):
-    """Ask which folder a located write means (never guess the location)."""
+def _folder_hint_clarification(hint, command_text=""):
+    """Ask which folder a located write means (never guess the location).
+
+    R11: counted under the request — the SECOND failed ask for the same
+    request stops instead of interrogating again.
+    """
+    if command_text and _clarify_note(command_text) > _CLARIFY_MAX_ASKS:
+        _clarify_reset(command_text)
+        return _clarify_stop_line()
     if hint and hint[0] == "named":
         return ("Which folder should I use, sir — I could not find "
                 "'%s'. Please say the full folder name." % hint[1])
@@ -1919,6 +2058,9 @@ def _normalize_plan(plan, command):
         "response": _with_truncation_note(
             str(plan.get("response") or "").strip(), truncated),
         "truncated": truncated,
+        # R11/R16: the request identity every ask and every approval is
+        # counted/verified under — the counter and the record key off this.
+        "command_text": str(command or "").strip(),
         # F01: what the planner INTENDED, and the goals that the step budget
         # did not admit. The executor keeps these as unmet goals, so a plan
         # that was cut short is partial — never completed.
@@ -2961,11 +3103,23 @@ def cancel_pending_task_confirmation(reason=""):
     """R7: drop the armed task preview WITHOUT running anything.
 
     The correction path calls this so the old yes dies with the old plan —
-    a later "yes" can never authorize the superseded effect.
+    a later "yes" can never authorize the superseded effect. Also clears
+    the R11-held inspect plan and the request's ask count, so a correction
+    always starts its own fresh request.
     """
     global _pending_task_action
     with _task_confirm_lock:
         _pending_task_action = None
+    try:
+        _take_held_inspect_plan()
+    except Exception:
+        pass
+    if reason:
+        try:
+            _clarify_reset(re.sub(r"^revised by correction:\s*", "",
+                                  str(reason), flags=re.IGNORECASE))
+        except Exception:
+            pass
     try:
         approvals.cancel(reason or "cancelled")
     except Exception:
@@ -3112,30 +3266,19 @@ def _finish_run(plan, result, trace, verification):
     return result
 
 
-def execute_plan(plan, context, task_text="", confirmed=False):
-    """Run a normalized plan as a closed loop; returns a TaskResult.
+def _run_confirmed_steps(plan, context, task_text=""):
+    """R16/R17: the step loop for a GATE-BLESSED run.
 
-    Callers that speak to the user (consume_task_confirmation,
-    handle_task_message) wrap this with str(). Early paths keep today's
-    spoken text byte-identical: plan-not-ok returns a plain failed result
-    whose str() is exactly the plan response wording (default 'I could
-    not plan that task.'), the unconfirmed gate returns the byte-identical
-    confirmation preview (needs_input), and response-without-steps returns
-    plan['response'].
-    After steps run, the summary ALWAYS reflects actual outcomes — the
-    pre-authored response override is gone.
+    Called DIRECTLY by consume_task_confirmation after it took+verified the
+    approval — never via execute_plan, so a stray execute_plan(confirmed=True)
+    can never re-enter a blessed run. The body is the step loop the old
+    execute_plan ran, unchanged; only the confirmation gate is skipped,
+    because the gate already ran. ``task_text`` keeps the F01 re-approval
+    path armed with the right identity.
     """
-    if not isinstance(plan, dict) or not plan.get("ok"):
-        message = (plan.get("response") if isinstance(plan, dict) else "") \
-            or "I could not plan that task."
-        return TaskResult.failed(message, plain=True)
-
-    if plan.get("requires_confirmation") and not confirmed:
-        # F18: consent is bound to the WHOLE plan through a shared approval
-        # record — plan hash, every effect, every target, expiry and scope —
-        # instead of a bare dict carrying only the first step's description.
-        _arm_plan_confirmation(plan, context, task_text=task_text)
-        return TaskResult.needs_input(confirmation_prompt(plan))
+    steps = plan.get("steps", []) or []
+    outcomes = []
+    failed_folders = []  # (original path, normalized path) of failed mkdirs
 
     if plan.get("response") and not plan.get("steps"):
         return TaskResult.completed(plan["response"], detail=plan["response"])
@@ -3223,8 +3366,9 @@ def execute_plan(plan, context, task_text="", confirmed=False):
             # R15: re-check the target JUST before the write. The parent may
             # have vanished, the grant may have narrowed, or the file may
             # have appeared after the preview — any change STOPS the write,
-            # never renames or overwrites silently.
-            if not skip_reason and write_path and confirmed:
+            # never renames or overwrites silently. (Gate-blessed runs are
+            # always confirmed, so the loop needs no flag of its own.)
+            if not skip_reason and write_path:
                 expect = "create" if args.get("create_only") else "replace"
                 if expect == "create":
                     ok15, why15 = pre_execution_recheck(write_path, "create")
@@ -3267,8 +3411,10 @@ def execute_plan(plan, context, task_text="", confirmed=False):
                 # the user approved a specific effect set, consent does not
                 # carry over to different arguments — re-arm the gate with the
                 # real values. A plan that needed no confirmation has no
-                # approved arguments to invalidate, so it proceeds.
-                if confirmed and plan.get("requires_confirmation") \
+                # approved arguments to invalidate, so it proceeds. (Inside
+                # _run_confirmed_steps every run IS approved, so the flag is
+                # the plan's own requires_confirmation, not a parameter.)
+                if plan.get("requires_confirmation") \
                         and index < len(approved_args) \
                         and _canonical_step_args(step) != approved_args[index]:
                     updated = dict(plan)
@@ -3414,6 +3560,62 @@ def execute_plan(plan, context, task_text="", confirmed=False):
     result = TaskResult.partial(summary, detail=detail, evidence=evidence)
     result.artifacts = artifacts
     return _finish_run(plan, result, trace, verification)
+
+
+def execute_plan(plan, context, task_text="", confirmed=False, approval=None):
+    """Run a normalized plan as a closed loop; returns a TaskResult.
+
+    Callers that speak to the user (consume_task_confirmation,
+    handle_task_message) wrap this with str(). Early paths keep today's
+    spoken text byte-identical: plan-not-ok returns a plain failed result
+    whose str() is exactly the plan response wording (default 'I could
+    not plan that task.'), the unconfirmed gate returns the byte-identical
+    confirmation preview (needs_input), and response-without-steps returns
+    plan['response'].
+    After steps run, the summary ALWAYS reflects actual outcomes — the
+    pre-authored response override is gone.
+
+    R16/R17: ``approval`` is the taken record from the confirmation gate.
+    consume_task_confirmation passes it, so execute_plan can tell the
+    gate-blessed run from a stray execute_plan(confirmed=True): WITH the
+    record the loop runs even when confirmed is False (the record IS the
+    consent), WITHOUT it (and a live pending record) the call
+    re-arms-and-asks. Harness plans (raw _normalize_plan outputs that never
+    armed anything, no pending record) keep the old shortcut so unit tests
+    run closed loops.
+    """
+    if not isinstance(plan, dict) or not plan.get("ok"):
+        message = (plan.get("response") if isinstance(plan, dict) else "") \
+            or "I could not plan that task."
+        return TaskResult.failed(message, plain=True)
+
+    if approval is not None:
+        # Gate-blessed run: the record was taken+verified by
+        # consume_task_confirmation — the record IS the consent, so the loop
+        # below runs whether or not confirmed was also passed.
+        pass
+    elif plan.get("requires_confirmation") and not confirmed:
+        # F18: consent is bound to the WHOLE plan through a shared approval
+        # record — plan hash, every effect, every target, expiry and scope —
+        # instead of a bare dict carrying only the first step's description.
+        _arm_plan_confirmation(plan, context, task_text=task_text)
+        return TaskResult.needs_input(confirmation_prompt(plan))
+    elif (confirmed and plan.get("requires_confirmation")):
+        # R16/R17: confirmed WITHOUT going through the gate. Prod plans
+        # armed the shared record (approvals.pending() is live); harness
+        # plans never did. Stray confirmed WITH a live pending record
+        # re-asks; confirmed with NO pending record is the harness and runs.
+        _caller_claim = (str(task_text or "")
+                         or str(plan.get("command_text") or ""))
+        if _caller_claim and approvals.pending() is not None:
+            _arm_plan_confirmation(plan, context, task_text=(
+                task_text or plan.get("command_text") or ""))
+            return TaskResult.needs_input(confirmation_prompt(plan))
+
+    if plan.get("response") and not plan.get("steps"):
+        return TaskResult.completed(plan["response"], detail=plan["response"])
+
+    return _run_confirmed_steps(plan, context, task_text=task_text)
 
 
 #: F03: text that records a successful command which did NOTHING. A zero-exit
@@ -3680,8 +3882,62 @@ def consume_task_confirmation(answer):
     consumed FIRST (so it can never be used twice), then verified against the
     plan that is about to run: a changed plan, an expired window or a record
     armed for a different request executes nothing and asks again.
+
+    R11: the "create, or only check?" hold keeps its exact plan aside (not
+    armed). A clear "create"/"check" next turn that names the held request
+    resolves the hold WITHOUT counting as a new ask: create re-arms the same
+    previewed effect, check runs read-only. Anything else falls through.
     """
     global _pending_task_action
+    held = _peek_held_inspect_plan()
+    if held is not None and not has_pending_task_confirmation():
+        try:
+            answer_text = (answer or "").strip().lower()
+        except Exception:
+            answer_text = ""
+        _wants_create = bool(re.search(
+            r"\bcreate\b|\bmake\s+(?:the\s+|that\s+)?file\b"
+            r"|\bwrite\s+(?:the\s+|that\s+|it\b)|"
+            r"\byes\s*,?\s*(?:create|make|write)\b", answer_text or ""))
+        _wants_check = (bool(re.search(
+            r"\b(?:only\s+)?check\b|\bjust\s+(?:check|look)\b"
+            r"|\bquick\s+look\b|\bonly\s+look\b", answer_text or ""))
+            and not _wants_create)
+        if _wants_create or _wants_check:
+            held = _take_held_inspect_plan()
+            try:
+                _clarify_reset((held.get("plan") or {}).get(
+                    "command_text", ""))
+            except Exception:
+                pass
+            if _wants_check:
+                # Read-only stays read-only: list the folder, never the write.
+                try:
+                    from backend.services import code_tools as _ct
+                    target = ""
+                    for step in (held.get("plan") or {}).get("steps") or []:
+                        if (isinstance(step, dict)
+                                and step.get("tool") == "code.write_file"):
+                            target = os.path.dirname(str(
+                                (step.get("args") or {}).get("path")
+                                or "")) or ""
+                            break
+                    listing = _ct.list_directory(target) if target else None
+                    if isinstance(listing, dict) and listing.get("ok"):
+                        entries = listing.get("entries") or []
+                        shown = ", ".join(str(e)[:40] for e in entries[:8])
+                        tail = ("…" if len(entries) > 8 else "")
+                        return ("Sir, checked only — nothing created. "
+                                "%s contains: %s%s."
+                                % (target, shown or "nothing", tail))
+                except Exception:
+                    pass
+                return ("Sir, checked only — nothing created.")
+            _arm_plan_confirmation(held.get("plan"), held.get("context"))
+            _remember_task_result(None)
+            return ("Sir, understood — creating exactly what was previewed. "
+                    "%s" % (held.get("preview") or confirmation_prompt(
+                        held.get("plan")) or ""))
     with _task_confirm_lock:
         pending = _pending_task_action
         if pending is None:
@@ -3710,17 +3966,43 @@ def consume_task_confirmation(answer):
         return "As you wish, sir. I will skip that."
 
     if verdict == "unclear":
+        # R11: an un-understood answer counts as the request's ask — the
+        # SECOND failed ask stops instead of looping back into chat guesses.
         _pending_task_action = None
         approvals.cancel("task confirmation not understood")
+        command_text = ""
+        try:
+            command_text = (plan.get("command_text") if isinstance(
+                plan, dict) else "") or ""
+        except Exception:
+            command_text = ""
+        if command_text and _clarify_note(command_text) > _CLARIFY_MAX_ASKS:
+            _clarify_reset(command_text)
+            _remember_task_result(None)
+            return _clarify_stop_line()
+        _remember_task_result(None)
         return None
 
     if verdict == "inspect":
         # Astra Trace A: "Yes, a quick look" against a CREATION preview is
         # ambiguous — never run the write, never infer a browser task. Hold
-        # the write, keep ONE clarification, and let a clear "create" answer
-        # both disambiguate and approve the exact displayed effect.
+        # the write (approval cancelled, write HELD not armed), and let a
+        # clear "create" answer both disambiguate and approve the exact
+        # displayed effect. R11: this counts as the request's ask — a second
+        # ambiguous answer stops instead of asking a third time.
         approvals.cancel("held for inspection-vs-creation disambiguation")
         preview = pending.get("preview") or confirmation_prompt(plan) or ""
+        try:
+            held_command = (plan.get("command_text") if isinstance(
+                plan, dict) else "") or ""
+        except Exception:
+            held_command = ""
+        if held_command and _clarify_note(held_command) > _CLARIFY_MAX_ASKS:
+            _clarify_reset(held_command)
+            _remember_task_result(None)
+            return _clarify_stop_line()
+        if held_command:
+            _hold_inspect_plan(plan, context, preview)
         return ("Create the file, sir, or only check the folder? "
                 "%s" % preview if preview else
                 "Create the file, sir, or only check the folder?")
@@ -3746,19 +4028,77 @@ def consume_task_confirmation(answer):
 
     # verdict == "yes": consume, then verify: consumption is atomic, and a
     # failure here means NOTHING runs (not a partially authorised plan).
+    # R16: the 45s window + atomic take ARE the expiry and one-shot rules —
+    # a late yes finds nothing armed, a replayed yes finds the taken record
+    # gone, and an armed-but-changed plan fails verify. All three re-ask.
     record = approvals.take()
+    _early_command = ""
+    try:
+        _early_command = (plan.get("command_text") if isinstance(
+            plan, dict) else "") or ""
+    except Exception:
+        _early_command = ""
     if record is None:
-        return ("That approval is no longer available, sir. Please ask again.")
+        _clarify_reset(_early_command)
+        return ("That approval is no longer available, sir — yes lasts "
+                "one run only. Please ask again.")
     if record.id != pending.get("approval_id"):
+        _clarify_reset(_early_command or record.command or "")
         return ("That approval was replaced, sir. Please ask again.")
     command_text = plan.get("command_text") or record.command or ""
     ok, why = approvals.verify(plan, record, command_text=command_text)
     if not ok:
+        _clarify_reset(command_text or "")
         _remember_task_result(None)
         return ("I cannot proceed, sir — %s. Please ask again." % why)
-    result = execute_plan(plan, context, confirmed=True)
+    _clarify_reset(command_text or "")
+    # R16/R17: the gate-blessed run goes STRAIGHT to the step loop — never
+    # back through execute_plan, so a stray confirmed=True can never
+    # re-enter a blessed run. execute_plan is kept as the call (with the
+    # taken record) so harnesses patching execute_plan still observe the
+    # run; the record tells execute_plan this call IS the gate.
+    result = execute_plan(plan, context, task_text=(
+        command_text or plan.get("summary") or ""), approval=record)
     _remember_task_result(result, command_text or plan.get("summary") or "")
     return str(result) + extra_note
+
+
+#: R11-held inspect plan: "create, or only check?" keeps the exact write
+#: plan aside (NOT armed — no yes can fire it) so a clear "create" next
+#: turn runs the SAME previewed effect, while "check it" runs read-only.
+_held_inspect_plan = None
+_held_inspect_lock = threading.Lock()
+
+
+def _hold_inspect_plan(plan, context, preview):
+    global _held_inspect_plan
+    try:
+        with _held_inspect_lock:
+            _held_inspect_plan = {
+                "plan": plan, "context": context, "preview": preview,
+                "at": time.time(),
+            }
+    except Exception:
+        pass
+
+
+def _take_held_inspect_plan():
+    global _held_inspect_plan
+    try:
+        with _held_inspect_lock:
+            held = _held_inspect_plan
+            _held_inspect_plan = None
+            return held
+    except Exception:
+        return None
+
+
+def _peek_held_inspect_plan():
+    try:
+        with _held_inspect_lock:
+            return _held_inspect_plan
+    except Exception:
+        return None
 
 
 def _repreview_with_name(plan, context, new_name):

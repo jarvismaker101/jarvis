@@ -240,9 +240,10 @@ class ProposalApprovalTests(unittest.TestCase):
             orchestrator.run_orchestrator("create demo", env)
         executed = {}
 
-        def fake_execute(plan, context, task_text="", confirmed=False):
+        def fake_execute(plan, context, task_text="", confirmed=False,
+                         approval=None):
             executed["plan"] = plan
-            executed["confirmed"] = confirmed
+            executed["confirmed"] = confirmed or approval is not None
             from backend.services.task_result import TaskResult
 
             return TaskResult("completed", "Created the demo folder, sir.")

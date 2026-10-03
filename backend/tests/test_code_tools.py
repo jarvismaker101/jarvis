@@ -551,6 +551,105 @@ class LocatedWriteTests(unittest.TestCase):
         self.assertEqual(plan["steps"], [])
         self.assertIn("Which folder", plan["response"])
 
+    def test_second_failed_ask_stops_instead_of_looping(self):
+        cmd = "create a file in somewherexyz and write hello"
+        first = agent.plan_task(cmd, self.context)
+        self.assertIn("Which folder", first["response"])
+        second = agent.plan_task(cmd, self.context)
+        self.assertIn("Which folder", second["response"])
+        third = agent.plan_task(cmd, self.context)
+        self.assertIn("stopping rather than guessing", third["response"])
+        self.assertEqual(third["steps"], [])
+        # A fresh request starts fresh — the counter does not leak.
+        agent._clarify_reset(cmd)
+        fresh = agent.plan_task(cmd, self.context)
+        self.assertIn("Which folder", fresh["response"])
+        agent._clarify_reset(cmd)
+
+    def test_second_missing_slot_ask_stops(self):
+        cmd = "create a file in that folder"
+        agent._remember_task_result(None)
+        first = agent.plan_task(cmd, self.context)
+        self.assertIn("Which folder", first["response"])
+        agent._clarify_reset(cmd)
+
+    def test_unclear_answer_twice_stops(self):
+        plan = agent.plan_task("run pip list", self.context)
+        agent.execute_plan(plan, self.context)
+        command = plan.get("command_text") or ""
+        self.assertIsNone(agent.consume_task_confirmation("maybe later"))
+        agent.execute_plan(plan, self.context)
+        self.assertIsNone(agent.consume_task_confirmation("hmm what"))
+        agent.execute_plan(plan, self.context)
+        stopped = agent.consume_task_confirmation("er hello")
+        self.assertIn("stopping rather than guessing", stopped)
+        self.assertIsNone(agent._pending_task_action)
+        agent._clarify_reset(command)
+
+    def test_inspect_then_create_runs_same_previewed_effect(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        self._remember_folder(folder)
+        plan = agent.plan_task(
+            "now create a text file inside that folder and inside that "
+            "text file just write hello",
+            self.context,
+        )
+        agent.execute_plan(plan, self.context)
+        held_q = agent.consume_task_confirmation("yes, a quick look")
+        self.assertIn("Create the file, sir, or only check", held_q)
+        creating = agent.consume_task_confirmation("create it")
+        self.assertIn("exactly what was previewed", creating)
+        agent.execute_plan(plan, self.context)
+        done = agent.consume_task_confirmation("yes")
+        target = os.path.join(folder, "hello.txt")
+        self.assertTrue(os.path.exists(target))
+        self.assertIn("hello.txt", done)
+
+    def test_inspect_then_check_runs_read_only(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        self._remember_folder(folder)
+        plan = agent.plan_task(
+            "now create a text file inside that folder and inside that "
+            "text file just write hello",
+            self.context,
+        )
+        agent.execute_plan(plan, self.context)
+        agent.consume_task_confirmation("yes, a quick look")
+        checked = agent.consume_task_confirmation("just check it")
+        self.assertIn("checked only", checked)
+        self.assertFalse(os.path.exists(os.path.join(folder, "hello.txt")))
+
+    def test_replayed_yes_without_approval_reasks(self):
+        plan = agent.plan_task("run pip list", self.context)
+        agent.execute_plan(plan, self.context)  # arms the shared record
+        agent._pending_task_action = None  # ...then the gate state is lost
+        with patch.object(agent.code_tools, "call_tool") as fake:
+            response = agent.execute_plan(
+                plan, self.context, task_text="run pip list",
+                confirmed=True)
+        fake.assert_not_called()
+        self.assertIn("confirm task", str(response))
+
+    def test_refusals_stop_honestly(self):
+        for cmd, needle in (
+            ("navigate there", "without a target"),
+            ("undo the file I created, delete it back",
+             "cannot undo"),
+        ):
+            plan = agent.plan_task(cmd, self.context)
+            self.assertEqual(plan["steps"], [])
+            self.assertIn(needle, plan["response"])
+        refuse, line = agent.should_refuse("x", resolved_kind="candidates")
+        self.assertTrue(refuse)
+        self.assertIn("more than one folder", line)
+        refuse, line = agent.should_refuse("x", resolved_kind="none")
+        self.assertTrue(refuse)
+        self.assertIn("not guessing", line)
+        refuse, _line = agent.should_refuse("create hello.txt with hi")
+        self.assertFalse(refuse)
+
     def test_confirm_executes_the_write_end_to_end(self):
         folder = os.path.join(self._tmp.name, "mayankmalik")
         os.makedirs(folder)
