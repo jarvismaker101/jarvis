@@ -1265,6 +1265,10 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             # "I am unable to browse websites"). Real actions — file/folder
             # ops, code, shell, browser automation — run through task routes;
             # a request phrased as an action belongs there, not in chat.
+            # Honesty rule: this reply performs NOTHING. Never promise an
+            # action ("I will get that created", "done", "it is ready") —
+            # either the turn routed to a task path (which speaks its own
+            # verified result), or ask for the missing detail instead.
             # When asked to recall the conversation, answer ONLY from the
             # turns above; never invent topics, and never agree with a
             # premise ("I do recall that") unless the turns show it.
@@ -1272,6 +1276,9 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "shell and browser actions are performed by task routes, never "
             "by this chat reply, so never say you cannot do them — say you "
             "will get it done, or ask for the missing detail. "
+            "This reply itself performs nothing: never claim an action is "
+            "done, in progress, or promised — if the request needs an "
+            "action, ask for the missing detail instead. "
             "When asked what was discussed, report only what the turns "
             "above show; if a claimed topic is absent, say so plainly "
             "instead of agreeing. "
@@ -4257,6 +4264,30 @@ def _process_message_inner(
         return response
 
     if not msg.lower().startswith("command"):
+        # Honesty guard: a file/folder action the pre-route gates recognise
+        # must NEVER be answered by chat prose. A defensive re-check runs
+        # here (after the classifier, before any chat reply is produced) so
+        # a misrouted action still reaches the task path instead of a model
+        # promising work no tool ever does (live bug: a "create a text file
+        # ..." turn was answered with "I will get that created" and no file
+        # appeared). Unresolvable phrasing (no locatable target) stays chat
+        # and asks for the missing detail.
+        try:
+            if is_code_tool_request(msg):
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                print("[TASK] Code-tool safety net -> task path:", msg)
+                response = handle_task_message(msg, voice_compact=voice_compact)
+                _record_native_task_outcome(msg)
+                _disarm_other_gates_if_task_gate_armed()
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, response)
+                return response
+        except Exception as exc:
+            logging.warning("[TASK] Code-tool safety net failed: %s", exc)
         # [S6] ONE call, two jobs: the intent router classified this turn AND
         # wrote the answer, so a plain conversational turn no longer pays for a
         # second chat completion. The reply is used ONLY here - after every

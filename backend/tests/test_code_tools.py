@@ -189,6 +189,18 @@ class CodeToolRoutingTests(unittest.TestCase):
         self.assertTrue(agent.is_code_tool_request("read http_server.py"))
         self.assertTrue(agent.is_code_tool_request("write file notes.txt"))
         self.assertTrue(agent.is_code_tool_request("write file notes with hello"))
+        # Live follow-up phrasing: filler + adjective + located, nameless
+        # write — once fell through to chat, which promised work no tool did.
+        self.assertTrue(agent.is_code_tool_request(
+            "now create a text file inside that folder and inside that "
+            "text file just write hello"))
+        self.assertTrue(agent.is_code_tool_request(
+            "create a text file inside that folder and inside that text "
+            "file just write hello"))
+        self.assertTrue(agent.is_code_tool_request(
+            "please create a text file in mayankmalik and write hello"))
+        self.assertTrue(agent.is_code_tool_request(
+            "create a text file in that folder with hello"))
         self.assertTrue(agent.is_code_tool_request("run pip list"))
         self.assertTrue(agent.is_code_tool_request("run setup.py"))
         self.assertTrue(agent.is_code_tool_request("run curl http://localhost/health"))
@@ -211,12 +223,95 @@ class CodeToolRoutingTests(unittest.TestCase):
         self.assertFalse(agent.is_code_tool_request("run me a bath"))
         self.assertFalse(agent.is_code_tool_request("display my screen"))
         self.assertFalse(agent.is_code_tool_request("open file in chrome"))
+        # Content phrases are not locations ("in english" is what to write).
+        self.assertFalse(agent.is_code_tool_request(
+            "write hello in english"))
         # web/browser targets must NOT be caught by the code-tool router
         self.assertFalse(agent.is_code_tool_request("open http://example.com"))
         self.assertFalse(agent.is_code_tool_request("open youtube in chrome"))
         self.assertFalse(agent.is_code_tool_request("search google for python"))
         # conversation / unknown verbs must not be caught either
         self.assertFalse(agent.is_code_tool_request("what is the weather"))
+
+
+class LocatedWriteTests(unittest.TestCase):
+    """Live bug: "now create a text file inside that folder ... write hello"
+    fell through every route into chat, which promised the file while no tool
+    ran. These pin the routing, the cross-turn folder resolution, the default
+    name, and the end-to-end write."""
+
+    def setUp(self):
+        self.context = {
+            "windows": {"active_window": {"title": "x"}, "visible_controls": []},
+            "editor": {"available": False},
+            "browser": {"available": False, "tabs": []},
+        }
+        agent._pending_task_action = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved_result = agent.last_task_result()
+        self.addCleanup(agent._remember_task_result, *self._saved_result)
+
+    def tearDown(self):
+        agent._pending_task_action = None
+
+    def _remember_folder(self, folder):
+        from backend.services.task_result import TaskResult
+        agent._remember_task_result(
+            TaskResult.completed("done",
+                                 artifacts=[{"step": 0, "path": folder}]),
+            "create folder")
+
+    def test_that_folder_resolves_to_last_run_folder(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        self._remember_folder(folder)
+        plan = agent.plan_task(
+            "now create a text file inside that folder and inside that "
+            "text file just write hello",
+            self.context,
+        )
+        self.assertTrue(plan["requires_confirmation"])
+        self.assertEqual(plan["steps"][0]["tool"], "code.write_file")
+        self.assertEqual(plan["steps"][0]["args"]["path"],
+                         os.path.join(folder, "hello.txt"))
+        self.assertEqual(plan["steps"][0]["args"]["content"], "hello")
+
+    def test_bare_folder_name_resolves_under_desktop(self):
+        plan = agent.plan_task(
+            "create a text file in mayankmalik and write hello", self.context)
+        self.assertEqual(plan["steps"][0]["tool"], "code.write_file")
+        self.assertTrue(plan["steps"][0]["args"]["path"].endswith(
+            os.path.join("mayankmalik", "hello.txt")))
+        self.assertEqual(plan["steps"][0]["args"]["content"], "hello")
+
+    def test_unresolvable_pronoun_asks_instead_of_guessing(self):
+        agent._remember_task_result(None)
+        plan = agent.plan_task(
+            "create a text file inside that folder and write hello",
+            self.context,
+        )
+        self.assertEqual(plan["steps"], [])
+        self.assertIn("Which folder", plan["response"])
+
+    def test_confirm_executes_the_write_end_to_end(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        self._remember_folder(folder)
+        plan = agent.plan_task(
+            "now create a text file inside that folder and inside that "
+            "text file just write hello",
+            self.context,
+        )
+        preview = str(agent.execute_plan(plan, self.context))
+        self.assertIn("hello.txt", preview)
+        self.assertIn("hello", preview)
+        response = str(agent.consume_task_confirmation("confirm task"))
+        target = os.path.join(folder, "hello.txt")
+        self.assertTrue(os.path.exists(target))
+        with open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "hello")
+        self.assertIn("hello.txt", response)
 
 
 class CodeToolConfirmationGateTests(unittest.TestCase):

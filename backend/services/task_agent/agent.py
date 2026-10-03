@@ -198,8 +198,46 @@ _CODE_TOOL_COMMAND_TOKENS = (
     "java", "mvn", "gradle", "python3",
 )
 
+# Leading conversational fillers a spoken request may carry before the verb
+# ("now create ...", "please just make ..."). Routing strips these before
+# the anchored verb matches so the filler can never push a real action into
+# chat (live bug: "now create a text file ..." fell through to chat and the
+# model promised work no tool ever did).
+_CODE_TOOL_FILLER_RE = re.compile(
+    r"^(?:(?:now|ok|okay|so|then|please|just|actually|well|hey|hi|hello|"
+    r"jarvis|sir)\b[\s,.-]*)+",
+    re.IGNORECASE,
+)
+
+# "text file" / "txt file" / "notepad file" spoken adjectives: the noun is
+# still "file", so routing/planning must see through them.
+_CODE_TOOL_FILE_ADJECTIVES = (
+    "text", "txt", "notepad", "new", "empty", "blank", "simple", "small",
+)
+
 # Targets starting with these pronouns are conversational, not commands.
-_CODE_TOOL_PRONOUN_STARTS = ("me", "us", "him", "her", "them", "it", "that")
+# "that" is deliberately NOT here: "create a file inside that folder" is a
+# write with a location, not small talk (see _CODE_TOOL_LOCATION_RE).
+_CODE_TOOL_PRONOUN_STARTS = ("me", "us", "him", "her", "them", "it")
+
+# Location phrases that carry the write destination when no file name is
+# named ("create a text file inside that folder ...").
+_CODE_TOOL_LOCATION_RE = re.compile(
+    r"\b(?:inside|into|in|within|under)\s+"
+    r"(?:(?:the|this|that|my|our)\s+)?"
+    r"(folder|directory)(?:\s+(?:named|called)\s+([a-z0-9_ .\-]+))?",
+    re.IGNORECASE,
+)
+
+# A located write naming the folder BARE ("create a file in mayankmalik and
+# write hello") — no "folder" word at all. Requires the "and <verb>" shape
+# so content phrases ("write hello in english") never match.
+_CODE_TOOL_BARE_FOLDER_RE = re.compile(
+    r"\bin\s+([a-z0-9_ .\-]+?)\s+and\s+"
+    r"(?:inside(?:\s+(?:that|this|the))?(?:\s+(?:text\s+)?file)?\s+)?"
+    r"(?:just\s+)?(?:write|containing|with|as|saying|say|of)\b",
+    re.IGNORECASE,
+)
 
 # Path-like target: name with a dot-extension at the end.
 _CODE_TOOL_PATH_RE = re.compile(
@@ -230,21 +268,24 @@ def is_code_tool_request(text):
     normalized = _normalize(text)
     if any(hint in normalized for hint in _CODE_TOOL_WEB_HINTS):
         return False
+    # Spoken fillers ride in front of the verb ("now create ..."); strip
+    # them so the anchored verb matches still apply.
+    routed = _CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized
 
-    read_match = re.match(r"^(?:read|cat|open file)\s+(.+)$", normalized)
-    show_match = re.match(r"^show\s+(.+)$", normalized)
-    write_match = re.match(r"^(?:create|make|write|save|update)\b.*?\bfile\b\s*(.*)$", normalized)
+    read_match = re.match(r"^(?:read|cat|open file)\s+(.+)$", routed)
+    show_match = re.match(r"^show\s+(.+)$", routed)
+    write_match = re.match(r"^(?:create|make|write|save|update)\b.*?\bfile\b\s*(.*)$", routed)
     folder_match = re.match(
         r"^(?:create|make)\s+(?:a\s+|an\s+)?(?:folder|directory)\b(?:\s+(.+))?$",
-        normalized,
+        routed,
     )
     multi_match = re.match(
         r"^(?:create|make)\s+(?:(?:\d+|(?:one|two|three|four|five|six|seven|eight|nine|ten))\s+)?files?\b(?:\s*[:,-]?\s*(.+))?$",
-        normalized,
+        routed,
     )
-    run_match = re.match(r"^(?:run|execute)\s+(.+)$", normalized)
+    run_match = re.match(r"^(?:run|execute)\s+(.+)$", routed)
 
-    if _CODE_TOOL_URL_RE.search(normalized) and not run_match:
+    if _CODE_TOOL_URL_RE.search(routed) and not run_match:
         return False
 
     if read_match:
@@ -258,7 +299,19 @@ def is_code_tool_request(text):
         if re.search(r"\b(?:with|containing|as)\b", tail):
             return True
         tail_target = re.sub(r"^(?:called|named|the|a|an)\s+", "", tail.strip())
-        return _is_path_like(tail_target)
+        if _is_path_like(tail_target):
+            return True
+        # A located write names no file ("create a text file inside that
+        # folder and write hello inside it"): the location + the content
+        # are the intent, so it routes; planning resolves the folder and
+        # asks for (or defaults) the name.
+        if _located_write_folder(routed) is not None:
+            return True
+        if _CODE_TOOL_LOCATION_RE.search(tail):
+            return True
+        if re.search(r"\b(?:inside|into|within)\b.*\b(?:write|containing|content|text)\b", tail):
+            return True
+        return False
 
     # "create/make a folder named X", "create N files: a.txt, b.py, ..." —
     # route into the gated task-agent path. The folder tail must carry a
@@ -413,9 +466,28 @@ def _heuristic_plan(command, context):
         return _code_tool_plan("code.read_file", {"path": read_match.group(1).strip()}, "Reading the file.")
 
     # "create/write/save <file> containing/with/to ..." -> write_file
-    split = _split_write_request(raw)
+    split = _split_write_request(_strip_code_tool_filler(raw))
     if split is not None:
         path, content_after = split
+        folder_hint = _located_write_folder(raw)
+        if folder_hint is not None and not _is_path_like(path):
+            resolved = _resolve_folder_hint(folder_hint)
+            if resolved is None:
+                return {
+                    "ok": True,
+                    "confidence": 0.9,
+                    "summary": "Need the folder.",
+                    "requires_confirmation": False,
+                    "steps": [],
+                    "response": _folder_hint_clarification(folder_hint),
+                }
+            name = _located_write_name(raw, content_after)
+            content = _located_write_content(raw, content_after)
+            return _code_tool_plan(
+                "code.write_file",
+                {"path": os.path.join(resolved, name), "content": content},
+                "Writing the file.",
+            )
         return _code_tool_plan(
             "code.write_file",
             {"path": path, "content": content_after},
@@ -501,8 +573,11 @@ def _code_tool_plan(tool, args, summary, risk="safe"):
 #: F12 — the words that introduce file content in a write request. They are
 #: only delimiters when what precedes them is a COMPLETE file name; a file
 #: called "Q4 Report With Care.TXT" must not be truncated at its own "With".
+#: A file-type adjective ("text", "txt", "notepad") may sit between "a" and
+#: "file" ("create a text file X with Y").
 _WRITE_REQUEST_RE = re.compile(
-    r"^(?:create|make|write|save|update)\s+(?:a\s+)?file\s+"
+    r"^(?:create|make|write|save|update)\s+(?:a\s+)?"
+    r"(?:(?:text|txt|notepad|new|empty|blank|simple|small)\s+)?file\s+"
     r"(?:called\s+|named\s+)?",
     re.IGNORECASE,
 )
@@ -564,7 +639,192 @@ def _extract_write_content(raw):
     F12: a delimiter word inside the file name is part of the name, not a
     delimiter (see :func:`_split_write_request`)."""
     split = _split_write_request(raw)
-    return split[1] if split else ""
+    if split:
+        return _located_write_content(raw, split[1])
+    return ""
+
+
+#: Pronouns that refer to the folder of the previous turn ("that folder",
+#: "inside it", "in there") — resolved from the last native run's artifacts.
+_FOLDER_PRONOUN_RE = re.compile(
+    r"\b(?:that|this|the same|same)\s+(?:folder|directory)\b"
+    r"|\binside\s+(?:it|there|them)\b"
+    r"|\bin\s+(?:it|there|them)\b"
+    r"|\bthere\b",
+    re.IGNORECASE,
+)
+
+#: Words that introduce the file content AFTER the location ("... folder and
+#: write hello", "... folder containing hello", "... and inside just hello").
+_LOCATED_CONTENT_RE = re.compile(
+    r"\s+(?:and\s+)?(?:inside(?:\s+(?:that|this|the))?(?:\s+(?:text\s+)?file)?\s+)?"
+    r"(?:just\s+)?(?:write|containing|with|as|saying|say|of)\s+(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: Default name for a nameless file request ("create a text file ..."), spoken
+#: verbatim in the confirmation preview so the user's "yes" authorizes the
+#: exact effect.
+_DEFAULT_TEXT_FILE_NAME = "hello.txt"
+
+
+def _strip_code_tool_filler(raw):
+    """Remove leading spoken fillers ("now", "please just", ...) so the
+    anchored write/folder/run matches apply to the verb, not the filler."""
+    stripped = _CODE_TOOL_FILLER_RE.sub("", (raw or "").strip())
+    return stripped.strip() or (raw or "").strip()
+
+
+def _located_write_folder(raw):
+    """The destination hint of a located write, or None when the request
+    names no folder ("inside that folder", "in mayankmalik", ...).
+
+    Returns (kind, detail): ("pronoun", "") for "that folder"/"inside it"
+    (resolved from the last run's artifacts), ("named", name) for an
+    explicitly named folder. A bare "in <word>" is only a folder hint when
+    the word is not a file name or content delimiter tail.
+    """
+    match = _CODE_TOOL_LOCATION_RE.search(raw or "")
+    if match:
+        named = (match.group(2) or "").strip()
+        if named and _is_path_like(named):
+            pass  # an extension-looking name is a FILE, not a folder
+        elif named:
+            return ("named", named.strip().strip("\"'"))
+        else:
+            # "in X" with no determiner and no folder word is too weak on its
+            # own ("write hello in english" is content, not a location) —
+            # only a determiner ("that folder", "the folder") or
+            # inside/into/within/under counts as a location cue.
+            preposition = (match.group(0).split() or [""])[0].lower()
+            determiner = re.search(r"\b(?:the|this|that|my|our)\b",
+                                   match.group(0), re.IGNORECASE)
+            if (match.group(1).lower() in ("folder", "directory")
+                    and (preposition in ("inside", "into", "within", "under")
+                         or determiner)):
+                return ("pronoun", "")
+    # Bare folder name, no "folder" word: "create a file in mayankmalik
+    # and write hello". The "and <verb>" shape keeps content phrases
+    # ("write hello in english") from matching.
+    bare = _CODE_TOOL_BARE_FOLDER_RE.search(raw or "")
+    if bare:
+        name = (bare.group(1) or "").strip().strip("\"'")
+        if name and not _is_path_like(name):
+            return ("named", name)
+    return None
+
+
+def _resolve_folder_hint(hint):
+    """Turn a located-write folder hint into an absolute folder path.
+
+    "that folder" resolves from the last native run's artifacts (the folder
+    just created/confirmed); a named folder resolves against the desktop
+    when unqualified. Returns None when unresolvable — the planner then
+    asks which folder instead of guessing.
+    """
+    if not hint:
+        return None
+    kind, detail = hint
+    if kind == "named":
+        name = (detail or "").strip()
+        if not name:
+            return None
+        lowered = name.lower()
+        try:
+            folders = _known_folders()
+        except Exception:
+            folders = {}
+        for key in ("desktop", "documents", "downloads", "home"):
+            base = folders.get(key) or ""
+            if base and _normalize_fs_path(name) == _normalize_fs_path(base):
+                return base
+        desktop = folders.get("desktop") or ""
+        candidate = name if os.path.isabs(name) else (
+            os.path.join(desktop, name) if desktop else name)
+        if os.path.isdir(candidate):
+            return candidate
+        return os.path.normpath(candidate)
+    # Pronoun: the folder of the previous turn. Prefer the most recent
+    # create_folder artifact; fall back to the parent dir of the most recent
+    # write_file artifact.
+    try:
+        result, _task_text = last_task_result()
+    except Exception:
+        return None
+    artifacts = list(getattr(result, "artifacts", None) or []) if result else []
+    if not artifacts and result is not None:
+        # A folder-creation run whose artifacts list is empty (older runs
+        # recorded only step observations): recover the folder dir from the
+        # most recent folder/file trace entry. Never guess — only real,
+        # existing directories count.
+        try:
+            trace = list(getattr(result, "trace", None) or [])
+        except Exception:
+            trace = []
+        for entry in reversed(trace):
+            if not isinstance(entry, dict):
+                continue
+            tool = str(entry.get("tool") or "")
+            if tool not in ("code.create_folder", "code.write_file"):
+                continue
+            raw_path = ""
+            try:
+                raw_path = str((entry.get("args") or {}).get("path") or "")
+            except Exception:
+                raw_path = ""
+            if not raw_path:
+                continue
+            candidate = (raw_path if tool == "code.create_folder"
+                         else os.path.dirname(raw_path))
+            if candidate and os.path.isdir(candidate):
+                return candidate
+        return None
+    for entry in reversed(artifacts):
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if path and os.path.isdir(str(path)):
+            return str(path)
+    for entry in reversed(artifacts):
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if path:
+            parent = os.path.dirname(str(path))
+            if parent and os.path.isdir(parent):
+                return parent
+    return None
+
+
+def _folder_hint_clarification(hint):
+    """Ask which folder a located write means (never guess the location)."""
+    if hint and hint[0] == "named":
+        return ("Which folder should I use, sir — I could not find "
+                "'%s'. Please say the full folder name." % hint[1])
+    return ("Which folder should I create that file in, sir? "
+            "Please say the folder name.")
+
+
+def _located_write_name(raw, content_after):
+    """File name for a located write: an explicit name wins, else the
+    predictable default (spoken verbatim in the confirmation preview)."""
+    split = _split_write_request(_strip_code_tool_filler(raw))
+    if split:
+        candidate = (split[0] or "").strip().strip("\"'")
+        if candidate and _is_path_like(candidate):
+            return os.path.basename(candidate)
+    tail = (content_after or "").strip().strip("\"'")
+    if tail and _is_path_like(tail) and not re.search(r"\s", tail):
+        return os.path.basename(tail)
+    return _DEFAULT_TEXT_FILE_NAME
+
+
+def _located_write_content(raw, content_after):
+    """Content for a located write ("... folder and write hello")."""
+    match = _LOCATED_CONTENT_RE.search(raw or "")
+    if match:
+        content = (match.group(1) or "").strip().strip("\"'")
+        content = re.sub(r"^(?:it\s+)?(?:as\s+)?", "", content,
+                         flags=re.IGNORECASE).strip()
+        if content:
+            return content
+    return (content_after or "").strip()
 
 
 # Extensions recognized when a request lists file types instead of names
