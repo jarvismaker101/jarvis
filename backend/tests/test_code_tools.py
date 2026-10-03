@@ -308,6 +308,34 @@ class R4ConfirmationVerdictTests(unittest.TestCase):
         self.assertEqual(agent.classify_confirmation("not yet"), "no")
 
 
+class R1MeaningNotFirstWordTests(unittest.TestCase):
+    """R1: the WANT anywhere in the sentence is the request."""
+
+    def test_declarative_want_routes(self):
+        self.assertTrue(agent.is_code_tool_request(
+            "on my desktop there is a folder Mayank Malik, "
+            "I want a text file inside it"))
+        self.assertTrue(agent.is_code_tool_request(
+            "there should be a new file in that folder"))
+        self.assertTrue(agent.is_code_tool_request(
+            "I need a file inside that folder"))
+
+    def test_bare_existence_stays_chat(self):
+        self.assertFalse(agent.is_code_tool_request("there is a file"))
+        self.assertFalse(
+            agent.is_code_tool_request("there is a file on the desktop"))
+
+    def test_declarative_plans_located_write(self):
+        plan = agent._heuristic_plan(
+            "on my desktop there is a folder, I want a text file inside it",
+            {"windows": {}})
+        # Unresolvable pronoun -> asks which folder, never a browser job.
+        if plan is not None:
+            tools = [s.get("tool") for s in plan.get("steps", [])]
+            self.assertNotIn("browser.open_url", tools)
+            self.assertNotIn("browser.search_web", tools)
+
+
 class LocatedWriteTests(unittest.TestCase):
     """Live bug: "now create a text file inside that folder ... write hello"
     fell through every route into chat, which promised the file while no tool

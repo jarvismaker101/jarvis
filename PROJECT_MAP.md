@@ -1594,3 +1594,7 @@ Tag `local-models`. Documented in full at the top of this map ("Local models as 
 ### Astra R4 — whole-sentence yes check: tails decide (uncommitted at map time)
 
 `backend/services/task_agent/agent.py`: `classify_confirmation` returns yes/no/rename/inspect/extra/unclear — "yes, don't create it" declines, "yes, but call it X" re-previews under the new name via `_repreview_with_name` + `arm_task_confirmation` (old yes dead), "yes, a quick look" HOLDS the write and asks "create, or only check?", extras never inherit, "did I say yes?" is a question not assent. `consume_task_confirmation` and brain `_consume_opencode_confirmation` both use it (opencode inspect re-arms so a clear "create" next turn approves). Tests: `R4ConfirmationVerdictTests` in `test_code_tools.py`, `R4OpencodeGateTests` in `test_brain_gate.py`.
+
+### Astra R1 — meaning, not first word (`pending`)
+
+Declarative/desire phrasing routes deterministically: `_WANT_CREATE_RE` catches "I want / I need / there should be ... file" ANYWHERE in the sentence ("on my desktop there is a folder Mayank Malik, I want a file inside it"), while `_WANT_ASSERT_ONLY_RE` keeps bare existence ("there is a file") conversational. Both `is_code_tool_request` and `_heuristic_plan` handle the R1 shape (located-write plan with defaulted name). Tests: `R1MeaningNotFirstWordTests` in `test_code_tools.py`.

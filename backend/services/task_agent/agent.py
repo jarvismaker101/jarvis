@@ -314,6 +314,24 @@ _CODE_TOOL_BARE_FOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: R1 — meaning, not first word. Declarative/desire phrasing carries the
+#: WANT anywhere in the sentence: "on my desktop there is a folder ...,
+#: I want a file inside it", "there should be a file there", "I need a
+#: file in that folder". Bare existence ("there is a file") is information,
+#: not a request — the WANT clause is what routes.
+_WANT_CREATE_RE = re.compile(
+    r"\b(?:i\s+want|we\s+want|i\s+need|we\s+need|"
+    r"there\s+should\s+be|there\s+needs?\s+to\s+be|"
+    r"make\s+(?:me\s+|us\s+|one)|get\s+me|i(?:'d| would)\s+like)\b"
+    r".{0,80}?\b(?:a\s+|an\s+|the\s+|another\s+|one\s+)?"
+    r"(?:text\s+|txt\s+|notepad\s+|new\s+|empty\s+)?files?\b",
+    re.IGNORECASE,
+)
+_WANT_ASSERT_ONLY_RE = re.compile(
+    r"^\s*there\s+(?:is|are)\s+",
+    re.IGNORECASE,
+)
+
 # Path-like target: name with a dot-extension at the end.
 _CODE_TOOL_PATH_RE = re.compile(
     r"^[a-z0-9_ .\-]+\.(?:[a-z0-9]{1,8})$",
@@ -343,6 +361,11 @@ def is_code_tool_request(text):
     quick look at that folder", "see what is inside") is a LOCAL read via
     code.list_directory — never a browser job. "Look"/"navigate" alone never
     implies the browser; only a web URL / web target does.
+
+    R1: meaning, not first word. A declarative WANT anywhere in the
+    sentence ("on my desktop there is a folder Mayank Malik, I want a
+    file inside it") routes as a located write. Bare existence
+    ("there is a file") stays conversational — assertion, not request.
     """
     if not text or not text.strip():
         return False
@@ -352,6 +375,18 @@ def is_code_tool_request(text):
     # Spoken fillers ride in front of the verb ("now create ..."); strip
     # them so the anchored verb matches still apply.
     routed = _CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized
+
+    # R1: declarative desire — the WANT clause is the request even when the
+    # sentence OPENS with scene-setting ("on my desktop there is...").
+    # Assertion-only ("there is a file", no want) never routes.
+    if (_WANT_CREATE_RE.search(routed)
+            and not _WANT_ASSERT_ONLY_RE.match(routed)):
+        if _located_write_folder(routed) is not None:
+            return True
+        if _CODE_TOOL_LOCATION_RE.search(routed):
+            return True
+        if re.search(r"\b(?:inside|into|within|there)\b", routed):
+            return True
 
     # R5: local inspect/existence shape — checked FIRST, before the web
     # "look up" branch in _heuristic_plan can claim it. A bare local folder
@@ -578,6 +613,36 @@ def _heuristic_plan(command, context):
             "code.list_directory", {"path": resolved},
             "Checking the folder.",
         )
+
+    # ── R1 declarative WANT (meaning anywhere in the sentence) ──
+    # "On my desktop there is a folder Mayank Malik, I want a file inside
+    # it" — the opening is scene-setting; the WANT clause is the request.
+    # Plans as a located write (folder resolved, name defaulted) exactly
+    # like its imperative twin. Assertion-only ("there is a file") never
+    # reaches here — is_code_tool_request already filtered it.
+    _r1_routed = _CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized
+    if (_WANT_CREATE_RE.search(_r1_routed)
+            and not _WANT_ASSERT_ONLY_RE.match(_r1_routed)):
+        _r1_hint = (_located_write_folder(_r1_routed)
+                    or _located_write_folder(raw))
+        if _r1_hint is not None:
+            _r1_resolved = _resolve_folder_hint(_r1_hint)
+            if _r1_resolved is None:
+                return {
+                    "ok": True,
+                    "confidence": 0.9,
+                    "summary": "Need the folder.",
+                    "requires_confirmation": False,
+                    "steps": [],
+                    "response": _folder_hint_clarification(_r1_hint),
+                }
+            _r1_content = _extract_write_content(raw) or ""
+            return _code_tool_plan(
+                "code.write_file",
+                {"path": os.path.join(_r1_resolved, _DEFAULT_TEXT_FILE_NAME),
+                 "content": _r1_content},
+                "Writing the file.",
+            )
 
     # ── Native code-tools heuristics (short-circuit; no LLM needed) ──
     # "read <file>", "show me <file>", "what's in <file>" -> read_file
