@@ -1293,6 +1293,10 @@ def get_latency(limit: int = 50):
     """
     limit = max(1, min(int(limit or 50), 200))
     try:
+        try:
+            browser_perf = browser_agent.browser_agent_perf_snapshot()
+        except Exception:
+            browser_perf = {"tasks_observed": 0}
         return {
             "summary": _latency.summary(limit),
             "recent": _latency.recent(limit),
@@ -1300,6 +1304,10 @@ def get_latency(limit: int = 50):
                 "remote": _aec_remote_stats(),
                 "listener_aec_errors": _published_voice_aec_errors(),
             },
+            # BA-00: the browser agent's own census — per-task STOPWATCH
+            # lines carry the detail; this block carries the cross-task
+            # model-turn percentiles the hedging work needs.
+            "browser_agent": browser_perf,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

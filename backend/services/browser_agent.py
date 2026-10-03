@@ -752,10 +752,20 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
     """
     last_error = None
     req_bytes = 0
+    # BA-00: serializing the history IS the upload-size measurement — the
+    # payload is dominated by base64 look images, so its byte count is the
+    # "what did this turn cost to send" number.
+    _ser = _Span("model.serialize")
     try:
         req_bytes = len(json.dumps(history, default=str))
     except Exception:
         req_bytes = 0
+    _ser.done(stats, req_bytes=req_bytes)
+    if stats is not None:
+        try:
+            stats.upload_bytes_total += req_bytes
+        except Exception:
+            pass
     total_t0 = None
     first_start = ""
     try:
@@ -771,11 +781,17 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
             start = _sw_timestamp()
         except Exception:
             pass
+        # BA-00: the whole attempt as one span. NOTE — there is deliberately
+        # no `model.ttfb` span: the provider calls are NON-streaming POSTs
+        # (headers and body arrive together), so time-to-first-byte is not
+        # separable from the total. True TTFB needs streaming (a later item).
+        _total = _Span("model.total")
         try:
             text, tool_calls = _model_turn(history, tools)
         except Exception as exc:
             last_error = exc
             dur_ms = _sw_elapsed_ms(t0)
+            _total.done(stats, ok=False)
             try:
                 if attempt < 2:
                     append_activity_line(
@@ -790,6 +806,7 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
                 time.sleep(0.5)
             continue
         dur_ms = _sw_elapsed_ms(t0)
+        _total.done(stats, ok=True)
         resp_bytes = 0
         try:
             resp_bytes = len(json.dumps(text or "", default=str)) + len(
@@ -818,10 +835,47 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
     raise RuntimeError(str(last_error))
 
 
+# ── BA-00: turn-level instrumentation ───────────────────────────────────────
+# The audit's central claim ("the staleness check wastes most turns") was an
+# ESTIMATE with nothing in the codebase able to confirm or refute it. These
+# spans and counters turn it into a measured number. They are observational
+# only: a timing hiccup can never change a task's outcome, and every recorder
+# below is exception-swallowing by construction.
+
+#: Bounded per-task span map: at most this many distinct span names.
+_SPAN_LIMIT = 64
+
+
+class _Span:
+    """One timed stage. ``done()`` records into the task stats and returns
+    the elapsed ms so callers can use it without a second clock read."""
+
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name):
+        self.name = name
+        self.t0 = time.monotonic()
+
+    def done(self, stats=None, **fields):
+        try:
+            ms = int((time.monotonic() - self.t0) * 1000)
+        except Exception:
+            return 0
+        if stats is not None:
+            try:
+                stats.record_span(self.name, ms, fields)
+            except Exception:
+                pass
+        return ms
+
+
 class _SwStats:
     """Per-task STOPWATCH state: totals plus the samples the end summary
     ranks. Created per task and threaded through the loop only - never
-    module-global, so tasks cannot corrupt each other's numbers."""
+    module-global, so tasks cannot corrupt each other's numbers.
+
+    BA-00 adds per-stage spans and the wasted-turn census on top of the
+    original totals; every pre-existing key keeps its exact meaning."""
 
     def __init__(self):
         self.model_calls = 0
@@ -830,6 +884,34 @@ class _SwStats:
         self.total_tool_ms = 0
         self.model_samples = []
         self.tool_samples = []
+        # ── BA-00 census ──
+        #: ``{span_name: [total_ms, count]}`` - bounded by _SPAN_LIMIT.
+        self.spans = {}
+        #: Model turns consumed (a step whose every attempt failed counts).
+        self.model_turns = 0
+        #: Turns whose ONLY tool outcomes were refusals / stale marks /
+        #: policy blocks - the "wasted turn" census the audit lacked.
+        self.wasted_turns = 0
+        #: Stale-mark refusals attributable specifically to `mut` drift.
+        self.stale_refusals = 0
+        #: Stale-mark refusals for every OTHER reason (doc/dpr/url/frame/...),
+        #: so `stale_refusals` can be read against its total.
+        self.stale_refusals_other = 0
+        #: Off-screen mark refusals.
+        self.offscreen_refusals = 0
+        #: Composite looks performed.
+        self.look_count = 0
+        #: Image bytes uploaded to the model this task.
+        self.bytes_uploaded = 0
+        #: Estimated image tokens uploaded (what those bytes actually bill).
+        self.image_tokens_est = 0
+        #: Full request-payload bytes across all model turns (history JSON,
+        #: dominated by the same base64 images — the "what did turns cost to
+        #: send" number, distinct from the image-only counters above).
+        self.upload_bytes_total = 0
+        # Per-turn wasted-outcome accounting, reset by begin_turn().
+        self._turn_outcomes = 0
+        self._turn_wasted = 0
 
     def record_model(self, step, dur_ms, ok, retry=False):
         """Accumulate one model attempt. Retried attempts add wall time but
@@ -838,12 +920,124 @@ class _SwStats:
         if retry:
             return
         self.model_calls += 1
+        self.model_turns += 1
         self.model_samples.append((step, dur_ms, ok))
 
     def record_tool(self, name, dur_ms):
         self.tool_calls += 1
         self.total_tool_ms += dur_ms
         self.tool_samples.append((name, dur_ms))
+
+    def record_span(self, name, dur_ms, fields=None):
+        """Accumulate one stage timing. Bounded by ``_SPAN_LIMIT`` names so a
+        pathological tool name cannot grow the dict without limit."""
+        entry = self.spans.get(name)
+        if entry is None:
+            if len(self.spans) >= _SPAN_LIMIT:
+                return
+            entry = [0, 0]
+            self.spans[name] = entry
+        entry[0] += dur_ms
+        entry[1] += 1
+
+    def note_image_upload(self, n_bytes, tokens_est=0):
+        try:
+            self.bytes_uploaded += max(0, int(n_bytes))
+            self.image_tokens_est += max(0, int(tokens_est))
+        except Exception:
+            pass
+
+    # ── wasted-turn census ──
+    # A turn is "wasted" when it advanced nothing: every tool it dispatched
+    # came back refused. begin_turn() / record_outcome() / end_turn() bracket
+    # one model step's dispatch loop.
+
+    def begin_turn(self):
+        self._turn_outcomes = 0
+        self._turn_wasted = 0
+
+    def record_outcome(self, wasted):
+        self._turn_outcomes += 1
+        if wasted:
+            self._turn_wasted += 1
+
+    def end_turn(self):
+        if self._turn_outcomes and self._turn_wasted == self._turn_outcomes:
+            self.wasted_turns += 1
+        self._turn_outcomes = 0
+        self._turn_wasted = 0
+
+    def span_table(self):
+        """``[(name, total_ms, count)]`` sorted by total ms, descending."""
+        out = [(name, int(v[0]), int(v[1])) for name, v in self.spans.items()]
+        out.sort(key=lambda r: r[1], reverse=True)
+        return out
+
+
+# ── BA-00: cross-task model-turn percentile reservoir ───────────────────────
+# The audit needs p50/p90 model-turn latency ACROSS tasks (required later for
+# hedged requests). Per-task samples cannot answer that, so a bounded,
+# lock-guarded reservoir of each task's MEAN model turn is kept here.
+
+_PERF_MAX_SAMPLES = 512
+_perf_lock = threading.Lock()
+_perf_turn_ms = []
+_perf_tasks = 0
+
+
+def _perf_record_task(stats):
+    """Fold one finished task's numbers into the cross-task reservoir."""
+    global _perf_tasks
+    try:
+        if stats is None:
+            return
+        turns = int(getattr(stats, "model_turns", 0) or 0)
+        total = int(getattr(stats, "total_model_ms", 0) or 0)
+        with _perf_lock:
+            _perf_tasks += 1
+            if turns <= 0:
+                return
+            # One sample per task: its MEAN model turn. A task's single
+            # slowest turn would bias the percentile toward heavy tasks.
+            _perf_turn_ms.append(total // turns)
+            if len(_perf_turn_ms) > _PERF_MAX_SAMPLES:
+                del _perf_turn_ms[:len(_perf_turn_ms) - _PERF_MAX_SAMPLES]
+    except Exception:
+        pass
+
+
+def _percentile(sorted_values, pct):
+    """Nearest-rank percentile over an already-sorted list. 0 for empty."""
+    if not sorted_values:
+        return 0
+    try:
+        idx = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+    except Exception:
+        return 0
+    idx = max(0, min(len(sorted_values) - 1, idx))
+    return int(sorted_values[idx])
+
+
+def browser_agent_perf_snapshot():
+    """Cross-task browser-agent performance, for ``GET /latency``.
+
+    Read-only and self-contained: it returns plain JSON-safe types and never
+    raises, so a broken reservoir can never take down the latency endpoint.
+    """
+    try:
+        with _perf_lock:
+            samples = sorted(int(v) for v in _perf_turn_ms)
+            tasks = int(_perf_tasks)
+        return {
+            "tasks_observed": tasks,
+            "turn_samples": len(samples),
+            "mean_turn_ms_p50": _percentile(samples, 50),
+            "mean_turn_ms_p90": _percentile(samples, 90),
+            "mean_turn_ms_min": samples[0] if samples else 0,
+            "mean_turn_ms_max": samples[-1] if samples else 0,
+        }
+    except Exception:
+        return {"tasks_observed": 0, "turn_samples": 0}
 
 
 def _sw_timestamp():
@@ -881,8 +1075,8 @@ def _sw_log_tool(name, start, t0, stats=None):
 
 def _emit_summary(stats, started):
     """End-of-task STOPWATCH block: totals, slowest model steps, slowest
-    tools, and any deadline overshoot. Never raises and never changes the
-    task's outcome."""
+    tools, the BA-00 census, and any deadline overshoot. Never raises and
+    never changes the task's outcome."""
     try:
         total_ms = max(0, int((time.monotonic() - started) * 1000))
         append_activity_line(
@@ -891,6 +1085,27 @@ def _emit_summary(stats, started):
             % (total_ms, stats.model_calls, stats.total_model_ms,
                stats.tool_calls, stats.total_tool_ms)
         )
+        # BA-00: the census the audit needed and could not get. Every number
+        # here is MEASURED, never estimated.
+        stale_total = stats.stale_refusals + stats.stale_refusals_other
+        append_activity_line(
+            "STOPWATCH census model_turns=%d wasted_turns=%d "
+            "wasted_pct=%d look_count=%d stale_refusals=%d "
+            "stale_refusals_other=%d offscreen_refusals=%d\n"
+            % (stats.model_turns, stats.wasted_turns,
+               _wasted_pct(stats), stats.look_count, stats.stale_refusals,
+               stats.stale_refusals_other, stats.offscreen_refusals)
+        )
+        append_activity_line(
+            "STOPWATCH upload bytes_uploaded=%d image_tokens_est=%d "
+            "upload_bytes_total=%d\n"
+            % (stats.bytes_uploaded, stats.image_tokens_est,
+               stats.upload_bytes_total)
+        )
+        for name, span_ms, count in stats.span_table()[:12]:
+            append_activity_line(
+                "STOPWATCH span %s total_ms=%d count=%d\n"
+                % (name, span_ms, count))
         for step, dur_ms, _ok in sorted(
                 stats.model_samples, key=lambda s: s[1], reverse=True)[:3]:
             append_activity_line(
@@ -904,8 +1119,19 @@ def _emit_summary(stats, started):
         overshoot_ms = total_ms - config.BROWSER_AGENT_TIMEOUT * 1000
         if overshoot_ms > 0:
             append_activity_line("STOPWATCH overshoot_ms=%d\n" % overshoot_ms)
+        _perf_record_task(stats)
     except Exception:
         pass
+
+
+def _wasted_pct(stats):
+    """Percentage of consumed turns that advanced nothing; 0 when no turns."""
+    try:
+        if not stats.model_turns:
+            return 0
+        return int(round(100.0 * stats.wasted_turns / stats.model_turns))
+    except Exception:
+        return 0
 
 
 # ── Virtual (composite) tools ──────────────────────────────────────────────
@@ -1216,9 +1442,16 @@ def _write_inline_screenshot(client, path):
     return False
 
 
-def _handle_look(client, session):
+def _handle_look(client, session, stats=None):
     """Composite look: evaluate -> screenshot -> downscale -> annotate -> JPEG (reordered, no threads)."""
     tmp_path = None
+    # BA-00: every stage below is timed separately so a slow look can be
+    # attributed (daemon round trip vs local image work) instead of guessed.
+    if stats is not None:
+        try:
+            stats.look_count += 1
+        except Exception:
+            pass
     try:
         fd, tmp_path = tempfile.mkstemp(prefix="jarvis_", suffix=".png")
         os.close(fd)
@@ -1290,7 +1523,9 @@ def _handle_look(client, session):
             "})()"
         )
         try:
+            _sp = _Span("look.evaluate")
             raw = client.call_tool("evaluate", {"expression": js})
+            _sp.done(stats, marks=len(js))
         except Exception as exc:
             return _clip_result("look failed: evaluate error: %s" % exc), None
         # parse
@@ -1320,11 +1555,13 @@ def _handle_look(client, session):
         # G6 (F39 + F47): correlate the observed page with a real daemon tab
         # id, best-effort — unknown tabs keep "" and no identity is guessed.
         # The same id lands on every mark (see step 4).
-        look_tab_id = _current_tab_id(client, url)
+        look_tab_id = _current_tab_id(client, url, stats)
         _publish_look_tab(url, title, look_tab_id)
         # 2. screenshot (after evaluate - evaluate needs no image)
         try:
+            _sp = _Span("look.screenshot")
             client.call_tool("screenshot", {"path": tmp_path})
+            _sp.done(stats)
         except Exception as exc:
             return _clip_result("look failed: screenshot error: %s" % exc), None
         if not _screenshot_has_content(tmp_path):
@@ -1338,7 +1575,9 @@ def _handle_look(client, session):
         # Confirm the page did not navigate/reload or change its display scale
         # in between, or the marks would describe a page the image no longer
         # shows (and click_point's coordinate frame would be wrong).
+        _sp = _Span("look.capture_state")
         capture = _capture_state(client)
+        _sp.done(stats)
         capture_verified = capture is not None
         if capture is not None:
             capture_doc = _epoch_text(capture.get("doc"))
@@ -1354,6 +1593,7 @@ def _handle_look(client, session):
                     "being taken, so the marks and the image would not match - "
                     "call look again."), None
         # 3. read PNG and downscale using config width
+        _sp = _Span("look.pil")
         try:
             img = Image.open(tmp_path).convert("RGB")
         except Exception as exc:
@@ -1462,6 +1702,9 @@ def _handle_look(client, session):
         except Exception:
             pass
         # 6. JPEG quality from config
+        _sp.done(stats, out_w=img_small.size[0], out_h=img_small.size[1],
+                 scaled=scale < 1.0)
+        _sp = _Span("look.jpeg")
         if img_small.mode == "RGBA":
             img_small = img_small.convert("RGB")
         try:
@@ -1471,7 +1714,19 @@ def _handle_look(client, session):
         jpeg_quality = max(40, min(95, jpeg_quality))
         buf = io.BytesIO()
         img_small.save(buf, format="JPEG", quality=jpeg_quality)
+        jpeg_bytes = len(buf.getvalue())
+        _sp.done(stats, jpeg_bytes=jpeg_bytes)
+        _sp = _Span("look.b64")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        _sp.done(stats, b64_chars=len(b64))
+        # BA-00: what this observation actually costs to send. Tokens are the
+        # standard 750px-per-token estimate for a downscaled screenshot.
+        if stats is not None:
+            try:
+                px = max(1, img_small.size[0] * img_small.size[1])
+                stats.note_image_upload(len(b64), px // 750)
+            except Exception:
+                pass
         # 7. text part
         img_w, img_h = img_small.size
         lines = []
@@ -1687,7 +1942,7 @@ def _active_tab_id(client):
     return ""
 
 
-def _mark_target_state(client, stored):
+def _mark_target_state(client, stored, stats=None):
     """Re-resolve a stored mark against the live page (F39).
 
     Returns ``(state, error)``: live ``epoch``/``url``/``exists``/
@@ -1717,7 +1972,11 @@ def _mark_target_state(client, stored):
     except Exception:
         return None, None
     try:
+        # BA-00: this probe is the "validation" half of every guarded
+        # click/fill — timed separately so its cost is visible per task.
+        _val = _Span("act.validate")
         raw = client.call_tool("evaluate", {"expression": js})
+        _val.done(stats)
     except Exception as exc:
         return None, "Target check failed (%s) - call look again." % exc
     live = _parse_json_result(raw)
@@ -2036,7 +2295,7 @@ def _publish_look_tab(url, title, tab_id):
         pass
 
 
-def _current_tab_id(client, url):
+def _current_tab_id(client, url, stats=None):
     """F39/F47: which daemon tab is the page at *url*?
 
     Correlates the page the agent is looking at with a real tab id by asking
@@ -2051,7 +2310,11 @@ def _current_tab_id(client, url):
     if not url:
         return ""
     try:
+        # BA-00: this is the round trip BA-01 proposes deleting; measuring it
+        # per look is what makes that deletion provable rather than asserted.
+        _sp = _Span("look.list_tabs")
         raw = client.call_tool("list_tabs", {})
+        _sp.done(stats)
     except Exception:
         return ""
     matches = []
@@ -2446,7 +2709,7 @@ def _upload_origin_error(session, client):
                      _UPLOAD_ORIGINS_ENV))
 
 
-def _handle_click_mark(client, session, arguments):
+def _handle_click_mark(client, session, arguments, stats=None):
     idx = _parse_mark_idx(arguments.get("index"))
     if idx is None:
         return _clip_result("click_mark error: index must be integer, got %r" % (arguments.get("index"),))
@@ -2467,7 +2730,7 @@ def _handle_click_mark(client, session, arguments):
     # coordinates. A validated mark is then clicked with REAL daemon input
     # (G6 / F40: click_locator) instead of coordinate JavaScript.
     if info.get("cssPath"):
-        _state, stale = _mark_target_state(client, info)
+        _state, stale = _mark_target_state(client, info, stats)
         if stale:
             return _clip_result("click_mark error: %s" % stale)
         try:
@@ -2479,7 +2742,11 @@ def _handle_click_mark(client, session, arguments):
             # no post-click evaluate: the daemon already settled and reported
             # the after-state inside its result text (see
             # _click_confirm_locator_result).
+            # BA-00: the "locator" half of the guarded click — the real
+            # input round trip, timed apart from the validation probe above.
+            _loc = _Span("act.locator")
             raw = client.call_tool("click_locator", args)
+            _loc.done(stats)
         except Exception as exc:
             return _clip_result("click_mark failed: real click error: %s" % exc)
         return _click_confirm_locator_result(client, "click_mark", raw)
@@ -2552,7 +2819,7 @@ def _handle_batch_probe(client, arguments):
     return _clip_result(raw)
 
 
-def _handle_wait_for(client, arguments):
+def _handle_wait_for(client, arguments, stats=None):
     selector = arguments.get("selector")
     text = arguments.get("text")
     # F41: a wait with neither a selector nor text used to return found=true
@@ -2596,21 +2863,29 @@ def _handle_wait_for(client, arguments):
     )
     started = time.monotonic()
     deadline = started + timeout_ms / 1000.0
+    # BA-00: count the polls so a slow wait_for can be attributed (many cheap
+    # polls vs one slow daemon round trip) instead of guessed.
+    _wait = _Span("wait.polls")
+    polls = 0
     while True:
         try:
             raw = client.call_tool("evaluate", {"expression": js})
         except Exception as exc:
+            _wait.done(stats, polls=polls, found=False)
             return _clip_result("wait_for failed: evaluate error: %s" % exc)
         payload = _parse_json_result(raw)
         if payload is None:
+            _wait.done(stats, polls=polls, found=False)
             return _clip_result(
                 "wait_for error: could not parse page check: %s" % (raw or "")[:500]
             )
+        polls += 1
         found = bool(payload.get("found"))
         elapsed_ms = int(round((time.monotonic() - started) * 1000))
         if found or time.monotonic() >= deadline:
             payload["found"] = found
             payload["elapsed_ms"] = elapsed_ms
+            _wait.done(stats, polls=polls, found=found)
             return _clip_result(json.dumps(payload))
         time.sleep(_WAIT_POLL_S)
 
@@ -2755,7 +3030,7 @@ def _handle_fill(client, arguments):
         "tag": payload.get("tag") or ""}))
 
 
-def _handle_fill_mark(client, session, arguments):
+def _handle_fill_mark(client, session, arguments, stats=None):
     idx = _parse_mark_idx(arguments.get("index"))
     if idx is None:
         return _clip_result("fill_mark error: index must be integer, got %r" % (arguments.get("index"),))
@@ -2774,7 +3049,7 @@ def _handle_fill_mark(client, session, arguments):
     # ONE explicit submission channel instead of synthetic KeyboardEvents +
     # requestSubmit improvisation. Legacy coordinate marks keep the old JS.
     if info.get("cssPath"):
-        _state, stale = _mark_target_state(client, info)
+        _state, stale = _mark_target_state(client, info, stats)
         if stale:
             return _clip_result("fill_mark error: %s" % stale)
         submit = "enter" if press_enter else "none"
@@ -2783,7 +3058,10 @@ def _handle_fill_mark(client, session, arguments):
         if frame:
             args["frame"] = frame
         try:
+            # BA-00: the "locator" half of the guarded fill.
+            _loc = _Span("act.locator")
             raw = client.call_tool("fill_locator", args)
+            _loc.done(stats)
         except Exception as exc:
             return _clip_result("fill_mark failed: real fill error: %s" % exc)
         parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -2998,7 +3276,7 @@ _VERIFY_PLAYING_DIFF_THRESHOLD = 0.02
 # index re-resolves the mark's stored identity (F39); an explicit css
 # dispatches straight to the daemon primitive (the daemon still probes the
 # target before acting, so a gone element is reported honestly either way).
-def _resolve_mark_or_css(client, session, verb, index_raw, css, need_visible=True):
+def _resolve_mark_or_css(client, session, verb, index_raw, css, need_visible=True, stats=None):
     """Resolve one typed interaction target to ``(css, frame, error)``.
 
     F13/F39/F40: the FRAME identity travels with the target, not just the CSS
@@ -3017,7 +3295,7 @@ def _resolve_mark_or_css(client, session, verb, index_raw, css, need_visible=Tru
             return None, "", ("%s error: mark %d is off-screen (outside the current viewport) "
                               "- scroll it into view first" % (verb, idx))
         if info.get("cssPath"):
-            _state, stale = _mark_target_state(client, info)
+            _state, stale = _mark_target_state(client, info, stats)
             if stale:
                 return None, "", "%s error: %s" % (verb, stale)
             return info["cssPath"], (info.get("frame") or ""), ""
@@ -3028,15 +3306,19 @@ def _resolve_mark_or_css(client, session, verb, index_raw, css, need_visible=Tru
     return css, "", ""
 
 
-def _locator_call(client, name, arguments):
+def _locator_call(client, name, arguments, stats=None):
     """Call a daemon primitive with the resolved frame included (F40)."""
+    # BA-00: the "locator" half of every typed-tool action.
+    _loc = _Span("act.locator")
     try:
         return client.call_tool(name, arguments), None
     except Exception as exc:
         return None, "%s failed: %s" % (name, exc)
+    finally:
+        _loc.done(stats)
 
 
-def _handle_scroll(client, arguments):
+def _handle_scroll(client, arguments, stats=None):
     direction = (arguments.get("direction") or "down")
     try:
         amount = int(arguments.get("amount", 600))
@@ -3046,7 +3328,7 @@ def _handle_scroll(client, arguments):
     payload = {"direction": direction, "amount": max(1, min(amount, 5000))}
     if css:
         payload["css"] = css
-    raw, error = _locator_call(client, "scroll", payload)
+    raw, error = _locator_call(client, "scroll", payload, stats)
     if error:
         return _clip_result(error)
     parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -3063,17 +3345,19 @@ def _control_readback_missing(verb, css):
             % (verb, css))
 
 
-def _handle_select_option(client, session, arguments):
+def _handle_select_option(client, session, arguments, stats=None):
     value = arguments.get("value")
     if not isinstance(value, str) or not value.strip():
         return _clip_result("select_option error: value must be a non-empty string")
     css, frame, error = _resolve_mark_or_css(client, session, "select_option",
                                              arguments.get("index"),
-                                             arguments.get("css"))
+                                             arguments.get("css"),
+                                             stats=stats)
     if error:
         return _clip_result(error)
     raw, error = _locator_call(client, "select_option",
-                               _locator_target({"value": value}, css, frame))
+                               _locator_target({"value": value}, css, frame),
+                               stats)
     if error:
         return _clip_result(error)
     parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -3098,17 +3382,19 @@ def _handle_select_option(client, session, arguments):
         "navigated": bool(parsed.get("navigated"))}))
 
 
-def _handle_set_checked(client, session, arguments):
+def _handle_set_checked(client, session, arguments, stats=None):
     checked = arguments.get("checked")
     if not isinstance(checked, bool):
         return _clip_result("set_checked error: checked must be true or false")
     css, frame, error = _resolve_mark_or_css(client, session, "set_checked",
                                              arguments.get("index"),
-                                             arguments.get("css"))
+                                             arguments.get("css"),
+                                             stats=stats)
     if error:
         return _clip_result(error)
     raw, error = _locator_call(client, "set_checked",
-                               _locator_target({"checked": checked}, css, frame))
+                               _locator_target({"checked": checked}, css, frame),
+                               stats)
     if error:
         return _clip_result(error)
     parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -3130,7 +3416,7 @@ def _handle_set_checked(client, session, arguments):
         "navigated": bool(parsed.get("navigated"))}))
 
 
-def _handle_upload_file(client, session, arguments):
+def _handle_upload_file(client, session, arguments, stats=None):
     upload_path = arguments.get("path")
     if not isinstance(upload_path, str) or not upload_path.strip():
         return _clip_result("upload_file error: path must be a non-empty string")
@@ -3148,7 +3434,8 @@ def _handle_upload_file(client, session, arguments):
         return _clip_result("upload_file error: file does not exist: %s" % resolved)
     css, frame, error = _resolve_mark_or_css(client, session, "upload_file",
                                              arguments.get("index"),
-                                             arguments.get("css"))
+                                             arguments.get("css"),
+                                             stats=stats)
     if error:
         return _clip_result(error)
     # F13: reading the file is NOT authority to send it to any site. The
@@ -3162,7 +3449,7 @@ def _handle_upload_file(client, session, arguments):
         return _clip_result(origin_error)
     raw, error = _locator_call(
         client, "upload_file",
-        _locator_target({"paths": [resolved]}, css, frame))
+        _locator_target({"paths": [resolved]}, css, frame), stats)
     if error:
         return _clip_result(error)
     parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -3186,13 +3473,15 @@ def _download_artifact(text):
     return match.group(1).strip().strip('"') if match else ""
 
 
-def _handle_download(client, session, arguments):
+def _handle_download(client, session, arguments, stats=None):
     css, frame, error = _resolve_mark_or_css(client, session, "download",
                                              arguments.get("index"),
-                                             arguments.get("css"))
+                                             arguments.get("css"),
+                                             stats=stats)
     if error:
         return _clip_result(error)
-    raw, error = _locator_call(client, "download", _locator_target({}, css, frame))
+    raw, error = _locator_call(client, "download", _locator_target({}, css, frame),
+                               stats)
     if error:
         return _clip_result(error)
     text = raw if isinstance(raw, str) else str(raw or "")
@@ -3216,15 +3505,17 @@ def _handle_download(client, session, arguments):
         artifact, parsed.get("url") or ""))
 
 
-def _handle_drag_drop(client, session, arguments):
+def _handle_drag_drop(client, session, arguments, stats=None):
     src, src_frame, error = _resolve_mark_or_css(client, session, "drag_drop",
                                                  arguments.get("index"),
-                                                 arguments.get("css"))
+                                                 arguments.get("css"),
+                                                 stats=stats)
     if error:
         return _clip_result(error)
     dst, dst_frame, target_error = _resolve_mark_or_css(
         client, session, "drag_drop",
-        arguments.get("target_index"), arguments.get("target_css"))
+        arguments.get("target_index"), arguments.get("target_css"),
+        stats=stats)
     if target_error:
         return _clip_result(target_error)
     payload = {"css": src, "target_css": dst}
@@ -3232,7 +3523,7 @@ def _handle_drag_drop(client, session, arguments):
         payload["frame"] = src_frame
     if dst_frame:
         payload["target_frame"] = dst_frame
-    raw, error = _locator_call(client, "drag_drop", payload)
+    raw, error = _locator_call(client, "drag_drop", payload, stats)
     if error:
         return _clip_result(error)
     parsed = _parse_locator_outcome(raw if isinstance(raw, str) else str(raw or ""))
@@ -3636,20 +3927,26 @@ _OBSERVATION_TOOLS = frozenset((
 ))
 
 
-def _run_virtual_tool(client, name, arguments, session):
-    """Dispatch a virtual tool; returns (result_text, image_b64|None)."""
+def _run_virtual_tool(client, name, arguments, session, stats=None):
+    """Dispatch a virtual tool; returns (result_text, image_b64|None).
+
+    BA-00: the handlers that own measurable stages (look, click_mark,
+    fill_mark, wait_for) receive the task stats; every other handler keeps
+    its exact signature."""
     if name == "look":
-        return _handle_look(client, session)
+        return _handle_look(client, session, stats)
     if name == "click_mark":
-        return _handle_click_mark(client, session, arguments), None
+        return _handle_click_mark(client, session, arguments,
+                                 stats=stats), None
     if name == "fill_mark":
-        return _handle_fill_mark(client, session, arguments), None
+        return _handle_fill_mark(client, session, arguments,
+                                stats=stats), None
     if name == "verify_playing":
         return _handle_verify_playing(client), None
     if name == "batch_probe":
         return _handle_batch_probe(client, arguments), None
     if name == "wait_for":
-        return _handle_wait_for(client, arguments), None
+        return _handle_wait_for(client, arguments, stats=stats), None
     if name == "fill":
         return _handle_fill(client, arguments), None
     if name == "click_text":
@@ -3657,17 +3954,22 @@ def _run_virtual_tool(client, name, arguments, session):
     if name == "click_point":
         return _handle_click_point(client, session, arguments), None
     if name == "scroll":
-        return _handle_scroll(client, arguments), None
+        return _handle_scroll(client, arguments, stats=stats), None
     if name == "select_option":
-        return _handle_select_option(client, session, arguments), None
+        return _handle_select_option(client, session, arguments,
+                                     stats=stats), None
     if name == "set_checked":
-        return _handle_set_checked(client, session, arguments), None
+        return _handle_set_checked(client, session, arguments,
+                                   stats=stats), None
     if name == "upload_file":
-        return _handle_upload_file(client, session, arguments), None
+        return _handle_upload_file(client, session, arguments,
+                                   stats=stats), None
     if name == "download":
-        return _handle_download(client, session, arguments), None
+        return _handle_download(client, session, arguments,
+                                stats=stats), None
     if name == "drag_drop":
-        return _handle_drag_drop(client, session, arguments), None
+        return _handle_drag_drop(client, session, arguments,
+                                 stats=stats), None
     return None
 
 
@@ -3707,6 +4009,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         append_activity_line("REFUSED %s: malformed arguments (%s)\n"
                             % (name, parse_error))
         _log_tool_result(name, "REFUSED " + parse_text)
+        _ba00_note_result(stats, parse_text)
         return None
     # F21: arguments cross the redacted egress boundary before they reach the
     # activity log, so a password/token typed into a form never lands in a
@@ -3747,6 +4050,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         })
         append_activity_line("REFUSED %s: arguments are not an object\n" % name)
         _log_tool_result(name, "REFUSED " + malformed_text)
+        _ba00_note_result(stats, malformed_text)
         return None
     # F13: the schema validated here is the SAME object the model was shown
     # (see _VIRTUAL_TOOL_SPECS), so the advertisement cannot drift from what
@@ -3773,6 +4077,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         )
         append_activity_line("POLICY BLOCK %s: %s\n" % (name, decision.reason))
         _log_tool_result(name, "BLOCKED " + blocked_text)
+        _ba00_note_result(stats, blocked_text)
         return None
     try:
         _sw_t0 = time.monotonic()
@@ -3838,6 +4143,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
                     })
                     _sw_log_tool(name, _sw_start, _sw_t0, stats)
                     _log_tool_result(name, "OUTCOME-UNKNOWN " + reconcile_text)
+                    _ba00_note_result(stats, reconcile_text)
                     return None
             outcome = _run_virtual_tool(client, name, arguments, session)
             if outcome is None:
@@ -3879,6 +4185,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
             result_text = tool_policy.redact_for_egress(result_text)
         _sw_log_tool(name, _sw_start, _sw_t0, stats)
         _log_tool_result(name, result_text)
+        _ba00_note_result(stats, result_text)
         # G6 / F47: tab-speaking results keep the broker current — a
         # navigation, tab switch or new tab changes "which tab is which", and
         # every subsystem must read the same picture (not its own guess).
@@ -3917,6 +4224,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         _sw_log_tool(name, _sw_start, _sw_t0, stats)
         _log_tool_result(name, "BLOCKED " + blocked_text)
         blocked_evidence = "blocked: repeated failure of %s" % name
+        _ba00_note_result(stats, blocked_text)
         try:
             session["task_blocked"] = blocked_evidence
         except Exception:
@@ -3939,6 +4247,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
             })
             _sw_log_tool(name, _sw_start, _sw_t0, stats)
             _log_tool_result(name, "ALREADY-COMMITTED " + committed_text)
+            _ba00_note_result(stats, committed_text)
             return None
         # F05: a mutation whose EARLIER attempt ended with a lost response may
         # already have committed. Replaying the identical action without
@@ -3961,6 +4270,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
             })
             _sw_log_tool(name, _sw_start, _sw_t0, stats)
             _log_tool_result(name, "OUTCOME-UNKNOWN " + reconcile_text)
+            _ba00_note_result(stats, reconcile_text)
             return None
         # Single attempt: never auto-replay a possibly committed mutation
         # after an ambiguous transport failure.
@@ -4029,6 +4339,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         )
         _sw_log_tool(name, _sw_start, _sw_t0, stats)
         _log_tool_result(name, "FAILED " + result_text)
+        _ba00_note_result(stats, result_text)
         return None
     # WI3: make evaluate SyntaxError actionable (do not auto-retry)
     if name == "evaluate" and isinstance(result_text, str) and "syntaxerror" in result_text.lower():
@@ -4061,6 +4372,7 @@ def _run_one_tool(client, history, call, session=None, stats=None):
                 ok=not _tool_text_reports_failure(result_text))
     _sw_log_tool(name, _sw_start, _sw_t0, stats)
     _log_tool_result(name, result_text)
+    _ba00_note_result(stats, result_text)
     # G6 / F47: native daemon tab tools speak about tabs too — publish what
     # they said (previously only dead code, never called).
     if name in _TAB_PUBLISH_TOOLS:
@@ -4074,6 +4386,117 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         }
     )
     return None
+
+
+# ── BA-00: outcome classification ───────────────────────────────────────────
+# One choke point for the wasted-turn census. Every tool result — virtual or
+# native — is classified here, so no handler signature needs a stats param.
+# Classification is by stable, distinctive F39/F05 refusal substrings, never
+# by full-text equality (callers prepend "click_mark error: " etc.).
+
+#: The one text _mark_target_state returns ONLY for `mut` drift.
+_MUT_STALE_MARKER = "That mark is stale (the page content changed since the look)"
+
+#: Every OTHER staleness refusal _mark_target_state / the missing-mark path
+#: can produce. Kept in the same order as _mark_target_state's checks.
+_OTHER_STALE_MARKERS = (
+    "carries no page-identity stamp",
+    "did not report which document it is",
+    "from an older page (the document changed",
+    "observed at a different display scale",
+    "belongs to a different page",
+    "belongs to a different frame",
+    "element is gone from the page",
+    "Target check failed",
+    "Target check returned no readable result",
+    "not found. Available marks:",
+    "No marks available - call look first",
+)
+
+_OFFSCREEN_MARKER = "is off-screen (outside the current viewport)"
+
+#: Refusal / policy-block markers that are NOT staleness: the model was told
+#: no without anything being attempted. These are the exact virtual-tool
+#: error prefixes (enumerated from every ``_clip_result("<tool> error"``
+#: call site), so native daemon results carrying page text can never match.
+_REFUSAL_MARKERS = (
+    "tool call refused:",
+    "REFUSED ",
+    "refused:",
+    "not replayed: the previous",
+    "action blocked after",
+    "NOT repeated; continue with",
+    "upload_file refused:",
+    "wait_for failed: provide a selector",
+    "look failed:",
+    "batch_probe error",
+    "batch_probe failed",
+    "click_mark error",
+    "click_mark failed",
+    "click_point error",
+    "click_text error",
+    "download failed",
+    "drag_drop failed",
+    "fill error",
+    "fill failed",
+    "fill_mark error",
+    "fill_mark failed",
+    "scroll failed",
+    "select_option error",
+    "select_option failed",
+    "set_checked error",
+    "set_checked failed",
+    "upload_file error",
+    "upload_file failed",
+    "wait_for failed",
+    "tool failed after retries:",
+    "tool failed:",
+    "tool blocked by policy:",
+    "virtual tool ",
+)
+
+
+def _ba00_classify_result(text):
+    """Classify one tool result for the BA-00 census.
+
+    Returns ``(wasted, stale_kind)`` where ``stale_kind`` is ``"mut"``,
+    ``"other"``, ``"offscreen"`` or ``""``. Never raises; unrecognized text
+    is simply not wasted.
+    """
+    try:
+        text = str(text or "")
+    except Exception:
+        return False, ""
+    if not text:
+        return False, ""
+    if _MUT_STALE_MARKER in text:
+        return True, "mut"
+    if _OFFSCREEN_MARKER in text:
+        return True, "offscreen"
+    for marker in _OTHER_STALE_MARKERS:
+        if marker in text:
+            return True, "other"
+    for marker in _REFUSAL_MARKERS:
+        if marker in text:
+            return True, ""
+    return False, ""
+
+
+def _ba00_note_result(stats, text):
+    """Fold one tool result into the BA-00 census. Never raises."""
+    if stats is None:
+        return
+    try:
+        wasted, stale_kind = _ba00_classify_result(text)
+        stats.record_outcome(wasted)
+        if stale_kind == "mut":
+            stats.stale_refusals += 1
+        elif stale_kind == "other":
+            stats.stale_refusals_other += 1
+        elif stale_kind == "offscreen":
+            stats.offscreen_refusals += 1
+    except Exception:
+        pass
 
 
 # Daemon tools the model is allowed to see. Everything else the daemon
@@ -4434,6 +4857,13 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
         history.append(
             {"role": "assistant", "content": text, "tool_calls": tool_calls}
         )
+        # BA-00: bracket one model step's dispatch so the census can tell a
+        # turn that advanced nothing (every tool refused) from a mixed turn.
+        if stats is not None:
+            try:
+                stats.begin_turn()
+            except Exception:
+                pass
         for call in tool_calls:
             # Cancellation is checked before EVERY tool call, not just at
             # the outer step boundary.
@@ -4454,8 +4884,18 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
                 summary = ("I stopped the task after %s failed 3 times "
                            "in a row." % (call.get("name") or "the action"))
                 append_activity_line("RESULT partial: %s\n" % summary)
+                if stats is not None:
+                    try:
+                        stats.end_turn()
+                    except Exception:
+                        pass
                 return TaskResult.partial(summary, detail=summary,
                                           evidence=evidence)
+        if stats is not None:
+            try:
+                stats.end_turn()
+            except Exception:
+                pass
     # Budget exhausted: force ONE final summary turn with tools withheld
     # instead of returning a bare error - whatever the model achieved so
     # far is reported to the user, never flailed for more steps.

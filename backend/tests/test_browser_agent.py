@@ -1832,7 +1832,9 @@ class VirtualToolTests(unittest.TestCase):
         ]
         with patch.object(browser_agent.time, "sleep") as sleep_mock, \
              patch.object(browser_agent.time, "monotonic",
-                          side_effect=[0.0, 0.1, 0.1, 0.4]):
+                          side_effect=[0.0, 0.0, 0.1, 0.1, 0.4, 0.4]):
+            # BA-00: the wait.polls span reads the clock twice more (start +
+            # done); the started/elapsed/check values are unchanged.
             result = browser_agent._handle_wait_for(
                 client, {"selector": "#foo", "text": "hello", "timeout_ms": 5000})
         payload = json.loads(result)
@@ -1854,7 +1856,8 @@ class VirtualToolTests(unittest.TestCase):
             {"found": False, "url": "https://x", "title": "t"})
         with patch.object(browser_agent.time, "sleep"), \
              patch.object(browser_agent.time, "monotonic",
-                          side_effect=[0.0, 10.5, 10.5]):
+                          side_effect=[0.0, 0.0, 10.5, 10.5, 10.5]):
+            # BA-00: +2 clock reads for the wait.polls span (see above).
             result = browser_agent._handle_wait_for(
                 client, {"selector": "#foo", "timeout_ms": 15000})
         payload = json.loads(result)
@@ -1871,7 +1874,8 @@ class VirtualToolTests(unittest.TestCase):
             {"found": False, "url": "https://x", "title": "t"})
         with patch.object(browser_agent.time, "sleep"), \
              patch.object(browser_agent.time, "monotonic",
-                          side_effect=[0.0, 6.0, 6.0]):
+                          side_effect=[0.0, 0.0, 6.0, 6.0, 6.0]):
+            # BA-00: +2 clock reads for the wait.polls span (see above).
             result = browser_agent._handle_wait_for(client, {"selector": "#foo"})
         payload = json.loads(result)
         self.assertFalse(payload["found"])
@@ -2631,7 +2635,7 @@ class HistoryTrimTests(unittest.TestCase):
         # need to mock look handler to return images so history grows
         original_handle_look = browser_agent._handle_look
 
-        def fake_handle_look(client, session):
+        def fake_handle_look(client, session, stats=None):
             text = "Page: https://x%d.example\nTitle: T%d\n\nMarks 1\n1 | a | X | 10,10" % (len(seen_histories), len(seen_histories))
             b64 = "img%d" % len(seen_histories)
             session["marks"] = {1: {"cx": 10, "cy": 10, "tag": "a", "label": "X"}}
