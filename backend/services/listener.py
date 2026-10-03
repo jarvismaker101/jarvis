@@ -1,4 +1,5 @@
 import atexit
+import http.client as http_exceptions
 import os
 import re
 import threading
@@ -671,6 +672,10 @@ class _SpeakStopWorker:
         self._lock = threading.Lock()
         self._thread = None
         self._conn = None
+        # [stale-socket retry] the timing anchor and the error behind the last
+        # attempt, so a dead keep-alive socket can be re-dialed immediately.
+        self._started = time.monotonic()
+        self._last_error = None
         self._auth_warned = False
         self._error_warned = False
         self.stats = {
@@ -745,10 +750,32 @@ class _SpeakStopWorker:
                 pass
 
     def _deliver(self):
-        """Send ONE stop request. Never raises; records timing and result."""
+        """Send ONE stop request. Never raises; records timing and result.
+
+        A keep-alive socket the voice process has already closed fails on the
+        FIRST write with a connection-abort error (WinError 10053/10054 and
+        friends). That used to cost the whole barge-in - the stop was dropped
+        and only the NEXT utterance retried on a fresh socket, so Jarvis kept
+        talking over the user. One immediate re-dial turns that into a stop
+        that lands a few milliseconds later instead.
+        """
+        ok, status = self._attempt()
+        if not ok and status is None and self._is_stale_socket():
+            self._close_connection()
+            ok, status = self._attempt()
+        elapsed_ms = (time.monotonic() - self._started) * 1000.0
+        with self._lock:
+            self.stats["last_ms"] = round(elapsed_ms, 1)
+            self.stats["last_status"] = status
+            self.stats["last_ok"] = ok
+            self.stats["delivered" if ok else "failed"] += 1
+        self._mark_delivery(ok, elapsed_ms, status)
+
+    def _attempt(self):
+        """One send on the persistent connection. Returns (ok, status)."""
         from backend.services import local_auth
 
-        started = time.monotonic()
+        self._started = time.monotonic()
         ok, status = False, None
         try:
             conn = self._conn
@@ -770,14 +797,20 @@ class _SpeakStopWorker:
             # Drop the connection so the NEXT attempt dials fresh instead of
             # reusing a socket the server has already closed.
             self._close_connection()
+            self._last_error = exc
             self._warn_error(exc)
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        with self._lock:
-            self.stats["last_ms"] = round(elapsed_ms, 1)
-            self.stats["last_status"] = status
-            self.stats["last_ok"] = ok
-            self.stats["delivered" if ok else "failed"] += 1
-        self._mark_delivery(ok, elapsed_ms, status)
+            ok = False
+        return ok, status
+
+    def _is_stale_socket(self):
+        """True when the last failure was a dead keep-alive socket (not an
+        HTTP-level answer). Those are the ones a fresh dial fixes."""
+        exc = getattr(self, "_last_error", None)
+        if exc is None:
+            return False
+        if isinstance(exc, (ConnectionError, OSError, http_exceptions.HTTPException)):
+            return True
+        return "10053" in str(exc) or "10054" in str(exc) or "10055" in str(exc)
 
     def _warn_auth(self, status):
         with self._lock:

@@ -78,6 +78,15 @@ def _thinking_config(model=None):
             budget = int(raw)
         except ValueError:
             return None
+    if budget == 0:
+        # NOT {"thinkingBudget": 0}. An explicit zero is "disable thinking",
+        # and gemini-3.5-flash-lite rejects exactly that with
+        # 400 INVALID_ARGUMENT - every chat call failed and the turn fell
+        # through to a dead fallback chain. Omitting the field is the model
+        # default and is accepted by every family we ship, so a zero budget is
+        # expressed by leaving it out. A model that refuses even the omitted
+        # case is still covered by the one-shot no-thinkingConfig replay.
+        return None
     return {"thinkingBudget": budget}
 
 _GEMINI_URL = (
@@ -471,10 +480,34 @@ def ask_gemini_chat(messages, temperature=0.7, max_tokens=None, model=None, time
                     )
 
             if resp.status_code != 200:
-                logging.warning(
-                    "[GEMINI CHAT] %d: %s", resp.status_code, _redact(resp.text[:300])
-                )
-                return {}
+                # F56 self-heal: a 400 that names a bad argument is the API
+                # refusing the thinking control. Replay ONCE with the whole
+                # thinkingConfig dropped rather than losing the turn - the
+                # model default is always a legal request.
+                if (resp.status_code == 400
+                        and "generationConfig" in body
+                        and "thinkingConfig" in body["generationConfig"]):
+                    logging.warning(
+                        "[GEMINI CHAT] model rejected thinkingConfig - replaying once without it")
+                    body = dict(body)
+                    body["generationConfig"] = {
+                        k: v for k, v in body["generationConfig"].items()
+                        if k != "thinkingConfig"
+                    }
+                    if handle is None:
+                        resp = _session.post(
+                            url, params={"key": GEMINI_API_KEY}, json=body,
+                            timeout=attempt_timeout)
+                    else:
+                        with bound(handle):
+                            resp = _session.post(
+                                url, params={"key": GEMINI_API_KEY},
+                                json=body, timeout=attempt_timeout)
+                if resp.status_code != 200:
+                    logging.warning(
+                        "[GEMINI CHAT] %d: %s", resp.status_code, _redact(resp.text[:300])
+                    )
+                    return {}
 
             data = resp.json()
             if "error" in data:
