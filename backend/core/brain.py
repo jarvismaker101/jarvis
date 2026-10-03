@@ -2614,6 +2614,131 @@ def is_status_question(msg):
     return bool(_STATUS_QUESTION_RE.search(text))
 
 
+#: R10 — pronouns resolve from the notebook, not the nearest noun.
+#: "that folder" = focus-head folder (active task); "there" = a PLACE
+#: (folder/directory/location), never a file or a browser page; bare "it"
+#: = the focus-head folder when one exists, AMBIGUOUS when a file and a
+#: folder both fit (caller asks once).
+_THAT_FOLDER_RE = re.compile(
+    r"\bthat\s+(?:folder|directory)\b|\bthe\s+same\s+(?:folder|directory)\b",
+    re.IGNORECASE,
+)
+_THERE_RE = re.compile(r"\bthere\b", re.IGNORECASE)
+_BARE_IT_RE = re.compile(r"\bit\b", re.IGNORECASE)
+
+#: "queued task" names a REAL queue entry: the S18 action queue, a held R6
+#: redirect, or an armed confirmation awaiting yes. Anything else is "nothing
+#: is queued" — never invented.
+_QUEUED_TASK_RE = re.compile(
+    r"\bqueued\s+task\b|\bqueue\b",
+    re.IGNORECASE,
+)
+
+
+def resolve_that_folder():
+    """R10: "that folder" from the notebook focus head, or None.
+
+    One resolver, used by the folder-hint path and any future pronoun
+    route — never the nearest noun in the current sentence.
+    """
+    try:
+        return notebook_focus_folder()
+    except Exception:
+        return None
+
+
+def resolve_there():
+    """R10: "there" is always a place — the focus-head folder, or None.
+
+    Never a file, never a browser page: when no folder is in focus the
+    caller asks once instead of guessing.
+    """
+    return resolve_that_folder()
+
+
+def resolve_bare_it(text):
+    """R10: bare "it" from notebook focus — folder path, "ask", or None.
+
+    Returns (kind, value): ("folder", path) when the focus head decides;
+    ("ask", "it ...") when a file entity and a folder entity both fit the
+    job (caller asks once); (None, "") when no "it" is present at all.
+    """
+    if not _BARE_IT_RE.search(text or ""):
+        return None, ""
+    folder = resolve_that_folder()
+    files = []
+    try:
+        with _notebook_lock:
+            entries = list(_notebook_entities)
+        files = [e for e in entries if e.get("kind") == "file"
+                 and e.get("path")]
+    except Exception:
+        files = []
+    if folder and files:
+        # File-vs-folder both fit "it" — Astra: ask once, never guess.
+        return "ask", ("Sir, by 'it' do you mean the folder %s or the file "
+                       "%s?" % (folder, files[-1].get("path")))
+    if folder:
+        return "folder", folder
+    return None, ""
+
+
+def resolve_last_command():
+    """R10: "last command" = last REAL work from the notebook, or None.
+
+    Skips own messages, bare confirmations, stop controls, and status
+    questions — the same skip rules as _record_last_work_request, but read
+    from the notebook ledger so it survives restarts of the globals.
+    """
+    try:
+        with _notebook_lock:
+            entries = list(_notebook_requests)
+    except Exception:
+        return None
+    for entry in reversed(entries):
+        state = str(entry.get("state") or "")
+        if state in ("superseded",):
+            continue
+        return str(entry.get("text") or "")
+    return None
+
+
+def resolve_queued_task():
+    """R10: "queued task" from the real queue entries, or "nothing queued".
+
+    Returns (kind, value): ("action", text) for the oldest S18 entry,
+    ("held", text) for the R6 held redirect, ("approval", text) for an
+    armed confirmation, ("none", "Nothing is queued, sir.") otherwise.
+    """
+    try:
+        with _action_queue_lock:
+            queued = list(_pending_action_requests)
+        if queued:
+            return "action", str(queued[0].get("message") or "")
+    except Exception:
+        pass
+    try:
+        with _held_redirect_lock:
+            held = _held_redirect
+        if held and held.get("text"):
+            return "held", str(held.get("text"))
+    except Exception:
+        pass
+    try:
+        from backend.services.task_agent import agent as _ta
+        if _ta.has_pending_task_confirmation():
+            return "approval", "a file task awaiting your approval"
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            if _pending_opencode_task:
+                return "approval", "a browser task awaiting your approval"
+    except Exception:
+        pass
+    return "none", "Nothing is queued, sir."
+
+
 def _status_snapshot():
     """R12: read the live operational state in one consistent snapshot.
 
@@ -2679,17 +2804,19 @@ def answer_status_question(msg):
     lowered = text.lower()
     asks_queue = bool(re.search(r"\bqueu", lowered))
 
-    # Queue-specific questions get queue-grounded answers first.
+    # Queue-specific questions get queue-grounded answers first — R10 reads
+    # the REAL entries (S18 queue, held redirect, armed approval), never an
+    # invented count.
     if asks_queue:
-        if snap["queued"]:
+        kind, value = resolve_queued_task()
+        if kind == "none":
             if snap["running"]:
-                return ("Sir, the browser task is running. "
-                        "%d task(s) queued, not started." % snap["queued"])
-            return ("Not yet, sir. %d task(s) queued."
-                    % snap["queued"])
+                return "Sir, a task is running. Nothing is queued."
+            return "Nothing is queued, sir."
         if snap["running"]:
-            return "Sir, a task is running. Nothing is queued."
-        return "Nothing is queued, sir."
+            return ("Sir, the browser task is running. "
+                    "Queued: %s — not started." % value[:120])
+        return "Not yet, sir. Queued: %s." % value[:120]
 
     # "Q test" was never a tracked task: ask once, never assert absence.
     if _Q_TEST_RE.search(text):

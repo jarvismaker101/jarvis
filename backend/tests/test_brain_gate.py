@@ -969,5 +969,56 @@ class R7CorrectionReplacesTests(unittest.TestCase):
         self.assertIsNone(_ta.consume_task_confirmation("yes"))
 
 
+class R10ResolveFromNotebookTests(unittest.TestCase):
+    """R10: that/it/there/last/queued resolve from the notebook, not nouns."""
+
+    def tearDown(self):
+        brain._notebook_entities.clear()
+        brain._notebook_requests.clear()
+
+    def test_that_folder_is_focus_head(self):
+        brain.notebook_record_entity("Mayank Malik", "C:\\d\\Mayank Malik",
+                                      kind="folder")
+        self.assertEqual(brain.resolve_that_folder(), "C:\\d\\Mayank Malik")
+        self.assertEqual(brain.resolve_there(), "C:\\d\\Mayank Malik")
+
+    def test_bare_it_asks_when_file_and_folder_fit(self):
+        brain.notebook_record_entity("Mayank Malik", "C:\\d\\Mayank Malik",
+                                      kind="folder")
+        brain.notebook_record_entity("q.txt", "C:\\d\\q.txt", kind="file")
+        kind, value = brain.resolve_bare_it("delete it")
+        self.assertEqual(kind, "ask")
+        self.assertIn("do you mean", value.lower())
+
+    def test_bare_it_resolves_folder_when_only_folder(self):
+        brain.notebook_record_entity("Mayank Malik", "C:\\d\\Mayank Malik",
+                                      kind="folder")
+        kind, value = brain.resolve_bare_it("open it")
+        self.assertEqual(kind, "folder")
+
+    def test_last_command_is_last_real_work(self):
+        rid = brain.notebook_record_request(
+            "create a file in Mayank Malik with hello")
+        self.assertEqual(brain.resolve_last_command(),
+                         "create a file in Mayank Malik with hello")
+        brain.notebook_mark_state(rid, "superseded")
+        brain.notebook_record_request("check whether folder Malik exists")
+        self.assertEqual(brain.resolve_last_command(),
+                         "check whether folder Malik exists")
+
+    def test_queued_task_names_real_entry(self):
+        brain._pending_action_requests.append(
+            {"message": "create folder x", "from_voice": False})
+        try:
+            kind, value = brain.resolve_queued_task()
+            self.assertEqual(kind, "action")
+            self.assertEqual(value, "create folder x")
+        finally:
+            brain._pending_action_requests.clear()
+        kind, value = brain.resolve_queued_task()
+        self.assertEqual(kind, "none")
+        self.assertIn("nothing is queued", value.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

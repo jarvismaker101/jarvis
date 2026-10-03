@@ -861,7 +861,9 @@ def _extract_write_content(raw):
 
 
 #: Pronouns that refer to the folder of the previous turn ("that folder",
-#: "inside it", "in there") — resolved from the last native run's artifacts.
+#: "inside it", "in there") — R10 resolves them from the notebook focus
+#: head, never the nearest noun. "There" is a PLACE (folder), never a file
+#: or browser page; bare "it" asks once when a file and a folder both fit.
 _FOLDER_PRONOUN_RE = re.compile(
     r"\b(?:that|this|the same|same)\s+(?:folder|directory)\b"
     r"|\binside\s+(?:it|there|them)\b"
@@ -1091,12 +1093,14 @@ def _resolve_folder_hint(hint):
             return candidate
         return os.path.normpath(candidate)
     # Pronoun: the R2 notebook focus head first ("that folder" = most recent
-    # compatible folder in the ACTIVE task, not the nearest noun); then the
-    # folder of the previous native turn (create_folder artifact, else parent
-    # of write_file artifact); else None so the planner asks, never guesses.
+    # compatible folder in the ACTIVE task, not the nearest noun — R10's
+    # resolve_that_folder, the one resolver every pronoun route shares);
+    # then the folder of the previous native turn (create_folder artifact,
+    # else parent of write_file artifact); else None so the planner asks,
+    # never guesses.
     try:
         from backend.core import brain as _brain
-        focus = _brain.notebook_focus_folder()
+        focus = _brain.resolve_that_folder()
         if focus and os.path.isdir(focus):
             return focus
     except Exception:

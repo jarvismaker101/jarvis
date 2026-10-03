@@ -1595,14 +1595,25 @@ Tag `local-models`. Documented in full at the top of this map ("Local models as 
 
 `backend/services/task_agent/agent.py`: `classify_confirmation` returns yes/no/rename/inspect/extra/unclear — "yes, don't create it" declines, "yes, but call it X" re-previews under the new name via `_repreview_with_name` + `arm_task_confirmation` (old yes dead), "yes, a quick look" HOLDS the write and asks "create, or only check?", extras never inherit, "did I say yes?" is a question not assent. `consume_task_confirmation` and brain `_consume_opencode_confirmation` both use it (opencode inspect re-arms so a clear "create" next turn approves). Tests: `R4ConfirmationVerdictTests` in `test_code_tools.py`, `R4OpencodeGateTests` in `test_brain_gate.py`.
 
-### Astra R1 — meaning, not first word (`pending`)
+### Astra R1 — meaning, not first word (`450472c`)
 
 Declarative/desire phrasing routes deterministically: `_WANT_CREATE_RE` catches "I want / I need / there should be ... file" ANYWHERE in the sentence ("on my desktop there is a folder Mayank Malik, I want a file inside it"), while `_WANT_ASSERT_ONLY_RE` keeps bare existence ("there is a file") conversational. Both `is_code_tool_request` and `_heuristic_plan` handle the R1 shape (located-write plan with defaulted name). Tests: `R1MeaningNotFirstWordTests` in `test_code_tools.py`.
 
-### Astra R2 — notebook across turns (`pending`)
+### Astra R2 — notebook across turns (`7e99bda`)
 
 `backend/core/brain.py`: bounded in-memory ledger (`_notebook_requests` max 20, `_notebook_entities` max 12) — `notebook_record_request` (id req-N, kind, state seen→…) fed by every `_record_last_work_request`, `notebook_mark_state`, `notebook_record_entity` upsert with focus-head order, `notebook_focus_folder`, `notebook_snapshot` (requests + entities + live `_status_snapshot`). It is a READ model over the existing globals, not a replacement. `_resolve_folder_hint` in `task_agent/agent.py` reads the focus head first ("that folder" = active-task folder); `code_tools.create_folder` / `list_directory` record observed entities. Tests: `R2NotebookTests` in `test_brain_gate.py`.
 
-### Astra R14 — chat has no action voice (`pending`)
-
+### Astra R14 — chat has no action voice (`e97bbed`)
 `backend/core/brain.py`: `_ACTION_CLAIM_RE` extended to the optimistic pre-execution acks ("On it", "Playing/Opening/Checking/Searching/Navigating ... now", "Back in a moment", "I've opened ... for you"); `generate_command_response` now only NAMES the request ("{song}, sir." — completion comes from the result narrator); `handle_research_intent` acks name the request ("Quick lookup for that, sir."); `browser_search` chat path reports the fact ("I ran a search for that."); crash path no longer claims "I started the task"; `_orchestrator_reply` gates suspension/error planner text too; `_ChatRacer.adopt` gates at sentence boundaries (byte-identical passthrough when nothing cut, held-claim redelivery at stream end) so live speech and stored text agree. Tests: `R14NoActionVoiceTests` in `test_brain_gate.py` + updated `test_browser_search_prebuilt_path` expectation in `test_chat_race.py`.
+
+### Astra R3 — all slots before acting (`6d31829`)
+
+`backend/services/task_agent/agent.py`: `_explicit_file_name` ("name it New Zealand" → `New Zealand.txt`; "name it anything/whatever" → the spoken default, never a vague plan); both located-write branches (R1 declarative + imperative) bind exact parent path + frozen name, ask ONE bundled question when content is missing (R11-shaped: "before I create that I still need: …"), and build via `_code_tool_plan` which binds `create_only=True` so an approved create can never silently clobber a file that appeared after the preview; `_confirmation_preview` speaks the exact target ("Ready to create new file … (refusing if it already exists)"). Tests: `R3AllSlotsBeforeActTests` in `test_code_tools.py`.
+
+### Astra R7 — correction replaces, never adds (`8909df4`)
+
+`backend/core/brain.py`: `is_correction` ("that was meant/supposed to be", "I meant check…", "actually just look…", "correction:") + `handle_correction` runs BEFORE the confirmation gates so the old preview can never eat the revision as "unclear"; `_cancel_armed_gates` kills every armed approval (native via new `cancel_pending_task_confirmation` in `task_agent/agent.py`, opencode, research, shared record, browser clarification) so the old yes dies; the superseded notebook record is marked; a check-shaped correction executes read-only immediately ("understood — checking instead"), anything else returns an explicit replace ack. Tests: `R7CorrectionReplacesTests` in `test_brain_gate.py`.
+
+### Astra R10 — that/it/there/last/queued resolve from the notebook (`pending`)
+
+`backend/core/brain.py`: one resolver family over the R2 ledger — `resolve_that_folder`/`resolve_there` (focus head; "there" is always a place, never a file/page), `resolve_bare_it` (folder / ask-once when file+folder both fit / none), `resolve_last_command` (last non-superseded notebook request — skips own/yes/stop/status by construction), `resolve_queued_task` (oldest S18 entry / held R6 redirect / armed approval / "Nothing is queued"); `_resolve_folder_hint` in `task_agent/agent.py` now calls the shared `resolve_that_folder`; the R12 queue-status branch speaks the REAL entry ("Queued: … — not started") instead of an invented count. Tests: `R10ResolveFromNotebookTests` in `test_brain_gate.py`.
