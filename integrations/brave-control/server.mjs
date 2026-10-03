@@ -584,20 +584,96 @@ server.tool(
 server.tool(
   "evaluate",
   "Run arbitrary JavaScript in the page and return the JSON-serialized result (up to 50000 chars).",
-  { expression: z.string().describe("JavaScript expression to evaluate in the page") },
-  async ({ expression }) => withPage(async (p) => {
-    const result = await p.evaluate((expr) => {
+  {
+    expression: z.string().describe("JavaScript expression to evaluate in the page"),
+    awaitPromise: z.boolean().optional().describe("Await a returned Promise before serializing (default false)"),
+  },
+  async ({ expression, awaitPromise }) => withPage(async (p) => {
+    const result = await p.evaluate(async ({ expr, doAwait }) => {
       const fn = new Function(`return (${expr})`)
-      const v = fn()
+      let v = fn()
+      // BA-14: without this, a returned Promise stringified to '{}' and an
+      // async waiter was structurally impossible. Opt-in per call so the
+      // default path stays byte-identical to before.
+      if (doAwait && v && typeof v.then === "function") v = await v
       if (typeof v === "string") return v
       try {
         return JSON.stringify(v)
       } catch {
         return String(v)
       }
-    }, expression)
+    }, { expr: expression, doAwait: !!awaitPromise })
     const text = String(result).slice(0, 50000)
     return { content: [{ type: "text", text: text }] }
+  })
+)
+
+// ── BA-14 (L-5): event-driven wait_for ──
+// The agent used to poll evaluate from Python every 200 ms (15 round trips
+// for a 3 s wait, each re-shipping the same JS). This tool waits INSIDE the
+// daemon with Playwright's own waiters and returns the instant the condition
+// holds: one round trip, no residual 200 ms. locator.waitFor is the
+// waitForSelector equivalent; getByText covers the text case without page-JS
+// injection (no CSP/new-Function concerns). A zero timeout is one immediate
+// check — never "wait forever", which is what a zero Playwright timeout
+// would mean. Invalid selectors report found:false with an error note,
+// matching the old polling semantics (querySelector throwing meant
+// never-found, not a crash).
+server.tool(
+  "wait_for",
+  "Wait event-driven for a CSS selector or text to appear (ONE round trip, returns the instant the condition holds) instead of polling. Returns {found, elapsed_ms, url, title} as JSON.",
+  {
+    selector: z.string().optional().describe("CSS selector to wait for"),
+    text: z.string().optional().describe("Page text to wait for (substring)"),
+    state: z.string().optional().describe('Wait for "attached" (default) or "visible"'),
+    timeout_ms: z.number().int().optional().describe("Max wait in ms (default 5000, cap 30000)"),
+    frame: z.string().optional().describe("CSS selector of the containing <iframe>/<frame>; omit for the top document"),
+  },
+  async ({ selector, text, state, timeout_ms, frame }) => withPage(async (p) => {
+    const t0 = Date.now()
+    const sel = (selector && String(selector).trim()) || ""
+    const txt = (text && String(text).trim()) || ""
+    if (!sel && !txt) {
+      return { content: [{ type: "text", text: "wait_for failed: provide a selector, text, or both - an empty wait verifies nothing." }] }
+    }
+    const mode = String(state || "attached").toLowerCase() === "visible" ? "visible" : "attached"
+    let cap = Number(timeout_ms)
+    if (!Number.isFinite(cap) || cap < 0) cap = 5000
+    cap = Math.min(cap, 30000)
+    const target = (frame && String(frame).trim()) || ""
+    const root = target ? p.frameLocator(target) : p
+    const finish = async (found, error) => {
+      const out = { found: !!found, elapsed_ms: Date.now() - t0, url: p.url(), title: "" }
+      try {
+        out.title = await p.title()
+      } catch {}
+      if (error) out.error = String(error).slice(0, 300)
+      return { content: [{ type: "text", text: JSON.stringify(out) }] }
+    }
+    let handle = null
+    try {
+      handle = sel ? root.locator(sel).first() : root.getByText(txt).first()
+    } catch (err) {
+      return finish(false, err && err.message ? err.message : err)
+    }
+    if (cap <= 0) {
+      try {
+        const present = mode === "visible"
+          ? await handle.isVisible()
+          : (await handle.count()) > 0
+        return finish(present)
+      } catch (err) {
+        return finish(false, err && err.message ? err.message : err)
+      }
+    }
+    try {
+      await handle.waitFor({ state: mode, timeout: cap })
+      return finish(true)
+    } catch (err) {
+      const timedOut = err && (err.name === "TimeoutError" || /timed out/i.test(err.message || ""))
+      if (timedOut) return finish(false)
+      return finish(false, err && err.message ? err.message : err)
+    }
   })
 )
 

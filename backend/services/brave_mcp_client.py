@@ -90,6 +90,10 @@ class BraveMcpClient:
         "download": 45,
         "upload_file": 45,
         "drag_drop": 45,
+        # BA-14: the event-driven waiter may legitimately hold the round
+        # trip for the full requested wait (virtual timeout_ms caps at
+        # 10 s) plus settle margin.
+        "wait_for": 15,
     }
 
     def __init__(self, base_url=None, token=None, timeout=None):

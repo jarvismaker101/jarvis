@@ -1410,7 +1410,7 @@ _VIRTUAL_TOOL_DEFS = [
     ),
     _spec(
         "wait_for",
-        "Wait for async page updates (search results, SPA loads) in one step. Checks the TOP DOCUMENT ONLY - it cannot see text or selectors inside iframes (a cross-origin player's timecode will never appear here). Waits up to timeout_ms (default 5000, hard cap 10000) polling every 200ms for selector (querySelector) or text (body innerText contains) to appear. Supply at least one of selector/text: an empty wait verifies nothing and is refused. Returns {found: true/false, url, title}.",
+        "Wait for async page updates (search results, SPA loads) in one step. Checks the TOP DOCUMENT ONLY - it cannot see text or selectors inside iframes (a cross-origin player's timecode will never appear here). Event-driven on current daemons (one round trip, returns the instant the condition holds; Python polling fallback on older ones). Waits up to timeout_ms (default 5000, hard cap 10000) for selector (querySelector) or text (body innerText contains) to appear. Supply at least one of selector/text: an empty wait verifies nothing and is refused. Returns {found: true/false, url, title}.",
         {
             "type": "object",
             "properties": {
@@ -3041,7 +3041,7 @@ def _handle_batch_probe(client, arguments):
     return _clip_result(raw)
 
 
-def _handle_wait_for(client, arguments, stats=None):
+def _handle_wait_for(client, arguments, stats=None, session=None):
     selector = arguments.get("selector")
     text = arguments.get("text")
     # F41: a wait with neither a selector nor text used to return found=true
@@ -3067,12 +3067,94 @@ def _handle_wait_for(client, arguments, stats=None):
         timeout_ms = 10000
     if timeout_ms < 0:
         timeout_ms = 0
+    # BA-14: a daemon that advertises its own event-driven `wait_for` gets
+    # ONE round trip instead of N polls. The capability comes from the task's
+    # daemon tool list (see _agent_loop_inner) — never error-sniffed — so an
+    # old daemon transparently keeps the polling path below.
+    daemon_names = session.get("daemon_tools") if isinstance(session, dict) else None
+    if daemon_names and "wait_for" in daemon_names:
+        return _handle_wait_for_event(client, selector, text, timeout_ms,
+                                       stats=stats, session=session)
+    return _handle_wait_for_poll(client, selector, text, timeout_ms,
+                                 stats=stats)
+
+
+#: Markers proving the daemon predates the event-driven `wait_for` tool
+#: (BA-14): only THESE fall back to polling. Any other daemon error is a
+#: real failure — silently converting it to N polls would burn round trips
+#: hiding a breakage.
+_UNKNOWN_TOOL_MARKERS = (
+    "unknown tool",
+    "tool not found",
+    "method not found",
+    "-32601",
+)
+
+
+def _is_unknown_tool_error(exc):
+    try:
+        text = str(exc or "").lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in _UNKNOWN_TOOL_MARKERS)
+
+
+def _handle_wait_for_event(client, selector, text, timeout_ms, stats=None,
+                           session=None):
+    """One daemon round trip for the whole wait (BA-14).
+
+    The daemon waits inside its own process and returns the instant the
+    condition holds; the BA-00 span still closes with polls=1 so a slow wait
+    attributes to one daemon round trip, not many cheap polls. An old daemon
+    that somehow lacks the tool (capability raced a downgrade) falls back to
+    polling; a daemon that HAS it but answers garbage fails loudly — that is
+    a contract violation, not a missing capability.
+    """
+    payload = {"timeout_ms": timeout_ms}
+    if selector:
+        payload["selector"] = selector
+    if text:
+        payload["text"] = text
+    _wait = _Span("wait.polls")
+    try:
+        raw = client.call_tool("wait_for", payload)
+    except Exception as exc:
+        if _is_unknown_tool_error(exc):
+            return _handle_wait_for_poll(client, selector, text, timeout_ms,
+                                         stats=stats)
+        _wait.done(stats, polls=1, found=False)
+        return _clip_result("wait_for failed: daemon waiter error: %s" % exc)
+    data = _parse_json_result(raw)
+    if not isinstance(data, dict) or "found" not in data:
+        _wait.done(stats, polls=1, found=False)
+        return _clip_result(
+            "wait_for error: daemon waiter returned an unparsable result: %s"
+            % ((raw or "")[:500] if isinstance(raw, str) else str(raw or "")))
+    try:
+        found = bool(data.get("found"))
+    except Exception:
+        found = False
+    try:
+        elapsed_ms = int(data.get("elapsed_ms", 0))
+    except Exception:
+        elapsed_ms = 0
+    out = {"found": found, "elapsed_ms": elapsed_ms,
+           "url": data.get("url") or "", "title": data.get("title") or ""}
+    if data.get("error"):
+        out["error"] = str(data.get("error"))[:300]
+    _wait.done(stats, polls=1, found=found)
+    return _clip_result(json.dumps(out))
+
+
+def _handle_wait_for_poll(client, selector, text, timeout_ms, stats=None):
+    """The pre-BA-14 polling path, kept as the capability-gated fallback."""
     sel_json = json.dumps(selector) if isinstance(selector, str) else "null"
     text_json = json.dumps(text) if isinstance(text, str) else "null"
-    # Python-side poll loop: the daemon stringify is synchronous, so a
-    # Promise-based waiter would stringify to '{}' and hang. Each poll is
-    # ONE synchronous IIFE checking the page; Python sleeps between polls
-    # and stops at the timeout, reporting found + elapsed_ms.
+    # Polling fallback for daemons predating the event-driven `wait_for`
+    # tool: the old daemon stringify is synchronous, so a Promise-based
+    # waiter would stringify to '{}' and hang. Each poll is ONE synchronous
+    # IIFE checking the page; Python sleeps between polls and stops at the
+    # timeout, reporting found + elapsed_ms.
     js = (
         "(() => {"
         "const selector = %s;"
@@ -4173,7 +4255,8 @@ def _run_virtual_tool(client, name, arguments, session, stats=None):
     if name == "batch_probe":
         return _handle_batch_probe(client, arguments), None
     if name == "wait_for":
-        return _handle_wait_for(client, arguments, stats=stats), None
+        return _handle_wait_for(client, arguments, stats=stats,
+                                session=session), None
     if name == "fill":
         return _handle_fill(client, arguments), None
     if name == "click_text":
@@ -5021,6 +5104,15 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
         except Exception as exc:
             return _fail_and_log("tools/list failed: %s" % exc)
         _note_pooled_tools(client, tool_defs)
+    # BA-14: the daemon's own tool names, captured BEFORE allowlisting — the
+    # capability is about what the daemon HAS (event-driven `wait_for`?),
+    # not what the model may SEE. Virtual handlers read session["daemon_tools"]
+    # to prefer the event-driven path with a polling fallback on old daemons.
+    try:
+        daemon_tool_names = {t.get("name") for t in tool_defs
+                             if isinstance(t, dict)}
+    except Exception:
+        daemon_tool_names = set()
     # Allowlist the daemon tools BEFORE the model ever sees them.
     tool_defs = [
         tool for tool in tool_defs
@@ -5033,6 +5125,7 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
         tool_defs = list(_VIRTUAL_TOOL_DEFS)
     session = {"marks": {}, "failures": FailureTracker(), "tool_failures": [],
                "job": job, "completed_actions": [], "url": "", "tab": "",
+               "daemon_tools": daemon_tool_names,
                "trace": trace if trace is not None else []}
     history = [
         {"role": "system", "content": _SYSTEM_PROMPT},
