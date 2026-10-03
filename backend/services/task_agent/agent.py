@@ -1110,6 +1110,125 @@ def _located_write_folder(raw):
     return None
 
 
+#: R15 — folder-name candidate match. "malik" may CANDIDATE "Mayank Malik"
+#: but never silently renames: lookup ignores case/extra spaces, the preview
+#: shows the CANONICAL on-disk spelling, and ambiguity asks once. The cued→
+#: queued repair stays status-only (brain._CUED_TASK_RE) — never filenames.
+def _norm_folder_token(text):
+    """Fold a folder name for lookup: case-insensitive, spaces collapsed."""
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _folder_name_candidates(name, roots):
+    """All on-disk folders under *roots* matching *name*, canonical paths.
+
+    Exact (case/space-insensitive) matches lead, then prefix, then
+    containment — every entry is the real on-disk path, never the spoken
+    guess. Returns [] when nothing matches.
+    """
+    want = _norm_folder_token(name)
+    if not want:
+        return []
+    scored = []
+    for root in roots or []:
+        try:
+            entries = sorted(os.listdir(root))
+        except Exception:
+            continue
+        for entry in entries:
+            full = os.path.join(root, entry)
+            try:
+                if not os.path.isdir(full):
+                    continue
+            except Exception:
+                continue
+            have = _norm_folder_token(entry)
+            if have == want:
+                scored.append((0, full))
+            elif have.startswith(want) or want.startswith(have):
+                scored.append((1, full))
+            elif want in have:
+                scored.append((2, full))
+    scored.sort(key=lambda item: (item[0], item[1].lower()))
+    seen, out = set(), []
+    for _score, path in scored:
+        key = os.path.normcase(os.path.normpath(path))
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def resolve_folder_name(name, roots=None):
+    """R15: resolve a spoken folder name to (kind, value).
+
+    - ("exact", path): one exact (case-insensitive) on-disk match.
+    - ("candidates", [paths]): prefix/containment matches — caller shows
+      them and asks once, never picks silently.
+    - ("none", ""): no on-disk match — caller asks, never invents.
+    """
+    if not (name or "").strip():
+        return "none", ""
+    folders = {}
+    try:
+        folders = _known_folders()
+    except Exception:
+        folders = {}
+    if roots is None:
+        roots = [folders.get(key) for key in
+                 ("desktop", "documents", "downloads", "home")]
+        roots = [r for r in roots if r and os.path.isdir(r)]
+    matches = _folder_name_candidates(name, roots)
+    if not matches:
+        return "none", ""
+    want = _norm_folder_token(name)
+    exact = [p for p in matches
+             if _norm_folder_token(os.path.basename(p)) == want]
+    if len(exact) == 1:
+        return "exact", exact[0]
+    if len(exact) > 1:
+        return "candidates", exact
+    return "candidates", matches
+
+
+def pre_execution_recheck(path, expect):
+    """R15: re-verify a resolved target JUST before the write runs.
+
+    - expect="create": the parent must still exist, stay inside the granted
+      area, and the file must NOT have appeared since the preview — any
+      change stops the write, never renames or overwrites silently.
+    - expect="folder": the target dir (or its parent for a create) must
+      still exist.
+    Returns (ok, reason): ok=True runs; ok=False stops with the reason.
+    """
+    target = os.path.normpath(str(path or ""))
+    if not target or target == ".":
+        return False, "no target path"
+    try:
+        from backend.services import code_grants as _grants
+        if expect == "folder":
+            probe = (target if os.path.isdir(target)
+                     else os.path.dirname(target) or target)
+            allowed, resolved, reason = _grants.grant_check(probe)
+            if not allowed:
+                return False, reason or "outside the allowed area"
+            if not os.path.isdir(resolved or probe):
+                return False, "the folder is no longer there"
+            return True, ""
+        parent = os.path.dirname(target) or target
+        allowed, _resolved, reason = _grants.grant_check(parent)
+        if not allowed:
+            return False, reason or "outside the allowed area"
+        if not os.path.isdir(parent):
+            return False, "the folder is no longer there"
+        if os.path.exists(target):
+            return False, ("the file appeared after the preview — "
+                            "nothing was overwritten")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc) or "recheck failed"
+
+
 def _resolve_folder_hint(hint):
     """Turn a located-write folder hint into an absolute folder path.
 
@@ -1125,7 +1244,6 @@ def _resolve_folder_hint(hint):
         name = (detail or "").strip()
         if not name:
             return None
-        lowered = name.lower()
         try:
             folders = _known_folders()
         except Exception:
@@ -1134,6 +1252,14 @@ def _resolve_folder_hint(hint):
             base = folders.get(key) or ""
             if base and _normalize_fs_path(name) == _normalize_fs_path(base):
                 return base
+        # R15: the spoken name is only a CANDIDATE lookup against the real
+        # folders — an exact (case-insensitive) match resolves; ambiguity or
+        # no match returns None so the caller asks once, never guesses.
+        kind15, value15 = resolve_folder_name(name)
+        if kind15 == "exact":
+            return value15
+        if kind15 == "candidates":
+            return None
         desktop = folders.get("desktop") or ""
         candidate = name if os.path.isabs(name) else (
             os.path.join(desktop, name) if desktop else name)
@@ -3094,6 +3220,29 @@ def execute_plan(plan, context, task_text="", confirmed=False):
                 if write_path and _path_is_inside(write_path, original):
                     skip_reason = "prerequisite failed: folder %s" % original
                     break
+            # R15: re-check the target JUST before the write. The parent may
+            # have vanished, the grant may have narrowed, or the file may
+            # have appeared after the preview — any change STOPS the write,
+            # never renames or overwrites silently.
+            if not skip_reason and write_path and confirmed:
+                expect = "create" if args.get("create_only") else "replace"
+                if expect == "create":
+                    ok15, why15 = pre_execution_recheck(write_path, "create")
+                    if not ok15:
+                        skip_reason = "pre-execution recheck: %s" % why15
+            if skip_reason and skip_reason.startswith(
+                    "pre-execution recheck"):
+                outcomes.append({
+                    "tool": tool,
+                    "status": "failed",
+                    "result": "",
+                    "reason": skip_reason,
+                    "goal": _goal_of(step),
+                    "fragment": ("Stopped, sir — %s. Nothing was "
+                                 "overwritten." % skip_reason
+                                 .replace("pre-execution recheck: ", "")),
+                })
+                continue
         if skip_reason:
             outcomes.append({
                 "tool": tool,

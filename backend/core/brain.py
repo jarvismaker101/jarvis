@@ -3703,6 +3703,28 @@ def _cancel_armed_gates(reason):
     return True
 
 
+def answer_exact_vs_candidate(name, resolved):
+    """R15: "is there a folder named Malik" names exact vs candidate.
+
+    *resolved* is the ("kind", value) from
+    task_agent.resolve_folder_name. Exact → plain confirmation with the
+    canonical spelling; candidates → "no exact …, but … exists" with the
+    real on-disk names; none → plain absence. Never a bare yes/no that
+    hides the alias.
+    """
+    spoken = (name or "").strip() or "that"
+    if not resolved:
+        return "Sir, I could not verify that folder."
+    kind, value = resolved
+    if kind == "exact":
+        return "Yes, sir. The folder %s exists." % value
+    if kind == "candidates" and value:
+        names = ", ".join(value[:3]) if isinstance(value, list) else value
+        return ("Sir, no exact folder named %s — but this exists: %s. "
+                "Shall I use it?" % (spoken, names))
+    return "No, sir. No folder named %s was found." % spoken
+
+
 def handle_correction(msg, from_voice=False, voice_compact=False):
     """R7: replace the old request with the corrected one — never add.
 

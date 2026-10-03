@@ -344,6 +344,54 @@ class R9SttSafeConfirmationTests(unittest.TestCase):
         self.assertEqual(raw, "yes yesterday, no now")
 
 
+class R15CarefulNameMatchingTests(unittest.TestCase):
+    """R15: lookup ignores case, preview shows canon, writes recheck."""
+
+    def test_lowercase_candidates_canonical(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "Mayank Malik"))
+            kind, value = agent.resolve_folder_name(
+                "malik", roots=[root])
+            self.assertEqual(kind, "candidates")
+            self.assertIn("Mayank Malik", value[0])
+
+    def test_exact_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "Mayank Malik"))
+            kind, value = agent.resolve_folder_name(
+                "mayank malik", roots=[root])
+            self.assertEqual(kind, "exact")
+            self.assertTrue(value.endswith("Mayank Malik"))
+
+    def test_no_match_is_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                agent.resolve_folder_name("zznope", roots=[root]),
+                ("none", ""))
+
+    def test_cued_repair_never_touches_filenames(self):
+        kind, value = agent.resolve_folder_name("cued task", roots=[])
+        self.assertEqual((kind, value), ("none", ""))
+
+    def test_precheck_stops_when_file_appeared(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "New Zealand.txt")
+            ok, _ = agent.pre_execution_recheck(target, "create")
+            self.assertTrue(ok)
+            with open(target, "w") as fh:
+                fh.write("someone else")
+            ok2, why2 = agent.pre_execution_recheck(target, "create")
+            self.assertFalse(ok2)
+            self.assertIn("appeared", why2)
+
+    def test_exact_vs_candidate_answer(self):
+        from backend.core import brain as _brain
+        reply = _brain.answer_exact_vs_candidate(
+            "Malik", ("candidates", ["C:\\d\\Mayank Malik"]))
+        self.assertIn("no exact folder named malik", reply.lower())
+        self.assertIn("Mayank Malik", reply)
+
+
 class R1MeaningNotFirstWordTests(unittest.TestCase):
     """R1: the WANT anywhere in the sentence is the request."""
 
