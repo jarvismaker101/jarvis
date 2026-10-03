@@ -55,9 +55,10 @@ _INTENT_PROMPT = (
     ' {"action": "open_website", "input": "site.com"} {"action": "launch_app", "input": "app"}'
     ' {"action": "youtube_play", "input": "song"} {"action": "search", "input": "query"}'
     ' (+ browser chrome|edge|brave)\n\n'
-    'Rules: "how are you" -> chat NOT research. screen/region no steps. task has task_description. tool has steps. research has query.'
-    ' Hinglish e.g. "deepseek kya hai, dhundho" -> research.\n\n'
-    'Reply ONLY JSON: {"intent": "chat"|"tool"|"screen"|"region"|"research"|"task", "steps": [], "query": "...", "task_description": "...", "original": "..."}\n'
+    'Rules: "how are you" -> chat not research; screen/region no steps; task/task_description; tool/steps; research/query.'
+    ' Hinglish e.g. "deepseek kya hai, dhundho" -> research.\n'
+    '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "".\n'
+    'Reply ONLY JSON: {"intent": "chat"|"tool"|"screen"|"region"|"research"|"task", "reply": "...", "steps": [], "query": "...", "task_description": "...", "original": "..."}\n'
     "User message: __MESSAGE__"
 )
 
@@ -80,16 +81,34 @@ def _extract_json(content):
 
 
 def _parse_intent_json(content, message):
-    """Normalise any model output into the canonical router result dict."""
+    """Normalise any model output into the canonical router result dict.
+
+    [S6] A ``chat`` verdict also carries ``reply`` - the answer the router
+    itself wrote, so a conversational turn costs ONE model call instead of a
+    classification call followed by a separate chat completion. Non-chat
+    verdicts never carry a reply: routing decides the action, and their
+    ``reply`` is empty.
+    """
     result = {
         "intent": "chat",
         "steps": [],
         "task_description": "",
         "query": message,
+        "reply": "",
     }
 
     parsed = _extract_json(content)
     intent = parsed.get("intent")
+
+    if intent == "chat":
+        # [S6] The router answered in the same call. Anything unusable (absent,
+        # not a string, empty after stripping) leaves reply empty, and the
+        # caller falls back to the normal chat model - a failed single call
+        # must never cost the user their answer.
+        reply = parsed.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            result["reply"] = re.sub(r"\s+", " ", reply).strip()[:1200]
+        return result
 
     if intent == "research":
         research_q = str(parsed.get("query") or parsed.get("original") or message).strip()
@@ -396,6 +415,9 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
         "steps": [],
         "task_description": "",
         "query": message,
+        # [S6] No classifier answer came back, so there is no reply to speak:
+        # the caller falls back to the chat model rather than inventing one.
+        "reply": "",
         # [PERF] P1-19 — which hop produced a verdict travels with the verdict,
         # so the latency waterfall can say whether OpenRouter, Gemini or Groq
         # answered (and "none" when every hop failed).
@@ -427,6 +449,11 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
             if result["intent"] != "chat" or content:
                 # Even a chat verdict from the model is a deliberate answer.
                 result["_source"] = provider      # [PERF] P1-19 (hop label)
+                if (result.get("reply") and selected
+                        and provider != selected[0]):
+                    # [S5] A fallback hop may ROUTE the turn, but the text the
+                    # user hears is always the SELECTED model's own reply.
+                    result["reply"] = ""
                 return result
         except Exception as exc:
             logging.warning("[INTENT] %s classifier unavailable: %s", provider, exc)

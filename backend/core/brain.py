@@ -2057,13 +2057,65 @@ class _ChatRacer:
         return self._has_stream
 
 
-def handle_chat(user_message, voice_compact=False, commit_response=True, stream=None, prebuilt=None, live_stream=None):
+def _finalize_chat_reply(user_message, content, pieces, stream,
+                         commit_response, request_id):
+    """The shared tail of every chat reply: sanity floor, F26 uncertainty
+    handling, history commit, work-event record. Returns the final text.
+
+    Split out of :func:`handle_chat` so a reply the intent router already
+    wrote ([S6] one call for classification AND answer) goes through exactly
+    the same commit/stream/memory path as a streamed chat completion - it is
+    the same kind of answer, just produced earlier and by the router.
+    """
+    if not content:
+        content = "I'm having trouble connecting. Please try again."
+    # F26 - the uncertainty/clarification decision must happen BEFORE speech.
+    # With a stream consumer attached every delta has already been spoken, so
+    # swapping the reply here would speak one answer and store a different
+    # permission question. When the stream produced nothing, nothing has been
+    # spoken yet and the rewrite is still safe.
+    if stream is not None and pieces:
+        if re.search(_UNSURE_RE, content):
+            print("[CHAT] Answer looked unsure - already spoken, keeping it verbatim.")
+    elif re.search(_UNSURE_RE, content):
+        print("[CHAT] Answer looked unsure - asking before researching.")
+        if maybe_proactive_research(user_message):
+            content = _confirmation_question()
+    if commit_response:
+        _commit_chat("assistant", content)
+    print("[CHAT] Reply:", content)
+    # G9 (F07): the chat exchange lands in the work-event store (bounded,
+    # masked) - cross-restart continuity beyond the 20-message window.
+    if memory_store is not None:
+        try:
+            memory_store.record_event(
+                "chat_exchange",
+                "user: %s" % user_message,
+                request_id=request_id,
+                detail={"reply": content[:300]},
+            )
+            # F07: the terminal event LINKED to the identified request. Chat is
+            # a projection of the work-event store, not a parallel record.
+            if request_id:
+                memory_store.record_result(request_id, "completed",
+                                           summary=content)
+        except Exception:
+            pass
+    return content
+
+
+def handle_chat(user_message, voice_compact=False, commit_response=True, stream=None, prebuilt=None, live_stream=None, answered=None):
     """Handle a chat message.
 
     If *stream* is a callable(delta_text), the reply is delivered token by
     token as it is generated (live typewriter feel) instead of waiting for
     the full response. *_commit_response* controls whether the final text is
     stored to conversation memory.
+
+    [S6] *answered* is a reply the intent router already produced in the same
+    call that classified the turn. When it is set the chat model is NOT called
+    at all - one LLM call served both the route and the answer - and the text
+    still travels the normal commit/stream/memory path.
     """
     print("\n[CHAT] Processing chat...")
 
@@ -2077,6 +2129,18 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
             request_id = memory_store.begin_request(user_message, route="chat")
         except Exception:
             request_id = None
+
+    if answered:
+        # [S6] The router already wrote this answer. Emit it as a single delta
+        # so a streaming consumer (voice/UI) sees exactly one reply, and skip
+        # message building and the chat model entirely.
+        content = re.sub(r"\s+", " ", str(answered)).strip()
+        pieces = []
+        if stream:
+            stream(content)
+            pieces = [content]
+        return _finalize_chat_reply(
+            user_message, content, pieces, stream, commit_response, request_id)
 
     built = prebuilt if prebuilt is not None else _build_chat_messages(user_message, voice_compact=voice_compact)
 
@@ -2130,41 +2194,8 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
             return response
         content = re.sub(r"\s+", " ", result["choices"][0]["message"]["content"]).strip()
 
-    if not content:
-        content = "I'm having trouble connecting. Please try again."
-    # F26 — the uncertainty→clarification decision must happen BEFORE speech.
-    # With a stream consumer attached every delta has already been spoken, so
-    # swapping the reply here would speak one answer and store a different
-    # permission question. When the stream produced nothing, nothing has been
-    # spoken yet and the rewrite is still safe.
-    if stream is not None and pieces:
-        if re.search(_UNSURE_RE, content):
-            print("[CHAT] Answer looked unsure — already spoken, keeping it verbatim.")
-    elif re.search(_UNSURE_RE, content):
-        print("[CHAT] Answer looked unsure — asking before researching.")
-        if maybe_proactive_research(user_message):
-            content = _confirmation_question()
-    if commit_response:
-        _commit_chat("assistant", content)
-    print("[CHAT] Reply:", content)
-    # G9 (F07): the chat exchange lands in the work-event store (bounded,
-    # masked) — cross-restart continuity beyond the 20-message window.
-    if memory_store is not None:
-        try:
-            memory_store.record_event(
-                "chat_exchange",
-                "user: %s" % user_message,
-                request_id=request_id,
-                detail={"reply": content[:300]},
-            )
-            # F07: the terminal event LINKED to the identified request. Chat is
-            # a projection of the work-event store, not a parallel record.
-            if request_id:
-                memory_store.record_result(request_id, "completed",
-                                           summary=content)
-        except Exception:
-            pass
-    return content
+    return _finalize_chat_reply(
+        user_message, content, pieces, stream, commit_response, request_id)
 
 
 
@@ -4168,6 +4199,34 @@ def _process_message_inner(
         return response
 
     if not msg.lower().startswith("command"):
+        # [S6] ONE call, two jobs: the intent router classified this turn AND
+        # wrote the answer, so a plain conversational turn no longer pays for a
+        # second chat completion. The reply is used ONLY here - after every
+        # deterministic net (screen question, fresh-info search, task shape) had
+        # its chance to upgrade the route - so a misrouted chat verdict still
+        # becomes research/task/screen exactly as before. An empty reply (the
+        # fast path, or a router that returned no text) falls through to the
+        # normal chat model below.
+        router_reply = str((intent or {}).get("reply") or "").strip()
+        if router_reply:
+            if racer is not None:
+                # The answer already exists, so the speculative chat stream is
+                # pure waste - same cancellation every non-chat route does.
+                try:
+                    racer.cancel()
+                except Exception:
+                    pass
+            print("[INTENT] Chat answered by the router (no second LLM call)")
+            response = handle_chat(
+                msg,
+                voice_compact=voice_compact,
+                commit_response=commit_response,
+                stream=stream_reply,
+                answered=router_reply,
+            )
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, response)
+            return response
         if racer is not None:
             prebuilt = racer.built()
             live_stream = None

@@ -826,7 +826,17 @@ class ResearchStateClearTests(unittest.TestCase):
 
 class IntentDeadlineTests(unittest.TestCase):
     """F24: classify_intent threads ONE monotonic deadline through primary
-    and fallback — the advertised budget is real and never exceeded."""
+    and fallback �?" the advertised budget is real and never exceeded."""
+
+    def setUp(self):
+        from backend.services import intent as _int
+        # The hop ORDER depends on the user's persisted intent selection (the
+        # selected model goes FIRST, then the shipped chain), and these tests
+        # reason about the chain order. Pin "no explicit selection" so the
+        # deadline maths is the same on every machine.
+        patcher = patch.object(_int, "_selected_intent_model", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_zero_budget_fast_fails_to_chat_without_calls(self):
         from backend.services import intent as _int
