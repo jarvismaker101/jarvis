@@ -2082,10 +2082,13 @@ class VirtualToolTests(unittest.TestCase):
             client.call_tool.call_args_list[1][0][1]["expression"], "location.href")
 
     def test_click_mark_second_evaluate_failure_degrades_gracefully(self):
+        # BA-06: only TWO consecutive failures degrade to unknown — a
+        # single blip is absorbed by the probe retry (see next test).
         session = {"marks": {1: {"cx": 25, "cy": 30, "tag": "a", "label": "Home"}}}
         client = Mock()
         client.call_tool.side_effect = [
             json.dumps({"clicked": True, "tag": "a", "href": "https://x/before"}),
+            RuntimeError("browser closed"),
             RuntimeError("browser closed"),
             json.dumps({"title": "Page", "url": "https://x/after", "items": []}),
         ]
@@ -2096,6 +2099,25 @@ class VirtualToolTests(unittest.TestCase):
         self.assertTrue(payload["clicked"])
         self.assertIn("unknown", payload["url"])
         self.assertFalse(payload["navigated"])
+
+    def test_click_mark_single_url_blip_absorbed_by_probe_retry(self):
+        # BA-06: one dropped connection on the post-click url read costs
+        # 50 ms, not the page identity.
+        session = {"marks": {1: {"cx": 25, "cy": 30, "tag": "a", "label": "Home"}}}
+        client = Mock()
+        client.call_tool.side_effect = [
+            json.dumps({"clicked": True, "tag": "a", "href": "https://x/before"}),
+            RuntimeError("browser closed"),
+            "https://x/after",
+            json.dumps({"title": "Page", "url": "https://x/after", "items": []}),
+        ]
+        with patch.object(browser_agent.time, "sleep"):
+            result = browser_agent._handle_click_mark(client, session,
+                                                      {"index": 1})
+        payload = json.loads(result)
+        self.assertTrue(payload["clicked"])
+        self.assertEqual(payload["url"], "https://x/after")
+        self.assertTrue(payload["navigated"])
 
     def _look_capture_session(self, **overrides):
         capture = {"url": "https://x", "doc": "111", "mut": "7", "dpr": "1",

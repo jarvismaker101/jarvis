@@ -1620,6 +1620,37 @@ def _write_inline_screenshot(client, path):
     return False
 
 
+def _probe(client, expression, attempts=2, timeout=8.0):
+    """BA-06: read-only evaluate with a short timeout and one fast retry.
+
+    The virtual handlers used to call ``client.call_tool("evaluate", ...)``
+    directly, so one dropped connection turned a read-only probe into a
+    failed look / failed target check — costing a full model turn to
+    recover. Retrying is safe here because these are read-only probes
+    (``tool_policy.probe_expression_error`` already guarantees no
+    mutation), so this never violates the single-attempt-for-mutations
+    invariant that keeps model-issued ``evaluate`` at ``max_attempts = 1``.
+
+    The ``timeout`` kwarg needs the L-15 per-call client; older or test
+    clients without it fall back to the client's default timeout.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            try:
+                return client.call_tool("evaluate",
+                                        {"expression": expression},
+                                        timeout=timeout)
+            except TypeError:
+                return client.call_tool("evaluate",
+                                        {"expression": expression})
+        except Exception as exc:
+            last = exc
+            if i + 1 < attempts:
+                time.sleep(0.05)
+    raise last
+
+
 def _handle_look(client, session, stats=None):
     """Composite look: evaluate -> screenshot -> downscale -> annotate -> JPEG (reordered, no threads)."""
     tmp_path = None
@@ -1706,7 +1737,7 @@ def _handle_look(client, session, stats=None):
         )
         try:
             _sp = _Span("look.evaluate")
-            raw = client.call_tool("evaluate", {"expression": js})
+            raw = _probe(client, js)
             _sp.done(stats, marks=len(js))
         except Exception as exc:
             return _clip_result("look failed: evaluate error: %s" % exc), None
@@ -2040,7 +2071,7 @@ _CAPTURE_STATE_JS = (
 def _capture_state(client):
     """F39: page identity/scale right now, or None when unreadable."""
     try:
-        raw = client.call_tool("evaluate", {"expression": _CAPTURE_STATE_JS})
+        raw = _probe(client, _CAPTURE_STATE_JS)
     except Exception:
         return None
     payload = _parse_json_result(raw)
@@ -2168,7 +2199,7 @@ def _mark_target_state(client, stored, stats=None):
         # BA-00: this probe is the "validation" half of every guarded
         # click/fill — timed separately so its cost is visible per task.
         _val = _Span("act.validate")
-        raw = client.call_tool("evaluate", {"expression": js})
+        raw = _probe(client, js)
         _val.done(stats)
     except Exception as exc:
         return None, "Target check failed (%s) - call look again." % exc
@@ -2542,7 +2573,7 @@ def _after_state(client):
     or empty string '' on any failure. Never raises.
     """
     try:
-        raw = client.call_tool("evaluate", {"expression": _AFTER_STATE_JS})
+        raw = _probe(client, _AFTER_STATE_JS)
         data = _parse_json_result(raw)
         if not isinstance(data, dict):
             return ""
@@ -2584,7 +2615,7 @@ def _click_and_confirm(client, name, click_js):
     url = href_before
     url_known = True
     try:
-        raw_url = client.call_tool("evaluate", {"expression": "location.href"})
+        raw_url = _probe(client, "location.href")
         if isinstance(raw_url, str):
             text_url = raw_url.strip()
             try:
@@ -2714,7 +2745,7 @@ _LOCATOR_SUCCESS_RE = re.compile(
 def _page_url(client):
     """The live page's URL ("" when it cannot be read)."""
     try:
-        raw = client.call_tool("evaluate", {"expression": "location.href"})
+        raw = _probe(client, "location.href")
     except Exception:
         return ""
     if raw is None:
@@ -2779,7 +2810,7 @@ def _locator_target(arguments, css, frame):
 def _real_locate(client, name, resolve_js):
     """One synchronous resolve probe -> (identity payload, error text)."""
     try:
-        raw = client.call_tool("evaluate", {"expression": resolve_js})
+        raw = _probe(client, resolve_js)
     except Exception as exc:
         return None, "%s failed: target resolution error: %s" % (name, exc)
     payload = _parse_json_result(raw)
@@ -2856,7 +2887,7 @@ def _read_control_state(client, css):
     except Exception:
         return None
     try:
-        raw = client.call_tool("evaluate", {"expression": js})
+        raw = _probe(client, js)
     except Exception:
         return None
     state = _parse_json_result(raw)
@@ -3035,7 +3066,7 @@ def _handle_batch_probe(client, arguments):
         "})()" % exprs_json
     )
     try:
-        raw = client.call_tool("evaluate", {"expression": js})
+        raw = _probe(client, js)
     except Exception as exc:
         return _clip_result("batch_probe failed: evaluate error: %s" % exc)
     return _clip_result(raw)
@@ -3173,7 +3204,7 @@ def _handle_wait_for_poll(client, selector, text, timeout_ms, stats=None):
     polls = 0
     while True:
         try:
-            raw = client.call_tool("evaluate", {"expression": js})
+            raw = _probe(client, js)
         except Exception as exc:
             _wait.done(stats, polls=polls, found=False)
             return _clip_result("wait_for failed: evaluate error: %s" % exc)
@@ -3905,7 +3936,7 @@ _MEDIA_STATE_JS = (
 def _probe_media_state(client):
     """F41: read the page's media elements, or None when unreadable."""
     try:
-        raw = client.call_tool("evaluate", {"expression": _MEDIA_STATE_JS})
+        raw = _probe(client, _MEDIA_STATE_JS)
     except Exception as exc:
         logging.debug("verify_playing media probe failed: %s", exc)
         return None
