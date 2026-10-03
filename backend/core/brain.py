@@ -3146,12 +3146,244 @@ def push_research_progress(query, message, evidence=None):
 STOP_RESEARCH_PHRASES = (
     "stop the research", "stop the search", "stop researching",
     "stop the deepsearch", "stop deepsearch",
+    # R6: the typed/voiced browser-task stop had NO brain text route — only
+    # /task/stop HTTP and the 5 research phrases above. "Stop the browser
+    # task" must signal the worker through the same control path.
+    "stop the browser task", "stop browser task", "stop the browser",
+    "stop browser",
 )
 _STOP_RESEARCH_NEGATION_RE = re.compile(
     r"(?:dont|don't|do not|never)\s+(?:.{0,30})?(?:"
-    + "|".join(re.escape(p) for p in STOP_RESEARCH_PHRASES)
+    + "|".join(re.escape(p) for p in STOP_RESEARCH_PHRASES if "browser" not in p)
     + r")"
 )
+
+
+#: R6 — "stop X and do Y" is TWO jobs (control + redirect), never one queued
+#: blob. Splitter runs before the stop handler: the stop half goes through
+#: the control path NOW, the redirect half is held behind the browser's
+#: quiescence and never queued behind a task we claimed to stop.
+_STOP_AND_REDIRECT_RE = re.compile(
+    r"^(?P<stop>.*?stop\s+(?:the\s+)?(?:browser(?:\s+task)?|research|search|it|that|everything).*?)"
+    r"\s+(?:and|then)\s+(?P<redirect>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: Redirect references that need the last real work request ("execute the
+#: last command", "do the last thing", "run that again"). Excludes the
+#: assistant's own messages, confirmations, status turns, and stop controls.
+_LAST_COMMAND_RE = re.compile(
+    r"\b(?:last\s+(?:command|task|thing|request)|that\s+again|do\s+it\s+again|"
+    r"run\s+that\s+again|execute\s+(?:it|that)\s+again)\b",
+    re.IGNORECASE,
+)
+
+#: R6 — a held redirect waits for browser quiescence before it may run.
+#: Keys: text (the redirect utterance, resolved lazily at release so folder
+#: resolution sees fresh state), armed_at. Guarded: stop+redirect can arrive
+#: on any thread.
+_held_redirect_lock = threading.Lock()
+_held_redirect = None
+
+
+def _record_last_work_request(msg):
+    """R6: remember the last SUBSTANTIVE user work request.
+
+    Status questions, bare confirmations ("yes"/"no"), stop controls, and
+    "command"-prefixed lines are not work — the redirect resolver must skip
+    them so "execute the last command" means the last real thing asked.
+    """
+    text = (msg or "").strip()
+    if not text or text.lower().startswith("command"):
+        return
+    try:
+        if is_status_question(text):
+            return
+    except Exception:
+        pass
+    lowered = text.lower()
+    if re.match(r"^(yes|yeah|yep|yup|no|nope|nah|sure|ok(ay)?|alright|"
+                r"haan|ha|kar\s*do|karo|proceed|continue|do\s+it)\b",
+                lowered):
+        return
+    if re.search(r"\bstop\s+(the\s+)?(browser|research|search|it|that|everything)\b",
+                 lowered):
+        return
+    global _last_user_work_request
+    _last_user_work_request = text
+
+
+#: The last substantive user work request (see _record_last_work_request).
+_last_user_work_request = ""
+
+
+def _resolve_last_command():
+    """R6: the last real work the user asked, or "" when none is known."""
+    try:
+        return str(globals().get("_last_user_work_request") or "")
+    except Exception:
+        return ""
+
+
+def split_stop_and_redirect(msg):
+    """R6: split "stop X and do Y" into (stop_half, redirect_half).
+
+    Returns (None, None) when the turn is not a compound. The stop half must
+    contain a real stop phrase; the redirect half must be non-trivial text.
+    "Did you stop it?" (status) never splits — it has no redirect half.
+    """
+    if not msg or not msg.strip():
+        return None, None
+    match = _STOP_AND_REDIRECT_RE.match(msg.strip())
+    if not match:
+        return None, None
+    stop_half = (match.group("stop") or "").strip()
+    redirect = (match.group("redirect") or "").strip()
+    if len(redirect) < 3:
+        return None, None
+    if is_status_question(msg):
+        return None, None
+    return stop_half, redirect
+
+
+def _browser_quiescent():
+    """R6: True when no browser work is observably in flight.
+
+    No job running, no armed opencode/browser confirmation about to start
+    one, no pending clarification holding a checkpoint. Best-effort ack:
+    the worker loop honours should_stop() before every tool call and
+    reports a terminal stopped result; until then the redirect stays held.
+    """
+    try:
+        if opencode_task_in_progress():
+            return False
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            if _pending_opencode_task:
+                return False
+    except Exception:
+        pass
+    try:
+        from backend.services.task_agent import agent as _ta
+        if _ta.has_pending_task_confirmation():
+            return False
+    except Exception:
+        pass
+    try:
+        with _browser_clarification_lock:
+            if _pending_browser_clarification:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _release_held_redirect():
+    """R6: run the held redirect once the browser is quiescent.
+
+    Returns the reply string, or None when nothing is held or the browser
+    is still busy. Runs on the caller's thread — the caller (process_message
+    entry) decides threading; this only executes the already-held text.
+    """
+    global _held_redirect
+    with _held_redirect_lock:
+        held = _held_redirect
+        _held_redirect = None
+    if not held:
+        return None
+    if not _browser_quiescent():
+        with _held_redirect_lock:
+            _held_redirect = held
+        return None
+    redirect = held.get("text") or ""
+    if _LAST_COMMAND_RE.search(redirect):
+        resolved = _resolve_last_command()
+        if not resolved:
+            return ("Sir, the browser task is stopped. "
+                    "I have no earlier command to run — "
+                    "what would you like me to do?")
+        redirect = resolved
+    print("[STOP] Releasing held redirect:", redirect)
+    try:
+        return process_message(
+            redirect, from_voice=held.get("from_voice", False),
+            sync_voice=False, voice_compact=held.get("voice_compact", False),
+            commit_response=True)
+    except Exception as exc:
+        logging.warning("[STOP] Held redirect failed: %s", exc)
+        return ("Sir, the browser task is stopped, but I could not "
+                "start the next part.")
+
+
+def handle_stop_then_redirect(stop_half, redirect, from_voice=False,
+                              voice_compact=False):
+    """R6: stop FIRST, hold the redirect behind browser quiescence.
+
+    1) Signals the worker through the control path NOW (never queues the
+    redirect behind the job being stopped). 2) When nothing was running,
+    says so honestly (Trace A — no false "stopping" claim) and runs the
+    redirect's exact preview path immediately. 3) When something WAS
+    running, holds the redirect and says so (Trace B). The held redirect
+    needs NO new approval to resolve — but starting it still needs valid
+    authority (fresh preview/approval), never a resurrected stale yes.
+    """
+    was_running = False
+    try:
+        was_running = bool(opencode_task_in_progress())
+    except Exception:
+        pass
+    if not was_running:
+        try:
+            with _browser_clarification_lock:
+                was_running = bool(_pending_browser_clarification)
+        except Exception:
+            pass
+    try:
+        request_browser_task_stop()
+    except Exception:
+        pass
+    try:
+        invalidate_browser_runs("browser stop requested")
+    except Exception:
+        pass
+    if _research_running:
+        try:
+            request_research_stop()
+        except Exception:
+            pass
+    try:
+        set_narration_enabled(False)
+    except Exception:
+        pass
+    if not was_running:
+        # Trace A: no browser job exists — no cancellation is falsely
+        # recorded, no compound queued. Resolve "last command" to the
+        # original user file request (never our own wording) and run the
+        # redirect through the normal path so it gets its FIRST valid
+        # approval opportunity, not a second approval after execution.
+        text = redirect
+        if _LAST_COMMAND_RE.search(redirect):
+            resolved = _resolve_last_command()
+            if not resolved:
+                return ("Sir, no browser task is running. "
+                        "I have no earlier command to run — "
+                        "what would you like me to do?")
+            text = resolved
+        reply = process_message(
+            text, from_voice=from_voice, sync_voice=False,
+            voice_compact=voice_compact, commit_response=True)
+        return "Sir, no browser task is running. " + str(reply or "")
+    # Trace B: a job was in flight — hold the redirect, do NOT claim
+    # stopping succeeded while an in-flight action may still continue.
+    global _held_redirect
+    with _held_redirect_lock:
+        _held_redirect = {"text": redirect, "from_voice": from_voice,
+                          "voice_compact": voice_compact,
+                          "armed_at": time.time()}
+    return ("Stop requested for the browser task, sir. "
+            "The next part is held until it stops.")
 
 
 def is_stop_research(text):
@@ -3657,9 +3889,16 @@ def _arm_opencode_confirmation(task_description, original_message,
 def _consume_opencode_confirmation(answer):
     """Resolve a pending opencode-handoff confirmation (mirrors the task gate).
 
-    Returns the spoken reply when the user confirms or declines, else None
+    R4: the WHOLE sentence decides (shared classify_confirmation): a clean
+    "yes" runs the exact deferred effect; "yes, but call it X" re-previews
+    under the new name; "yes, a quick look" holds and asks once
+    ("create, or only check?"); "yes, don't create it" declines. Extra
+    actions never inherit the old yes.
+
+    Returns the spoken reply when the answer resolves the gate, else None
     when nothing is pending, the window lapsed, or the answer is unclear
-    (pending is discarded so the message falls through to normal chat).
+    (unclear DISCARDS the pending preview so the message falls through to
+    normal chat — same as before R4).
     """
     with _opencode_confirm_lock:
         global _pending_opencode_task
@@ -3669,12 +3908,56 @@ def _consume_opencode_confirmation(answer):
     if time.time() > pending["expires"]:
         print("[TASK] opencode confirmation window expired — skipped.")
         return None
-    if _TASK_CONFIRM_NO_RE.search(answer):
+    try:
+        from backend.services.task_agent import agent as _ta
+        verdict = _ta.classify_confirmation(answer)
+    except Exception:
+        verdict = None
+    if verdict is None:
+        if _TASK_CONFIRM_NO_RE.search(answer):
+            verdict = "no"
+        elif _TASK_CONFIRM_YES_RE.search(answer):
+            verdict = "yes"
+        else:
+            verdict = "unclear"
+    if verdict == "no":
         print("[TASK] User declined the opencode handoff.")
         return "As you wish, sir. I will skip that."
-    if not _TASK_CONFIRM_YES_RE.search(answer):
+    if verdict == "unclear":
         print("[TASK] opencode confirmation answered with something else — skipped.")
         return None
+    if verdict == "inspect":
+        # Re-arm: the write is HELD, not discarded — a clear "create" next
+        # turn both disambiguates and approves the exact displayed effect.
+        with _opencode_confirm_lock:
+            _pending_opencode_task = pending
+        return ("Create it, sir, or only check? "
+                "Say create to proceed, or check for a read-only look.")
+    if verdict.startswith("rename:"):
+        new_name = verdict[len("rename:"):].strip()
+        if not new_name:
+            with _opencode_confirm_lock:
+                _pending_opencode_task = pending
+            return ("Sir, what name should I use instead? "
+                    "Nothing was started.")
+        pending = dict(pending)
+        pending["task_description"] = re.sub(
+            r"(?:named|called)\s+\S+",
+            "named %s" % new_name, pending.get("task_description") or "",
+            count=1, flags=re.IGNORECASE) or pending.get("task_description")
+        pending["original_message"] = pending.get("task_description")
+        with _opencode_confirm_lock:
+            _pending_opencode_task = pending
+        return ("Sir, noted — %s. Say yes to proceed with that name, "
+                "or no to skip." % new_name)
+    if verdict == "extra":
+        print("[TASK] Confirmed by user — handing off to opencode.")
+        reply = _execute_deferred_opencode(
+            pending["task_description"], pending["original_message"],
+            contract=pending.get("contract"),
+        )
+        return str(reply or "") + (" Sir, I only did what was previewed — "
+                                   "please ask the extra part separately.")
     print("[TASK] Confirmed by user — handing off to opencode.")
     return _execute_deferred_opencode(
         pending["task_description"], pending["original_message"],
@@ -4050,6 +4333,14 @@ def _process_message_inner(
     if from_voice and msg.lower().startswith("command"):
         voice_log_message = msg[len("command"):].strip()
 
+    # R6: every turn refreshes the last-work pointer FIRST, so "execute the
+    # last command" on the NEXT turn resolves to this turn's real request.
+    # (Status/confirm/stop turns are filtered inside.)
+    try:
+        _record_last_work_request(msg)
+    except Exception:
+        pass
+
     global _proactive_research_fired
     _proactive_research_fired = False
 
@@ -4085,6 +4376,38 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, memory_reply)
             return memory_reply
+
+    # ── R6: release a held redirect once the browser is quiescent ──
+    # A "stop X and do Y" turn held Y behind the stop ack; when a later turn
+    # arrives with the browser quiet, the held part runs now. Runs before
+    # the confirmation gates so a held write still gets its approval path.
+    try:
+        if not is_status_question(msg):
+            held_reply = _release_held_redirect()
+            if held_reply is not None:
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, held_reply)
+                return held_reply
+    except Exception as exc:
+        logging.warning("[STOP] Held redirect release failed: %s", exc)
+
+    # ── R6: "stop X and do Y" splits into control + held redirect ──
+    # The stop half signals the worker NOW through the control path; the
+    # redirect half is NEVER queued behind the job being stopped. Runs
+    # before the research-stop handler so the "and do Y" half survives
+    # (the old handler returned early and discarded it).
+    try:
+        stop_half, redirect = split_stop_and_redirect(msg)
+    except Exception:
+        stop_half, redirect = None, None
+    if stop_half and redirect:
+        print("[STOP] Stop-then-redirect:", stop_half, "||", redirect)
+        response = handle_stop_then_redirect(
+            stop_half, redirect, from_voice=from_voice,
+            voice_compact=voice_compact)
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, response)
+        return response
 
     # ── Explicit websearch stop — before any other routing ──
     _t = time.perf_counter_ns()

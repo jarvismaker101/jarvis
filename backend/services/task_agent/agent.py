@@ -155,6 +155,81 @@ _TASK_CONFIRM_NO_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+#: R4 — whole-sentence yes check. A bare "yes"/"ok"/"kar do" approves the
+#: exact preview; a QUALIFIED yes changes the effect and needs a new preview:
+#: "yes, but call it X" (rename), "yes, don't create it" (negates the
+#: effect), "yes, a quick look" (inspection tail vs creation preview —
+#: ambiguous, hold the write and ask once). Extra actions ("yes, and also
+#: ...") never inherit the old yes. Courtesy tails ("please", "thanks")
+#: are harmless and stay approvals.
+_TAIL_RENAME_RE = re.compile(
+    r"\b(?:but|instead|rather)\b.{0,40}?\b(?:call|name|rename|use)\b"
+    r"|\bcall\s+it\b|\bname\s+it\b",
+    re.IGNORECASE,
+)
+_TAIL_INSPECT_RE = re.compile(
+    r"\bquick\s+look\b|\bjust\s+(?:look|check|checking|see|seeing)\b"
+    r"|\bcheck\s+(?:it|that|this|the\s+folder)\s+first\b"
+    r"|\bonly\s+(?:check|look|see)\b",
+    re.IGNORECASE,
+)
+_TAIL_EXTRA_ACTION_RE = re.compile(
+    r"\b(?:and\s+also|also\s+(?:create|make|delete|remove|move|send)|"
+    r"then\s+(?:delete|remove|send|create|make))\b",
+    re.IGNORECASE,
+)
+_TAIL_NEGATE_EFFECT_RE = re.compile(
+    r"\b(?:don'?t|do not|never)\s+(?:create|make|write|delete|remove|"
+    r"send|run|execute|do)\b|\bnot\s+(?:that|the)\s+(?:folder|file)\b",
+    re.IGNORECASE,
+)
+_HARMLESS_TAIL_RE = re.compile(
+    r"^(?:please|thanks?|thank\s+you|sir|ji|ok)[\s,!.]*$", re.IGNORECASE)
+
+
+def classify_confirmation(answer):
+    """R4: the whole-sentence verdict on a pending-preview answer.
+
+    Returns one of:
+    - "yes": clean assent to the unchanged effect ("yes", "yes please").
+    - "no": decline, including effect-negating tails ("yes, don't create").
+    - "rename:<name>": assent with a changed name ("yes, but call it X").
+    - "inspect": assent with an inspection tail vs a write preview
+      ("yes, a quick look") — ambiguous, hold the write, ask once.
+    - "extra": assent plus an extra action — the extra never inherits.
+    - "unclear": no assent at all ("did I say yes?", "not yet").
+
+    The caller decides the reply; NOTHING here executes or discards state.
+    """
+    text = (answer or "").strip()
+    if not text:
+        return "unclear"
+    lowered = text.lower()
+    # R4: a QUESTION about saying yes is a question, never assent.
+    if "?" in text and re.search(r"\bdid\s+i\s+say\b", lowered):
+        return "unclear"
+    has_yes = bool(_TASK_CONFIRM_YES_RE.search(text))
+    # Negation of the EFFECT ("don't create it") is a decline even when a
+    # "yes" word rides along — NO-first, whole sentence.
+    if _TAIL_NEGATE_EFFECT_RE.search(text):
+        return "no"
+    if _TASK_CONFIRM_NO_RE.search(text):
+        return "no"
+    if not has_yes:
+        return "unclear"
+    # A yes-word is present and nothing declined: check the tail.
+    if _TAIL_RENAME_RE.search(text):
+        name = re.search(
+            r"(?:call|name)\s+it\s+([A-Za-z0-9][\w\- ]{0,60}?)(?:\s+please)?[\s.,!]*$",
+            text, re.IGNORECASE)
+        rename = (name.group(1).strip().rstrip(".,! ") if name else "")
+        return "rename:%s" % rename if rename else "rename:"
+    if _TAIL_INSPECT_RE.search(text):
+        return "inspect"
+    if _TAIL_EXTRA_ACTION_RE.search(text):
+        return "extra"
+    return "yes"
+
 
 def _normalize(text):
     return " ".join((text or "").strip().lower().split())
@@ -257,11 +332,17 @@ def _is_path_like(target):
 def is_code_tool_request(text):
     """True when *text* looks like a direct file/command/script operation that
     the native code tools can handle deterministically (no LLM needed):
-    read a file, create/write a file, or run a command / script.
+    read a file, create/write a file, inspect a local folder, or run a
+    command / script.
 
     Deliberately conservative: targets must look path-like or start with a
     known command token, and anything that smells like a web/browser target
     is excluded so those keep flowing through the normal tool/executor path.
+
+    R5: local folder inspection ("check whether folder X exists", "have a
+    quick look at that folder", "see what is inside") is a LOCAL read via
+    code.list_directory — never a browser job. "Look"/"navigate" alone never
+    implies the browser; only a web URL / web target does.
     """
     if not text or not text.strip():
         return False
@@ -271,6 +352,12 @@ def is_code_tool_request(text):
     # Spoken fillers ride in front of the verb ("now create ..."); strip
     # them so the anchored verb matches still apply.
     routed = _CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized
+
+    # R5: local inspect/existence shape — checked FIRST, before the web
+    # "look up" branch in _heuristic_plan can claim it. A bare local folder
+    # mention with an inspect verb is a list_directory read, never browser.
+    if _local_inspect_folder(routed) is not None:
+        return True
 
     read_match = re.match(r"^(?:read|cat|open file)\s+(.+)$", routed)
     show_match = re.match(r"^show\s+(.+)$", routed)
@@ -429,35 +516,68 @@ def _heuristic_plan(command, context):
 
     search_match = re.match(r"^(?:search|google|find|look up)\s+(.+)$", raw, re.IGNORECASE | re.DOTALL)
     if search_match and " in " not in normalized:
-        return {
-            "ok": True,
-            "confidence": 0.9,
-            "summary": "Opening a web search.",
-            "requires_confirmation": False,
-            "steps": [
-                {
-                    "tool": "browser.search_web",
-                    "args": {"query": search_match.group(1).strip()},
-                    "risk": "safe",
-                }
-            ],
-        }
+        # R5: a LOCAL folder target keeps the turn local even when the verb
+        # looks web-ish ("find malik folder", "look up what's in there").
+        # Tool choice comes from the target, never from the verb alone.
+        if _local_inspect_folder(_CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized) is None:
+            return {
+                "ok": True,
+                "confidence": 0.9,
+                "summary": "Opening a web search.",
+                "requires_confirmation": False,
+                "steps": [
+                    {
+                        "tool": "browser.search_web",
+                        "args": {"query": search_match.group(1).strip()},
+                        "risk": "safe",
+                    }
+                ],
+            }
 
     open_match = re.match(r"^(?:open|go to|navigate to)\s+(.+)$", raw, re.IGNORECASE | re.DOTALL)
-    if open_match and any(token in open_match.group(1).lower() for token in (".com", ".org", ".net", "http")):
-        return {
-            "ok": True,
-            "confidence": 0.9,
-            "summary": "Opening the requested URL.",
-            "requires_confirmation": False,
-            "steps": [
-                {
-                    "tool": "browser.open_url",
-                    "args": {"url": open_match.group(1).strip()},
-                    "risk": "safe",
-                }
-            ],
-        }
+    if open_match and "navigate to" not in normalized:
+        # R5 repair: bare "navigate to <folder>" is NOT a browser open. The
+        # old rule only fired on URL tokens, so this branch keeps that —
+        # and a non-URL navigate target falls through to the local-inspect
+        # shape below instead of becoming a vague browser plan.
+        if any(token in open_match.group(1).lower() for token in (".com", ".org", ".net", "http")):
+            return {
+                "ok": True,
+                "confidence": 0.9,
+                "summary": "Opening the requested URL.",
+                "requires_confirmation": False,
+                "steps": [
+                    {
+                        "tool": "browser.open_url",
+                        "args": {"url": open_match.group(1).strip()},
+                        "risk": "safe",
+                    }
+                ],
+            }
+
+    # ── R5 local inspect/existence (read-only; no approval needed) ──
+    # "check whether folder Malik exists", "have a quick look at that
+    # folder", "see what is inside" -> one code.list_directory read. This
+    # branch runs BEFORE any model plan so a local folder can never become
+    # a "Navigate to ..." browser job. "Look"/"navigate" never imply the
+    # browser — the local target picks the local tool.
+    inspect_hint = _local_inspect_folder(
+        _CODE_TOOL_FILLER_RE.sub("", normalized).strip() or normalized)
+    if inspect_hint is not None:
+        resolved = _resolve_folder_hint(inspect_hint)
+        if resolved is None:
+            return {
+                "ok": True,
+                "confidence": 0.9,
+                "summary": "Need the folder.",
+                "requires_confirmation": False,
+                "steps": [],
+                "response": _folder_hint_clarification(inspect_hint),
+            }
+        return _code_tool_plan(
+            "code.list_directory", {"path": resolved},
+            "Checking the folder.",
+        )
 
     # ── Native code-tools heuristics (short-circuit; no LLM needed) ──
     # "read <file>", "show me <file>", "what's in <file>" -> read_file
@@ -666,6 +786,67 @@ _LOCATED_CONTENT_RE = re.compile(
 #: verbatim in the confirmation preview so the user's "yes" authorizes the
 #: exact effect.
 _DEFAULT_TEXT_FILE_NAME = "hello.txt"
+
+
+#: R5 — inspect/existence verbs that make a turn a LOCAL folder read, never a
+#: browser job. "Look" and "navigate" are deliberately ABSENT: "have a quick
+#: look" inspects, but does not say with what tool — tool choice comes from
+#: the target (local folder = local tool), never from "look"/"navigate".
+_INSPECT_VERB_RE = re.compile(
+    r"\b(?:check|verify|confirm|see|show|list|inspect|look\s+at|"
+    r"have\s+a\s+(?:quick\s+)?look|tell\s+me\s+(?:what(?:'s| is))?|"
+    r"what(?:'s|\s+is)\s+(?:in(?:side)?|there))"
+    r"|\b(?:is\s+there|does\s+\w+\s+exist|exists?)\b",
+    re.IGNORECASE,
+)
+
+#: R5 — a local folder target: the folder word, a pronoun, or a bare/named
+#: local location. Web targets are excluded upstream by _CODE_TOOL_WEB_HINTS
+#: and the URL guard, so this only ever names filesystem places.
+_INSPECT_FOLDER_RE = re.compile(
+    r"\b(?:folder|directory)\b"
+    r"|\bthat\s+(?:folder|directory)\b"
+    r"|\binside\s+(?:it|there|them)\b"
+    r"|\bin\s+(?:it|there|them)\b",
+    re.IGNORECASE,
+)
+
+
+def _local_inspect_folder(routed):
+    """R5: the folder target of a local inspect/existence request, or None.
+
+    "check whether folder Malik exists", "have a quick look at that folder",
+    "see what is inside", "list that folder" -> ("named"|"pronoun", detail).
+    Returns None for web-shaped targets (URL already excluded upstream) and
+    for turns with no inspect verb at all, so plain chit-chat never routes.
+
+    "Create a directory listing" is NOT an inspect request — "listing" there
+    is the THING being created, not the act of listing. The inspect verb
+    must not sit inside a create/make/write shaped turn.
+    """
+    if not routed or not _INSPECT_VERB_RE.search(routed):
+        return None
+    if re.match(r"^(?:create|make|write|save|update)\b", routed or ""):
+        return None
+    hint = _located_write_folder(routed)
+    if hint is not None:
+        return hint
+    if _INSPECT_FOLDER_RE.search(routed):
+        return ("pronoun", "")
+    # Named folder without the folder word: "check whether malik exists",
+    # "see what is inside mayankmalik".
+    named = re.search(
+        r"(?:whether|if|named\s+(?:folder\s+)?|called\s+(?:folder\s+)?"
+        r"|folder\s+(?:named\s+|called\s+)?|inside\s+|in\s+folder\s+)"
+        r"([A-Za-z][\w\- ]{1,60}?)\s*(?:exists?|is\s+there|folder|directory|$)",
+        routed,
+        re.IGNORECASE,
+    )
+    if named:
+        name = named.group(1).strip().strip("\"'")
+        if name and not _is_path_like(name):
+            return ("named", name)
+    return None
 
 
 def _strip_code_tool_filler(raw):
@@ -2385,6 +2566,20 @@ def _arm_plan_confirmation(plan, context, task_text=""):
     return record
 
 
+def arm_task_confirmation(plan, context, task_text="", preview=""):
+    """R4 public wrapper: arm the ONE identified approval for *plan*.
+
+    Used when a qualified yes ("yes, but call it X") re-previews under a
+    changed effect: the caller already cancelled the old approval, and this
+    mints the new exact-effect record the next yes must match.
+    """
+    record = _arm_plan_confirmation(plan, context, task_text=task_text)
+    with _task_confirm_lock:
+        if _pending_task_action is not None:
+            _pending_task_action["preview"] = preview
+    return record
+
+
 def confirmation_prompt(plan):
     """The byte-identical confirmation preview for *plan* (F02).
 
@@ -3054,10 +3249,17 @@ def has_pending_task_confirmation():
 def consume_task_confirmation(answer):
     """Resolve a pending task-action confirmation.
 
-    Returns a response string when the answer confirms or declines the
-    pending plan, or None when nothing is pending, the window expired, or
-    the answer is unclear/off-topic (pending is discarded in that case so
-    the message falls through to normal chat).
+    R4: the WHOLE sentence decides. A clean "yes"/"yes please" runs the exact
+    previewed effect. A renamed yes ("yes, but call it X") re-previews under
+    the new name — the old yes never authorizes the changed plan. An
+    inspection tail ("yes, a quick look") HOLDS the write and asks once
+    ("create, or only check?"). An effect-negating tail ("yes, don't create
+    it") declines. An extra action ("yes, and also delete...") runs the
+    approved effect only; the extra needs its own turn.
+
+    Returns a response string when the answer resolves the gate, or None
+    when nothing is pending or the window expired (pending is discarded in
+    that case so the message falls through to normal chat).
 
     F18: a confirmation cannot cross-authorize. The shared approval record is
     consumed FIRST (so it can never be used twice), then verified against the
@@ -3080,14 +3282,7 @@ def consume_task_confirmation(answer):
             _pending_task_action = None
             approvals.cancel("task confirmation abandoned")
             return None
-        if _TASK_CONFIRM_NO_RE.search(answer):
-            verdict = "no"
-        elif _TASK_CONFIRM_YES_RE.search(answer):
-            verdict = "yes"
-        else:
-            _pending_task_action = None
-            approvals.cancel("task confirmation not understood")
-            return None
+        verdict = classify_confirmation(answer)
         plan = pending["plan"]
         context = pending["context"]
         # Clear BEFORE executing so a crash can never re-trigger the gate.
@@ -3099,8 +3294,43 @@ def consume_task_confirmation(answer):
         approvals.cancel("declined by the user")
         return "As you wish, sir. I will skip that."
 
-    # Consume, then verify: consumption is atomic, and a failure here means
-    # NOTHING runs (not a partially authorised plan).
+    if verdict == "unclear":
+        _pending_task_action = None
+        approvals.cancel("task confirmation not understood")
+        return None
+
+    if verdict == "inspect":
+        # Astra Trace A: "Yes, a quick look" against a CREATION preview is
+        # ambiguous — never run the write, never infer a browser task. Hold
+        # the write, keep ONE clarification, and let a clear "create" answer
+        # both disambiguate and approve the exact displayed effect.
+        approvals.cancel("held for inspection-vs-creation disambiguation")
+        preview = pending.get("preview") or confirmation_prompt(plan) or ""
+        return ("Create the file, sir, or only check the folder? "
+                "%s" % preview if preview else
+                "Create the file, sir, or only check the folder?")
+
+    if verdict.startswith("rename:"):
+        new_name = verdict[len("rename:"):].strip()
+        approvals.cancel("renamed after preview — new preview required")
+        if not new_name:
+            return ("Sir, what name should I use instead? "
+                    "Nothing was started.")
+        # Re-plan under the new name so the user approves the EXACT changed
+        # effect; the old yes authorizes nothing.
+        return _repreview_with_name(plan, context, new_name)
+
+    if verdict == "extra":
+        # The approved effect may run; the EXTRA action never inherits the
+        # yes — it needs its own turn. Fall through to normal execution of
+        # the exact previewed plan, then name the leftover.
+        extra_note = (" Sir, I only did what was previewed — "
+                      "please ask the extra part separately.")
+    else:
+        extra_note = ""
+
+    # verdict == "yes": consume, then verify: consumption is atomic, and a
+    # failure here means NOTHING runs (not a partially authorised plan).
     record = approvals.take()
     if record is None:
         return ("That approval is no longer available, sir. Please ask again.")
@@ -3113,7 +3343,43 @@ def consume_task_confirmation(answer):
         return ("I cannot proceed, sir — %s. Please ask again." % why)
     result = execute_plan(plan, context, confirmed=True)
     _remember_task_result(result, command_text or plan.get("summary") or "")
-    return str(result)
+    return str(result) + extra_note
+
+
+def _repreview_with_name(plan, context, new_name):
+    """R4: re-preview a write plan under a renamed file, nothing executed.
+
+    Swaps the file name inside the pending plan's write/create steps, re-arms
+    the confirmation gate, and returns the new exact preview. The caller
+    already cancelled the old approval, so the old yes is dead.
+    """
+    from copy import deepcopy
+    plan = deepcopy(plan)
+    steps = plan.get("steps") or []
+    changed = False
+    for step in steps:
+        tool = str(step.get("tool") or "")
+        if tool not in ("code.write_file", "code.create_folder"):
+            continue
+        args = dict(step.get("args") or {})
+        path = str(args.get("path") or "")
+        if not path:
+            continue
+        parent = os.path.dirname(path)
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", new_name).strip()
+        if not safe:
+            continue
+        if tool == "code.write_file" and not os.path.splitext(safe)[1]:
+            safe += ".txt"
+        args["path"] = os.path.join(parent, safe) if parent else safe
+        step["args"] = args
+        changed = True
+    if not changed:
+        return ("Sir, I could not apply that name to the preview. "
+                "Nothing was started.")
+    preview = confirmation_prompt(plan) or ""
+    arm_task_confirmation(plan, context, preview=preview)
+    return preview
 
 
 #: F09/F07 — the structured result of the most recent native run, so the

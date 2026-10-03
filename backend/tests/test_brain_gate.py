@@ -755,5 +755,104 @@ class R12StatusGroundingTests(unittest.TestCase):
             brain.is_status_question("are you doing the cued task right now"))
 
 
+class R6StopThenRedirectTests(unittest.TestCase):
+    """R6: "stop X and do Y" is control + held redirect, never one blob."""
+
+    def setUp(self):
+        brain._held_redirect = None
+        brain._last_user_work_request = ""
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+
+    def tearDown(self):
+        brain._held_redirect = None
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+
+    def test_splitter(self):
+        stop_half, redirect = brain.split_stop_and_redirect(
+            "stop the browser task and execute the last command I asked you")
+        self.assertIn("stop", stop_half.lower())
+        self.assertIn("last command", redirect.lower())
+
+    def test_status_never_splits(self):
+        self.assertEqual(
+            brain.split_stop_and_redirect("did you stop it?"), (None, None))
+        self.assertEqual(
+            brain.split_stop_and_redirect("create a folder named x"),
+            (None, None))
+
+    def test_browser_stop_phrase_recognized(self):
+        self.assertTrue(brain.is_stop_research("stop the browser task"))
+
+    def test_trace_a_no_job_runs_redirect_honestly(self):
+        # Nothing running: no false "stopping" claim; the redirect resolves
+        # to the recorded last work and gets its approval preview.
+        brain._record_last_work_request("create a folder named x")
+        reply = brain.process_message(
+            "stop the browser task and execute the last command I asked you",
+            sync_voice=False)
+        self.assertIn("no browser task is running", reply.lower())
+        self.assertIsNone(brain._held_redirect)
+
+    def test_trace_a_no_last_command_says_so(self):
+        reply = brain.process_message(
+            "stop the browser task and execute the last command",
+            sync_voice=False)
+        self.assertIn("no earlier command", reply.lower())
+
+    def test_trace_b_running_holds_redirect(self):
+        brain._opencode_task_running = True
+        try:
+            reply = brain.process_message(
+                "stop the browser task and create a folder named x",
+                sync_voice=False)
+        finally:
+            brain._opencode_task_running = False
+        self.assertIn("held until it stops", reply.lower())
+        self.assertIsNotNone(brain._held_redirect)
+
+    def test_last_work_skips_status_and_yes(self):
+        brain._record_last_work_request("create a folder named x")
+        brain._record_last_work_request("is it done?")
+        brain._record_last_work_request("yes")
+        brain._record_last_work_request("stop the browser task")
+        self.assertEqual(
+            brain._resolve_last_command(), "create a folder named x")
+
+
+class R4OpencodeGateTests(unittest.TestCase):
+    """R4 on the opencode handoff gate: tails decide, not bare yes-words."""
+
+    def setUp(self):
+        brain._pending_opencode_task = {
+            "task_description": "create folder x",
+            "original_message": "create folder x",
+            "contract": None,
+            "expires": __import__("time").time() + 60,
+        }
+
+    def tearDown(self):
+        brain._pending_opencode_task = None
+
+    def test_inspect_tail_holds_and_rearms(self):
+        reply = brain._consume_opencode_confirmation("yes, a quick look")
+        self.assertIn("or only check", reply.lower())
+        # Still armed: a clear "create" next turn can approve it.
+        self.assertIsNotNone(brain._pending_opencode_task)
+        brain._pending_opencode_task = None
+
+    def test_negating_tail_declines(self):
+        reply = brain._consume_opencode_confirmation("yes, don't create it")
+        self.assertIn("skip", reply.lower())
+        self.assertIsNone(brain._pending_opencode_task)
+
+
 if __name__ == "__main__":
     unittest.main()

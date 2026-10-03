@@ -1574,3 +1574,23 @@ One commit carrying five audit items: a whole-word gate on memory search; a spok
 ### F56 — local Ollama models as selectable brains (`f004e36`, `cfd1f7f`)
 
 Tag `local-models`. Documented in full at the top of this map ("Local models as selectable brains"). `cfd1f7f` additionally fixes the active checkmark in the INTENT CLASSIFIER MODEL list.
+
+### Astra R13 — strict speech gateway: tool-less chat has zero action authority (`8837f3c`)
+
+`backend/core/brain.py`: `_ACTION_CLAIM_RE` / `_ACTION_OFFER_RE` detect action sentences; `_CHAT_NO_ACTION_FALLBACK` ("Understood, sir. Nothing was started — which exact folder and file name should I use?") replaces any unverified claim via `_strip_unverified_action_claims`, applied in `_finalize_chat_reply`; the chat prompt's "say you will get it done" instruction removed; `_orchestrator_reply` ANSWERED gated. Task/result narrators untouched. Tests: `R13SpeechGatewayTests` in `test_brain_gate.py`.
+
+### Astra R12 — status answered from live state, never chat recall (`f5ee444`)
+
+`is_status_question` / `_status_snapshot` (armed confirmations, running flag, S18 queue, clarification, last verified result) / `answer_status_question` (Astra §4 controlled forms; running+queued names both; "cued"→"queued" only in status; "q test" asks instead of denying). Status turns skip all three confirmation gates so "is it done?" never discards the preview it asks about. Tests: `R12StatusGroundingTests` in `test_brain_gate.py`.
+
+### Astra R5 — local folder inspection is a local read, never browser (uncommitted at map time)
+
+`backend/services/task_agent/agent.py`: `_INSPECT_VERB_RE` + `_INSPECT_FOLDER_RE` + `_local_inspect_folder` ("check whether folder Malik exists", "have a quick look at that folder", "see what is inside" → `code.list_directory`); checked FIRST in `is_code_tool_request` and `_heuristic_plan` (before the web "look up" branch, which now yields to local targets); bare "navigate to <folder>" no longer browser-shaped without URL tokens. "Create a directory listing" stays a create, not an inspect. Tests: `R5LocalInspectTests` in `test_code_tools.py`.
+
+### Astra R6 — stop-then-redirect: control first, redirect held behind quiescence (uncommitted at map time)
+
+`backend/core/brain.py`: `STOP_RESEARCH_PHRASES` gains the browser-task stop phrases (previously no brain text route); `split_stop_and_redirect` splits "stop X and do Y" (status turns never split); `handle_stop_then_redirect` signals the worker NOW — nothing running → honest "no browser task is running" + redirect runs immediately (Trace A); running → redirect held in `_held_redirect`, reply "held until it stops" (Trace B), released by `_release_held_redirect` on a later quiescent turn; `_record_last_work_request` / `_resolve_last_command` track the last real work (skips status/yes-no/stop) so "execute the last command" resolves to the user's file request. Tests: `R6StopThenRedirectTests` in `test_brain_gate.py`.
+
+### Astra R4 — whole-sentence yes check: tails decide (uncommitted at map time)
+
+`backend/services/task_agent/agent.py`: `classify_confirmation` returns yes/no/rename/inspect/extra/unclear — "yes, don't create it" declines, "yes, but call it X" re-previews under the new name via `_repreview_with_name` + `arm_task_confirmation` (old yes dead), "yes, a quick look" HOLDS the write and asks "create, or only check?", extras never inherit, "did I say yes?" is a question not assent. `consume_task_confirmation` and brain `_consume_opencode_confirmation` both use it (opencode inspect re-arms so a clear "create" next turn approves). Tests: `R4ConfirmationVerdictTests` in `test_code_tools.py`, `R4OpencodeGateTests` in `test_brain_gate.py`.

@@ -234,6 +234,80 @@ class CodeToolRoutingTests(unittest.TestCase):
         self.assertFalse(agent.is_code_tool_request("what is the weather"))
 
 
+class R5LocalInspectTests(unittest.TestCase):
+    """R5: local folder inspection is a LOCAL read, never a browser job.
+
+    "Check whether folder Malik exists", "have a quick look at that
+    folder", "search that folder and see what is inside" must route into
+    the native code path (code.list_directory) — "look"/"navigate" never
+    imply the browser; only a web URL / web target does.
+    """
+
+    def test_inspect_routes_to_code_tools(self):
+        for text in (
+            "check whether folder Malik exists",
+            "have a quick look at that folder",
+            "search that folder and see what is inside",
+            "is there a folder named Malik",
+            "list that folder",
+            "tell me what is in there",
+            "see what is inside mayankmalik",
+        ):
+            self.assertTrue(agent.is_code_tool_request(text), text)
+
+    def test_web_targets_stay_out(self):
+        self.assertFalse(agent.is_code_tool_request("search google for python"))
+        self.assertFalse(agent.is_code_tool_request("open http://example.com"))
+        self.assertFalse(agent.is_code_tool_request("navigate to example.com"))
+
+    def test_create_shaped_turns_not_inspect(self):
+        self.assertFalse(agent.is_code_tool_request("create a directory listing"))
+
+    def test_heuristic_plans_local_list_not_browser(self):
+        plan = agent._heuristic_plan(
+            "have a quick look at that folder", {"windows": {}})
+        if plan is not None:
+            tools = [s.get("tool") for s in plan.get("steps", [])]
+            self.assertNotIn("browser.open_url", tools)
+            self.assertNotIn("browser.search_web", tools)
+
+
+class R4ConfirmationVerdictTests(unittest.TestCase):
+    """R4: the WHOLE confirmation sentence decides, including the tail."""
+
+    def test_clean_yes(self):
+        for text in ("yes", "yes please", "ok", "yes, please do it",
+                     "haan kar do"):
+            self.assertEqual(agent.classify_confirmation(text), "yes", text)
+
+    def test_decline(self):
+        for text in ("no", "no thanks", "yes, don't create it",
+                     "don't create it"):
+            self.assertEqual(agent.classify_confirmation(text), "no", text)
+
+    def test_rename_needs_new_preview(self):
+        verdict = agent.classify_confirmation("yes, but call it another name")
+        self.assertTrue(verdict.startswith("rename:"), verdict)
+        verdict = agent.classify_confirmation("yes, but name it demo please")
+        self.assertEqual(verdict, "rename:demo", verdict)
+
+    def test_inspect_tail_holds_write(self):
+        self.assertEqual(
+            agent.classify_confirmation("yes, a quick look"), "inspect")
+
+    def test_extra_action_flagged(self):
+        self.assertEqual(
+            agent.classify_confirmation("yes, and also delete the old one"),
+            "extra")
+
+    def test_question_is_not_yes(self):
+        self.assertEqual(
+            agent.classify_confirmation("did I say yes?"), "unclear")
+        # "Not yet" declines the CURRENT preview (existing NO-first rule);
+        # it is never assent.
+        self.assertEqual(agent.classify_confirmation("not yet"), "no")
+
+
 class LocatedWriteTests(unittest.TestCase):
     """Live bug: "now create a text file inside that folder ... write hello"
     fell through every route into chat, which promised the file while no tool
