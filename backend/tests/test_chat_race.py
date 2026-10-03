@@ -278,7 +278,9 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         prebuilt = {"path": "browser_search", "system_prompt": "sys", "query": "what is 2+2?", "search_info": None}
         with patch.object(brain, "execute_multiple", return_value=["ok"]) as mock_exec:
             resp = brain.handle_chat("what is 2+2?", stream=collector, prebuilt=prebuilt, live_stream=None)
-        self.assertEqual(resp, "Sir, I couldn't access that information directly, so I've opened a search for you.")
+        # R14: no unverified "I've opened a search for you" — the lookup ran
+        # synchronously, so the reply reports the fact, not a promise.
+        self.assertEqual(resp, "Sir, I ran a search for that.")
         self.assertEqual(collected, [resp])
         mock_exec.assert_called_once_with([{"action": "search", "input": "what is 2+2?"}])
         hist = self.get_history()

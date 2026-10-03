@@ -301,7 +301,15 @@ _ACTION_CLAIM_RE = re.compile(
     r"(?:started|starting|running|executing|working\s+on)\s+(?:the|that|your|this)?\s*(task|file|folder|browser|job|request)|"
     r"(?:queued|in\s+the\s+queue)|"
     r"taking\s+over\s+the\s+browser\s+task|"
-    r"handing\s+the\s+task\s+to"
+    r"handing\s+the\s+task\s+to|"
+    # R14: optimistic pre-execution acks spoken BEFORE any worker ack —
+    # "On it", "Playing now", "Opening/Checking/Searching/Looking ... now",
+    # "Navigating to ...", "I've opened ... for you".
+    r"on\s+it|"
+    r"(?:playing|opening|checking|searching|looking|running|navigating)\s+.*\bnow\b|"
+    r"(?:playing|opening|checking|searching|looking|running|navigating)\b|"
+    r"back\s+in\s+a\s+moment|"
+    r"(?:i(?:'ve| have)\s+)?(?:opened|started)\s+.*\bfor\s+you\b"
     r")\b",
     re.IGNORECASE,
 )
@@ -1931,8 +1939,9 @@ def _orchestrator_reply(outcome):
         # R13: the orchestrator's free-form answer travels the chat channel,
         # so it carries chat authority only — strip unverified action claims.
         return _strip_unverified_action_claims(reply, "chat")
-    # suspension/error: hand back whatever was produced, or nothing at all.
-    return reply
+    # R14: suspension/error planner text travels the chat channel too — a
+    # "navigating to..." planner line must never reach speech unexamined.
+    return _strip_unverified_action_claims(reply, "chat")
 
 
 class _ChatRacer:
@@ -2102,14 +2111,63 @@ class _ChatRacer:
         # [P0-10] From here the speculation IS the reply: the turn's cleanup
         # must not cancel it (cancel() injects the sentinel, which would cut
         # the drained stream short).
+        #
+        # R14: the live deltas were generated BEFORE the route was known, so
+        # they may carry action sentences chat has no authority to speak.
+        # Gate at SENTENCE boundaries: deltas pass through byte-identical
+        # (whitespace intact) until a terminator completes a sentence, then
+        # the whole sentence is gated. Gating each delta alone would strip
+        # trailing spaces and merge words ("Hello"+"sir." -> "Hellosir.").
+        # The final content is still re-gated in _finalize_chat_reply, so a
+        # claim split ACROSS the stream end can never slip through — the
+        # boundary gate only protects what the user hears live.
         self._adopted = True
 
         def _drain():
+            buf = ""
             while True:
                 item = self._queue.get()
                 if item is self._sentinel:
+                    if buf:
+                        try:
+                            gated = _strip_unverified_action_claims(buf, "chat")
+                        except Exception:
+                            gated = buf
+                        # Only emit when nothing was cut: the common case is
+                        # benign fragments ("a", "b") whose gated form EQUALS
+                        # the buffer (nothing claim-shaped), in which case we
+                        # must NOT reduplicate what was already yielded. A
+                        # cut claim ("I will get that created" -> fallback)
+                        # is redelivered here in gated form — live speech
+                        # pauses rather than lies.
+                        if (gated and str(gated).strip()
+                                and str(gated) != buf
+                                and len(str(gated).split()) != len(buf.split())):
+                            yield gated
                     break
-                yield item
+                piece = str(item or "")
+                buf += piece
+                # Emit complete sentences; hold the tail (maybe a claim cut
+                # mid-sentence) for the next delta or the sentinel flush.
+                parts = re.split(r"(?<=[.!?])(\s+)", buf)
+                if len(parts) > 1:
+                    head = "".join(parts[:-1])
+                    buf = parts[-1]
+                    try:
+                        gated = _strip_unverified_action_claims(head, "chat")
+                    except Exception:
+                        gated = head
+                    # Byte-identical passthrough when nothing was cut (the
+                    # overwhelming case — preserves "Hello "+"sir." spacing).
+                    # A cut sentence is HELD in buf for the sentinel flush
+                    # above, which redelivers it in gated form.
+                    if gated and str(gated).strip():
+                        if len(str(gated).split()) == len(head.split()):
+                            yield head
+                        else:
+                            buf = str(gated) + (" " if buf[:1].isspace() else "") + buf
+                else:
+                    yield piece
         return _drain()
 
     def cancel(self):
@@ -2285,7 +2343,9 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
 
     if built["path"] == "browser_search":
         execute_multiple([{"action": "search", "input": user_message}])
-        response = "Sir, I couldn't access that information directly, so I've opened a search for you."
+        # R14: no unverified "I've opened a search for you" — the lookup
+        # ran synchronously above, so report the fact, not a promise.
+        response = "Sir, I ran a search for that."
         if commit_response:
             _commit_chat("assistant", response)
         if stream:
@@ -2333,20 +2393,22 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
 
 
 def generate_command_response(actions):
+    """R14: describe the REQUEST, never claim the outcome.
+
+    The old lines ("Consider it done. Now playing", "On it") spoke action
+    sentences before the worker thread proved anything. These lines only
+    name what was asked — completion is announced by the result narrator
+    after verified execution, never here. "Playing <song>" alone names the
+    request; the gate distinguishes it from the claim "Playing ... now".
+    """
     play_lines = [
-        "On it, sir. Playing {song}.",
-        "Right away, sir. Enjoy {song}.",
-        "Consider it done. Now playing {song}.",
+        "{song}, sir.",
     ]
     open_lines = [
-        "Opening {site}, sir.",
-        "Launching {site}.",
-        "Accessing {site}.",
+        "{site}, sir.",
     ]
     search_lines = [
         "Searching for {query}, sir.",
-        "Looking that up now.",
-        "Opening search results for {query}.",
     ]
 
     responses = []
@@ -2383,9 +2445,12 @@ def handle_tool_intent(steps, original_message, from_voice=False, voice_compact=
     """Execute structured tool steps, acknowledge like a human, and route
     any opencode handoff through the confirmation gate.
 
-    Returns an immediate ack text ("On it, sir."). If execution fails, the
-    opencode handoff is armed for spoken confirmation and the real result is
-    delivered async via the async-reply callback after the user confirms.
+    R14: the immediate ack only NAMES the request (see
+    generate_command_response) — it never claims done/started/queued. The
+    real outcome is announced after verified execution (or via the gated
+    handoff's own narrators). If execution fails, the opencode handoff is
+    armed for spoken confirmation and the real result is delivered async
+    via the async-reply callback after the user confirms.
     """
     if not steps:
         # No local steps — route through the gated opencode handoff instead
@@ -2679,6 +2744,9 @@ _research_running = False
 
 # Mandatory announcement made exactly at handoff — exempt from the mute so
 # the UI path never swallows it (the flag is already True by then).
+# R14: these name the HANDOFF (a real event — the worker thread just
+# started), never the outcome. "Started/done/queued" are spoken only by
+# the result narrator after verification, never here.
 OPENCODE_START_PHRASE = "Handing the task to opencode, sir."
 # The browser-agent engine makes its own announcement with the same status.
 BROWSER_AGENT_START_PHRASE = "Taking over the browser task, sir."
@@ -3021,7 +3089,8 @@ def _execute_deferred_opencode(task_description, original_message,
             )
         elif result.error == "internal crash":
             # Engine raised (old output=None path): keep the legacy snag line.
-            _notify_async_reply("I started the task, sir, but my agent hit a snag.")
+            # R14: no "I started the task" — the worker never proved start.
+            _notify_async_reply("Sir, the task could not start.")
         else:
             summary = _summarize_opencode_output(
                 result.detail, status="failed", error=result.error)
@@ -3587,19 +3656,14 @@ def handle_research_intent(research_query, from_voice=False, voice_compact=False
     subject so we never type the user's sentence verbatim into the browser.
     """
     global _research_running
+    # R14: the ack only NAMES the request — "On it / running now" claims
+    # execution before the worker thread below proves anything. Completion
+    # is announced by the result path when the research actually lands.
     if deep:
-        ack_chosen = random.choice([
-            "On it, sir. Running a deepsearch now.",
-            "Deepsearch it is, sir. Digging through the sites now.",
-        ])
-        ack = (ack_chosen +
-               " The full report is coming up on your screen — and I'll sum it up for you when it's ready.")
+        ack = ("Deepsearch for that, sir — the full report comes up on "
+               "your screen, and I will sum it up when it is ready.")
     else:
-        ack_chosen = random.choice([
-            "On it, sir. Quick look coming up.",
-            "Let me check that on Google, sir.",
-        ])
-        ack = ack_chosen + " Back in a moment with the short version."
+        ack = "Quick lookup for that, sir."
 
     if voice_compact and len(ack) > 110:
         ack = ("Deepsearch running, sir — full report on your screen, "

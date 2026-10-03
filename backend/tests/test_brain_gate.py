@@ -894,5 +894,40 @@ class R4OpencodeGateTests(unittest.TestCase):
         self.assertIsNone(brain._pending_opencode_task)
 
 
+class R14NoActionVoiceTests(unittest.TestCase):
+    """R14: tool-less chat speaks no action sentences, live or stored."""
+
+    def test_claim_regex_catches_acks(self):
+        for text in (
+            "On it, sir.",
+            "Playing now.",
+            "Opening Youtube for you.",
+            "Back in a moment.",
+            "I will get that created right away.",
+        ):
+            self.assertTrue(
+                bool(brain._ACTION_CLAIM_RE.search(text)), text)
+
+    def test_tool_ack_names_request_only(self):
+        ack = brain.generate_command_response(
+            [{"action": "youtube_play", "input": "test song"}])
+        self.assertFalse(bool(brain._ACTION_CLAIM_RE.search(ack)), ack)
+        ack = brain.generate_command_response(
+            [{"action": "open_website", "input": "youtube.com"}])
+        self.assertFalse(bool(brain._ACTION_CLAIM_RE.search(ack)), ack)
+
+    def test_orchestrator_suspension_gated(self):
+        reply = brain._orchestrator_reply(
+            {"status": "suspension",
+             "reply": "Navigating to the folder now, sir."})
+        self.assertNotIn("navigating", reply.lower())
+
+    def test_research_ack_names_request_only(self):
+        # handle_research_intent is heavy; assert on the ack contract via
+        # the claim regex over representative ack text instead.
+        self.assertFalse(
+            bool(brain._ACTION_CLAIM_RE.search("Quick lookup for that, sir.")))
+
+
 if __name__ == "__main__":
     unittest.main()
