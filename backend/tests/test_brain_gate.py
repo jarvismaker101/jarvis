@@ -655,5 +655,105 @@ class R13SpeechGatewayTests(unittest.TestCase):
         self.assertIn("Nothing was started", reply)
 
 
+class R12StatusGroundingTests(unittest.TestCase):
+    """R12: "are you doing X?" is answered from live state, never chat recall."""
+
+    def setUp(self):
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+        from backend.services.task_agent import agent as task_agent
+        task_agent._pending_task_action = None
+        task_agent._remember_task_result(None)
+
+    def tearDown(self):
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+
+    def _status(self, msg):
+        return brain.process_message(msg, sync_voice=False)
+
+    def test_idle_reports_nothing_running(self):
+        self.assertEqual(
+            self._status("are you doing anything right now?"),
+            "Sir, nothing is running right now.")
+
+    def test_cued_task_repaired_to_queued_empty(self):
+        # Transcript turn: "are you doing the cued task right now" (= queued).
+        # No queue entry -> honest empty, never "I am monitoring".
+        reply = self._status("i'm asking are you doing the cued task right now")
+        self.assertIn("Nothing is queued", reply)
+        self.assertNotIn("monitoring", reply.lower())
+
+    def test_q_test_unknown_asks_instead_of_denying_topic(self):
+        # Transcript turn: "are you doing the q test now?" must NOT answer
+        # "that topic has not been raised" from chat recall.
+        reply = self._status("are you doing the q test now?")
+        self.assertIn("no task matching", reply.lower())
+
+    def test_running_reported(self):
+        brain._opencode_task_running = True
+        try:
+            reply = self._status("are you doing the file task right now?")
+        finally:
+            brain._opencode_task_running = False
+        self.assertTrue(reply.startswith("Yes, sir"))
+
+    def test_running_plus_queued_names_both(self):
+        brain._opencode_task_running = True
+        brain._pending_action_requests.append(
+            {"message": "create file", "from_voice": False})
+        try:
+            reply = self._status("are you doing anything?")
+        finally:
+            brain._opencode_task_running = False
+            brain._pending_action_requests = []
+        self.assertIn("running", reply.lower())
+        self.assertIn("queued", reply.lower())
+
+    def test_queued_only(self):
+        brain._pending_action_requests.append(
+            {"message": "create file", "from_voice": False})
+        try:
+            reply = self._status("what is queued?")
+        finally:
+            brain._pending_action_requests = []
+        self.assertIn("queued", reply.lower())
+
+    def test_awaiting_approval(self):
+        brain.handle_opencode_task("create a folder named x",
+                                   original_message="create a folder named x")
+        try:
+            reply = self._status("is it done?")
+        finally:
+            brain._pending_opencode_task = None
+        self.assertIn("waiting for your approval", reply.lower())
+
+    def test_completed_last_result(self):
+        from backend.services.task_agent import agent as task_agent
+
+        class _R:
+            status = "completed"
+            summary = "Created and verified note.txt in Mayank Malik."
+            detail = ""
+        task_agent._remember_task_result(_R(), "create file")
+        try:
+            reply = self._status("did you finish?")
+        finally:
+            task_agent._remember_task_result(None)
+        self.assertTrue(reply.startswith("Yes, sir"))
+
+    def test_non_status_turns_unaffected(self):
+        self.assertFalse(brain.is_status_question("hello jarvis"))
+        self.assertFalse(brain.is_status_question("create a folder named x"))
+        self.assertTrue(
+            brain.is_status_question("are you doing the cued task right now"))
+
+
 if __name__ == "__main__":
     unittest.main()

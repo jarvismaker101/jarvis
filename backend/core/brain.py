@@ -2513,6 +2513,162 @@ def handle_opencode_task(task_description, original_message,
     return question
 
 
+# ── R12 status grounding: answer "are you doing X?" from live state ────
+# A status question must NEVER be answered from chat recall ("that topic has
+# not been raised"). The speaker reads a live snapshot — armed confirmations,
+# running jobs, queue entries, last verified result — and answers from that.
+# Astra §4 utterance table; every reply below is a fixed controlled form.
+_STATUS_QUESTION_RE = re.compile(
+    r"\b("
+    r"are\s+you\s+(doing|working\s+on|running|executing)|"
+    r"is\s+(it|that|the\s+\w+\s+task)\s+(done|finished|complete|completed|running|started)|"
+    r"did\s+you\s+(finish|complete|do|start|stop|cancel)|"
+    r"have\s+you\s+(finished|completed|started|done)|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:status|queued|running|happening)|"
+    r"anything\s+(queued|running|pending)|"
+    r"are\s+you\s+done|"
+    r"is\s+it\s+done"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# "cued task" is STT noise for "queued task" in status language (transcript
+# turn: "are you doing the cued task right now"). Repair ONLY here — never in
+# filenames or task descriptions.
+_CUED_TASK_RE = re.compile(r"\bcued\s+tasks?\b", re.IGNORECASE)
+_Q_TEST_RE = re.compile(r"\bq[\s-]?test\b", re.IGNORECASE)
+
+
+def is_status_question(msg):
+    """R12: True when the turn asks about live work, not new work."""
+    if not msg:
+        return False
+    text = str(msg)
+    if _CUED_TASK_RE.search(text):
+        return True
+    return bool(_STATUS_QUESTION_RE.search(text))
+
+
+def _status_snapshot():
+    """R12: read the live operational state in one consistent snapshot.
+
+    Sources: armed opencode/native confirmations, the running flag, the
+    S18 action queue, the pending browser clarification, and the last
+    verified native result. Returns a plain dict — the speaker below only
+    reads this, never live globals.
+    """
+    try:
+        with _opencode_confirm_lock:
+            pending_opencode = dict(_pending_opencode_task or {})
+    except Exception:
+        pending_opencode = {}
+    try:
+        from backend.services.task_agent import agent as _ta
+        pending_native = bool(_ta.has_pending_task_confirmation())
+    except Exception:
+        pending_native = False
+    try:
+        with _action_queue_lock:
+            queued = list(_pending_action_requests)
+    except Exception:
+        queued = []
+    try:
+        with _browser_clarification_lock:
+            clarification = dict(_pending_browser_clarification or {})
+    except Exception:
+        clarification = {}
+    running = bool(_opencode_task_running)
+    researching = bool(_research_running)
+    last_status, last_summary = "", ""
+    try:
+        result, task_text = _last_task_result()
+        if result is not None:
+            last_status = str(getattr(result, "status", "") or "")
+            last_summary = str(
+                getattr(result, "summary", "")
+                or getattr(result, "detail", "") or task_text or "")
+    except Exception:
+        pass
+    return {
+        "pending_opencode": bool(pending_opencode),
+        "pending_native": bool(pending_native),
+        "awaiting_approval": bool(pending_opencode) or pending_native,
+        "running": running,
+        "researching": researching,
+        "queued": len(queued),
+        "clarification": bool(clarification),
+        "last_status": last_status,
+        "last_summary": re.sub(r"\s+", " ", last_summary).strip()[:160],
+    }
+
+
+def answer_status_question(msg):
+    """R12: the grounded status reply for *msg* (Astra §4 table).
+
+    Reads _status_snapshot() and returns a controlled-form sentence. Never
+    consults chat history or the LLM. Never invents monitoring processes.
+    Uncertain states say so plainly ("I cannot verify...").
+    """
+    snap = _status_snapshot()
+    text = _CUED_TASK_RE.sub("queued task", str(msg or ""))
+    lowered = text.lower()
+    asks_queue = bool(re.search(r"\bqueu", lowered))
+
+    # Queue-specific questions get queue-grounded answers first.
+    if asks_queue:
+        if snap["queued"]:
+            if snap["running"]:
+                return ("Sir, the browser task is running. "
+                        "%d task(s) queued, not started." % snap["queued"])
+            return ("Not yet, sir. %d task(s) queued."
+                    % snap["queued"])
+        if snap["running"]:
+            return "Sir, a task is running. Nothing is queued."
+        return "Nothing is queued, sir."
+
+    # "Q test" was never a tracked task: ask once, never assert absence.
+    if _Q_TEST_RE.search(text):
+        if snap["running"] or snap["queued"] or snap["awaiting_approval"]:
+            return ("Sir, I have a task in motion, but I have no task "
+                    "matching that description. Do you mean the file task "
+                    "or the browser task?")
+        return ("Sir, I have no task matching that description. "
+                "What would you like me to work on?")
+
+    # Precedence: running > queued > awaiting approval > clarification >
+    # last verified result > idle. Combined states name both facts.
+    if snap["running"] and snap["queued"]:
+        return ("Sir, the browser task is running. "
+                "The other task is queued, not started.")
+    if snap["running"]:
+        return "Yes, sir. A task is running right now."
+    if snap["queued"]:
+        return "Not yet, sir. The task is queued."
+    if snap["awaiting_approval"]:
+        return "No, sir. The task is waiting for your approval."
+    if snap["researching"]:
+        return "Yes, sir. A search is running right now."
+    if snap["clarification"]:
+        return "Sir, quick question is waiting on you before I continue."
+    status = snap["last_status"]
+    if status == "completed":
+        if snap["last_summary"]:
+            return "Yes, sir. Done — %s." % _voice_clip(
+                snap["last_summary"], 140)
+        return "Yes, sir. The last task finished."
+    if status == "partial":
+        return ("Partly, sir. The last task is only partly done"
+                + (" — %s." % _voice_clip(snap["last_summary"], 120)
+                   if snap["last_summary"] else "."))
+    if status in ("failed", "known_failure"):
+        return "No, sir. The last attempt failed."
+    if status == "stopped":
+        return "Sir, the task was stopped. No further changes were verified."
+    if status == "needs_input":
+        return "Sir, I asked a question before continuing."
+    return "Sir, nothing is running right now."
+
+
 # ── Dual-voice mute: while an opencode task runs, only opencode speaks ──
 _opencode_task_running = False
 
@@ -3942,8 +4098,11 @@ def _process_message_inner(
         return response
 
     # ── Pending 'shall I look it up?' answer — consume before any routing ──
+    # R12: a STATUS question ("is it done?", "are you doing X?") is never a
+    # confirmation answer — it must reach the grounded status path, not be
+    # swallowed here as an unclear answer that DISCARDS the pending preview.
     _t = time.perf_counter_ns()
-    confirmed = _consume_confirmation(msg)
+    confirmed = None if is_status_question(msg) else _consume_confirmation(msg)
     _mark_latency_duration(request_id, "preroute_confirmation", _t)
     if confirmed is not None:
         if from_voice and sync_voice:
@@ -3951,8 +4110,11 @@ def _process_message_inner(
         return confirmed
 
     # ── Pending task-action confirmation answer — consume before routing ──
+    # R12: same guard — a status question leaves the armed task preview
+    # intact so the later answer can report "waiting for your approval".
     _t = time.perf_counter_ns()
-    task_confirmed = consume_task_confirmation(msg)
+    task_confirmed = (None if is_status_question(msg)
+                      else consume_task_confirmation(msg))
     _mark_latency_duration(request_id, "preroute_task_confirmation", _t)
     if task_confirmed is not None:
         _record_native_task_outcome(msg)
@@ -3962,8 +4124,11 @@ def _process_message_inner(
         return task_confirmed
 
     # ── Pending opencode-handoff confirmation answer — consume before routing ──
+    # R12: same status guard — "is it done?" must not discard the preview it
+    # is asking about.
     _t = time.perf_counter_ns()
-    opencode_confirmed = _consume_opencode_confirmation(msg)
+    opencode_confirmed = (None if is_status_question(msg)
+                          else _consume_opencode_confirmation(msg))
     _mark_latency_duration(request_id, "preroute_opencode_confirmation", _t)
     if opencode_confirmed is not None:
         _clear_browser_clarification()
@@ -3979,6 +4144,26 @@ def _process_message_inner(
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, browser_followup)
         return browser_followup
+
+    # ── R12 status grounding — answer from live state, not chat recall ──
+    # "Are you doing the queued task?", "is it done?", "what's queued" are
+    # state queries, not new work: the speaker reads the live snapshot
+    # (armed confirmations, running flag, action queue, last verified
+    # result) and answers a controlled form. Runs BEFORE the intent
+    # classifier so a status turn can never be answered from chat memory
+    # ("that topic has not been raised"). Confirmation-shaped status ("yes,
+    # check it" answering a pending preview) is NOT status — the gates above
+    # already consumed it.
+    if not msg.lower().startswith("command"):
+        try:
+            if is_status_question(msg):
+                print("[STATUS] Grounded status answer from live state:", msg)
+                status_reply = answer_status_question(msg)
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, status_reply)
+                return status_reply
+        except Exception as exc:
+            logging.warning("[STATUS] Grounded answer failed: %s", exc)
 
     # ── [P0-10] Speculative chat racer — started HERE ────────────────────
     # This used to start after the whole predicate chain below (task request,
