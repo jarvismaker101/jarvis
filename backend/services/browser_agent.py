@@ -746,6 +746,11 @@ def _model_turn(messages, tools):
 def _model_turn_with_retries(history, tools, step=None, stats=None):
     """Model call with at most 2 retries on transport/HTTP errors.
 
+    L-8: only RETRYABLE failures loop (transient HTTP statuses, transport
+    errors, anything without a provider response). A deterministic
+    rejection — an HTTP error whose status is outside _RETRYABLE_STATUS —
+    breaks out after the first attempt with the provider's own message.
+
     Timing is observational only: every attempt is timed and logged as a
     STOPWATCH line, but the retry policy, the raised error and the model
     call itself are never affected by a timing hiccup.
@@ -792,6 +797,10 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
             last_error = exc
             dur_ms = _sw_elapsed_ms(t0)
             _total.done(stats, ok=False)
+            # L-8: a deterministic rejection (same payload fails identically)
+            # breaks out immediately instead of burning two more full-image
+            # uploads plus a second of sleeping.
+            retryable = _is_retryable(exc)
             try:
                 if attempt < 2:
                     append_activity_line(
@@ -802,8 +811,23 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
                         stats.record_model(step, dur_ms, ok=False, retry=True)
             except Exception:
                 pass
+            if not retryable:
+                try:
+                    append_activity_line(
+                        "STOPWATCH model deterministic step=%s attempt=%d "
+                        "dur_ms=%d error=%s\n"
+                        % (step, attempt, dur_ms,
+                           _provider_message(exc)[:200] or type(exc).__name__)
+                    )
+                except Exception:
+                    pass
+                break
             if attempt < 2:
-                time.sleep(0.5)
+                # L-8: the provider's Retry-After wins over the flat gap.
+                try:
+                    time.sleep(_retry_delay_s(exc))
+                except Exception:
+                    pass
             continue
         dur_ms = _sw_elapsed_ms(t0)
         _total.done(stats, ok=True)
@@ -832,7 +856,127 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
             stats.record_model(step, dur_total, ok=False)
     except Exception:
         pass
-    raise RuntimeError(str(last_error))
+    raise RuntimeError(_model_failure_message(last_error))
+
+
+# ── L-8 / BA-02: retryable vs. deterministic model errors ──────────────────
+# _model_turn_with_retries used to catch bare Exception and loop exactly 3
+# attempts for EVERYTHING. A deterministic 400 (bad schema, context overflow,
+# unsupported reasoning_effort, oversize image) therefore cost 3 full image
+# uploads + 1.0 s of sleeping, and the operator saw only "model call failed".
+
+#: HTTP statuses worth another attempt. Anything ELSE that arrives with a
+#: provider response — notably 400 invalid_request — fails identically on
+#: the same payload, so retrying only burns uploads.
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: Longest a provider's Retry-After is honoured (seconds). A broken
+#: `Retry-After: 3600` must not park the task for an hour.
+_RETRY_AFTER_CAP_S = 10.0
+
+#: Fallback gap between attempts when the provider names no wait.
+_RETRY_GAP_S = 0.5
+
+
+def _is_retryable(exc):
+    """True when another attempt could plausibly succeed.
+
+    Fail-fast applies ONLY to known-deterministic failures: an error
+    carrying an HTTP response whose status is outside _RETRYABLE_STATUS.
+    Anything without a response (transport errors, RuntimeErrors from the
+    adapters) keeps today's retry behaviour — failing fast on unknowns
+    would trade a measured waste for unmeasured fragility, and the suite
+    pins bare RuntimeErrors as retried.
+    """
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return True
+        return int(getattr(resp, "status_code", 0)) in _RETRYABLE_STATUS
+    except Exception:
+        return True
+
+
+def _retry_after_s(exc):
+    """Seconds the provider asked us to wait (Retry-After), capped at
+    _RETRY_AFTER_CAP_S. 0 when absent, unparsable, or past (HTTP-date)."""
+    try:
+        resp = getattr(exc, "response", None)
+        headers = getattr(resp, "headers", None) if resp is not None else None
+        raw = headers.get("Retry-After") if headers else None
+        if raw is None:
+            return 0.0
+        raw = str(raw).strip()
+        try:
+            wait = float(raw)
+        except ValueError:
+            # HTTP-date form: wait until then, never backwards.
+            try:
+                from email.utils import parsedate_to_datetime
+                target = parsedate_to_datetime(raw).timestamp()
+                wait = target - time.time()
+            except Exception:
+                return 0.0
+        if wait <= 0:
+            return 0.0
+        return min(wait, _RETRY_AFTER_CAP_S)
+    except Exception:
+        return 0.0
+
+
+def _provider_message(exc):
+    """The provider's own error text, best-effort (truncated).
+
+    `raise_for_status()` keeps only status+URL in str(exc); the body — the
+    part that says WHICH schema field or limit broke — is what the operator
+    needs, and it used to be discarded by the retry loop's RuntimeError.
+    """
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return ""
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict) and err.get("message"):
+                text = str(err["message"])
+            elif isinstance(body.get("message"), str):
+                text = body["message"]
+            else:
+                text = json.dumps(body, default=str)
+        elif body is not None:
+            text = str(body)
+        else:
+            try:
+                text = resp.text or ""
+            except Exception:
+                text = ""
+        text = " ".join(str(text).split())
+        return text[:500]
+    except Exception:
+        return ""
+
+
+def _model_failure_message(exc):
+    """What the task raises with: the error plus the provider's own words."""
+    try:
+        base = str(exc) if exc is not None else "unknown model error"
+    except Exception:
+        base = "unknown model error"
+    detail = _provider_message(exc)
+    if detail and detail not in base:
+        return "%s | provider said: %s" % (base, detail)
+    return base
+
+
+def _retry_delay_s(exc):
+    """Gap before the next attempt: the provider's Retry-After when it
+    names one (429/503), else the flat historical 0.5 s."""
+    wait = _retry_after_s(exc)
+    return wait if wait > 0 else _RETRY_GAP_S
 
 
 # ── BA-00: turn-level instrumentation ───────────────────────────────────────
