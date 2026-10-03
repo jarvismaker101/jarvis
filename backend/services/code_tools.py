@@ -159,6 +159,13 @@ def create_folder(path):
         return {"ok": False, "error": reason, "content": "", "path": _resolved}
     try:
         os.makedirs(resolved, exist_ok=True)
+        try:
+            from backend.core import brain as _brain
+            _brain.notebook_record_entity(
+                os.path.basename(resolved) or resolved, resolved,
+                kind="folder", source="created")
+        except Exception:
+            pass
         return {"ok": True, "content": f"Folder ready: {resolved}", "error": "", "path": resolved, "exit_code": 0}
     except OSError as exc:
         return {"ok": False, "error": str(exc), "content": "", "path": resolved}
@@ -170,6 +177,13 @@ def list_directory(path="."):
     if not os.path.isdir(resolved):
         return {"ok": False, "error": f"Directory not found: {path}", "content": "", "path": resolved}
     try:
+        try:
+            from backend.core import brain as _brain
+            _brain.notebook_record_entity(
+                os.path.basename(resolved) or resolved, resolved,
+                kind="folder", source="listed")
+        except Exception:
+            pass
         entries = sorted(os.listdir(resolved))
         lines = []
         for name in entries[:500]:

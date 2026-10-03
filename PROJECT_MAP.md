@@ -1598,3 +1598,7 @@ Tag `local-models`. Documented in full at the top of this map ("Local models as 
 ### Astra R1 — meaning, not first word (`pending`)
 
 Declarative/desire phrasing routes deterministically: `_WANT_CREATE_RE` catches "I want / I need / there should be ... file" ANYWHERE in the sentence ("on my desktop there is a folder Mayank Malik, I want a file inside it"), while `_WANT_ASSERT_ONLY_RE` keeps bare existence ("there is a file") conversational. Both `is_code_tool_request` and `_heuristic_plan` handle the R1 shape (located-write plan with defaulted name). Tests: `R1MeaningNotFirstWordTests` in `test_code_tools.py`.
+
+### Astra R2 — notebook across turns (`pending`)
+
+`backend/core/brain.py`: bounded in-memory ledger (`_notebook_requests` max 20, `_notebook_entities` max 12) — `notebook_record_request` (id req-N, kind, state seen→…) fed by every `_record_last_work_request`, `notebook_mark_state`, `notebook_record_entity` upsert with focus-head order, `notebook_focus_folder`, `notebook_snapshot` (requests + entities + live `_status_snapshot`). It is a READ model over the existing globals, not a replacement. `_resolve_folder_hint` in `task_agent/agent.py` reads the focus head first ("that folder" = active-task folder); `code_tools.create_folder` / `list_directory` record observed entities. Tests: `R2NotebookTests` in `test_brain_gate.py`.

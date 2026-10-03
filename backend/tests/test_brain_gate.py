@@ -827,6 +827,46 @@ class R6StopThenRedirectTests(unittest.TestCase):
             brain._resolve_last_command(), "create a folder named x")
 
 
+class R2NotebookTests(unittest.TestCase):
+    """R2: one small ledger across turns — requests, entities, focus."""
+
+    def setUp(self):
+        brain._notebook_requests[:] = []
+        brain._notebook_entities[:] = []
+
+    def test_request_record_and_focus(self):
+        rid = brain.notebook_record_request("create a folder named x")
+        self.assertTrue(rid.startswith("req-"))
+        last = brain.notebook_last_request()
+        self.assertEqual(last["id"], rid)
+        self.assertEqual(last["state"], "seen")
+        brain.notebook_mark_state(rid, "awaiting_approval")
+        self.assertEqual(
+            brain.notebook_last_request()["state"], "awaiting_approval")
+
+    def test_entity_focus_head(self):
+        brain.notebook_record_entity("Mayank Malik", "C:\\d\\Mayank Malik")
+        brain.notebook_record_entity("Other", "C:\\d\\Other")
+        self.assertEqual(brain.notebook_focus_folder(), "C:\\d\\Other")
+
+    def test_last_work_feeds_notebook(self):
+        brain._record_last_work_request("create a folder named x")
+        last = brain.notebook_last_request()
+        self.assertIsNotNone(last)
+        self.assertIn("folder", last["text"])
+        # Non-work never lands in the notebook.
+        n = len(brain._notebook_requests)
+        brain._record_last_work_request("is it done?")
+        brain._record_last_work_request("yes")
+        self.assertEqual(len(brain._notebook_requests), n)
+
+    def test_snapshot_reads_live(self):
+        snap = brain.notebook_snapshot()
+        self.assertIn("requests", snap)
+        self.assertIn("entities", snap)
+        self.assertIn("live", snap)
+
+
 class R4OpencodeGateTests(unittest.TestCase):
     """R4 on the opencode handoff gate: tails decide, not bare yes-words."""
 

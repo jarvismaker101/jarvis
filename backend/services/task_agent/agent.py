@@ -990,9 +990,17 @@ def _resolve_folder_hint(hint):
         if os.path.isdir(candidate):
             return candidate
         return os.path.normpath(candidate)
-    # Pronoun: the folder of the previous turn. Prefer the most recent
-    # create_folder artifact; fall back to the parent dir of the most recent
-    # write_file artifact.
+    # Pronoun: the R2 notebook focus head first ("that folder" = most recent
+    # compatible folder in the ACTIVE task, not the nearest noun); then the
+    # folder of the previous native turn (create_folder artifact, else parent
+    # of write_file artifact); else None so the planner asks, never guesses.
+    try:
+        from backend.core import brain as _brain
+        focus = _brain.notebook_focus_folder()
+        if focus and os.path.isdir(focus):
+            return focus
+    except Exception:
+        pass
     try:
         result, _task_text = last_task_result()
     except Exception:

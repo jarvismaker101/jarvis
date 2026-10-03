@@ -3192,6 +3192,7 @@ def _record_last_work_request(msg):
     Status questions, bare confirmations ("yes"/"no"), stop controls, and
     "command"-prefixed lines are not work — the redirect resolver must skip
     them so "execute the last command" means the last real thing asked.
+    Also mirrors into the R2 notebook (focus stack + entity table).
     """
     text = (msg or "").strip()
     if not text or text.lower().startswith("command"):
@@ -3211,10 +3212,127 @@ def _record_last_work_request(msg):
         return
     global _last_user_work_request
     _last_user_work_request = text
+    try:
+        notebook_record_request(text)
+    except Exception:
+        pass
 
 
 #: The last substantive user work request (see _record_last_work_request).
 _last_user_work_request = ""
+
+
+# ── R2 notebook: one small authoritative ledger across turns ──────────
+# Scattered globals used to own cross-turn truth separately (pending
+# opencode preview, pending native plan, S18 queue, held redirect, last
+# result, last work text). The notebook does NOT replace them — it is the
+# one READ model over them: request records (turn, kind, state), entity
+# table (folders/files with canonical paths + focus order), approval and
+# result mirrors. Resolvers ("that folder", status speaker) read the
+# notebook; writers update it at the same points that arm/clear the
+# underlying globals, so it can never drift from live state.
+_notebook_lock = threading.Lock()
+_notebook_requests = []
+_NOTEBOOK_REQUESTS_MAX = 20
+_notebook_entities = []
+_NOTEBOOK_ENTITIES_MAX = 12
+_notebook_seq = 0
+
+#: Request kinds the notebook tracks (Astra §2 task states, compressed).
+_NOTEBOOK_KIND_RE = re.compile(
+    r"\b(create|make|write|save|check|verify|list|inspect|see|show|"
+    r"search|find|look\s+up|open|run|execute|stop)\b",
+    re.IGNORECASE,
+)
+
+
+def notebook_record_request(text):
+    """R2: append one request record; returns its id (req-N)."""
+    global _notebook_seq
+    with _notebook_lock:
+        _notebook_seq += 1
+        rid = "req-%d" % _notebook_seq
+        kind = "work"
+        try:
+            kind_m = _NOTEBOOK_KIND_RE.search(text or "")
+            kind = kind_m.group(1).lower() if kind_m else "work"
+        except Exception:
+            pass
+        _notebook_requests.append({
+            "id": rid, "text": str(text or "")[:300], "kind": kind,
+            "state": "seen", "turn": _notebook_seq,
+            "at": time.time(),
+        })
+        while len(_notebook_requests) > _NOTEBOOK_REQUESTS_MAX:
+            _notebook_requests.pop(0)
+        return rid
+
+
+def notebook_mark_state(rid, state):
+    """R2: move a request record to a new task state (no-op if unknown)."""
+    if not rid:
+        return
+    with _notebook_lock:
+        for entry in _notebook_requests:
+            if entry.get("id") == rid:
+                entry["state"] = str(state)
+                entry["at"] = time.time()
+                return
+
+
+def notebook_last_request(kind=None):
+    """R2: the most recent request record (optionally of one kind)."""
+    with _notebook_lock:
+        entries = list(_notebook_requests)
+    for entry in reversed(entries):
+        if kind and entry.get("kind") != kind:
+            continue
+        return dict(entry)
+    return None
+
+
+def notebook_record_entity(name, path, kind="folder", source="observed"):
+    """R2: upsert a folder/file entity with its canonical path + focus.
+
+    Most-recently-touched entity is the focus head: "that folder" resolves
+    here first, before the last-native-artifacts fallback.
+    """
+    if not path:
+        return
+    canon = os.path.normpath(str(path))
+    with _notebook_lock:
+        _notebook_entities[:] = [
+            e for e in _notebook_entities
+            if os.path.normpath(str(e.get("path") or "")) != canon]
+        _notebook_entities.append({
+            "name": str(name or ""), "path": canon, "kind": str(kind),
+            "source": str(source), "at": time.time(),
+        })
+        while len(_notebook_entities) > _NOTEBOOK_ENTITIES_MAX:
+            _notebook_entities.pop(0)
+
+
+def notebook_focus_folder():
+    """R2: the focus-head folder entity's path, or None."""
+    with _notebook_lock:
+        entries = list(_notebook_entities)
+    for entry in reversed(entries):
+        if entry.get("kind") == "folder" and entry.get("path"):
+            return entry["path"]
+    return None
+
+
+def notebook_snapshot():
+    """R2: one consistent read for resolvers and the status speaker."""
+    with _notebook_lock:
+        requests = [dict(r) for r in _notebook_requests]
+        entities = [dict(e) for e in _notebook_entities]
+    live = {}
+    try:
+        live = _status_snapshot()
+    except Exception:
+        live = {}
+    return {"requests": requests, "entities": entities, "live": live}
 
 
 def _resolve_last_command():
