@@ -98,27 +98,49 @@ class SameUrlReloadTests(unittest.TestCase):
         self.assertIn("older page", result)
         self.assertNotIn("click_locator", daemon.names())
 
-    def test_same_url_reload_whose_counters_restart_at_zero_refuses(self):
-        # doc epoch is identical but the mutation counter restarted at 0: the
-        # explicit zero must be COMPARED, not skipped as "missing".
+    def test_same_url_reload_whose_counters_restart_at_zero_proceeds(self):
+        # BA-05: doc epoch is identical but the mutation counter restarted
+        # at 0 — the explicit zero is still COMPARED (not skipped), but the
+        # drift is a tolerance hint now, not a refusal: the element is
+        # present, visible and unmoved, so the click goes through.
         daemon = FakeDaemon(probe=_live_probe(mut=0))
         session = {"marks": {1: _mark(epoch_mut="7")}}
         result = browser_agent._handle_click_mark(daemon, session, {"index": 1})
+        self.assertIn("click_locator", daemon.names())
+        self.assertNotIn("stale", result.lower())
+
+    def test_legacy_flag_restores_the_mutation_refusal(self):
+        daemon = FakeDaemon(probe=_live_probe(mut=0))
+        session = {"marks": {1: _mark(epoch_mut="7")}}
+        with patch.dict(os.environ, {"JARVIS_BROWSER_STALE_ON_MUTATION": "1"}):
+            result = browser_agent._handle_click_mark(daemon, session,
+                                                      {"index": 1})
         self.assertIn("stale", result.lower())
         self.assertNotIn("click_locator", daemon.names())
 
-    def test_first_mutation_after_a_look_refuses_the_mark(self):
+    def test_first_mutation_after_a_look_no_longer_refuses_the_mark(self):
+        # BA-05: one unrelated DOM mutation used to invalidate every mark.
         daemon = FakeDaemon(probe=_live_probe(mut=8))
         session = {"marks": {1: _mark()}}
         result = browser_agent._handle_click_mark(daemon, session, {"index": 1})
+        self.assertIn("click_locator", daemon.names())
+        self.assertNotIn("stale", result.lower())
+
+    def test_first_mutation_refuses_under_the_legacy_flag(self):
+        daemon = FakeDaemon(probe=_live_probe(mut=8))
+        session = {"marks": {1: _mark()}}
+        with patch.dict(os.environ, {"JARVIS_BROWSER_STALE_ON_MUTATION": "1"}):
+            result = browser_agent._handle_click_mark(daemon, session,
+                                                      {"index": 1})
         self.assertIn("stale", result.lower())
         self.assertNotIn("click_locator", daemon.names())
 
-    def test_a_zero_mutation_mark_is_refused_on_the_first_mutation(self):
+    def test_a_zero_mutation_mark_survives_the_first_mutation(self):
         daemon = FakeDaemon(probe=_live_probe(mut=1))
         session = {"marks": {1: _mark(epoch_mut="0")}}
         result = browser_agent._handle_click_mark(daemon, session, {"index": 1})
-        self.assertIn("stale", result.lower())
+        self.assertIn("click_locator", daemon.names())
+        self.assertNotIn("stale", result.lower())
 
     def test_an_identical_zero_state_is_accepted(self):
         daemon = FakeDaemon(probe=_live_probe(mut=0))

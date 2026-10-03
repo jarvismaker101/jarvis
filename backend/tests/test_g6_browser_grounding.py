@@ -132,13 +132,32 @@ class MarkIdentityTests(unittest.TestCase):
         self.assertIn("look again", result.lower())
         self.assertNotIn("click_locator", client.names())
 
-    def test_same_url_spa_update_refuses_stale_mark(self):
+    def test_same_url_spa_update_no_longer_refuses_on_mut_drift(self):
+        # BA-05: SAME url and doc, mutation counter advanced -> SPA update.
+        # The drift is a hint, not a refusal: the element still exists at
+        # the same rect, so the click goes through via real input.
         client = FakeDaemon()
-        # SAME url and doc, but the mutation counter advanced -> SPA update
+        client.responses["evaluate"] = lambda n, a, i: _live_probe(mut=99)
+        client.responses["click_locator"] = (
+            "Clicked via real input (top).\n"
+            "url=https://example.com navigated=no\n"
+            "title=T")
+        session = {"marks": {1: _mark("a.home")}}
+        with patch.object(browser_agent.time, "sleep"):
+            result = browser_agent._handle_click_mark(client, session,
+                                                      {"index": 1})
+        self.assertIn("real-input", result)
+        self.assertIn("click_locator", client.names())
+
+    def test_same_url_spa_update_refuses_under_the_legacy_flag(self):
+        client = FakeDaemon()
         client.responses["evaluate"] = lambda n, a, i: _live_probe(mut=99)
         session = {"marks": {1: _mark("a.home")}}
-        result = browser_agent._handle_click_mark(client, session, {"index": 1})
+        with patch.dict(os.environ, {"JARVIS_BROWSER_STALE_ON_MUTATION": "1"}):
+            result = browser_agent._handle_click_mark(client, session,
+                                                      {"index": 1})
         self.assertIn("look again", result.lower())
+        self.assertNotIn("click_locator", client.names())
 
     def test_gone_element_is_refused(self):
         client = FakeDaemon()
@@ -199,6 +218,14 @@ class RealInputOutcomeTests(unittest.TestCase):
         parsed = browser_agent._parse_locator_outcome(
             "click_locator: no element matches (url=https://example.com).")
         self.assertFalse(parsed["ok"])
+
+    def test_empty_daemon_reply_fails_gracefully(self):
+        # BA-05 fallout pin: an empty reply must be a clean failure, never
+        # an IndexError out of the outcome parser.
+        for text in ("", "   ", None):
+            parsed = browser_agent._parse_locator_outcome(text)
+            self.assertFalse(parsed["ok"])
+            self.assertEqual(parsed["reason"], "")
 
     def test_failed_action_is_not_a_click(self):
         parsed = browser_agent._parse_locator_outcome(

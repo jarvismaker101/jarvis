@@ -1608,12 +1608,16 @@ def _handle_look(client, session, stats=None):
             "const selectors = 'a, button, input, select, textarea, [role=\"button\"], [onclick], [contenteditable], video, iframe, [tabindex]';"
             # F39: a document epoch — timeOrigin changes on ANY navigation
             # (including same-URL reloads); the MutationObserver counter
-            # changes on SPA DOM updates. Together they catch what URL
+            # changes on structural DOM updates. Together they catch what URL
             # equality cannot. cssPath gives every mark a real element
             # identity to re-resolve against later.
+            # BA-05: the observer watches direct-child structure ONLY (no
+            # subtree, no attributes) — class toggles, aria-live updates,
+            # lazy images and spinner animations were pure counter noise for
+            # a signal that is now just a tolerance hint, not a refusal.
             "if (!window.__jarvisEpoch) { window.__jarvisEpoch = {mut: 0};"
             " try { new MutationObserver(ms => { window.__jarvisEpoch.mut += ms.length; })"
-            " .observe(document.documentElement, {subtree: true, childList: true, attributes: true}); } catch(e) {} }"
+            " .observe(document.documentElement, {childList: true}); } catch(e) {} }"
             "const epochDoc = (performance && performance.timeOrigin) ? Math.round(performance.timeOrigin) : 0;"
             # F39: 0 is a REAL epoch value (the first mutation count, a
             # timeOrigin that rounds to zero), so it is reported explicitly
@@ -1930,6 +1934,14 @@ def _handle_look(client, session, stats=None):
 _MARK_RECT_TOLERANCE = 12  # px: reflow slop before a mark counts as moved
 
 
+def _stale_on_mutation():
+    """Legacy kill-switch (BA-05): JARVIS_BROWSER_STALE_ON_MUTATION=1 restores
+    the pre-BA-05 refusal on ANY mutation-epoch drift. Default (unset) is the
+    hint policy: drift only widens the rect tolerance."""
+    return str(os.getenv("JARVIS_BROWSER_STALE_ON_MUTATION", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _epoch_text(value):
     """One epoch/DPR component as an EXPLICIT string (F39).
 
@@ -2102,6 +2114,9 @@ def _mark_target_state(client, stored, stats=None):
         a look, and a same-URL reload whose counters restart, are detected;
       * a document/url/DPR/frame/tab change is a refusal, so a mark cannot be
         redirected onto whatever now occupies the same coordinates.
+      * BA-05: a MUTATION-counter drift is NOT a refusal (the counter fires
+        on unrelated DOM noise) — it only widens the rect tolerance 3x,
+        unless JARVIS_BROWSER_STALE_ON_MUTATION=1 restores the old refusal.
     """
     css = (stored or {}).get("cssPath") or ""
     if not css:
@@ -2133,7 +2148,15 @@ def _mark_target_state(client, stored, stats=None):
     if want_doc and have_doc != want_doc:
         return None, ("That mark is from an older page (the document changed since the look). "
                       "Call look again.")
-    if want_mut and have_mut and have_mut != want_mut:
+    # BA-05: mut drift is NO LONGER a refusal — the global counter fires on
+    # any unrelated DOM activity (class toggles, aria-live updates,
+    # lazy images, spinners), so equality on it invalidated every mark at
+    # once. A drifted counter only widens the rect tolerance: the precise
+    # question ("is this still this element, in the same place?") is
+    # answered by the exists/visible/live-rect checks below, which re-query
+    # the cssPath against the live page.
+    mut_drifted = bool(want_mut and have_mut and have_mut != want_mut)
+    if mut_drifted and _stale_on_mutation():
         return None, ("That mark is stale (the page content changed since the look). "
                       "Call look again.")
     have_dpr = _epoch_text(live.get("dpr"))
@@ -2167,12 +2190,15 @@ def _mark_target_state(client, stored, stats=None):
                           "tab is now %s). Call look again." % (stored_tab, active_tab))
     rect = live.get("rect") or {}
     observed = (stored or {}).get("rect") or {}
+    # BA-05: a drifted mutation counter widens the tolerance 3x — the page
+    # may have reflowed around an element that is still the same element.
+    tolerance = _MARK_RECT_TOLERANCE * (3 if mut_drifted else 1)
     for key in ("x", "y", "w", "h"):
         try:
             moved = abs(int(rect.get(key, 0)) - int(observed.get(key, 0)))
         except Exception:
             moved = 0
-        if moved > _MARK_RECT_TOLERANCE:
+        if moved > tolerance:
             return None, "That mark moved on the page since the look. Call look again."
     return live, None
 # stringifies to literal '{}' and the resolve value is discarded forever.
@@ -2620,7 +2646,10 @@ def _parse_locator_outcome(text):
         ok = True
     else:
         ok = False
-    reason = line.splitlines()[0][:300] if not ok else ""
+    # BA-05 fallout: more clicks reach this parser now that mut drift no
+    # longer refuses up front — an empty daemon reply must fail gracefully,
+    # never IndexError on splitlines()[0].
+    reason = line.splitlines()[0][:300] if (not ok and line) else ""
     return {"ok": ok, "url": url, "navigated": navigated, "reason": reason}
 
 
