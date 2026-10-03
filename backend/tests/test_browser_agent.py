@@ -1519,12 +1519,15 @@ class VirtualToolTests(unittest.TestCase):
         self.assertEqual(result, "done")
         tool_names = {t["name"] for t in seen["tools"]}
         for allowed in ("open_brave", "navigate", "list_tabs", "switch_tab",
-                        "new_tab", "evaluate"):
+                        "new_tab"):
             self.assertIn(allowed, tool_names)
+        # BA-07: evaluate is no longer advertised (advertise-then-forbid
+        # became unadvertised) — it stays dispatchable for our own
+        # handlers but the model never sees its schema.
         for hidden in ("read_file", "list_dir", "screenshot", "ask_chat",
                        "copy_code_block", "extract_code_blocks",
                        "close_brave", "understand_page", "click_element",
-                       "fill_element"):
+                       "fill_element", "evaluate"):
             self.assertNotIn(hidden, tool_names)
         # virtual tools are still merged in
         for virtual in ("look", "click_mark", "fill_mark", "verify_playing",
@@ -1691,15 +1694,31 @@ class VirtualToolTests(unittest.TestCase):
         self.assertTrue(any("iframe" in l for l in lines))
 
     def test_evaluate_syntax_error_guidance_and_click_element_stale(self):
+        # BA-07: raw page JavaScript is internal-only now. A MODEL-authored
+        # evaluate is refused at the dispatch name gate (grant or not, the
+        # daemon is never reached); the SyntaxError guidance below still
+        # serves the INTERNAL origin, which kept its dispatch path.
+        model_history = []
+        model_client = Mock()
+        model_call = {"id": "c0", "name": "evaluate",
+                      "arguments": {"expression": "a; b;"}}
+        with patch.object(browser_agent, "append_activity_line"), patch.object(browser_agent, "narrate_activity"):
+            browser_agent._run_one_tool(model_client, model_history,
+                                        model_call, {"grants": {"privileged_js"}})
+        model_client.call_tool.assert_not_called()
+        self.assertIn("blocked by policy", model_history[0]["content"])
+        self.assertIn("not in the dispatch allowlist",
+                      model_history[0]["content"])
         # F17: raw page JavaScript is privileged, so it only runs for a job
         # that holds the privileged_js grant (JARVIS_BROWSER_PRIVILEGED_JS).
-        privileged = {"grants": {"privileged_js"}}
+        internal = {"_internal_tool_call": True,
+                    "grants": {"privileged_js"}}
         history = []
         client = Mock()
         client.call_tool.return_value = "SyntaxError: Unexpected token ';'"
         call = {"id": "c1", "name": "evaluate", "arguments": {"expression": "a; b;"}}
         with patch.object(browser_agent, "append_activity_line"), patch.object(browser_agent, "narrate_activity"):
-            browser_agent._run_one_tool(client, history, call, privileged)
+            browser_agent._run_one_tool(client, history, call, internal)
         content = history[0]["content"]
         self.assertIn("SyntaxError", content)
         self.assertIn("IIFE", content)
@@ -1709,7 +1728,7 @@ class VirtualToolTests(unittest.TestCase):
         client2.call_tool.return_value = "ok result"
         call2 = {"id": "c2", "name": "evaluate", "arguments": {"expression": "document.title"}}
         with patch.object(browser_agent, "append_activity_line"), patch.object(browser_agent, "narrate_activity"):
-            browser_agent._run_one_tool(client2, history2, call2, privileged)
+            browser_agent._run_one_tool(client2, history2, call2, internal)
         self.assertNotIn("IIFE", history2[0]["content"])
         # click_element is not exposed to the model at all, so a direct call
         # is refused at the dispatch boundary instead of reaching the daemon.
@@ -1723,7 +1742,8 @@ class VirtualToolTests(unittest.TestCase):
         self.assertIn("blocked by policy", history3[0]["content"])
 
     def test_evaluate_without_grant_is_refused_at_dispatch(self):
-        """F17: privileged page execution needs an explicit grant."""
+        """BA-07: a model-authored evaluate never reaches the grant gate —
+        the dispatch name gate refuses it first (unadvertised tool)."""
         history = []
         client = Mock()
         call = {"id": "c1", "name": "evaluate",
@@ -1733,7 +1753,7 @@ class VirtualToolTests(unittest.TestCase):
         client.call_tool.assert_not_called()
         content = history[0]["content"]
         self.assertIn("blocked by policy", content)
-        self.assertIn("privileged", content)
+        self.assertIn("not in the dispatch allowlist", content)
 
     def test_batch_probe_rejects_mutating_expressions(self):
         """F17: a probe must be a single typed read-only expression."""
@@ -1765,9 +1785,10 @@ class VirtualToolTests(unittest.TestCase):
         prompt = browser_agent._SYSTEM_PROMPT
         lower = prompt.lower()
         self.assertIn("for click_mark and fill_mark only", lower)
-        self.assertIn("different inventory", lower)
-        self.assertIn("understand_page indices", lower)
-        self.assertIn("re-look and use click_mark", lower)
+        # BA-07: the phantom inventory sentences are gone — the marks
+        # table is the only index space because it is the only one left.
+        self.assertNotIn("different inventory", lower)
+        self.assertNotIn("understand_page", lower)
         self.assertIn("play affordance", lower)
         self.assertIn("verify_playing", lower)
         self.assertIn("do not re-click the same coordinates", lower)
@@ -2338,18 +2359,21 @@ class VirtualToolTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("RESULT partial: ") for line in lines))
 
     def test_tool_results_logged_truncated_and_never_base64(self):
+        # BA-07: evaluate is internal-only, so the truncation pin rides a
+        # still-advertised tool (navigate) on the model path.
         history = []
         client = Mock()
         client.call_tool.return_value = "x" * 500
-        call = {"id": "c", "name": "evaluate", "arguments": {}}
+        call = {"id": "c", "name": "navigate",
+                "arguments": {"url": "https://example.com"}}
         with patch.object(browser_agent, "append_activity_line") as log_line:
             browser_agent._run_one_tool(client, history, call, {})
         result_lines = [c.args[0] for c in log_line.call_args_list
-                       if c.args[0].startswith("RESULT evaluate: ")]
+                        if c.args[0].startswith("RESULT navigate: ")]
         self.assertEqual(len(result_lines), 1)
         # cap is 200 chars + "..." marker + trailing newline
         self.assertLessEqual(len(result_lines[0]),
-                             len("RESULT evaluate: ") + 200 + 3 + 1)
+                             len("RESULT navigate: ") + 200 + 3 + 1)
         # fill results stay at full length (short JSON)
         fill_result = json.dumps({"ok": False, "visible_inputs": "y" * 600})
         client.call_tool.return_value = fill_result
@@ -2538,13 +2562,14 @@ class VirtualToolTests(unittest.TestCase):
         self.assertIn("look -> act visually", prompt)
         # DOM tools are fallback only; no understand_page when marks exist
         self.assertIn("fallback only", prompt)
-        # F17: the model is told raw page JavaScript is unavailable, so it
-        # never wastes a turn asking for evaluate.
-        self.assertIn("evaluate) is not available", prompt)
+        # BA-07: evaluate is unadvertised now — an unmentioned tool needs
+        # no prohibition, so the prompt must NOT name it at all.
+        self.assertNotIn("evaluate", prompt)
         self.assertIn("typed read-only expressions", prompt)
         self.assertIn("never", prompt)
-        # mark numbers are not understand_page indices
-        self.assertIn("not understand_page indices", prompt)
+        # BA-07: the phantom index-space sentence is gone with the tools
+        # it was disambiguating.
+        self.assertNotIn("understand_page", prompt)
         # cross-origin player doctrine + verify_playing
         self.assertIn("cross-origin", prompt)
         self.assertIn("verify_playing", prompt)
@@ -3008,7 +3033,9 @@ class TurnChurnReductionTests(unittest.TestCase):
         # Append-only: existing doctrine text must still be present
         self.assertIn("COMPLETION DOCTRINE", prompt)
         self.assertIn("Default browser loop: look -> act visually", prompt)
-        self.assertIn("If click_element says an index is stale", prompt)
+        # BA-07: the phantom index sentence is gone — it was never
+        # doctrine, it was disambiguation against tools that do not exist.
+        self.assertNotIn("click_element", prompt)
 
     def test_off_screen_annotation_in_marks_table(self):
         from PIL import Image
@@ -3120,13 +3147,28 @@ class TurnChurnReductionTests(unittest.TestCase):
         self.assertNotIn("click_element", browser_agent._TOOL_ALLOWLIST)
         self.assertNotIn("fill_element", browser_agent._TOOL_ALLOWLIST)
         self.assertNotIn("understand_page", browser_agent._TOOL_ALLOWLIST)
-        self.assertIn("evaluate", browser_agent._TOOL_ALLOWLIST)
+        # BA-07: evaluate left the advertised set but stays dispatchable
+        # for the internal handlers (F17 invariant: model calls dispatch
+        # only what the model was offered).
+        self.assertNotIn("evaluate", browser_agent._TOOL_ALLOWLIST)
+        self.assertIn("evaluate", browser_agent._TOOL_DISPATCH_ALLOWLIST)
+        self.assertNotIn("evaluate",
+                         browser_agent._MODEL_DISPATCH_ALLOWLIST)
         self.assertIn("navigate", browser_agent._TOOL_ALLOWLIST)
         self.assertIn("open_brave", browser_agent._TOOL_ALLOWLIST)
 
-    def test_daemon_tool_pruning_prompt_sentence_appended(self):
+    def test_phantom_tool_prose_absent_from_prompt(self):
+        # BA-07: every sentence about the three phantom tools is gone, and
+        # so is the advertise-then-forbid prohibition — an unmentioned tool
+        # needs no warning. (The import-time _PHANTOM_TOOL_MENTIONS guard
+        # is the enforcement; this pins the prose.)
         prompt = browser_agent._SYSTEM_PROMPT
-        self.assertIn("daemon inventory tools (click_element, fill_element, understand_page)", prompt)
-        self.assertIn("no longer exposed to the model", prompt)
-        self.assertIn("mark numbers from the look table are the only index space", prompt)
-        self.assertIn("Use click_mark / click_point / click_text for all clicks", prompt)
+        for phantom in ("understand_page", "click_element", "fill_element",
+                        "evaluate"):
+            self.assertNotIn(phantom, prompt)
+        self.assertNotIn("no longer exposed to the model", prompt)
+        self.assertNotIn("NOT available", prompt)
+        self.assertNotIn("never ask for it", prompt)
+        # The surviving guidance names only real tools.
+        self.assertIn("Use click_mark / click_point / click_text for all clicks",
+                      prompt)

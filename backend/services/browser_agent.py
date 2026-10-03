@@ -95,8 +95,6 @@ _SYSTEM_PROMPT = (
     "screenshot with numbered marks plus a table; act on the marks you see. "
     "Marks are from the most recent look and become stale after navigation "
     "or page changes - after any navigation or missed click, look again. "
-    "Mark numbers are NOT understand_page indices: never pass a mark number "
-    "to fill_element or click_element. "
     "For text inputs use fill_mark on the input's mark number (press_enter "
     "true for search boxes); use fill only when the input has no mark. "
     "DOM tools (batch_probe / wait_for) are FALLBACK ONLY: "
@@ -106,9 +104,7 @@ _SYSTEM_PROMPT = (
     "exists. "
     "Use batch_probe to answer several DOM questions in one step - it takes "
     "typed read-only expressions such as document.querySelector('#price')"
-    ".innerText or document.querySelectorAll('.row').length. Raw page "
-    "JavaScript (evaluate) is NOT available: assignment, fetch, cookies and "
-    "arbitrary calls are refused by policy, so never ask for it. "
+    ".innerText or document.querySelectorAll('.row').length. "
     "After actions that trigger async updates (search, form submit, SPA "
     "navigation), call wait_for instead of sleeping or re-polling. "
     "Video players / cross-origin embeds: DOM tools (wait_for, batch_probe) "
@@ -130,10 +126,6 @@ _SYSTEM_PROMPT = (
     "notable items, not just 'it worked'). If the task is genuinely "
     "impossible, say exactly what failed. "
     "Indices in the look marks table are for click_mark and fill_mark ONLY. "
-    "The daemon tools click_element, fill_element and understand_page use a "
-    "DIFFERENT inventory (their own understand_page indices) - never mix them. "
-    "If click_element says an index is stale, that is why: re-look and use "
-    "click_mark instead. "
     "On a watch, embed or player page, click the play affordance (player "
     "mark, video overlay, or a labeled play button) ONCE, then IMMEDIATELY "
     "call verify_playing - it is the designated playback check. Do not "
@@ -156,9 +148,6 @@ _SYSTEM_PROMPT = (
     "look is for discovering a genuinely unknown page, finding an element "
     "that has no mark, or locating an unlabeled target - never call look "
     "just to double-check what the tool result already told you. "
-    "NOTE: the daemon inventory tools (click_element, fill_element, "
-    "understand_page) are no longer exposed to the model - mark numbers "
-    "from the look table are the only index space for clicks and fills. "
     "Use click_mark / click_point / click_text for all clicks and "
     "fill_mark / fill for all fills. "
     "G6 MARK-TRUTH: marks are bound to the element they were seen on - a "
@@ -1556,6 +1545,21 @@ if unknown_checks:  # pragma: no cover - import-time guard, never in a good buil
                        % ", ".join(unknown_checks))
 
 _VIRTUAL_TOOL_NAMES = set(_VIRTUAL_TOOL_SPECS_BY_NAME)
+
+# BA-07: the system prompt must never name a tool the model was not
+# offered. Naming a phantom tool reads like an escape hatch (tried, then
+# policy-blocked — a burned turn); advertising-then-forbidding is worse
+# still. Mirrors the F13 import-time guard above.
+# NOTE: "screenshot" is deliberately NOT in this set — the prompt uses it
+# as plain English ("annotated screenshot"), and it was never advertised
+# as a callable tool, so matching the bare word would false-positive.
+_PROMPT_TOOL_MENTIONS = set(
+    re.findall(r"\b([a-z][a-z_]{3,24})\b", _SYSTEM_PROMPT))
+_PHANTOM_TOOL_MENTIONS = {"understand_page", "click_element", "fill_element",
+                          "evaluate"} & _PROMPT_TOOL_MENTIONS
+if _PHANTOM_TOOL_MENTIONS:  # pragma: no cover - import-time guard, never in a good build
+    raise RuntimeError("system prompt names non-advertised tools: %s"
+                       % sorted(_PHANTOM_TOOL_MENTIONS))
 
 
 def _virtual_schema(name):
@@ -4853,9 +4857,12 @@ def _ba00_note_result(stats, text):
 # ever return text (no image can reach the model that way, and the model
 # improvised screenshot+read_file chasing one), and the internal tools are
 # invoked by the virtual handlers themselves.
+# BA-07: raw page JavaScript (evaluate) is NOT advertised anymore — showing
+# its schema while forbidding it in prose was the worst of both worlds
+# (schema tokens + prohibition tokens + a wasted turn when tried anyway).
+# An unmentioned tool needs no warning, so the prohibition went with it.
 _TOOL_ALLOWLIST = frozenset((
     "open_brave", "navigate", "list_tabs", "switch_tab", "new_tab",
-    "evaluate",
 ))
 
 # F17: the set the DISPATCH gate validates against. It is deliberately
@@ -4865,7 +4872,11 @@ _TOOL_ALLOWLIST = frozenset((
 # gate must refuse is anything that mutates, navigates or executes without
 # the grant for it. G6: the real-input F13/F40 daemon tools are dispatchable
 # too — the virtual handlers call them on behalf of the model.
+# BA-07: evaluate STAYS here so the internal handlers keep working through
+# the internal-origin path — only the MODEL population lost it (see
+# _MODEL_DISPATCH_ALLOWLIST below, which no longer includes it).
 _TOOL_DISPATCH_ALLOWLIST = _TOOL_ALLOWLIST | frozenset((
+    "evaluate",
     "read_file", "list_dir",
     "click_locator", "fill_locator", "scroll", "select_option", "set_checked",
     "upload_file", "download", "drag_drop",

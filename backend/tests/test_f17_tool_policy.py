@@ -90,7 +90,11 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertIn("allowlist", decision.reason)
 
     def test_hidden_primitive_is_not_dispatchable_by_the_model(self):
-        for name in ("read_file", "list_dir", "click_locator", "fill_locator"):
+        # BA-07: evaluate joined the hidden primitives — advertised-then-
+        # forbidden became unadvertised, so the model path refuses it at
+        # the NAME gate before grants are even consulted.
+        for name in ("read_file", "list_dir", "click_locator", "fill_locator",
+                     "evaluate"):
             self.assertNotIn(name, browser_agent._MODEL_DISPATCH_ALLOWLIST)
             decision = tool_policy.validate_dispatch(
                 name, {"path": "x"}, browser_agent._MODEL_DISPATCH_ALLOWLIST)
@@ -111,17 +115,31 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertEqual(decision.operation, tool_policy.PRIVILEGED)
 
     def test_grantless_privileged_invocation_fails_before_effects(self):
+        # BA-07: the model population never reaches the authority gate for
+        # evaluate anymore — the name gate refuses first.
         decision = tool_policy.validate_dispatch(
             "evaluate", {"expression": "1+1"},
             browser_agent._MODEL_DISPATCH_ALLOWLIST, grants=set())
         self.assertFalse(decision.allowed)
-        self.assertIn("not granted", decision.reason)
+        self.assertIn("not in the dispatch allowlist", decision.reason)
 
-    def test_granted_privileged_invocation_is_allowed(self):
+    def test_granted_model_evaluate_is_still_refused(self):
+        # BA-07: not even privileged_js admits a MODEL-authored evaluate —
+        # the tool is no longer offered, so naming it is not enough.
         decision = tool_policy.validate_dispatch(
             "evaluate", {"expression": "1+1"},
             browser_agent._MODEL_DISPATCH_ALLOWLIST,
             grants={"privileged_js"})
+        self.assertFalse(decision.allowed, decision.reason)
+        self.assertIn("not in the dispatch allowlist", decision.reason)
+
+    def test_granted_internal_evaluate_is_allowed(self):
+        # BA-07 kept this path: our own handlers still dispatch evaluate
+        # through the internal origin with the grant.
+        decision = tool_policy.validate_dispatch(
+            "evaluate", {"expression": "1+1"},
+            browser_agent._TOOL_DISPATCH_ALLOWLIST,
+            grants={"privileged_js"}, origin="internal")
         self.assertTrue(decision.allowed, decision.reason)
 
     def test_malformed_nested_arguments_are_rejected(self):
