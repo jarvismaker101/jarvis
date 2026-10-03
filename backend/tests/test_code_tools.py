@@ -308,6 +308,42 @@ class R4ConfirmationVerdictTests(unittest.TestCase):
         self.assertEqual(agent.classify_confirmation("not yet"), "no")
 
 
+class R9SttSafeConfirmationTests(unittest.TestCase):
+    """R9: Whisper tails and time-splits never smuggle a write."""
+
+    def test_dropped_leading_yes_still_inspect(self):
+        self.assertEqual(
+            agent.classify_confirmation("s, a quick look"), "inspect")
+        self.assertEqual(
+            agent.classify_confirmation("yes, a quick look"), "inspect")
+
+    def test_time_split_is_decline(self):
+        self.assertEqual(
+            agent.classify_confirmation("yes yesterday, no now"), "no")
+        self.assertEqual(
+            agent.classify_confirmation("yes, but not now"), "no")
+
+    def test_echo_question_is_not_assent(self):
+        self.assertEqual(
+            agent.classify_confirmation("did you say yes?"), "unclear")
+        self.assertEqual(
+            agent.classify_confirmation("did I say ok?"), "unclear")
+
+    def test_empty_preview_says_empty_with_full_path(self):
+        plan = agent._code_tool_plan(
+            "code.write_file",
+            {"path": "C:\\d\\New Zealand.txt", "content": ""},
+            "Writing the file.")
+        preview = agent._confirmation_preview(plan)
+        self.assertIn("New Zealand.txt", preview)
+        self.assertIn("(empty)", preview)
+
+    def test_original_text_never_rewritten(self):
+        raw = "yes yesterday, no now"
+        self.assertEqual(agent.classify_confirmation(raw), "no")
+        self.assertEqual(raw, "yes yesterday, no now")
+
+
 class R1MeaningNotFirstWordTests(unittest.TestCase):
     """R1: the WANT anywhere in the sentence is the request."""
 

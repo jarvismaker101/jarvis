@@ -187,6 +187,49 @@ _HARMLESS_TAIL_RE = re.compile(
     r"^(?:please|thanks?|thank\s+you|sir|ji|ok)[\s,!.]*$", re.IGNORECASE)
 
 
+#: R9 — STT near-misses on the confirmation gate. Whisper drops the
+#: leading "yes" ("[s, a quick look]" for "yes, a quick look"), swaps words
+#: ("cue" for "queue", "create" for "great"), and merges time references
+#: ("yes yesterday, no now"). These hypotheses keep the ORIGINAL text
+#: verbatim — nothing is rewritten — but they decide the VERDICT so a noisy
+#: tail can never smuggle a write past an ambiguous answer.
+_STT_YES_NEAR_MISS_RE = re.compile(
+    r"^\s*(?:[sy]e?s?|yea|yep?|yup|yas)\s*[,….]?\s*"
+    r"(?:a\s+)?quick\s+look\b"
+    r"|^\s*\[?\s*s\s*[,\]]\s*a?\s*quick\s+look\b",
+    re.IGNORECASE,
+)
+_STT_TIME_SPLIT_RE = re.compile(
+    r"\byesterday\b.*\bno\b|\bno\b.*\bnow\b|\bnot\s+now\b"
+    r"|\bnot\s+anymore\b|\bno\s+longer\b",
+    re.IGNORECASE,
+)
+_STT_ECHO_QUESTION_RE = re.compile(
+    r"\bdid\s+(?:i|you)\s+say\s+(?:yes|no|ok)\b",
+    re.IGNORECASE,
+)
+
+
+def _stt_confirmation_verdict(text):
+    """R9: the STT-noise verdict for *text*, or None when no rule fires.
+
+    Runs BEFORE the word-match classifier: "yes yesterday, no now" is a
+    decline (the latest word wins), a dropped-leading-yes "s, a quick look"
+    is still an inspect tail, and "did I say yes?" stays a question. The
+    original string is NEVER rewritten — only the verdict changes.
+    """
+    if not text or not text.strip():
+        return None
+    lowered = text.lower()
+    if _STT_ECHO_QUESTION_RE.search(text):
+        return "unclear"
+    if _STT_TIME_SPLIT_RE.search(text):
+        return "no"
+    if _STT_YES_NEAR_MISS_RE.search(text):
+        return "inspect"
+    return None
+
+
 def classify_confirmation(answer):
     """R4: the whole-sentence verdict on a pending-preview answer.
 
@@ -205,6 +248,11 @@ def classify_confirmation(answer):
     if not text:
         return "unclear"
     lowered = text.lower()
+    # R9: STT noise hypotheses first — time-split declines, dropped-yes
+    # inspect tails, echo questions. Never rewrites the text.
+    stt = _stt_confirmation_verdict(text)
+    if stt is not None:
+        return stt
     # R4: a QUESTION about saying yes is a question, never assent.
     if "?" in text and re.search(r"\bdid\s+i\s+say\b", lowered):
         return "unclear"
@@ -2685,12 +2733,20 @@ def _describe_native_step(step):
                 verb = ""
             if content and path:
                 if verb:
-                    return (f"Ready to create {verb} with: {content}.")
+                    if "already exists" in verb:
+                        return (f"Ready to create {verb} with: {content}.")
+                    return (f"Ready to create {verb} at full path {path} "
+                            f"with: {content}.")
                 return f"Ready to write file {path} with: {content}."
             if path:
                 if verb:
-                    return f"Ready to create {verb}."
-                return f"Ready to write file {path}."
+                    # R9: an empty write says so — a yes to "nothing heard"
+                    # must name the emptiness, not hide it.
+                    if "already exists" not in verb:
+                        return (f"Ready to create {verb} at full path {path} "
+                                f"(empty).")
+                    return f"Ready to create {verb} (empty)."
+                return f"Ready to write file {path} (empty)."
             return "Ready to write file."
         if tool == "code.create_folder":
             return f"Ready to create folder: {_clip_preview(args.get('path') or '(folder)')}."

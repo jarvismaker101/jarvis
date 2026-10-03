@@ -838,6 +838,8 @@ class R8OneTurnTwoJobsTests(unittest.TestCase):
         brain._pending_browser_clarification = None
         brain._opencode_task_running = False
         brain._research_running = False
+        from backend.services.task_agent import agent as _ta
+        _ta.cancel_pending_task_confirmation("r8 setup")
 
     def tearDown(self):
         brain._held_redirect = None
@@ -846,6 +848,8 @@ class R8OneTurnTwoJobsTests(unittest.TestCase):
         brain._pending_browser_clarification = None
         brain._opencode_task_running = False
         brain._research_running = False
+        from backend.services.task_agent import agent as _ta
+        _ta.cancel_pending_task_confirmation("r8 teardown")
 
     def test_splitter(self):
         first, second = brain.split_compound_turn(
