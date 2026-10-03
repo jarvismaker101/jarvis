@@ -1373,7 +1373,7 @@ _VIRTUAL_TOOL_DEFS = [
     ),
     _spec(
         "click_mark",
-        "Click a numbered visual mark from the most recent look with REAL mouse input (click_locator) after re-resolving the mark's target. Input index is the 1-based mark number. If the mark is missing or stale (page navigated, reloaded, reflowed or SPA-updated since the look), the tool returns an error telling you to call look again. Returns {clicked, via, url, href_before, navigated} - navigated true means the click changed the page, so look again before acting. Synthetic clicks cannot click inside cross-origin iframes/embeds - if the mark sits over an embedded player, click_point on the player area or judge playback from the screenshot instead. After navigation or a missed click, call look again.",
+        "Click a numbered visual mark from the most recent look with REAL mouse input (click_locator) after re-resolving the mark's target. Input index is the 1-based mark number. If the mark is missing or stale (page navigated, reloaded, reflowed or SPA-updated since the look), the tool returns an error telling you to call look again. An off-screen mark is scrolled into view automatically inside the same call (reported as scrolled: true) - never scroll manually first. Returns {clicked, via, url, href_before, navigated} - navigated true means the click changed the page, so look again before acting. Synthetic clicks cannot click inside cross-origin iframes/embeds - if the mark sits over an embedded player, click_point on the player area or judge playback from the screenshot instead. After navigation or a missed click, call look again.",
         {
             "type": "object",
             "properties": {"index": {"type": "integer", "description": "1-based mark number from the most recent look"}},
@@ -1382,7 +1382,7 @@ _VIRTUAL_TOOL_DEFS = [
     ),
     _spec(
         "fill_mark",
-        "Fill the text input at a numbered visual mark from the most recent look with REAL keyboard input (fill_locator, one explicit submit channel: press_enter true sends Enter, omit it for no submit), in one step. Prefer this over fill whenever the input appears in the look marks. If the mark is missing or stale (page navigated, reloaded or updated since the look), returns an error telling you to call look again. If the mark is not a text input, returns an error naming the element's tag so you can recover in one step. Returns {ok, via, css, url, navigated} on the real-input path.",
+        "Fill the text input at a numbered visual mark from the most recent look with REAL keyboard input (fill_locator, one explicit submit channel: press_enter true sends Enter, omit it for no submit), in one step. Prefer this over fill whenever the input appears in the look marks. If the mark is missing or stale (page navigated, reloaded or updated since the look), returns an error telling you to call look again. An off-screen input is scrolled into view automatically (reported as scrolled: true). If the mark is not a text input, returns an error naming the element's tag so you can recover in one step. Returns {ok, via, css, url, navigated} on the real-input path.",
         {
             "type": "object",
             "properties": {
@@ -2616,7 +2616,7 @@ def _click_and_confirm(client, name, click_js):
     return _clip_result(json.dumps(payload))
 
 
-def _click_confirm_locator_result(client, name, raw):
+def _click_confirm_locator_result(client, name, raw, scrolled=False):
     """Fold a daemon *_locator result into the agent's click-result shape.
 
     The daemon already settles and reports after-state; Python keeps the
@@ -2624,14 +2624,21 @@ def _click_confirm_locator_result(client, name, raw):
     daemon's navigated/url lines rather than trusting a bare clicked flag.
     No further daemon round-trip happens here — the daemon is the source of
     truth for the after-state, and callers rely on the locator call being
-    the last tool invocation on this path. ``client`` is kept in the
+    the last tool invocation on this path.     ``client`` is kept in the
     signature for symmetry with the coordinate click path (and to allow a
     future enriched after-state without touching every call site).
+
+    *scrolled* (BA-15) marks a click on a target the look found off-screen:
+    the daemon scrolled it into view inside the same real-input call, so the
+    viewport moved — the model must look again before trusting coordinates.
+    Reported only on success; a failed click reports no scroll.
     """
     _ = client
     text = (raw or "") if isinstance(raw, str) else str(raw or "")
     parsed = _parse_locator_outcome(text)
     payload = {"clicked": parsed["ok"], "via": "real-input"}
+    if parsed["ok"] and scrolled:
+        payload["scrolled"] = True
     if parsed.get("reason"):
         payload["reason"] = parsed["reason"]
     payload["url"] = parsed.get("url") or ""
@@ -2926,7 +2933,14 @@ def _handle_click_mark(client, session, arguments, stats=None):
     info = marks[idx]
     cx = info["cx"]
     cy = info["cy"]
-    if not info.get("inView", True):
+    # BA-15: an off-screen mark with an addressable identity is NO LONGER
+    # refused — click_locator scrolls it into view inside the same real-input
+    # call (daemon scrollIntoViewIfNeeded), so the four-turn
+    # refuse -> scroll -> look -> click collapses to one. Only marks WITHOUT
+    # a cssPath keep the refusal: coordinate clicks cannot scroll to a
+    # target the daemon cannot address.
+    was_offscreen = not info.get("inView", True)
+    if was_offscreen and not info.get("cssPath"):
         return _clip_result(
             "click_mark error: mark %d is off-screen (outside the current viewport) "
             "- scroll it into view first" % idx
@@ -2956,7 +2970,8 @@ def _handle_click_mark(client, session, arguments, stats=None):
             _loc.done(stats)
         except Exception as exc:
             return _clip_result("click_mark failed: real click error: %s" % exc)
-        return _click_confirm_locator_result(client, "click_mark", raw)
+        return _click_confirm_locator_result(client, "click_mark", raw,
+                                             scrolled=was_offscreen)
     # Synchronous IIFE: elementFromPoint with ancestor clickable check up
     # to 3 levels. href is captured at click time; Python confirms the
     # navigation after a settle gap - SPA navigations report
@@ -3283,6 +3298,11 @@ def _handle_fill_mark(client, session, arguments, stats=None):
         result_obj = {"ok": True, "via": "real-input", "css": info["cssPath"],
                       "url": parsed.get("url") or "",
                       "navigated": bool(parsed.get("navigated"))}
+        # BA-15: fill_locator scrolls an off-screen target into view inside
+        # the same call (daemon parity with click_locator) — report it so
+        # the model knows the viewport moved. Success-only, like clicks.
+        if not info.get("inView", True):
+            result_obj["scrolled"] = True
         return _clip_result(json.dumps(result_obj))
     val_json = json.dumps(value)
     press_json = "true" if press_enter else "false"

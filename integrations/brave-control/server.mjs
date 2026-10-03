@@ -711,6 +711,10 @@ server.tool(
       return { content: [{ type: "text", text: `fill_locator: no element matches (url=${probe.url}).` }] }
     }
     const { scope, where } = scoped(p, frame, css)
+    // BA-15 parity with click_locator: an off-screen target is scrolled
+    // into view instead of failing actionability — the agent advertises
+    // off-screen marks as clickable, so the primitive must make them so.
+    await scope.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {})
     try {
       await scope.fill(value, { timeout: 5000 })
     } catch (err) {
