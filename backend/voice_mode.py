@@ -132,6 +132,69 @@ def backend_task_running():
     return _task_running_last_known
 
 
+#: [S19] The push channel's read timeout must exceed the server heartbeat
+#: (15s) so a quiet-but-alive stream is never mistaken for a dead one.
+_EVENTS_READ_TIMEOUT_S = 30.0
+
+
+def _apply_pushed_state(evt):
+    """[S19] Fold a pushed state event into the two poll caches.
+
+    The event is the backend's authoritative truth the moment it flips, so the
+    caches are updated AND their poll TTLs refreshed — the next 1s poll would
+    only re-read the same value. If the push channel is down, the polls keep
+    working as before; nothing breaks.
+    """
+    global _task_running_last_known, _task_running_checked_at
+    global _voice_flag_last_known, _voice_flag_checked_at
+    if not isinstance(evt, dict):
+        return
+    if "task_running" in evt:
+        _task_running_last_known = bool(evt.get("task_running"))
+        _task_running_checked_at = time.monotonic()
+    if "voice_input_enabled" in evt:
+        _voice_flag_last_known = bool(evt.get("voice_input_enabled", True))
+        _voice_flag_checked_at = time.monotonic()
+
+
+def _task_state_push_loop(stop_event=None):
+    """[S19] Subscribe to the backend's /events channel and stay subscribed.
+
+    Turns the task-mute and voice-input polls from "up to a second stale" into
+    instant. Reconnects with a short backoff on any error so a dropped channel
+    never wedges the worker (the polls remain the fallback).
+    """
+    backoff = 0.5
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        try:
+            request = Request(
+                f"http://127.0.0.1:{BACKEND_PORT}/events",
+                method="GET",
+                headers=_backend_headers(),
+            )
+            with urlopen(request, timeout=_EVENTS_READ_TIMEOUT_S) as response:
+                backoff = 0.5
+                for raw in response:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        evt = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    _apply_pushed_state(evt)
+        except Exception:
+            pass
+        if stop_event is not None and stop_event.is_set():
+            return
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 8.0)
+
+
 # ── Voice-state publisher (F50: publish, don't expose a module copy) ────────
 _voice_state_seq = 0
 
@@ -2025,6 +2088,11 @@ def start_voice_mode():
     # so /voice-state and /ui-state show the TRUTH instead of the backend's
     # empty listener_state module copy.
     threading.Thread(target=_publish_voice_state_loop, daemon=True).start()
+
+    # [S19] Subscribe to the backend's /events push channel so the task-mute
+    # and voice-input flags update the moment they flip, instead of on the1s
+    # poll. The polls stay as the fallback if this channel ever drops.
+    threading.Thread(target=_task_state_push_loop, daemon=True).start()
 
     # Async replies (task completions, screen Q&A) are SPOKEN BY THE BACKEND
     # process where those jobs actually run — the old in-process callback

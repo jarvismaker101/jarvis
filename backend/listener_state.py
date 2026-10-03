@@ -3,6 +3,7 @@ import threading
 import time
 
 from backend.services.audio_input import FIXED_IDLE_ENERGY_THRESHOLD
+from backend.services import event_bus
 
 _MAX_THRESHOLD = max(80, int(os.getenv("JARVIS_MAX_ENERGY_THRESHOLD", "700")))
 
@@ -188,6 +189,9 @@ def set_voice_input_enabled(enabled):
     if changed:
         # [P1-15] A mute toggle is a visible state change: publish it now.
         _notify_state_hooks()
+        # [S19] Push it to every event subscriber so the voice worker and UI
+        # see the switch instantly instead of on their next /ui-state poll.
+        event_bus.publish("voice_enabled", {"voice_input_enabled": _voice_input_enabled})
     return _voice_input_enabled
 
 

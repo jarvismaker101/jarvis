@@ -1,7 +1,9 @@
+import asyncio
 import functools
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from typing import List, Optional
@@ -21,6 +23,7 @@ from backend.core.brain import (
     BROWSER_AGENT_START_PHRASE,
 )
 from backend.services import browser_agent
+from backend.services import event_bus
 from backend.services import latency as _latency
 from backend.services import local_auth
 from backend.services import model_registry
@@ -124,6 +127,14 @@ _published_voice: dict = {}
 _published_voice_seq = 0
 _published_voice_publisher = ""
 _published_voice_lock = threading.Lock()
+
+# [S19] Speaking/thinking activity is PUSHED to event subscribers so the UI
+# sees "speaking started/ended" instantly instead of on its next /ui-state
+# poll. Only the fields that mean "who is doing what" are watched, and only a
+# real change emits — the 1s heartbeat publish must not flood the channel.
+_VOICE_ACTIVITY_KEYS = ("status", "speaking", "user_speaking", "thinking",
+                        "voice_input_enabled")
+_last_voice_activity_sig = object()  # sentinel: never equal to a real tuple
 
 # ── Screen answer state (for overlay) ──────────────
 _screen_answer_id = 0
@@ -881,7 +892,26 @@ def publish_voice_state(payload: dict):
             _published_voice["owner"] = owner
         if publisher:
             _published_voice["publisher_id"] = publisher
+    _emit_voice_activity()
     return {"ok": True}
+
+
+def _emit_voice_activity():
+    """[S19] Push a speaking/thinking change to event subscribers.
+
+    Called on every voice-state publish (which arrives on change AND on a 1s
+    heartbeat); only a real change to the watched fields emits, so the channel
+    stays quiet when nothing is happening.
+    """
+    global _last_voice_activity_sig
+    state = get_published_voice_state()
+    sig = tuple(state.get(k) for k in _VOICE_ACTIVITY_KEYS)
+    if sig == _last_voice_activity_sig:
+        return
+    _last_voice_activity_sig = sig
+    event_bus.publish("voice_state", {
+        k: state.get(k) for k in _VOICE_ACTIVITY_KEYS if k in state
+    })
 
 
 def get_published_voice_state():
@@ -928,6 +958,72 @@ def get_ui_state():
         # `voice_log`/history in full — this only lets the UI say it was cut off.
         "last_reply_interrupted": get_last_reply_interrupted(),
     }
+
+
+# �"?�"? S19 �?" push state over one persistent channel instead of polling �"?�"?�"?�"?�"?�"?�"?�"?�"?�"?�"?
+#: Idle keep-alive so a silent stream is not reaped by proxies as dead. A
+#: comment line (": ping") is ignored by SSE clients.
+_SSE_HEARTBEAT_S = 15.0
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.get("/events")
+async def events_stream():
+    """S19 — one SSE channel carrying every state change the moment it happens.
+
+    Replaces the 1s-cached polls (``backend_task_running`` /
+    ``voice_input_enabled`` / ``/ui-state``) with pushes: task started/ended,
+    voice enabled/disabled, speaking started/ended. A new subscriber first gets
+    the current snapshot, then each change. This is a PRIVATE read (the launch
+    token middleware applies), and it runs as an async generator so it holds NO
+    thread-pool slot for its whole life — unlike the chat streams it must never
+    starve barge-in.
+    """
+    loop = asyncio.get_running_loop()
+    wake = asyncio.Event()
+
+    def _wake():
+        # publish() runs on a request/task thread; cross into the loop safely.
+        loop.call_soon_threadsafe(wake.set)
+
+    q = event_bus.subscribe(wakeup=_wake)
+
+    async def generate():
+        try:
+            snap = event_bus.snapshot()
+            snap["type"] = "snapshot"
+            yield _sse(snap)
+            while True:
+                # Drain everything queued; publish() queues BEFORE it wakes, so
+                # clearing then re-checking the queue cannot drop an event.
+                drained = False
+                while True:
+                    try:
+                        yield _sse(q.get_nowait())
+                        drained = True
+                    except queue.Empty:
+                        break
+                wake.clear()
+                if not q.empty():
+                    continue
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=_SSE_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            event_bus.unsubscribe(q)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/speak/stop")

@@ -58,6 +58,7 @@ from backend.services.orchestrator import select_route as orchestrator_select_ro
 from backend.services.opencode_client import run_opencode_task, is_opencode_available, set_narration_enabled
 from backend.services.browser_agent import run_browser_task, request_stop as request_browser_task_stop
 from backend.services import browser_agent
+from backend.services import event_bus
 from backend.services.task_result import (
     TaskResult,
     is_failure_text,
@@ -2381,7 +2382,13 @@ def opencode_task_in_progress():
 
 def set_opencode_task_running(running):
     global _opencode_task_running
-    _opencode_task_running = bool(running)
+    running = bool(running)
+    changed = _opencode_task_running != running
+    _opencode_task_running = running
+    if changed:
+        # [S19] Push the flip to event subscribers so the voice worker and UI
+        # mute/unmute instantly instead of on their next /ui-state poll.
+        event_bus.publish("task_running", {"task_running": running})
     # [S18] The tools are free again — anything the user asked for mid-task
     # that needed them is run now, in order, on its own thread.
     if not _opencode_task_running:
