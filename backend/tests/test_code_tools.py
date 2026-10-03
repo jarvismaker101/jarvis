@@ -336,6 +336,77 @@ class R1MeaningNotFirstWordTests(unittest.TestCase):
             self.assertNotIn("browser.search_web", tools)
 
 
+class R3AllSlotsBeforeActTests(unittest.TestCase):
+    """R3: exact path + exact name + no-overwrite bound before acting."""
+
+    def setUp(self):
+        self.context = {
+            "windows": {"active_window": {"title": "x"}, "visible_controls": []},
+            "editor": {"available": False},
+            "browser": {"available": False, "tabs": []},
+        }
+        agent._pending_task_action = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved_result = agent.last_task_result()
+        self.addCleanup(agent._remember_task_result, *self._saved_result)
+
+    def tearDown(self):
+        agent._pending_task_action = None
+
+    def _plan_in_folder(self, text, folder):
+        from backend.core import brain as _brain
+        _brain.notebook_record_entity(
+            os.path.basename(folder), folder, kind="folder")
+        self.addCleanup(_brain._notebook_entities.clear)
+        return agent._heuristic_plan(text, self.context)
+
+    def test_explicit_name_lands_in_plan(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        plan = self._plan_in_folder(
+            "now create a text file inside that folder, name it New Zealand, "
+            "write hello inside it", folder)
+        self.assertEqual(plan["steps"][0]["tool"], "code.write_file")
+        self.assertEqual(
+            plan["steps"][0]["args"]["path"],
+            os.path.join(folder, "New Zealand.txt"))
+
+    def test_name_it_anything_uses_default(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        plan = self._plan_in_folder(
+            "create a text file inside that folder, name it anything, "
+            "write hello inside it", folder)
+        self.assertEqual(
+            plan["steps"][0]["args"]["path"],
+            os.path.join(folder, agent._DEFAULT_TEXT_FILE_NAME))
+
+    def test_missing_content_asks_one_question(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        plan = self._plan_in_folder(
+            "create a text file inside that folder, name it q-test", folder)
+        self.assertEqual(plan["steps"], [])
+        self.assertIn("what to write", plan["response"])
+
+    def test_create_binds_no_overwrite(self):
+        folder = os.path.join(self._tmp.name, "mayankmalik")
+        os.makedirs(folder)
+        plan = self._plan_in_folder(
+            "create a text file inside that folder, name it q-test, "
+            "write hello inside it", folder)
+        self.assertTrue(plan["steps"][0]["args"].get("create_only"))
+
+    def test_preview_speaks_exact_target(self):
+        preview = agent._confirmation_preview({
+            "steps": [{"tool": "code.write_file",
+                       "args": {"path": "C:\\d\\New Zealand.txt",
+                                "content": "hello", "create_only": True},
+                       "risk": "safe"}]})
+        self.assertIn("New Zealand.txt", preview)
+
+
 class LocatedWriteTests(unittest.TestCase):
     """Live bug: "now create a text file inside that folder ... write hello"
     fell through every route into chat, which promised the file while no tool

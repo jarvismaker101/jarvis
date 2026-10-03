@@ -636,10 +636,22 @@ def _heuristic_plan(command, context):
                     "steps": [],
                     "response": _folder_hint_clarification(_r1_hint),
                 }
+            # R3: every slot bound before the plan exists — exact parent
+            # path, explicit name (or the spoken default), name frozen at
+            # plan time so yes can never authorize a renamed file.
+            _r1_name = _explicit_file_name(raw) or _DEFAULT_TEXT_FILE_NAME
             _r1_content = _extract_write_content(raw) or ""
+            _r1_missing = []
+            if not _r1_content:
+                _r1_missing.append("what to write inside it")
+            _r1_ask = _slot_complete_write_plan(
+                os.path.join(_r1_resolved, _r1_name), _r1_content,
+                _r1_missing)
+            if _r1_ask is not None:
+                return _r1_ask
             return _code_tool_plan(
                 "code.write_file",
-                {"path": os.path.join(_r1_resolved, _DEFAULT_TEXT_FILE_NAME),
+                {"path": os.path.join(_r1_resolved, _r1_name),
                  "content": _r1_content},
                 "Writing the file.",
             )
@@ -666,8 +678,18 @@ def _heuristic_plan(command, context):
                     "steps": [],
                     "response": _folder_hint_clarification(folder_hint),
                 }
-            name = _located_write_name(raw, content_after)
+            # R3: explicit "name it X" wins over the tail-derived name, and
+            # the name is frozen here — a later yes cannot rename the file.
+            name = _explicit_file_name(raw) or _located_write_name(
+                raw, content_after)
             content = _located_write_content(raw, content_after)
+            missing = []
+            if not content:
+                missing.append("what to write inside %s" % name)
+            ask = _slot_complete_write_plan(
+                os.path.join(resolved, name), content, missing)
+            if ask is not None:
+                return ask
             return _code_tool_plan(
                 "code.write_file",
                 {"path": os.path.join(resolved, name), "content": content},
@@ -738,7 +760,16 @@ def _heuristic_plan(command, context):
 
 
 def _code_tool_plan(tool, args, summary, risk="safe"):
-    """Build a single-step plan invoking a native code tool."""
+    """Build a single-step plan invoking a native code tool.
+
+    R3: write_file plans bind the no-overwrite precondition — a located
+    create runs with ``create_only`` so an approved "create this file" can
+    never silently clobber a file that appeared after the preview.
+    """
+    step_args = dict(args or {})
+    if tool == "code.write_file" and isinstance(
+            step_args.get("path"), str) and step_args["path"]:
+        step_args.setdefault("create_only", True)
     return {
         "ok": True,
         "confidence": 0.9,
@@ -747,7 +778,7 @@ def _code_tool_plan(tool, args, summary, risk="safe"):
         "steps": [
             {
                 "tool": tool,
-                "args": args,
+                "args": step_args,
                 "risk": risk,
                 "reason": summary,
             }
@@ -851,6 +882,75 @@ _LOCATED_CONTENT_RE = re.compile(
 #: verbatim in the confirmation preview so the user's "yes" authorizes the
 #: exact effect.
 _DEFAULT_TEXT_FILE_NAME = "hello.txt"
+
+#: R3 — naming clichés whose "name it anything" is a request for the DEFAULT
+#: name, not a name at all. "Name it foo" IS an explicit name; "name it
+#: anything / whatever / something" is not.
+_DEFAULT_NAME_PHRASES_RE = re.compile(
+    r"\bname\s+it\s+(?:anything|whatever|something|whatever\s+you\s+want|"
+    r"whatever\s+you\s+like|as\s+you\s+like)\b",
+    re.IGNORECASE,
+)
+
+#: R3 — explicit file-name cues ("name it New Zealand", "call it hello",
+#: "a file called q-test") whose name is a slot that MUST land in the plan,
+#: never in a vague "navigate" summary.
+_EXPLICIT_NAME_RE = re.compile(
+    r"\bname\s+it\s+(.+?)(?:\s*,?\s*(?:and\s+)?(?:write|with|containing|"
+    r"inside|on\s+(?:the\s+)?(?:desktop|documents|downloads))|$)"
+    r"|\bcall\s+it\s+(.+?)(?:\s*,?\s*(?:and\s+)?(?:write|with|containing|"
+    r"inside|on\s+(?:the\s+)?(?:desktop|documents|downloads))|$)"
+    r"|\bcalled\s+(.+?)(?:\s*,?\s*(?:and\s+)?(?:write|with|containing|"
+    r"inside|on\s+(?:the\s+)?(?:desktop|documents|downloads))|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _explicit_file_name(raw):
+    """R3: the explicitly-spoken file name ("name it New Zealand"), or None.
+
+    Clichés ("name it anything") return the DEFAULT name — the plan still
+    carries an exact name, and the preview speaks it so yes authorizes it.
+    Strips a trailing folder-base phrase ("New Zealand on the desktop") so
+    only the file name survives.
+    """
+    if not raw:
+        return None
+    if _DEFAULT_NAME_PHRASES_RE.search(raw):
+        return _DEFAULT_TEXT_FILE_NAME
+    match = _EXPLICIT_NAME_RE.search(raw)
+    if not match:
+        return None
+    name = next((g for g in match.groups() if g), "") or ""
+    name = re.sub(r"\s+(?:inside|in|on|at)\s+.*$", "", name,
+                  flags=re.IGNORECASE).strip()
+    name = name.strip().strip("\"'")
+    if not name or len(name) > 80:
+        return None
+    if _is_path_like(name):
+        return os.path.basename(name)
+    # A bare word or two is a file STEM: New Zealand -> New Zealand.txt.
+    stem = re.sub(r"[\\/:*?\"<>|]", "", name).strip()
+    if not stem or not re.match(r"^[\w][\w\- ]{0,60}$", stem):
+        return None
+    return stem if re.search(r"\.\w{1,5}$", stem) else stem + ".txt"
+
+
+def _slot_complete_write_plan(path, content, missing):
+    """R3: a write plan whose slots are NOT all filled asks ONE bundled
+    question (R11) instead of acting: exact missing slots named, nothing
+    vague, no run. Returns None when every slot is filled."""
+    if missing:
+        return {
+            "ok": True,
+            "confidence": 0.9,
+            "summary": "Need details.",
+            "requires_confirmation": False,
+            "steps": [],
+            "response": ("Sir, before I create that I still need: %s." %
+                         ", ".join(missing)),
+        }
+    return None
 
 
 #: R5 — inspect/existence verbs that make a turn a LOCAL folder read, never a
@@ -2567,9 +2667,27 @@ def _describe_native_step(step):
         if tool == "code.write_file":
             content = (args.get("content") or "").strip()[:80]
             path = args.get("path") or "(file)"
-            if content:
+            # R3: the preview binds the no-overwrite rule to THIS exact
+            # target — a create plan says "new file" vs "already there", so
+            # yes authorizes the stated effect, never a silent clobber.
+            verb = ""
+            try:
+                if args.get("create_only") and path != "(file)":
+                    verb = ("new file %s (refusing if it already exists)"
+                            % path if not os.path.exists(path)
+                            else "file %s (already exists — "
+                            "will ask, not overwrite)" % path)
+            except Exception:
+                verb = ""
+            if content and path:
+                if verb:
+                    return (f"Ready to create {verb} with: {content}.")
                 return f"Ready to write file {path} with: {content}."
-            return f"Ready to write file {path}."
+            if path:
+                if verb:
+                    return f"Ready to create {verb}."
+                return f"Ready to write file {path}."
+            return "Ready to write file."
         if tool == "code.create_folder":
             return f"Ready to create folder: {_clip_preview(args.get('path') or '(folder)')}."
         if tool == "code.apply_patch":
