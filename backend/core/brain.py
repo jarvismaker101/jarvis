@@ -274,6 +274,91 @@ def set_screen_qa_callback(cb):
     _screen_qa_callback = cb
 
 
+# ── R13 speech gateway: action claims need a verified event ──────────────
+# Strict mode (user-approved): a sentence claiming Jarvis DID / WILL / IS
+# doing a real-world action may only be spoken when it is backed by an
+# authoritative operational event — a verified TaskResult, a worker
+# acknowledgement, a durable queue acceptance, or a delivered preview.
+# Tool-less chat has ZERO action authority: it may chit-chat, explain, or
+# ask for detail, but never promise/claim an action. Anything it emits that
+# looks like an action claim is replaced with an honest redirect.
+#
+# Narrator roles (Astra §5): preview proposes+asks, scheduler announces
+# queue-after-ack, runner announces started-after-ack, result announces
+# done-after-verification, status describes a live snapshot. Chat is none
+# of these, so chat-shaped text can never carry those sentences.
+_ACTION_CLAIM_RE = re.compile(
+    r"\b("
+    r"i\s+will\s+(get|have|create|make|check|do|run|start|open|send|fetch|look)|"
+    r"i(?:'m| am)\s+(?:right\s+)?on\s+it|"
+    r"(?:it(?:'s| is)\s+)?(?:done|created|ready|finished|taken\s+care\s+of)|"
+    r"consider\s+it\s+done|"
+    r"right\s+away|"
+    r"has\s+been\s+(created|deleted|removed|completed|finished|started)|"
+    r"have\s+been\s+(created|deleted|removed)|"
+    r"file\s+(?:has\s+been\s+)?created|"
+    r"folder\s+(?:has\s+been\s+)?created|"
+    r"(?:started|starting|running|executing|working\s+on)\s+(?:the|that|your|this)?\s*(task|file|folder|browser|job|request)|"
+    r"(?:queued|in\s+the\s+queue)|"
+    r"taking\s+over\s+the\s+browser\s+task|"
+    r"handing\s+the\s+task\s+to"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Sentences that merely offer to act or describe capability are NOT claims:
+# "I can create files", "Do you want me to...", "Say the word and I will".
+_ACTION_OFFER_RE = re.compile(
+    r"\b(i\s+can\s+(create|make|check|list|open|run|help|do)|"
+    r"do\s+you\s+want\s+me\s+to|"
+    r"shall\s+i\s+|"
+    r"say\s+the\s+word|"
+    r"let\s+me\s+know|"
+    r"what\s+(specific|exactly)|"
+    r"which\s+(folder|file|folder)|"
+    r"ask\s+for\s+the\s+missing|"
+    r"nothing\s+was\s+started|"
+    r"what\s+would\s+you\s+like)\b",
+    re.IGNORECASE,
+)
+
+# R13 chat-safe fallback: states what happened (nothing) + what is needed.
+# Never an action sentence — verified by _ACTION_CLAIM_RE below at def time.
+_CHAT_NO_ACTION_FALLBACK = (
+    "Understood, sir. Nothing was started — "
+    "which exact folder and file name should I use?"
+)
+
+
+def _strip_unverified_action_claims(text, role):
+    """R13 gate: drop action-claim sentences `role` has no authority to speak.
+
+    *role* is one of preview/scheduler/runner/result/status/chat.
+    Chat has no action authority at all: any claim-shaped sentence is CUT
+    and replaced with the honest fallback. The other narrators keep their
+    own authoritative sentences (they are constructed from verified events
+    upstream) — this gate only strips recognised action claims that leaked
+    in from free-form model prose.
+    """
+    if not text:
+        return text
+    if role != "chat":
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", str(text).strip())
+    kept = [
+        s for s in sentences
+        if not _ACTION_CLAIM_RE.search(s) or _ACTION_OFFER_RE.search(s)
+    ]
+    # If every sentence was a claim (the classic "I will get that created
+    # right away, sir." turn), say the honest fallback instead of silence.
+    if not kept or not any(s.strip() for s in kept):
+        logging.warning("[R13] chat action claim blocked: %r", text[:160])
+        return _CHAT_NO_ACTION_FALLBACK
+    if len(kept) != len(sentences):
+        logging.warning("[R13] chat action claim stripped: %r", text[:160])
+    return " ".join(kept).strip()
+
+
 # ── Generic async-reply callback (opencode fallback results, etc.) ──
 _async_reply_callback = None
 
@@ -1269,16 +1354,23 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             # action ("I will get that created", "done", "it is ready") —
             # either the turn routed to a task path (which speaks its own
             # verified result), or ask for the missing detail instead.
+            # R13 (strict): the deterministic gate in _finalize_chat_reply
+            # strips unverified action claims, but do not rely on it — NEVER
+            # emit claim-shaped sentences ("I will...", "I am on it", "right
+            # away", "has been created", "taking over...") from this route.
+            # Say capability ("I can create files..."), ask for the missing
+            # detail, or say plainly that nothing was started.
             # When asked to recall the conversation, answer ONLY from the
             # turns above; never invent topics, and never agree with a
             # premise ("I do recall that") unless the turns show it.
             "You are the voice interface, not the hands: file, folder, code, "
             "shell and browser actions are performed by task routes, never "
-            "by this chat reply, so never say you cannot do them — say you "
-            "will get it done, or ask for the missing detail. "
+            "by this chat reply, so never say you cannot do them. Name "
+            "capability as capability ('I can create files...') or ask for "
+            "the missing detail — never narrate an action as happening. "
             "This reply itself performs nothing: never claim an action is "
-            "done, in progress, or promised — if the request needs an "
-            "action, ask for the missing detail instead. "
+            "done, in progress, queued, or promised — if the request needs "
+            "an action, ask for the missing detail instead. "
             "When asked what was discussed, report only what the turns "
             "above show; if a claimed topic is absent, say so plainly "
             "instead of agreeing. "
@@ -1836,7 +1928,9 @@ def _orchestrator_reply(outcome):
             logging.warning("[ORCHESTRATOR] confirmation preview failed: %s", exc)
             return reply
     if status == ANSWERED:
-        return reply
+        # R13: the orchestrator's free-form answer travels the chat channel,
+        # so it carries chat authority only — strip unverified action claims.
+        return _strip_unverified_action_claims(reply, "chat")
     # suspension/error: hand back whatever was produced, or nothing at all.
     return reply
 
@@ -2102,6 +2196,12 @@ def _finalize_chat_reply(user_message, content, pieces, stream,
     """
     if not content:
         content = "I'm having trouble connecting. Please try again."
+    # R13: tool-less chat has zero action authority. A free-form model reply
+    # claiming Jarvis did/will/is doing an action ("I will get that created",
+    # "I am on it", "it is ready") is an unverified claim — strip it and say
+    # the honest fallback instead. Offers ("I can create files", "do you
+    # want me to...") and detail questions pass through untouched.
+    content = _strip_unverified_action_claims(content, "chat")
     # F26 - the uncertainty/clarification decision must happen BEFORE speech.
     # With a stream consumer attached every delta has already been spoken, so
     # swapping the reply here would speak one answer and store a different

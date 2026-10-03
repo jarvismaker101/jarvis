@@ -579,5 +579,81 @@ class ScreenQuestionNetTests(unittest.TestCase):
         self.assertEqual(response, "opened")
 
 
+class R13SpeechGatewayTests(unittest.TestCase):
+    """R13: tool-less chat has zero action authority.
+
+    Free-form model prose claiming Jarvis did/will/is doing an action is an
+    unverified claim — the gateway strips it. Offers, capability lines and
+    detail questions pass through untouched.
+    """
+
+    def test_full_promise_replaced_with_honest_fallback(self):
+        out = brain._strip_unverified_action_claims(
+            "I will get that file created in your Mayank Malik folder right away, sir.",
+            "chat",
+        )
+        self.assertNotIn("will get", out.lower())
+        self.assertNotIn("right away", out.lower())
+        self.assertIn("Nothing was started", out)
+        # The fallback itself must not be claim-shaped.
+        self.assertIsNone(brain._ACTION_CLAIM_RE.search(out))
+
+    def test_on_it_claim_replaced(self):
+        out = brain._strip_unverified_action_claims(
+            "I am on it, sir. I will check your desktop for that folder right away.",
+            "chat",
+        )
+        self.assertIn("Nothing was started", out)
+
+    def test_done_claim_replaced(self):
+        out = brain._strip_unverified_action_claims(
+            "Done, sir. The file has been created.", "chat")
+        self.assertIn("Nothing was started", out)
+
+    def test_partial_strip_keeps_benign_sentence(self):
+        out = brain._strip_unverified_action_claims(
+            "I will get that created right away, sir. "
+            "Which exact folder and file name should I use?",
+            "chat",
+        )
+        self.assertNotIn("will get", out.lower())
+        self.assertIn("Which exact folder", out)
+
+    def test_offer_and_capability_pass_through(self):
+        for benign in (
+            "I am right here, sir. What specific item on your desktop should I examine?",
+            "I can create files for you. Do you want me to go ahead?",
+            "Loud and clear, sir, though my name is Jarvis.",
+            "Understood, sir. Shall I check your desktop for a folder named Malik now?",
+        ):
+            self.assertEqual(
+                brain._strip_unverified_action_claims(benign, "chat"), benign)
+
+    def test_non_chat_roles_untouched(self):
+        text = "Sir, the folder has been created."
+        for role in ("preview", "scheduler", "runner", "result", "status"):
+            self.assertEqual(
+                brain._strip_unverified_action_claims(text, role), text)
+
+    def test_finalize_chat_reply_gates_model_output(self):
+        out = brain._finalize_chat_reply(
+            "create a file", "I will get that created right away, sir.",
+            [], None, False, None)
+        self.assertIn("Nothing was started", out)
+
+    def test_finalize_chat_reply_keeps_benign_chat(self):
+        benign = "Loud and clear, sir. How can I assist you tonight?"
+        out = brain._finalize_chat_reply(
+            "can you hear me", benign, [], None, False, None)
+        self.assertEqual(out, benign)
+
+    def test_orchestrator_answered_gated(self):
+        with patch.dict("sys.modules", {}):
+            reply = brain._orchestrator_reply(
+                {"status": "answered",
+                 "reply": "I will get that created right away, sir."})
+        self.assertIn("Nothing was started", reply)
+
+
 if __name__ == "__main__":
     unittest.main()
