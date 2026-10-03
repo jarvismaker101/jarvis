@@ -827,6 +827,48 @@ class R6StopThenRedirectTests(unittest.TestCase):
             brain._resolve_last_command(), "create a folder named x")
 
 
+class R8OneTurnTwoJobsTests(unittest.TestCase):
+    """R8: status+work is two jobs — answered, then routed, never one blob."""
+
+    def setUp(self):
+        brain._held_redirect = None
+        brain._last_user_work_request = ""
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+
+    def tearDown(self):
+        brain._held_redirect = None
+        brain._pending_opencode_task = None
+        brain._pending_action_requests = []
+        brain._pending_browser_clarification = None
+        brain._opencode_task_running = False
+        brain._research_running = False
+
+    def test_splitter(self):
+        first, second = brain.split_compound_turn(
+            "are you doing the queued task? also create a folder named x")
+        self.assertTrue(brain.is_status_question(first))
+        self.assertIn("create a folder", second.lower())
+
+    def test_bare_status_never_splits(self):
+        self.assertEqual(
+            brain.split_compound_turn("is it done?"), (None, None))
+        self.assertEqual(
+            brain.split_compound_turn("create a folder named x"),
+            (None, None))
+
+    def test_status_answered_and_work_routed(self):
+        reply = brain.process_message(
+            "is anything queued? also create a folder named x",
+            sync_voice=False)
+        lowered = reply.lower()
+        self.assertIn("nothing is queued", lowered)
+        self.assertIn("ready to create folder", lowered)
+
+
 class R2NotebookTests(unittest.TestCase):
     """R2: one small ledger across turns — requests, entities, focus."""
 

@@ -3355,6 +3355,54 @@ _STOP_RESEARCH_NEGATION_RE = re.compile(
 )
 
 
+#: R8 — one turn can be TWO jobs, never one queued blob. A question +
+#: a request ("are you doing X? also create Y", "is it done — and make Z")
+#: answers the status from live state FIRST, then routes the work half as a
+#: fresh turn (its own preview/approval, never inheriting anything). Stop +
+#: redirect compounds keep their dedicated control-first path (R6); this is
+#: for status+work pairs. Pure status ("did you stop it?") never splits —
+#: the work half must be non-trivial text.
+_TURN_SPLIT_RE = re.compile(
+    r"^(?P<first>.+?)\s*(?:[?!.…,;—–-]+\s*|\s+and\s+|\s+also\s+|\s+then\s+)"
+    r"(?P<second>(?:create|make|write|save|check|verify|list|inspect|see|"
+    r"show|search|find|look(?:\s+up)?|open|run|execute|stop)\b.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def split_compound_turn(msg):
+    """R8: split a status+work turn into (status_half, work_half).
+
+    Returns (None, None) when the turn is NOT such a compound: the first
+    half must be a real status question, the second a non-trivial work
+    request. Corrections, confirmations, and bare status never split — they
+    have their own gates.
+    """
+    text = (msg or "").strip()
+    if not text or len(text) < 12:
+        return None, None
+    try:
+        if is_correction(text):
+            return None, None
+    except Exception:
+        pass
+    match = _TURN_SPLIT_RE.match(text)
+    if not match:
+        return None, None
+    first = (match.group("first") or "").strip()
+    second = (match.group("second") or "").strip()
+    if len(second) < 8:
+        return None, None
+    try:
+        if not is_status_question(first):
+            return None, None
+        if is_status_question(second):
+            return None, None
+    except Exception:
+        return None, None
+    return first, second
+
+
 #: R6 — "stop X and do Y" is TWO jobs (control + redirect), never one queued
 #: blob. Splitter runs before the stop handler: the stop half goes through
 #: the control path NOW, the redirect half is held behind the browser's
@@ -4870,6 +4918,37 @@ def _process_message_inner(
                 return correction_reply
     except Exception as exc:
         logging.warning("[CORRECTION] Revision handling failed: %s", exc)
+
+    # ── R8: one turn, two jobs (status + work) ──
+    # "Are you doing the queued task? Also create a folder named x" is NOT
+    # one queued blob: the question is answered from live state NOW, and the
+    # work half routes as a FRESH turn through the normal path (its own
+    # preview/approval, never inheriting the answered question). Runs after
+    # held-redirect release and correction (their own compounds) but BEFORE
+    # the confirmation gates — neither half may be mistaken for a yes/no.
+    try:
+        status_half, work_half = split_compound_turn(msg)
+    except Exception:
+        status_half, work_half = None, None
+    if status_half and work_half:
+        print("[COMPOUND] Status+work split:", status_half, "||", work_half)
+        try:
+            status_reply = answer_status_question(status_half)
+        except Exception as exc:
+            logging.warning("[COMPOUND] Status half failed: %s", exc)
+            status_reply = "Sir, nothing is running right now."
+        try:
+            work_reply = _process_message_inner(
+                work_half, from_voice=from_voice, sync_voice=False,
+                voice_compact=voice_compact, commit_response=commit_response,
+                request_id=request_id)
+        except Exception as exc:
+            logging.warning("[COMPOUND] Work half failed: %s", exc)
+            work_reply = "Sir, I could not start the second part."
+        response = "%s %s" % (status_reply, work_reply)
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, response)
+        return response
 
     # ── R6: "stop X and do Y" splits into control + held redirect ──
     # The stop half signals the worker NOW through the control path; the
