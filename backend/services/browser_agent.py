@@ -30,6 +30,7 @@ import requests
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from backend import config
+from backend.core import deadline as budget
 from backend.services.brave_mcp_client import BraveMcpClient
 from backend.services.opencode_client import (
     append_activity_line,
@@ -547,6 +548,22 @@ def _adapter_supports_tools_and_vision(provider, model=None):
     return {"tool_calling", "vision_input"} <= capabilities
 
 
+def _model_wire_timeout():
+    """Wire timeout for one model generation (BA-03).
+
+    The model's own budget (``BROWSER_AGENT_MODEL_TIMEOUT``, ~90 s) sliced
+    to the bound task deadline — a generation never gets fresh time past
+    the task's end. Raises :class:`BudgetExhausted` instead of sending when
+    the budget is already spent; unbound callers (tests, one-off probes)
+    get the plain configured budget.
+    """
+    sliced = budget.seconds_for(None, config.BROWSER_AGENT_MODEL_TIMEOUT)
+    if sliced is None:
+        raise budget.BudgetExhausted(
+            "browser task budget exhausted - model call not sent")
+    return sliced
+
+
 def _call_openai_compatible(url, api_key, messages, tools, model=None, provider=None):
     """One turn against an OpenAI-compatible chat completions endpoint."""
     effective_model = model or config.BROWSER_AGENT_MODEL
@@ -579,7 +596,7 @@ def _call_openai_compatible(url, api_key, messages, tools, model=None, provider=
         url,
         headers={"Authorization": "Bearer %s" % api_key},
         json=payload,
-        timeout=config.BROWSER_AGENT_TOOL_TIMEOUT,
+        timeout=_model_wire_timeout(),
     )
     response.raise_for_status()
     body = response.json()
@@ -646,7 +663,7 @@ def _call_gemini(messages, tools, model=None):
         url,
         params={"key": config.GEMINI_API_KEY},
         json=payload,
-        timeout=config.BROWSER_AGENT_TOOL_TIMEOUT,
+        timeout=_model_wire_timeout(),
     )
     response.raise_for_status()
     body = response.json()
@@ -797,6 +814,15 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
             last_error = exc
             dur_ms = _sw_elapsed_ms(t0)
             _total.done(stats, ok=False)
+            # BA-03: a spent task budget is never retried — no slice of it
+            # can succeed, so further attempts only burn wall-clock past
+            # the deadline. Falls through to the final raise below.
+            try:
+                _handle = budget.resolve(None)
+                if _handle is not None and _handle.stopped():
+                    break
+            except Exception:
+                pass
             # L-8: a deterministic rejection (same payload fails identically)
             # breaks out immediately instead of burning two more full-image
             # uploads plus a second of sleeping.
@@ -824,8 +850,16 @@ def _model_turn_with_retries(history, tools, step=None, stats=None):
                 break
             if attempt < 2:
                 # L-8: the provider's Retry-After wins over the flat gap.
+                # BA-03: the wait is capped to the remaining task budget —
+                # a spent budget stops retrying instead of sleeping past
+                # the deadline.
                 try:
-                    time.sleep(_retry_delay_s(exc))
+                    _gap = _retry_delay_s(exc)
+                except Exception:
+                    _gap = 0.0
+                try:
+                    if not budget.wait(None, _gap):
+                        break
                 except Exception:
                     pass
             continue
@@ -4460,7 +4494,14 @@ def _run_one_tool(client, history, call, session=None, stats=None):
         except Exception as exc:
             last_error = exc
             if attempt < max_attempts - 1:
-                time.sleep(0.5)
+                # BA-03: capped to the remaining task budget (plain 0.5 s
+                # sleep when unbound). A spent budget makes the NEXT
+                # attempt fail fast on its sliced timeout instead of
+                # granting fresh time here.
+                try:
+                    budget.wait(None, 0.5)
+                except Exception:
+                    pass
     if result_text is None:
         # One optional tool failing must NOT kill the whole run (a single
         # read_file silence once aborted the entire task): deliver the
@@ -4899,7 +4940,7 @@ def _is_clarifying_question(text):
 
 
 def _agent_loop(client, task_description, started, stats=None, job=None,
-                checkpoint=None, cached_tools=None):
+                checkpoint=None, cached_tools=None, deadline=None):
     """Run the model/tool loop; returns the final TaskResult.
 
     The end-of-task STOPWATCH summary is emitted on EVERY exit path -
@@ -4912,9 +4953,17 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
 
     *cached_tools* (L-6) are raw tools/list defs from the pool cache: the
     inner loop advertises them without another wire round trip.
+
+    *deadline* (BA-03) is the task's absolute budget, derived from the same
+    *started* origin as the legacy timeout check so the two can never
+    disagree. When omitted one is built here, so direct callers and tests
+    keep working unchanged.
     """
     if stats is None:
         stats = _SwStats()
+    if deadline is None:
+        deadline = budget.Deadline.at(
+            started + config.BROWSER_AGENT_TIMEOUT)
     # F09: the verified trace of what this run actually did (one entry per
     # executed step) — the raw material for capturing a PROCEDURE, not just a
     # goal sentence, when the run is verified complete.
@@ -4922,7 +4971,8 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
     try:
         result = _agent_loop_inner(client, task_description, started, stats,
                                    job=job, checkpoint=checkpoint,
-                                   trace=trace, cached_tools=cached_tools)
+                                   trace=trace, cached_tools=cached_tools,
+                                   deadline=deadline)
     finally:
         _emit_summary(stats, started)
     if result is not None:
@@ -4934,7 +4984,13 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
 
 
 def _agent_loop_inner(client, task_description, started, stats, job=None,
-                      checkpoint=None, trace=None, cached_tools=None):
+                      checkpoint=None, trace=None, cached_tools=None,
+                      deadline=None):
+    if deadline is None:
+        # Same origin as the task timeout: one budget, never two that
+        # can disagree (BA-03 replaces the ad-hoc monotonic comparison).
+        deadline = budget.Deadline.at(
+            started + config.BROWSER_AGENT_TIMEOUT)
     if cached_tools is not None:
         # L-6: the pool already knows the daemon's tool list (code-static),
         # so the task starts without a tools/list round trip.
@@ -5002,7 +5058,7 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
             append_activity_line("stopped by user\n")
             narrate_activity("Stopping")
             return TaskResult.stopped()
-        if time.monotonic() - started > config.BROWSER_AGENT_TIMEOUT:
+        if deadline.expired():
             return _fail_and_log(
                 "task timed out after %ds" % config.BROWSER_AGENT_TIMEOUT
             )
@@ -5330,6 +5386,13 @@ def run_browser_task(task_description, job=None, resume_from=None):
     """
     started = time.monotonic()
     stats = _SwStats()
+    # BA-03: the ONE absolute budget for this task, from the same `started`
+    # origin the timeout message reports. Bound to this thread so every
+    # model POST and MCP call below slices its own timeout to what is
+    # actually left (see core/deadline); passed explicitly to the loop so
+    # the step-top check and the wire timeouts can never disagree.
+    task_deadline = budget.Deadline.at(
+        started + config.BROWSER_AGENT_TIMEOUT)
     checkpoint = resume_checkpoint(resume_from) if resume_from else None
     # F20: the legacy flag stays armed while ANOTHER live browser job is
     # already cancelled — that is what stops run B from disarming the stop the
@@ -5355,16 +5418,19 @@ def run_browser_task(task_description, job=None, resume_from=None):
         if owns_job:
             # Registered only once the run is actually under way: a task that
             # never gets a daemon must not leave a cancellable job behind.
-            # No job deadline — the loop already applies BROWSER_AGENT_TIMEOUT
-            # against its own `started` clock, and a second budget would just
-            # make the two disagree.
+            # BA-03: the job carries no second budget of its own — the
+            # task_deadline above is the single authority; the loop checks
+            # it and every wire call slices to it.
             job = job_registry.new_job(
                 kind="browser", label=(task_description or "")[:80])
         truncate_activity_log()
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         append_activity_line("\n=== %s === %s ===\n" % (stamp, task_description))
-        return _agent_loop(client, task_description, started, stats, job=job,
-                           checkpoint=checkpoint, cached_tools=cached_tools)
+        with budget.bound(task_deadline):
+            return _agent_loop(client, task_description, started, stats,
+                               job=job, checkpoint=checkpoint,
+                               cached_tools=cached_tools,
+                               deadline=task_deadline)
     finally:
         # L-6: pooled clients go back to the slot; private ones are closed
         # exactly as before.

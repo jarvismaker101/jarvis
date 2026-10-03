@@ -12,6 +12,7 @@ import time
 
 import requests
 
+from backend.core import deadline as budget
 from backend.services.opencode_client import BRAVE_MCP_PORT, BRAVE_MCP_TOKEN
 
 _DEFAULT_URL = "http://127.0.0.1:%d/mcp" % BRAVE_MCP_PORT
@@ -57,6 +58,39 @@ class BraveMcpClient:
     client only speaks the wire protocol. Errors surface as RuntimeError so
     the agent loop can retry and fail cleanly.
     """
+
+    #: BA-03: per-class wire budgets (seconds). The old code gave EVERY call
+    #: — a 2 s location.href read, a file download, the LLM-sized default —
+    #: the same 120 s via one shared self.timeout, so a hung CDP evaluate
+    #: could block a task for the full budget. Each class now gets its own:
+    #: probes 8 s, real-input actions 15 s, navigation 30 s, screenshot 15 s,
+    #: file transfer 45 s. Anything not listed falls back to self.timeout.
+    #: Every value is still capped to the bound task deadline at send time,
+    #: so a task never outlives BROWSER_AGENT_TIMEOUT by more than the one
+    #: call already in flight.
+    _TOOL_CLASS_TIMEOUTS = {
+        # probes / reads
+        "evaluate": 8,
+        "list_tabs": 8,
+        "read_file": 8,
+        "list_dir": 8,
+        # real-input actions
+        "click_locator": 15,
+        "fill_locator": 15,
+        "scroll": 15,
+        "select_option": 15,
+        "set_checked": 15,
+        "switch_tab": 15,
+        "new_tab": 15,
+        "open_brave": 15,
+        "screenshot": 15,
+        # navigation
+        "navigate": 30,
+        # file transfer
+        "download": 45,
+        "upload_file": 45,
+        "drag_drop": 45,
+    }
 
     def __init__(self, base_url=None, token=None, timeout=None):
         self.base_url = base_url or _DEFAULT_URL
@@ -175,7 +209,7 @@ class BraveMcpClient:
         logging.info("[BRAVE-MCP] session re-established (reconnect #%d)",
                      self.reconnects)
 
-    def _request(self, method, params=None, _healed=False):
+    def _request(self, method, params=None, _healed=False, timeout=None):
         self._next_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -183,13 +217,22 @@ class BraveMcpClient:
             "id": self._next_id,
             "params": params or {},
         }
+        # BA-03: the wire timeout is the class budget (or the explicit
+        # override) sliced to the bound task deadline. A spent budget sends
+        # NO request at all — the caller must stop, not start fresh work on
+        # expired time.
+        wire_timeout = budget.seconds_for(
+            None, timeout if timeout is not None else self.timeout)
+        if wire_timeout is None:
+            raise budget.BudgetExhausted(
+                "browser task budget exhausted - MCP %s not sent" % method)
         try:
             _sw_t0 = time.monotonic()
             response = self.session.post(
                 self.base_url,
                 headers=self._headers(),
                 json=payload,
-                timeout=self.timeout,
+                timeout=wire_timeout,
             )
             self._last_mcp_ms = int((time.monotonic() - _sw_t0) * 1000)
             response.raise_for_status()
@@ -205,12 +248,13 @@ class BraveMcpClient:
             # the agent's own retry policy untouched.
             if not _healed and _is_session_death(exc):
                 self.reconnect()
-                return self._request(method, params, _healed=True)
+                return self._request(method, params, _healed=True,
+                                     timeout=timeout)
             raise
 
-    def list_tools(self):
+    def list_tools(self, timeout=None):
         """Return the tool descriptors [{name, description, input_schema}]."""
-        result = self._request("tools/list")
+        result = self._request("tools/list", timeout=timeout)
         tools = []
         for tool in result.get("tools", []):
             tools.append(
@@ -236,7 +280,7 @@ class BraveMcpClient:
             "data": data,
         }
 
-    def call_tool(self, name, arguments=None):
+    def call_tool(self, name, arguments=None, timeout=None):
         """Call one tool; return the concatenated text of its content blocks.
 
         Non-text blocks keep their text marker ("[image omitted]") so the text
@@ -244,9 +288,16 @@ class BraveMcpClient:
         :attr:`last_images` — F38: an image the model needed must never exist
         only as the marker that says it was dropped. A JSON-RPC error response
         raises RuntimeError with the server's message.
+
+        BA-03: *timeout* overrides the per-class wire budget
+        (:attr:`_TOOL_CLASS_TIMEOUTS`, falling back to ``self.timeout`` for
+        unlisted tools) for this call only.
         """
+        if timeout is None:
+            timeout = self._TOOL_CLASS_TIMEOUTS.get(name, self.timeout)
         result = self._request(
-            "tools/call", {"name": name, "arguments": arguments or {}}
+            "tools/call", {"name": name, "arguments": arguments or {}},
+            timeout=timeout,
         )
         self.last_images = []
         parts = []

@@ -104,7 +104,12 @@ BROWSER_AGENT_REASONING_EFFORT = os.getenv(
 )
 BROWSER_AGENT_MAX_STEPS = int(os.getenv("JARVIS_BROWSER_AGENT_MAX_STEPS", "50"))  # safety margin - vision grounding cuts typical step counts, not a license to flail
 BROWSER_AGENT_TIMEOUT = int(os.getenv("JARVIS_BROWSER_AGENT_TIMEOUT", "480"))
-BROWSER_AGENT_TOOL_TIMEOUT = 120
+# BA-03: the single shared 120 s budget is split. Model generations get
+# their own (larger) budget; every MCP tool call gets a per-class budget
+# (see BraveMcpClient._TOOL_CLASS_TIMEOUTS) defaulting to this fallback.
+# Both are still capped to the remaining task budget at call time.
+BROWSER_AGENT_TOOL_TIMEOUT = int(os.getenv("JARVIS_BROWSER_AGENT_TOOL_TIMEOUT", "30"))
+BROWSER_AGENT_MODEL_TIMEOUT = int(os.getenv("JARVIS_BROWSER_AGENT_MODEL_TIMEOUT", "90"))
 BROWSER_AGENT_KEEP_LAST_IMAGES = int(os.getenv("JARVIS_BROWSER_AGENT_KEEP_LAST_IMAGES", "1"))
 # payload knobs — clamped at read time (env may be stale or test-patched)
 try:
