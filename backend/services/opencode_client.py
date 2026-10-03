@@ -135,22 +135,34 @@ def _reset_narration_state():
     _narration_count = 0
 
 
-def _narrate(phrase):
-    """Speak one short phrase, throttled: 3s min gap, no consecutive
-    duplicates, hard cap per task. Only speaks when narration is enabled."""
+def _claim_narration_slot(phrase):
+    """The narration throttle as a pure gate (True = may speak now).
+
+    Enabled flag, no-consecutive-duplicates, 3 s min gap, per-task cap.
+    Just float compares and counter updates — nanoseconds on the caller —
+    so both the sync engine path and the async request path share it.
+    """
     global _last_narration_at, _last_narration_phrase, _narration_count
     if not _narration_enabled:
-        return
+        return False
     now = time.monotonic()
     if phrase == _last_narration_phrase:
-        return
+        return False
     if now - _last_narration_at < _NARRATION_MIN_GAP_S:
-        return
+        return False
     if _narration_count >= _NARRATION_MAX_PER_TASK:
-        return
+        return False
     _last_narration_at = now
     _last_narration_phrase = phrase
     _narration_count += 1
+    return True
+
+
+def _narrate(phrase):
+    """Speak one short phrase, throttled: 3s min gap, no consecutive
+    duplicates, hard cap per task. Only speaks when narration is enabled."""
+    if not _claim_narration_slot(phrase):
+        return
     try:
         speak(phrase)
     except Exception as exc:
@@ -232,12 +244,176 @@ def _append_activity(text):
     boundary on the way in.
     """
     try:
-        with open(_activity_log_path(), "a", encoding="utf-8", errors="replace") as handle:
-            handle.write(tool_policy.redact_for_egress(text)
-                         if isinstance(text, str) else str(text))
-            handle.flush()
+        _write_activity_blob(
+            tool_policy.redact_for_egress(text)
+            if isinstance(text, str) else str(text))
     except Exception:
         pass
+
+
+def _write_activity_blob(blob):
+    """One open/write/flush/close for a pre-redacted blob. Raises on failure
+    (callers decide whether to retry); the redaction already happened."""
+    with open(_activity_log_path(), "a", encoding="utf-8",
+              errors="replace") as handle:
+        handle.write(blob)
+        handle.flush()
+
+
+# ── BA-08: async, non-blocking activity logging ──
+#
+# Every browser-agent tool call used to pay a blocking open + redaction +
+# write + flush through _append_activity (4+ lines per step, ~0.3-2 ms each
+# on Windows, on the critical path competing with live audio). Now the
+# request path only enqueues: one daemon writer thread drains the bounded
+# queue in batches (ONE open per batch, redaction on the writer), with
+# drop-on-overflow so a sick disk can delay lines but never the request.
+# project-map rule 19: telemetry never raises into, or blocks, the path.
+try:
+    _ACTIVITY_QUEUE_MAX = max(
+        1, int(os.getenv("JARVIS_ACTIVITY_QUEUE_MAX", "1000")))
+except (TypeError, ValueError):
+    _ACTIVITY_QUEUE_MAX = 1000
+#: Lines written per file open by the writer thread.
+_ACTIVITY_BATCH_MAX = 200
+#: Idle seconds before a partial batch is written anyway.
+_ACTIVITY_FLUSH_S = 0.5
+_ACTIVITY_QUEUE = queue.Queue(maxsize=_ACTIVITY_QUEUE_MAX)
+_ACTIVITY_FILE_LOCK = threading.Lock()
+_ACTIVITY_WRITER_LOCK = threading.Lock()
+_ACTIVITY_WRITER_STARTED = False
+#: Lines dropped by a full queue (bounded memory matters more than a
+#: complete tail when the disk stalls).
+_activity_dropped = 0
+
+
+def _ensure_activity_writer():
+    """Start the one daemon writer thread (lazy, so imports stay side-effect
+    free and tests that never log never spawn it)."""
+    global _ACTIVITY_WRITER_STARTED
+    if _ACTIVITY_WRITER_STARTED:
+        return
+    with _ACTIVITY_WRITER_LOCK:
+        if _ACTIVITY_WRITER_STARTED:
+            return
+        # The loop binds the queue object at start: tests may swap the
+        # module global for a scratch queue without hijacking (or being
+        # raced by) the live writer.
+        loop_queue = _ACTIVITY_QUEUE
+        thread = threading.Thread(target=_activity_writer_loop,
+                                  args=(loop_queue,),
+                                  name="activity-log", daemon=True)
+        thread.start()
+        _ACTIVITY_WRITER_STARTED = True
+
+
+def _enqueue_activity(item):
+    """Non-blocking enqueue (True) or drop with a counter (False). Never
+    raises, never blocks — this is what the request path pays."""
+    global _activity_dropped
+    try:
+        _ensure_activity_writer()
+        _ACTIVITY_QUEUE.put_nowait(item)
+        return True
+    except queue.Full:
+        _activity_dropped += 1
+        return False
+    except Exception:
+        return False
+
+
+def _write_lines_batch(lines):
+    """Write one drained batch under the file lock: ONE open for the whole
+    batch (this is the win over one-open-per-line), with an ensure-and-
+    retry for a missing directory. Best effort — never raises."""
+    blob = "".join(lines)
+    try:
+        with _ACTIVITY_FILE_LOCK:
+            try:
+                _write_activity_blob(blob)
+            except OSError:
+                _ensure_activity_log()
+                try:
+                    _write_activity_blob(blob)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _activity_writer_loop(loop_queue):
+    """Drain batches: ONE file open per batch, redaction here (not on the
+    request path), narration speaks here too. A batch is written when full
+    or after _ACTIVITY_FLUSH_S idle. The loop itself never dies — a dead
+    writer would be silent permanent log loss."""
+    while True:
+        try:
+            try:
+                first = loop_queue.get(timeout=_ACTIVITY_FLUSH_S)
+            except queue.Empty:
+                continue
+            batch = [first]
+            while len(batch) < _ACTIVITY_BATCH_MAX:
+                try:
+                    batch.append(loop_queue.get_nowait())
+                except queue.Empty:
+                    break
+            lines = []
+            flushes = []
+            for item in batch:
+                try:
+                    kind, payload = item
+                except (TypeError, ValueError):
+                    continue
+                if kind == "line":
+                    text = payload if isinstance(payload, str) else str(payload)
+                    lines.append(tool_policy.redact_for_egress(text))
+                elif kind == "speak":
+                    try:
+                        speak(payload)
+                    except Exception:
+                        pass
+                elif kind == "flush":
+                    flushes.append(payload)
+            if lines:
+                _write_lines_batch(lines)
+            for event in flushes:
+                try:
+                    event.set()
+                except Exception:
+                    pass
+            for _item in batch:
+                try:
+                    loop_queue.task_done()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+
+def flush_activity_log(timeout=5.0):
+    """Block until everything queued so far is on disk (True) or the wait
+    ran out (False). For tests, task end and shutdown — never the hot path."""
+    try:
+        _ensure_activity_writer()
+        done = threading.Event()
+        try:
+            _ACTIVITY_QUEUE.put_nowait(("flush", done))
+        except queue.Full:
+            return False
+        return bool(done.wait(timeout))
+    except Exception:
+        return False
+
+
+def activity_queue_stats():
+    """Inspector for tests/monitoring: depth, drops, bound."""
+    try:
+        return {"queued": _ACTIVITY_QUEUE.qsize(),
+                "dropped": _activity_dropped,
+                "maxsize": _ACTIVITY_QUEUE.maxsize}
+    except Exception:
+        return {"queued": -1, "dropped": -1, "maxsize": -1}
 
 
 def _truncate_activity_log():
@@ -245,10 +421,13 @@ def _truncate_activity_log():
 
     Runs at the very start of every task; the visible tail script notices
     the shrink, clears its console and follows the fresh log from the top.
+    Takes the file lock so a writer-thread batch cannot land after the
+    truncation (the public wrapper drains the queue first).
     """
     try:
-        with open(_activity_log_path(), "w", encoding="utf-8", errors="replace"):
-            pass
+        with _ACTIVITY_FILE_LOCK:
+            with open(_activity_log_path(), "w", encoding="utf-8", errors="replace"):
+                pass
     except Exception as exc:
         logging.warning("[OPENCODE] Could not truncate activity log: %s", exc)
 
@@ -298,18 +477,36 @@ def _taskkill(pid):
 
 
 def truncate_activity_log():
-    """Public wrapper: empty the activity log so it holds only the current task."""
+    """Public wrapper: drain anything queued, then empty the activity log
+    so it holds only the current task. The drain is bounded (2 s) — a
+    wedged writer delays the truncation, never the task."""
+    try:
+        flush_activity_log(timeout=2.0)
+    except Exception:
+        pass
     _truncate_activity_log()
 
 
 def append_activity_line(text):
-    """Public wrapper: append one line of text to the activity log."""
-    _append_activity(text)
+    """Public wrapper: enqueue one line for the writer thread. The request
+    path pays a put_nowait and a redaction-free return — no open(), no
+    flush, no block, never a raise (rule 19)."""
+    try:
+        _enqueue_activity(
+            ("line", text if isinstance(text, str) else str(text)))
+    except Exception:
+        pass
 
 
 def narrate_activity(text):
-    """Public wrapper: speak one short narration phrase (throttled)."""
-    _narrate(text)
+    """Public wrapper: claim a throttle slot on the caller (nanoseconds)
+    and let the writer thread speak. Same completeness treatment as the
+    log lines — cheap today only because narration defaults off."""
+    try:
+        if _claim_narration_slot(text):
+            _enqueue_activity(("speak", text))
+    except Exception:
+        pass
 
 
 def shutdown_opencode_server():

@@ -199,11 +199,28 @@ _MAX_RESULT_CHARS = 15000
 # just issued for the previous job).
 _STOP_REQUESTED = threading.Event()
 
+#: Job ids owned by a run through run_browser_task below. The job-cancelled
+#: stop handler (registered above) arms _STOP_REQUESTED ONLY for these — a
+#: foreign browser job (a direct registry test, another engine's stop) must
+#: not leak "user pressed STOP" into the next unrelated loop.
+_OWNED_JOB_IDS = set()
+
 _STOP_MESSAGE = "Stopped per your request."
 
 
 def _on_job_cancelled(job):
-    _STOP_REQUESTED.set()
+    # The stop handler fires for EVERY browser cancellation — including jobs
+    # this module never started (e.g. a /task/stop test that creates and
+    # cancels jobs directly). Arming the module-global flag for a foreign
+    # job leaks "user pressed STOP" into the next unrelated loop, which is
+    # exactly the order-dependent failure the BA-14/BA-03 plumbing tests hit
+    # after the websearch stop suite. Only jobs owned by a run through
+    # run_browser_task (tracked in _OWNED_JOB_IDS) may arm it.
+    try:
+        if job is not None and getattr(job, "job_id", None) in _OWNED_JOB_IDS:
+            _STOP_REQUESTED.set()
+    except Exception:
+        pass
 
 
 job_registry.register_stop_handler("browser", _on_job_cancelled)
@@ -5578,6 +5595,10 @@ def run_browser_task(task_description, job=None, resume_from=None):
             # it and every wire call slices to it.
             job = job_registry.new_job(
                 kind="browser", label=(task_description or "")[:80])
+            try:
+                _OWNED_JOB_IDS.add(job.job_id)
+            except Exception:
+                pass
         truncate_activity_log()
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         append_activity_line("\n=== %s === %s ===\n" % (stamp, task_description))
@@ -5592,3 +5613,7 @@ def run_browser_task(task_description, job=None, resume_from=None):
         _return_mcp_client(client, pooled)
         if owns_job and job is not None:
             job.finish()
+            try:
+                _OWNED_JOB_IDS.discard(job.job_id)
+            except Exception:
+                pass
