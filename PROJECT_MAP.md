@@ -1614,6 +1614,18 @@ Declarative/desire phrasing routes deterministically: `_WANT_CREATE_RE` catches 
 
 `backend/core/brain.py`: `is_correction` ("that was meant/supposed to be", "I meant check…", "actually just look…", "correction:") + `handle_correction` runs BEFORE the confirmation gates so the old preview can never eat the revision as "unclear"; `_cancel_armed_gates` kills every armed approval (native via new `cancel_pending_task_confirmation` in `task_agent/agent.py`, opencode, research, shared record, browser clarification) so the old yes dies; the superseded notebook record is marked; a check-shaped correction executes read-only immediately ("understood — checking instead"), anything else returns an explicit replace ack. Tests: `R7CorrectionReplacesTests` in `test_brain_gate.py`.
 
-### Astra R10 — that/it/there/last/queued resolve from the notebook (`pending`)
+### Astra R10 — that/it/there/last/queued resolve from the notebook (`76d56e6`)
 
 `backend/core/brain.py`: one resolver family over the R2 ledger — `resolve_that_folder`/`resolve_there` (focus head; "there" is always a place, never a file/page), `resolve_bare_it` (folder / ask-once when file+folder both fit / none), `resolve_last_command` (last non-superseded notebook request — skips own/yes/stop/status by construction), `resolve_queued_task` (oldest S18 entry / held R6 redirect / armed approval / "Nothing is queued"); `_resolve_folder_hint` in `task_agent/agent.py` now calls the shared `resolve_that_folder`; the R12 queue-status branch speaks the REAL entry ("Queued: … — not started") instead of an invented count. Tests: `R10ResolveFromNotebookTests` in `test_brain_gate.py`.
+
+### Astra R8 — one turn can be two jobs (`132ba68`)
+
+`backend/core/brain.py`: `split_compound_turn` (status-half must be a real status question, work-half a non-trivial action sentence; corrections/confirmations/bare status never split) + a role-detector block in `_process_message_inner` AFTER held-redirect release and correction but BEFORE the confirmation gates — the status half is answered from live state NOW (`answer_status_question`), the work half re-enters `_process_message_inner` as a FRESH turn (its own preview/approval, nothing inherited), and the two replies are joined. Stop+redirect compounds keep the dedicated control-first R6 path; this covers status+work. Tests: `R8OneTurnTwoJobsTests` in `test_brain_gate.py`.
+
+### Astra R9 — confirmations survive STT noise (`4036720`)
+
+`backend/services/task_agent/agent.py`: `_stt_confirmation_verdict` hypotheses run BEFORE the R4 word-match classifier — "yes yesterday, no now" declines (latest word wins), a dropped leading yes ("s, a quick look") still holds as inspect, "did I/you say yes/no/ok?" stays a question; the ORIGINAL text is never rewritten, only the verdict changes. `_describe_native_step` now says the emptiness out loud ("Ready to create new file … (empty)", full path always shown). Tests: `R9SttSafeConfirmationTests` in `test_code_tools.py`.
+
+### Astra R15 — fix names carefully (`37153a1`)
+
+`backend/services/task_agent/agent.py`: `_norm_folder_token` (case/space-folded lookup) + `_folder_name_candidates` (exact→prefix→containment over the real folders, on-disk canonical paths only) + `resolve_folder_name` (exact / candidates / none); `_resolve_folder_hint` resolves named folders through it — ambiguity and no-match return None so the caller asks once instead of guessing; `pre_execution_recheck` re-verifies JUST before a confirmed write runs (parent still exists, grant still covers it, file must not have appeared — any change stops, never renames/overwrites). `backend/core/brain.py`: `answer_exact_vs_candidate` ("no exact folder named Malik — but Mayank Malik exists. Shall I use it?"). The cued→queued repair stays status-only, never filenames. Tests: `R15CarefulNameMatchingTests` in `test_code_tools.py`.
