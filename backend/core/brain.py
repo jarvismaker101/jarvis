@@ -316,9 +316,19 @@ def _notify_async_reply(text, spoken=None):
     # follow-ups like "what was the second point?" or "open that" ground in
     # history instead of pointing at something the model never saw. The
     # marker rides in-band (the prompt shows it as a background result, not
-    # a turn answer); only DELIVERED results are remembered.
+    # a turn answer); only DELIVERED results are remembered. A repeat of the
+    # immediately-preceding entry (same text, e.g. a completion re-firing)
+    # is NOT appended again — seven identical "folder has been created"
+    # turns once crowded real conversation out of the model's window and
+    # broke "what did we talk about in the last six messages" counting.
     try:
-        add_message("assistant", "[background result] %s" % text)
+        entry = "[background result] %s" % text
+        try:
+            recent = get_history()[-1:]
+        except Exception:
+            recent = []
+        if not (recent and recent[0].get("content") == entry):
+            add_message("assistant", entry)
     except Exception as exc:
         logging.warning("[NOTIFY] background result history write failed: %s",
                         exc)
@@ -1250,6 +1260,21 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "Always respond only in English, even if the user speaks another language. "
             "You have memory of this conversation. Be concise and helpful. "
             "Address the user as 'sir' occasionally for character. "
+            # Capability grounding: this chat route has no tools, so it must
+            # NEVER claim an inability ("I cannot create files/folders",
+            # "I am unable to browse websites"). Real actions — file/folder
+            # ops, code, shell, browser automation — run through task routes;
+            # a request phrased as an action belongs there, not in chat.
+            # When asked to recall the conversation, answer ONLY from the
+            # turns above; never invent topics, and never agree with a
+            # premise ("I do recall that") unless the turns show it.
+            "You are the voice interface, not the hands: file, folder, code, "
+            "shell and browser actions are performed by task routes, never "
+            "by this chat reply, so never say you cannot do them — say you "
+            "will get it done, or ask for the missing detail. "
+            "When asked what was discussed, report only what the turns "
+            "above show; if a claimed topic is absent, say so plainly "
+            "instead of agreeing. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
 

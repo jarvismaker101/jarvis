@@ -132,6 +132,19 @@ class CodeToolRoutingTests(unittest.TestCase):
         self.assertIn("Desktop", plan["steps"][0]["args"]["path"])
         self.assertTrue(plan["steps"][0]["args"]["path"].endswith("demo"))
 
+    def test_folder_by_the_name_routes_to_desktop(self):
+        # Live phrasing that once fell through to chat ("by the name X"):
+        # routes into the gated task path AND resolves the desktop path.
+        plan = agent.plan_task(
+            "Create a folder on the desktop by the name Mayank Malik",
+            self.context,
+        )
+        self.assertTrue(plan["requires_confirmation"])
+        self.assertEqual(plan["steps"][0]["tool"], "code.create_folder")
+        self.assertIn("Desktop", plan["steps"][0]["args"]["path"])
+        self.assertTrue(
+            plan["steps"][0]["args"]["path"].endswith("Mayank Malik"))
+
     def test_multi_file_plan_gates_with_write_steps(self):
         plan = agent.plan_task("create 4 files .txt .py .js .html", self.context)
         self.assertTrue(plan["requires_confirmation"])
@@ -183,6 +196,8 @@ class CodeToolRoutingTests(unittest.TestCase):
         self.assertTrue(agent.is_code_tool_request("create a folder named badmoss"))
         self.assertTrue(agent.is_code_tool_request("create a folder on the desktop and name it demo"))
         self.assertTrue(agent.is_code_tool_request("create a directory named logs"))
+        self.assertTrue(agent.is_code_tool_request(
+            "Create a folder on the desktop by the name Mayank Malik"))
         self.assertTrue(agent.is_code_tool_request("create 4 files .txt .py .js .html"))
         self.assertTrue(agent.is_code_tool_request("create 4 files: a.txt, b.py, c.js, d.html"))
         # conversational hijack phrases must NOT be caught

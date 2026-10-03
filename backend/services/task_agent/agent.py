@@ -575,10 +575,12 @@ _MULTI_FILE_EXT_RE = re.compile(
 )
 
 # Naming/location cues that make a folder tail a real folder request
-# ("named X", "called X", "name it X", "in temp") rather than a bare noun
-# phrase like "a directory listing".
+# ("named X", "by the name X", "on the desktop", "in temp") rather than a
+# bare noun phrase like "a directory listing". "by the name" covers the
+# "... folder on the desktop by the name X" phrasing a bare "named" misses.
 _FOLDER_TAIL_HINT_RE = re.compile(
-    r"\b(?:named|called|call it|name it|name it as|call it as|at|in|for)\b",
+    r"\b(?:named|called|call it|name it|name it as|call it as|by the name|"
+    r"by name|at|on|in|for)\b",
     re.IGNORECASE,
 )
 
@@ -737,13 +739,23 @@ def _folder_plan_path(raw):
     Runs on the RAW utterance so folder names keep their original case."""
     name = None
     named = re.search(
-        r"(?:named|called|call it|name it|and name it|name it as|call it as)"
+        r"(?:named|called|call it|name it|and name it|name it as|call it as|"
+        r"by the name(?: of)?|by name)"
         r"\s+([a-z0-9_ .\-]+?)(?:\s+(?:on|in|at|inside|under)\s+.*)?$",
         raw,
         re.IGNORECASE | re.DOTALL,
     )
     if named:
         name = named.group(1).strip()
+        # A location phrase that rode along with the name ("X on the
+        # desktop") is a path cue, not part of the folder name.
+        name = re.split(
+            r"\s+(?:on|in|at|inside|under)\s+(?:the\s+)?(?:desktop|"
+            r"documents|downloads|workspace|home|folder|directory)\b",
+            name,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
     if not name:
         bare = re.match(
             r"^(?:create|make)\s+(?:a\s+|an\s+)?(?:folder|directory)\s+"

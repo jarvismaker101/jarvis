@@ -79,11 +79,31 @@ class DeliveredResultHistoryTests(_HistoryIsolation):
         recorded = []
         with patch.object(brain, "_async_reply_callback",
                           lambda t, s=None: recorded.append(t)), \
-                patch.object(brain, "add_message",
-                             side_effect=RuntimeError("disk full")):
+                 patch.object(brain, "add_message",
+                              side_effect=RuntimeError("disk full")):
             delivered = brain._notify_async_reply("delivered anyway")
         self.assertTrue(delivered)
         self.assertEqual(recorded, ["delivered anyway"])
+
+    def test_a_repeated_result_is_remembered_only_once(self):
+        # Live bug: a completion re-firing appended seven identical
+        # "folder has been created" turns, crowding real conversation out
+        # of the model's window and breaking "last six messages" recall.
+        delivered, _ = self._notify("Sir, the folder has been created.")
+        self.assertTrue(delivered)
+        delivered, _ = self._notify("Sir, the folder has been created.")
+        self.assertTrue(delivered)
+        entries = [m for m in memory.get_history()
+                   if m["content"].endswith("folder has been created.")]
+        self.assertEqual(len(entries), 1)
+
+    def test_a_different_result_still_joins_after_a_repeat(self):
+        self._notify("Sir, the folder has been created.")
+        self._notify("Sir, the folder has been created.")
+        self._notify("Sir, done — something else happened.")
+        self.assertEqual(
+            memory.get_history()[-1]["content"],
+            "[background result] Sir, done — something else happened.")
 
 
 if __name__ == "__main__":
