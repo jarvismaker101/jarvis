@@ -793,10 +793,10 @@ def ensure_whisper_daemon():
         time.sleep(0.25)
 
 
-#: [PERF] The in-process model is only the daemon-failure fallback, but it must
-#: not silently keep a different size than the daemon: ONE env var drives both
-#: (see backend/whisper_daemon.py, which ships "base" and decodes greedily).
-WHISPER_MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "base")
+#: [ACCURACY] The in-process model is only the daemon-failure fallback, but it
+#: must not silently keep a different size than the daemon: ONE env var drives
+#: both (see backend/whisper_daemon.py, which ships "medium" for accuracy).
+WHISPER_MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
 
 
 def _load_in_process_whisper():

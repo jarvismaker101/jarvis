@@ -76,15 +76,15 @@ if sys.platform == "win32":
 from backend.services import runtime_identity
 
 PORT = int(os.getenv("JARVIS_WHISPER_PORT", "8767"))
-MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "base")
-# [PERF] "base" is the shipped default as of the 2026-10 latency pass (owner
-# request). Measured on the target laptop, one 7.24s English utterance:
+MODEL_SIZE = os.getenv("JARVIS_WHISPER_MODEL", "medium")
+# [ACCURACY] "medium" is the shipped default as of the 2026-10 owner request:
+# "base" was the earlier latency default but mangles Hindi/Hinglish, names and
+# numbers. Measured on the target laptop, one 7.24s English utterance:
 #   medium cuda float16 -> 3.66s load, 1.53s decode (0.21x realtime)
 #   base   cuda float16 -> 0.53s load, 0.42s decode (0.06x realtime)
 #   medium cpu  int8    -> 6.92s load, 27.65s decode (3.82x realtime)
-# Accuracy is the price: base is weaker on Hindi/Hinglish, names and numbers.
-# This stays a one-line override - JARVIS_WHISPER_MODEL=medium restores the
-# previous behaviour exactly, and both models are already on disk.
+# CUDA is fine; a CPU-only box pays a large decode cost - override with
+# JARVIS_WHISPER_MODEL=base (or small) there. Both models are already on disk.
 # Wake-word biasing prompt. ONLY applied for wake matching — the caller asks
 # for it with ``X-Jarvis-Purpose: wake`` (watcher). Conversation transcription
 # runs WITHOUT it on purpose: on noise / TTS-echo audio the model hallucinates

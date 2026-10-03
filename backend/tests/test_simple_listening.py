@@ -142,11 +142,11 @@ class RemovedPartialApiTests(unittest.TestCase):
 
 
 class WhisperLatencyDefaultTests(unittest.TestCase):
-    """The shipped STT defaults are the fast ones, and stay overridable."""
+    """The shipped STT model is the accurate one, and stays overridable."""
 
-    def test_the_shipped_model_is_base(self):
+    def test_the_shipped_model_is_medium(self):
         self.assertEqual(whisper_daemon.MODEL_SIZE,
-                         os.getenv("JARVIS_WHISPER_MODEL", "base"))
+                         os.getenv("JARVIS_WHISPER_MODEL", "medium"))
 
     def test_the_default_is_read_from_the_same_env_var_as_before(self):
         # An override still wins: nothing about the knob's name changed.
@@ -154,7 +154,7 @@ class WhisperLatencyDefaultTests(unittest.TestCase):
             os.environ.pop("JARVIS_WHISPER_MODEL", None)
             self.assertEqual(
                 whisper_daemon.MODEL_SIZE,
-                os.environ.get("JARVIS_WHISPER_MODEL", "base"))
+                os.environ.get("JARVIS_WHISPER_MODEL", "medium"))
 
 
 if __name__ == "__main__":

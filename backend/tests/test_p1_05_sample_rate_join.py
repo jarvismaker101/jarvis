@@ -267,7 +267,7 @@ class UnchangedBehaviourTests(unittest.TestCase):
     """Constraints: this audit is a rate fix, nothing else moved."""
 
     def test_pause_threshold_and_caps_untouched(self):
-        self.assertEqual(listener.PAUSE_THRESHOLD_SECONDS, 1.2)
+        self.assertEqual(listener.PAUSE_THRESHOLD_SECONDS, 0.7)
         self.assertEqual(listener.MAX_PHRASE_SECONDS, 15)
         self.assertEqual(listener.LISTEN_TIMEOUT_SECONDS, 10)
 
