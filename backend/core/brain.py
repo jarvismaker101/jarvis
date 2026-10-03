@@ -2330,6 +2330,22 @@ def _voice_clip(text, limit=180):
     return kept + "..."
 
 
+def _browser_prewarm_due(contract):
+    """True when the armed handoff will run the browser agent (L-6).
+
+    A frozen contract naming another engine is authoritative (never prewarm
+    for it); without a contract the configured engine decides. Warming the
+    wrong pool is harmless (idle TTL reaps it, no side effects), so this
+    errs toward warming.
+    """
+    try:
+        if contract is not None:
+            return str(getattr(contract, "executor", "") or "") == "browser_agent"
+        return config.TASK_ENGINE == "browser_agent"
+    except Exception:
+        return False
+
+
 def handle_opencode_task(task_description, original_message,
                          from_voice=False, voice_compact=False, contract=None):
     """Route a complex command to the opencode agent.
@@ -2344,6 +2360,16 @@ def handle_opencode_task(task_description, original_message,
     """
     _arm_opencode_confirmation(task_description, original_message,
                                contract=contract)
+    # L-6: while the user reads the confirmation prompt, warm the MCP
+    # session + tool cache on a daemon thread — connect + tools/list then
+    # happen inside the approval gap instead of after "yes". Best effort:
+    # never delays the question, never navigates, never spawns the daemon.
+    if _browser_prewarm_due(contract):
+        try:
+            threading.Thread(target=browser_agent.prewarm_mcp_pool,
+                             name="mcp-prewarm", daemon=True).start()
+        except Exception:
+            pass
     suffix = "Do you want me to go ahead and execute it?"
     task_text = task_description or original_message
     prefix = "Sir, this is what I understood — "

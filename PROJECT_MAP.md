@@ -1,12 +1,13 @@
 # Jarvis Assistant Project Map
 
-This document gives another model enough context to work on the repo without re-discovering the architecture from scratch. **Refreshed 2026-10-01.**
+This document gives another model enough context to work on the repo without re-discovering the architecture from scratch. **Refreshed 2026-10-03.**
 
 State as of this refresh:
 
 - The **Fable-5 audit remediation** (G0–G11, F01–F55) is landed except the **G8 classifier-retirement step**, which remains open.
 - The **CODE_REVIEW_REPORT hardening wave** is landed for **C1–C3** and **H1–H9**, plus the **STT-hallucination gate**. The review's M/L/structural items are still open.
-- A **responsiveness audit** (43 findings, P0-01…P1-19) was completed 2026-09-29 and triaged by the owner. **13 of its items are now implemented** — the 2026-09-30 wave, commits `f37a519`…`6c89095`. Per-item detail is in "Responsiveness audit implementation state" below; the remaining items are still open, and `AUDIT_IMPLEMENTATION_PROMPTS.html` holds the per-item implementation prompts.
+- A **responsiveness audit** was completed 2026-09-29 and triaged by the owner. **27 of its items are now implemented** — 13 in the 2026-09-30 wave (`f37a519`…`6c89095`) and 14 in the 2026-10-01 wave (`2e85ebb`…`3b460d0`). Per-item detail is in "Responsiveness audit implementation state" below. The original triage prompts file was never committed to this repo, so the per-item prompts are **not recoverable**; git commit messages and the per-item test suites are the record.
+- **The S-series latency/intelligence wave (2026-10-02/03)** is the newest work and is the single biggest architectural change since F56: neural-VAD endpointing (S29), AEC alignment (S28), one Fish WebSocket session per reply (S7), one STT engine per utterance (S5), a single-call router that also answers chat (S6), conversation during a running task (S18), background results in history (S13), state pushed over one event channel (S19), and a voice-path latency batch (S1/S12/S23/S26/S27). See "Recent Improvements (2026-10)" below.
 - **F56 (landed, tag `local-models`)** — the LOCAL Ollama server is a first-class model provider, and the intent classifier is a selectable role. `chat` and the new `intent` role accept `ollama/<installed model>` from the Electron model switcher; `intent` gets a whole new sidebar section. See "Local models as selectable brains (F56)" below — including the MEASURED latency numbers, which are the reason this is a selection and not a new default.
 
 ## Local models as selectable brains (F56)
@@ -46,7 +47,12 @@ The project is heavily local-machine oriented. It assumes:
 
 ## The One-Sentence Mental Model
 
-Typed UI requests and spoken requests both end up in `backend.core.brain.process_message()` (defined at `brain.py:3266`, delegating to `_process_message_inner` at `brain.py:3308`). Deterministic phrase routes (memory, explicit stops, pending confirmations) run first; then explicit task/code-tool, screen-control and research routes, plus the optional G8 orchestrator. Otherwise that function races a speculative chat stream (`_ChatRacer`, `brain.py:1568`, started at `brain.py:3482`) against a cloud intent classifier, applies deterministic safety nets (screen questions, fresh-info search, all-search-steps reroute, web-shaped tasks) over the classifier verdict, then routes to chat, tool actions, screen Q&A, research, browser-agent tasks, or memory commands, and returns a short English reply that may also be spoken aloud.
+Typed UI requests and spoken requests both end up in `backend.core.brain.process_message()` (defined at `brain.py:3672`, delegating to `_process_message_inner` at `brain.py:3723`). Deterministic phrase routes (memory, explicit stops, pending confirmations) run first. Then — since P0-10 — **route selection and a speculative chat racer run FIRST, above the task/code-tool/screen-control/research chain** (`orchestrator_select_route` at `brain.py:3849`, then `_ChatRacer` at `brain.py:3857` for any non-`command` message with a stream). Only then do explicit task (`3864`), native code-tool (`3878`), screen-control (`3891`) and research (`3901`) gates run, plus the optional G8 orchestrator. Otherwise that function applies deterministic safety nets over the classifier verdict, then routes to chat, tool actions, screen Q&A, research, browser-agent tasks, or memory commands, and returns a short English reply that may also be spoken aloud.
+
+**Two changes since 2026-09-30 make this materially different from older descriptions of the flow:**
+
+1. **The router answers the turn (S6, `1fd635a`).** A deterministic fast path (`JARVIS_CHAT_FASTPATH`, default on) skips the network entirely for plain chat via `is_definitely_plain_chat` (`brain.py:942`, verdict synthesised at `3978-3991`). Otherwise the intent router's JSON carries a `reply` field (`intent.py:60-61`) which the brain speaks via `handle_chat(..., answered=router_reply)` (`brain.py:4209-4236`) — **no second chat completion**. A `chat` verdict no longer implies "fall through to the chat model".
+2. **State is pushed, not polled (S19, `a0ec729`).** The voice worker subscribes to the `GET /events` SSE channel (`backend/services/event_bus.py`) instead of polling `/ui-state` and `/voice-mode` on a 1s TTL. The 1s polls remain only as a fallback if the channel drops.
 
 
 ## Fable-5 Audit Remediation State
@@ -60,13 +66,13 @@ The Fable-5 audit's remediation plan groups work into G0–G11. State as of this
 - **G4 (landed)** — coding interface: `code.search/read_range/inspect_diff/apply_patch/run_checks` in `code_tools.py`; structured editor bridge renderers (F15) in `task_agent/agent.py`.
 - **G5 (landed)** — research pipeline: question-carrying evidence schema, `backend/services/provenance.py` (observed vs checked provenance, F48), bounded parallelism (`test_g5_research_pipeline.py`).
 - **G6 (landed)** — browser grounding: `backend/services/browser_session_broker.py` (profile/tab/origin identity), marks bound to real targets with epochs, Playwright input primitives, extended toolset.
-- **G7 (landed)** — Windows screen grounding: `screen_geometry.py` (coordinate-space helpers, monitor bookkeeping, F44 same-frame rect comparisons), `screen_ui_elements.py` (F42 runtime-id re-resolution, F44 preserved hierarchy), `screen_capture.py` (F43 multi-monitor/DPI/last non-Jarvis target), F29 UIA-first fast path in `screen_control.py`, F45 image-only vision fallback.
+- **G7 (landed)** — Windows screen grounding: `backend/services/screen_geometry.py` (coordinate-space helpers, monitor bookkeeping, F44 same-frame rect comparisons), `backend/services/screen_ui_elements.py` (F42 runtime-id re-resolution, F44 preserved hierarchy), `backend/services/screen_capture.py` (F43 multi-monitor/DPI/last non-Jarvis target), F29 UIA-first fast path in `screen_control.py`, F45 image-only vision fallback.
 - **G8 (landed)** — orchestrator migration behind the migration flag: `backend/services/orchestrator.py` (F02 native tool-use loop over the registry-resolved qwen3p7-plus planner; tool args validated; invalid output distinguished from a conversational answer; mutations only PROPOSED through the existing gates), `backend/services/capability_resolver.py` (F16 engine dispatch; availability ≠ permission; opencode opt-in only; browser recovery needs no CLI), `backend/services/context_envelope.py` (F46 bounded request-scoped envelope with explicit omissions), planner role + capability validation in `model_registry.py` (F49; wired into `task_agent._model_plan`). Enable with `JARVIS_ORCHESTRATOR_MODE=orchestrator`; the legacy classifier routing and all deterministic safety nets stay until parity (the screen-question net replays deterministically inside the orchestrator).
 - **G9 (landed)** — memory & continuity: `backend/core/memory_store.py`, one SQLite store (FTS5 with graceful LIKE fallback) with `facts`/`entities` (F06: provenance, confidence, sensitivity, superseded-by revision chain, tombstoned scoped forgetting, bounded `memory_context` injection in `_build_chat_messages`), `events` (F07: every chat exchange, async reply and task result recorded bounded + secret-masked via `tool_policy.mask_secrets`, grounding "use the report you just researched" follow-ups), `commitments` (F10: explicitly-armed deadline/job-completed triggers with a state machine and scheduler daemon; delivery rides the same async-reply UI/speech path as background results — notification only, never computer control; calendar/file-watch triggers deliberately rejected as assumption-flagged), `skills` (F09: verified completions capture approval-gated candidates; only user-approved skills ground `_model_plan`; versioned + invalidated after repeated failures; webpage instructions are never promoted). Deterministic phrase ops (`remember that…`, `forget…`, `what do you remember about…`, `remind me to … in N minutes/at HH:MM`, `cancel the reminder`, `approve/retire the … skill`) run before any other routing and are gated by `JARVIS_MEMORY_ENABLED` (default on; empty store changes zero prompts).
-- **G10 (landed)** — voice runtime: `backend/services/audio_actor.py` (F32 single playback owner with a generation token — chunks carry the generation they were produced for and stale-generation PCM is dropped at every await/play boundary; the PCM ring + spoken cursor make interrupted resumes exact; `abort()` stops **this** stream, never `sd.stop()` for everyone; audio cache is identity-keyed by model+reference+format+text), `backend/services/echo_cancel.py` (F33 AEC3 reference path: every chunk that reaches the device feeds a monotonic reference ring resampled to 16k, the listener's VAD/onset window is AEC-cancelled before it can look like a barge-in — `py-webrtc-aec3` when installed, otherwise a loud no-op at the [ASSUMPTION] boundary), `backend/services/transcript_stabilizer.py` (F34 local-agreement conversation windows: finals commit immediately, agreeing overlapping partials after N windows, and `listen()` only ever returns *committed* transcripts so unstable partials can never trigger an action). F36 wake/command separation in `backend/services/wake_engine.py` + `watcher.py`: the phrase tail after the wake window is now extracted and forwarded to `/ask` ("wake up jarvis and search for cats" acts on both parts), an optional pre-roll ring (`JARVIS_WAKE_PRE_ROLL_SECONDS`) plus online Whisper verification of false positives (`JARVIS_WAKE_ONLINE_VERIFY`), and `openwakeword` keyword spotting when installed (`JARVIS_WAKE_ENGINE`) with graceful fallback to the fuzzy path. Fish playback feeds the actor + reference path on every device write; `test_voice_latency.py` cache assertions were updated to the identity-key contract. AEC tuning and keyword-spot quality stay [ASSUMPTION]-flagged (need the real speaker/headset recordings).
+- **G10 (landed)** — voice runtime: `backend/services/audio_actor.py` (F32 single playback owner with a generation token — chunks carry the generation they were produced for and stale-generation PCM is dropped at every await/play boundary; the PCM ring + spoken cursor make interrupted resumes exact; `abort()` stops **this** stream, never `sd.stop()` for everyone; audio cache is identity-keyed by model+reference+format+text), `backend/services/echo_cancel.py` (F33 AEC3 reference path: every chunk that reaches the device feeds a monotonic reference ring resampled to 16k, the listener's VAD/onset window is AEC-cancelled before it can look like a barge-in — `py-webrtc-aec3` when installed, otherwise a loud no-op at the [ASSUMPTION] boundary; **S28 `80c094e` extended this substantially with `DelayEstimator` cross-correlation lag lock, a joint last-5-frame compare window, off-thread reference prefetch, and a `lag` block in `state()` exposed by `GET /aec/state`**), `backend/services/transcript_stabilizer.py` (F34 local-agreement conversation windows: finals commit immediately, agreeing overlapping partials after N windows, and `listen()` only ever returns *committed* transcripts so unstable partials can never trigger an action). **Utterance endpointing is now neural (S29 `acc366e`): `backend/services/neural_vad.py` runs Silero-on-ONNX with 100 ms-on / 200 ms-off hysteresis and falls back to `webrtcvad` only when the model is unavailable (`JARVIS_NEURAL_ENDPOINT=0` is the kill switch). The old partial-window layer was deleted outright in `7afefc0`, and S5 `c7b2128` collapses STT to exactly ONE engine per utterance whose output IS the transcript — there is no engine ladder and no fall-through.** F36 wake/command separation in `backend/services/wake_engine.py` + `watcher.py`: the phrase tail after the wake window is now extracted and forwarded to `/ask` ("wake up jarvis and search for cats" acts on both parts), an optional pre-roll ring (`JARVIS_WAKE_PRE_ROLL_SECONDS`) plus online Whisper verification of false positives (`JARVIS_WAKE_ONLINE_VERIFY`), and `openwakeword` keyword spotting when installed (`JARVIS_WAKE_ENGINE`) with graceful fallback to the fuzzy path. Fish playback feeds the actor + reference path on every device write; `test_voice_latency.py` cache assertions were updated to the identity-key contract. AEC tuning and keyword-spot quality stay [ASSUMPTION]-flagged (need the real speaker/headset recordings).
 - **G11 (landed)** — process architecture & security (audit F50/F51/F52):
 
-  * **F50 backend sole owner of intelligence state** (`backend/voice_mode.py`): the voice process is now a pure I/O worker — it no longer imports or executes `backend.core.brain` (the audit's "second, never-authoritative copy" bug). Every utterance is submitted to the ONE backend runtime via the authenticated `/ask/stream` SSE contract (`speak=False`, `origin=voice`); streamed deltas feed the same `StreamSpeaker`. Listening state is **published** (`POST /voice-state/publish`, authed) and the backend serves `/voice-state` + `/ui-state` from that snapshot instead of its empty `listener_state` module copy. Task state is **polled** from `/ui-state` (`backend_task_running`, 1s TTL, last-known-kept) — never a module copy. Stop/stop-research/cancel-approval controls route through the authed HTTP control plane (`/task/stop`, `/speak/stop`, `/approvals/reset`). A negation-aware `is_stop_research` lives in the worker (mirrors brain). `backend/api/routes.py`: `Query.speak`/`Query.origin` flags gate backend double-speaking; `_run_request_worker` gains a `speak_terminal` parameter so a voice submission stays silent; `/voice-state/publish` (authed) merges into `/voice-state` and `/ui-state` (monotonic `state_seq`); `/approvals/reset` invalidates pending consent + clears the pending screen plan + interrupts live registered requests before safe recovery.
+  * **F50 backend sole owner of intelligence state** (`backend/voice_mode.py`): the voice process is now a pure I/O worker — it no longer imports or executes `backend.core.brain` (the audit's "second, never-authoritative copy" bug). Every utterance is submitted to the ONE backend runtime via the authenticated `/ask/stream` SSE contract (`speak=False`, `origin=voice`); streamed deltas feed the same `StreamSpeaker`. Listening state is **published** (`POST /voice-state/publish`, authed) and the backend serves `/voice-state` + `/ui-state` from that snapshot instead of its empty `listener_state` module copy. Task state is **pushed** over the `GET /events` SSE channel from `backend/services/event_bus.py` (`backend_task_running`, plus speaking/thinking and the voice toggle; **S19 `a0ec729`**) — the worker subscribes and the old 1s-TTL `/ui-state` poll is retained only as a fallback if the channel drops. Stop/stop-research/cancel-approval controls route through the authed HTTP control plane (`/task/stop`, `/speak/stop`, `/approvals/reset`). A negation-aware `is_stop_research` lives in the worker (mirrors brain). `backend/api/routes.py`: `Query.speak`/`Query.origin` flags gate backend double-speaking; `_run_request_worker` gains a `speak_terminal` parameter so a voice submission stays silent; `/voice-state/publish` (authed) merges into `/voice-state` and `/ui-state` (monotonic `state_seq`); `/approvals/reset` invalidates pending consent + clears the pending screen plan + interrupts live registered requests before safe recovery.
   * **F51 sandboxed renderers + authenticated localhost** (`frontend/preload.js`, `main.js`, `frontend/capsule_main.js`, and all 5 renderer JS files): every window is now `contextIsolation:true, nodeIntegration:false, sandbox:true` with the minimal `contextBridge` preload bridge — validated IPC channels only, http/https-validated `openExternal`, and a token-attaching `jarvisAPI.backend()` proxy so the backend token rides on every call (overlays, which render web-derived content, can **never** read the token). Renderer-initiated navigation is denied and `window.open` is denied. `backend/services/local_auth.py` (`X-Jarvis-Token`, per-launch secret, constant-time compare) enforces the token on every endpoint EXCEPT the public liveness surface (`GET /health`) — that includes private READS such as `/ui-state`, `/voice-state`, `/screen-answer`, `/research-*` and `/ask/status/*`, which is why the renderer and the voice worker always attach the header. `backend/services/runtime_identity.py` writes an atomic `data/runtime/backend-instance.json` stamp (pid + instance_id + protocol + build) at startup, and `/health` exposes it. A missing token no longer disables enforcement: `local_auth` FAILS CLOSED outside explicit development mode, and only `JARVIS_DEV_MODE=1` reopens the surface. The old `allow_origins=["*"]` CORS is gone too — `backend/main.py` now allows the renderer origins plus loopback only, with credentials off. `frontend/*.html` carry a `Content-Security-Policy` meta tag. `BRAVE_MCP_TOKEN` is already env-based in source (rotation is a user step on `.env`/`~/.config/opencode/opencode.jsonc`).
   * **F52 supervised, versioned, observable runtime** (`main.js`, `watcher.py`): child processes are spawned with stdio piped and drained into bounded `data/logs/<label>.log` (cap + half-rotate) — never a blocking full pipe. `registerManagedProcess` retains the handle and restarts required workers within a restart **budget** (2 backend, 1 voice) on unexpected exit; deliberate stops never count. A backend replacement best-effort POSTs `/approvals/reset` first (invalidate stale approvals before recovery). `watcher.py` mints the per-launch token, injects it into every child (backend/voice/electron), and verifies the backend via **identity** (instance stamp vs. `/health`) instead of the mere existence of `/research-result`; it invalidates the live backend's approvals before replacing a stale one and exposes distinct warm-sleep (`/stop`, authed) and full-shutdown (`/shutdown`, authed) control semantics.
 
@@ -83,8 +89,8 @@ The Fable-5 audit's remediation plan groups work into G0–G11. State as of this
 - **H4/H5/H6 (landed)** — execution staleness and geometry: plans carry a `capture_epoch` probed before EVERY effect that refuses on mismatch; `_verify_window_identity` (IsWindow + process id) runs before every effect and at focus acquisition, and a hit-test with no window under the point now REFUSES; out-of-frame normalised points are rejected rather than clamped into edge clicks. Tests: `test_h4_h5_h6_staleness.py`. (The report's DPI/monitor double-scaling claim did not survive verification: captured pixels are physical end-to-end.)
 - **H8 (landed)** — the retired Groq model `llama-3.3-70b-versatile` is gone from `grok_client`'s default and from the offered catalog.
 - **H9 (landed)** — the research overlay accepts only `http(s)`/`mailto` markdown hrefs; `javascript:`/`data:`/`vbscript:` render as plain label text. Tests: `tests/research-overlay-href-scheme.test.js` (node).
-- **STT hallucination gate (landed)** — `backend/services/transcription.py::is_hallucinated_transcript()` rejects prompt-vocabulary echoes (5+ tokens drawn only from the wake-bias vocabulary), looped tokens/phrases, memorised silence phrases ("a ver si te acuerdas de esto", "thanks for watching", ...) and filler-only utterances, while never rejecting real commands, short wake phrases, literal payloads or repeated safety words. It is wired into the listener's partial windows, each STT engine's accept, the final `listen()` commit belt, the watcher's `is_wake_word`, and `_add_candidates`. `whisper_daemon`'s wake-bias `INITIAL_PROMPT` is now opt-in via `X-Jarvis-Purpose: wake` (sent only by the watcher), so conversation transcription runs unbiased. Tests: `test_stt_hallucination_gate.py`.
-- **Chat-outage root cause (2026-09-23, fixed)** — direct `generativelanguage.googleapis.com` degraded to 7-45s+ through the user's Proton VPN tunnel while the Fireworks account was suspended, so every query fell through to the generic failure message. Fixes: the `chat` role allowlist gained `openrouter`, `get_provider_credentials` returns canonical OpenAI-compatible base URLs for openrouter/groq, and `intent.py` now classifies OpenRouter -> Gemini -> Groq. The current `data/jarvis_settings.json` has vision and browser_tool on `openrouter/google/gemini-2.5-flash-lite` (chat is on `gemini/gemini-3.5-flash-lite`).
+- **STT hallucination gate (landed)** — `backend/services/transcription.py::is_hallucinated_transcript()` rejects prompt-vocabulary echoes (5+ tokens drawn only from the wake-bias vocabulary), looped tokens/phrases, memorised silence phrases ("a ver si te acuerdas de esto", "thanks for watching", ...) and filler-only utterances, while never rejecting real commands, short wake phrases, literal payloads or repeated safety words. It is wired into the single STT engine's accept path, the final `listen()` commit belt, the watcher's `is_wake_word`, and `_add_candidates`. (**The listener's partial-window layer it used to guard was deleted in `7afefc0`, and the multi-engine ladder collapsed to one engine per turn in S5 `c7b2128`** — `listener.py:1084`, `1270`, `1307` document the removal.) `whisper_daemon`'s wake-bias `INITIAL_PROMPT` is now opt-in via `X-Jarvis-Purpose: wake` (sent only by the watcher), so conversation transcription runs unbiased. Tests: `test_stt_hallucination_gate.py`.
+- **Chat-outage root cause (2026-09-23, fixed)** — direct `generativelanguage.googleapis.com` degraded to 7-45s+ through the user's Proton VPN tunnel while the Fireworks account was suspended, so every query fell through to the generic failure message. Fixes: the `chat` role allowlist gained `openrouter`, `get_provider_credentials` returns canonical OpenAI-compatible base URLs for openrouter/groq, and `intent.py` now classifies OpenRouter -> Gemini -> Groq. **Live selections have moved since (settings `revision` 61): chat is `gemini/gemini-3.5-flash-lite`; vision is `fireworks-2/accounts/fireworks/models/qwen3p8-max`; browser_tool and planner are `fireworks-2/accounts/fireworks/models/deepseek-v4p1-flash`; intent is `gemini/gemini-3.1-flash-lite`; tts is `fish/s2.1-pro-free`; listening is `whisper/whisper-local`. `fireworks-2` is a CUSTOM provider entry, not the `fireworks` env provider.**
 - **Still open** — the report's M1 (approvals verdict grammar: affirmation words anywhere count as consent) and the remaining M/L/structural items, plus the G8 classifier-retirement step.
 
 ## Current Runtime Topology
@@ -128,7 +134,7 @@ Flow:
 - It sets `JARVIS_EXTERNAL_RUNTIME=1` for Electron so `main.js` does not start the backend and voice mode a second time.
 - Before spawning, the watcher kills any stale backend listening on the configured port (`watcher.py` `_pids_on_port(BACKEND_PORT)` + `taskkill`), so a relaunch always owns port 9999.
 - While Jarvis is running, the watcher pauses.
-- It exposes an authed HTTP control plane on `JARVIS_WATCHER_CONTROL_PORT` with two DIFFERENT semantics: a warm sleep (`/stop`) tears down backend/voice/Electron but deliberately keeps the resident `whisper_daemon` (and the opencode/brave daemons) alive for an instant next wake, while a full shutdown (`/shutdown`) leaves nothing behind. Electron's stop button uses `/stop` and only falls back to killing port owners if the watcher does not answer.
+- It exposes an authed HTTP control plane on `JARVIS_WATCHER_CONTROL_PORT` with two DIFFERENT semantics: a warm sleep (`/stop`) brings down **only the voice worker and the UI** — `watcher.py:1471-1478` calls `stop_runtime(stop_electron=True, keep_backend=True)`, so the backend **stays warm and listening** along with the resident `whisper_daemon` (and the opencode/brave daemons) for an instant next wake — while a full shutdown (`/shutdown`) leaves nothing behind. Electron's stop button uses `/stop` and only falls back to killing port owners if the watcher does not answer.
 - When Electron exits and the backend is no longer on the configured port (`JARVIS_BACKEND_PORT`, default `9999`), the watcher resumes listening.
 
 ## End-to-End Request Flows
@@ -142,8 +148,8 @@ Path:
 -> `backend/api/routes.py` (admission -> one job -> `_run_request_worker` -> `process_message`)
 -> `backend/core/brain.py` (`process_message` -> `_process_message_inner`)
 -> deterministic phrase routes first (memory / commitments / skills, explicit stops, pending confirmations and clarifications)
--> then, in order: explicit task and code-tool handoff, screen control, explicit research, and — in `orchestrator` mode only — the G8 native tool-use loop
--> otherwise the legacy path: `classify_intent` raced against the speculative `_ChatRacer`, with the deterministic nets rewriting the verdict (see brain.py section)
+-> then, since P0-10: **route selection + speculative `_ChatRacer` first** (`brain.py:3846-3861`), then explicit task and code-tool handoff, screen control, explicit research, and — in `orchestrator` mode only — the G8 native tool-use loop
+-> otherwise the legacy path: `classify_intent` raced against the speculative `_ChatRacer`, with the deterministic nets rewriting the verdict (see brain.py section). **S6 changed this: a plain-chat fast path can skip the LLM entirely, and a non-fast-path `chat` verdict is ANSWERED by the router's own `reply` field rather than by a second chat completion**
 -> one of:
 - chat via the model-registry-selected provider chain (`gemini_client` / `fireworks_client` / OpenAI-compatible for every other provider)
 - tool actions via `backend/core/executor.py`
@@ -154,40 +160,45 @@ Path:
 - memory ops via `backend/core/memory_store.py`; memory reset via `backend/core/memory.py`
 - native code tools via `backend/services/code_tools.py`
 -> response returned to the UI as numbered SSE events
--> the same response is also spoken through `backend/services/voice.py` — unless the caller sent `speak=False`, which the voice worker always does
+-> the same response is also spoken through `backend/services/voice.py` — unless the caller sent `speak=False`, which the voice worker always does. **Since S7 `066220c` the primary playback path is ONE live bidirectional Fish Audio WebSocket session per reply (`fish_voice.py:67-69`, `_FishReplySession`, `open_ws_reply`/`play_ws_reply` on the audio actor); the HTTP ladder below it is now the fallback, switchable with `JARVIS_FISH_WS`.**
 
 Notes:
 
 - The UI has `chat` mode and `command` mode.
 - In command mode, the renderer prefixes the request with `command ` before sending it to `/ask/stream`.
-- Request admission lives in `request_registry`: a retried request id reuses its result instead of re-executing, a reused id carrying a different message is rejected, and identical messages inside 1 second are deduplicated.
+- Request admission lives in `request_registry`: a retried request id reuses its result instead of re-executing, and a reused id carrying a different message is rejected. **The 1-second identical-message dedup is NOT in `request_registry` — it is in `backend/api/routes.py:500-510` on `POST /ask` only, and it is gated on `not query.request_id`. Since `frontend/renderer.js:73` always sends a client-generated id, that guard can never fire on the real UI path, and `/ask/stream` has no equivalent guard.**
 
 ### Route selection and the chat race (inside process_message)
 
-`backend/core/brain.py` is now 3827 lines. `process_message` (line 3266) binds the F20 turn job and delegates to `_process_message_inner` (line 3308). The order today:
+`backend/core/brain.py` is now ~4360 lines. `process_message` (line 3672) binds the F20 turn job and delegates to `_process_message_inner` (line 3723). The order today:
 
 1. The `clear memory` phrase list.
 2. G9 memory / commitment / skill phrase ops (`memory_store.handle_memory_phrase`) — `remember that…`, `forget…`, `what do you remember about…`, `remind me to …`, `cancel the reminder`, `approve the … skill`. These run before every other route.
-3. Explicit research stop (`is_stop_research`), then the pending research / task-action / opencode-handoff confirmations and the browser-clarification follow-up.
-4. `is_explicit_task_request` and `is_code_tool_request` hand straight to `handle_task_message`.
-5. `maybe_handle_screen_control_message` (skipped for `command …`).
-6. `force_research` explicit research phrasings (including the `deepsearch` keyword).
-7. **G8 orchestrator route selection** (`orchestrator_select_route`, line 3451): with `JARVIS_ORCHESTRATOR_MODE=orchestrator` the native tool-use loop is attempted first and only a decline falls through to legacy routing; in the default `legacy` mode (the shipped default, `config.py:69`) the orchestrator is not selected at all.
-8. Legacy routing: `_ChatRacer` speculative stream (started line 3482) + `classify_intent` (line 3514, budgeted by `INTENT_BUDGET_VOICE_MS`) -> screen-question net -> racer holdback on any non-chat verdict -> fresh-info auto-search net -> tool / research / screen / region / task branches -> implicit `is_task_request` web-shaped handoff -> chat -> `command …` parsing.
+3. Explicit research stop (`is_stop_research`, `brain.py:3777`), then the pending research / task-action / opencode-handoff confirmations and the browser-clarification follow-up.
+4. **Route selection and the speculative racer — FIRST since P0-10** (`brain.py:3846-3861`): `is_explicit_command` → `orchestrator_select_route` (`3849`) → `_ChatRacer` start (`3857`) for any non-`command` message that has a stream. The comment at `brain.py:3825` states this explicitly. **The racer is therefore no longer "legacy branch only" — it starts for every routable message, including ones that go on to explicit task or code-tool handling.**
+5. `is_explicit_task_request` (`3864`) and `is_code_tool_request` (`3878`) hand straight to `handle_task_message`.
+6. `maybe_handle_screen_control_message` (`3891`, skipped for `command …`).
+7. `force_research` explicit research phrasings (`3901`, including the `deepsearch` keyword).
+8. **G8 orchestrator handling** (`3936`): with `JARVIS_ORCHESTRATOR_MODE=orchestrator` the native tool-use loop is attempted and only a decline falls through to legacy routing; in the default `legacy` mode (the shipped default, `config.py:69`) the orchestrator is not selected at all.
+9. Legacy routing: **deterministic chat fast path** (`brain.py:3978-3991` — `JARVIS_CHAT_FASTPATH`, default on, `is_definitely_plain_chat` at `brain.py:942` synthesises a `chat` verdict with **no network call at all**) → otherwise `classify_intent` (`3993`, budgeted by `INTENT_BUDGET_MS=3500` typed / `INTENT_BUDGET_VOICE_MS=1200` voice) → screen-question net → racer holdback on any non-chat verdict → fresh-info auto-search net → tool / research / screen / region / task branches → implicit `is_task_request` web-shaped handoff → chat → `command …` parsing. **Since S6 `1fd635a` a `chat` verdict from the classifier carries the router's own `reply` (`intent.py:60-61`, normalised `100-110`, defaulted `418-420`) and the brain speaks it via `_finalize_chat_reply` (`brain.py:2061`, `4209-4236`) — the second chat completion only happens if the router returned no usable reply.**
 
-`classify_intent` (`backend/services/intent.py:228`) asks **OpenRouter first** (Gemini 2.5 Flash Lite, `google/gemini-2.5-flash-lite`), then Gemini 3.5 Flash Lite direct, then Qwen 3.6 27B on Groq, and lands on a `chat` verdict if all three fail — which is exactly why the deterministic nets below exist. All three hops share ONE monotonic deadline (`_budget_timeout`), so the advertised `timeout_ms` is real rather than per-hop. The order was flipped to OpenRouter-first on 2026-09-23 because the Cloudflare-fronted OpenRouter endpoint stayed ~1.4 s while direct Gemini degraded to 7–45 s behind the VPN. **The module docstring still describes the old Gemini-first order and is stale.**
+`classify_intent` (`backend/services/intent.py:394`) tries the **registry-selected `intent` role first**, then the shipped fallback chain: OpenRouter (`google/gemini-2.5-flash-lite`), then Gemini direct, then Qwen 3.6 27B on Groq — landing on a `chat` verdict if everything fails, which is exactly why the deterministic nets exist. The selected hop is skipped inside the chain so the same endpoint is never paid twice in one budget. All hops share ONE monotonic deadline (`_budget_timeout`), so the advertised `timeout_ms` is real rather than per-hop. Order was flipped to OpenRouter-first on 2026-09-23 because the Cloudflare-fronted OpenRouter endpoint stayed ~1.4 s while direct Gemini degraded to 7–45 s behind the VPN; **since F56 the selected role is hop 1 and the live override is `gemini/gemini-3.1-flash-lite`, so in practice hop 1 is Gemini, not OpenRouter.** **The module docstring still describes the old Gemini-first order and is stale** (`intent.py:22-24`), and the old hop-number comment the map used to cite at `intent.py:286` no longer exists.
 
 ### Voice conversation flow
 
 Path:
 
 `backend/voice_mode.py` (pure I/O worker since G11/F50 — it deliberately does NOT import `backend.core.brain`)
--> `backend/services/listener.py` (transcripts only ever committed after the F34 stabiliser and the STT hallucination gate)
+-> `backend/services/listener.py` (transcripts only ever committed after the F34 stabiliser and the STT hallucination gate; endpointing is Silero neural VAD since S29, and exactly ONE STT engine runs per utterance since S5)
 -> `POST /ask/stream` on the one backend runtime, authenticated with the per-launch `X-Jarvis-Token`, sent with `speak=False` and `origin=voice`
 -> `backend/core/brain.py` (`process_message`)
 -> streamed deltas feed this process's `StreamSpeaker` (the backend stays silent for these requests)
--> `POST /voice-state/publish` publishes real listening state; task state is polled from `/ui-state`
--> `frontend/renderer.js` polls `/ui-state` and mirrors the exchange in the UI
+-> `POST /voice-state/publish` publishes real listening state; task state arrives by **push** over `GET /events` (`backend/services/event_bus.py`, S19) with the 1s `/ui-state` poll retained as a fallback
+-> `frontend/renderer.js` still polls `/ui-state` and mirrors the exchange in the UI (**the renderer has NOT adopted `/events`** — it cannot send the auth header from an `EventSource`)
+
+**Since S18 `66bacbc` the full voice mute is gone.** While a task is running the listener still submits committed utterances to `/ask/stream`; the backend answers them conversationally and QUEUES action requests (max 3 in flight) instead of refusing them. `test_voice_task_mute.py` was rewritten for this. **Since S13 `2ce627f` a delivered background result joins the conversation history** rather than being spoken as an orphan.
+
+**Barge-in robustness (`9839fe8`):** `_SpeakStopWorker` re-dials a fresh socket immediately when the keep-alive socket is dead (`_is_stale_socket`), so a stop is never lost to a stale connection. HTTP answers (401/403) are still not retried.
 
 Voice mode is split into two loops:
 
@@ -209,7 +220,7 @@ Path:
 `backend/watcher.py`
 -> microphone capture
 -> `backend/services/wake_engine.py` (F36): `openwakeword` keyword spotting when installed (`JARVIS_WAKE_ENGINE`, default `auto`), with the fuzzy phrase path as the graceful fallback
--> local GPU-accelerated faster-whisper served by the persistent `backend/whisper_daemon.py` (with Google/Groq fallback), optionally preceded by the `JARVIS_WAKE_PRE_ROLL_SECONDS` pre-roll ring and followed by online Whisper verification (`JARVIS_WAKE_ONLINE_VERIFY`)
+-> local GPU-accelerated faster-whisper served by the persistent `backend/whisper_daemon.py`, **medium** model by default (`JARVIS_WHISPER_MODEL`, `bedd9e0`), greedy decode, VAD filtering, disabled repetition conditioning. **There is NO Google/Groq fallback ladder in the watcher since S5 `c7b2128` — `watcher.py:934-948` runs exactly ONE engine, ONE pass, and its output IS the transcript; another provider is contacted only if it is itself the selected listening engine.** Transcription is pinned to English (`JARVIS_WHISPER_LANGUAGE=en`, `8ae2294`), so Whisper no longer auto-detects and cannot hallucinate in a random language. Optionally preceded by the `JARVIS_WAKE_PRE_ROLL_SECONDS` pre-roll ring and followed by online Whisper verification (`JARVIS_WAKE_ONLINE_VERIFY`)
 -> fuzzy/online wake-phrase matching, vetted by the STT hallucination gate (a prompt-vocabulary echo must never false-launch the stack)
 -> the phrase TAIL after the wake window is extracted and forwarded to `/ask` ("wake up jarvis and search for cats" acts on both parts)
 -> spawn backend + voice + Electron
@@ -280,7 +291,7 @@ This subsystem is off by default and must be enabled by saying or typing a phras
 - `frontend/renderer.js`
   - Sends `/ask` requests.
   - Adds the `command ` prefix in command mode.
-  - Polls the fused `/ui-state` endpoint â€” 250 ms while active (hearing/thinking/speaking), 600 ms when idle, exponential backoff up to 3 s on failures.
+  - Polls the fused `/ui-state` endpoint — **120 ms** while active (hearing/thinking/speaking; lowered from 250 ms, `renderer.js:515-519`), 600 ms when idle, exponential backoff up to 3 s on failures. It does **not** use the `GET /events` push channel (an `EventSource` cannot send the auth header).
   - Updates the UI badge/ring for `listening`, `hearing`, `thinking`, `speaking`, or `offline`.
   - Shows screen-control status and whether a screen action is awaiting confirmation.
 
@@ -294,31 +305,35 @@ This subsystem is off by default and must be enabled by saying or typing a phras
   - Creates the FastAPI app.
   - CORS is RESTRICTED (G11/F51): only the Electron renderer origins (`file://` reports `null`) and loopback dev servers, with credentials off. It used to be `allow_origins=["*"]`.
   - Installs `local_auth`, which FAILS CLOSED: with a supervisor-injected `JARVIS_LOCAL_TOKEN` every non-public endpoint requires it, and without one the surface is closed unless `JARVIS_DEV_MODE=1` explicitly declares development mode.
-  - On startup: `validate_environment()`, writes the `data/runtime/backend-instance.json` identity stamp, and starts the Ollama and TTS warm-up threads.
+  - On startup: `validate_environment()`, writes the `data/runtime/backend-instance.json` identity stamp, and starts **three** warm-up threads — Ollama (`main.py:53`), TTS (`main.py:58`), and provider pre-warm (`main.py:62-76`, calling `backend/services/prewarm.py::warm(force=True)`, landed by P0-12).
   - Includes routes from `backend/api/routes.py`.
 
 - `backend/app.py`
   - Secondary minimal FastAPI entrypoint.
   - Also includes the router, but current launch scripts use `backend.main:app`, not this file.
 
-- `backend/api/routes.py` — the whole local control plane (~1180 lines). Every mutating endpoint AND every private read requires the per-launch `X-Jarvis-Token` unless `JARVIS_DEV_MODE=1`; only the public liveness surface stays open.
-  - `POST /ask` — non-streaming request; F23 request-id admission (a retried id reuses its result instead of re-executing; the same id carrying a different message is a 409), a 1-second duplicate guard, and it speaks the reply unless the caller passed `speak=False`.
+- `backend/api/routes.py` — the whole local control plane (~1835 lines). Every mutating endpoint AND every private read requires the per-launch `X-Jarvis-Token` unless `JARVIS_DEV_MODE=1`; only `GET /health` stays open.
+  - `POST /ask` — non-streaming request; F23 request-id admission (a retried id reuses its result instead of re-executing; the same id carrying a different message is a 409), a 1-second duplicate guard **that only fires when the caller sends no `request_id`** (the renderer always sends one, so it never fires in practice), and it speaks the reply unless the caller passed `speak=False`.
   - `POST /ask/stream` (SSE) — the primary UI and voice path. One frame shape `{type, seq, request_id, ...}` with `delta|replace|progress|completed|interrupted|error`; reconnecting with `last_event_id` resumes without re-executing; a voice submission (`speak=False`, `origin=voice`) runs the same runtime but stays silent.
   - `GET /ask/status/{request_id}` — status lookup for reconnect checks.
+  - `POST /ask/cancel/{request_id}` (`routes.py:648`) — explicit client-side cancellation of one identified request; added with the 2026-09-30 voice-path fixes.
+  - **`GET /events` (SSE, decorator at `routes.py:973`, handler `events_stream` at `:974`)** — the S19 push channel: one `event_bus` stream carrying `snapshot` first, then live `task_running` / `voice_enabled` / `voice_state` events, with a 15 s `: ping` heartbeat. It is an async generator that holds **no thread-pool slot**, so it cannot starve barge-in. Authed like any other private read.
   - `POST /update-voice-log`, `GET /voice-log` — the latest single voice exchange for the UI mirror.
   - `GET /voice-mode`, `POST /voice-mode` — voice input on/off.
   - `POST /voice-setup/launch` — runs the "normal setup" applications as a typed backend job (F50).
   - `GET /voice-state`, `POST /voice-state/publish` — the voice I/O worker publishes its real listening state (owner incarnation + generation; a stale generation or an expired snapshot is rejected) and the backend serves it.
-  - `GET /ui-state` — fused `{state, voice_log, voice_input_enabled, task_running}`; halves renderer polling.
+  - `GET /ui-state` — fused `{state, voice_log, voice_input_enabled, task_running}`; still the renderer's read, and the voice worker's **fallback** since S19 pushed the same data over `/events`.
   - `POST /speak/stop`, `POST /speak/pause`, `POST /speak/resume`, `GET /speak/remaining` — F35 barge-in / pause / continue controls (the pause remainder is published here because the voice process is a separate OS process).
-  - `GET /aec/state`, `GET /aec/reference` — F33 echo-cancellation diagnostics and the cross-process rendered-PCM reference span.
+  - `GET /aec/state`, `GET /aec/reference` — F33 echo-cancellation diagnostics and the cross-process rendered-PCM reference span. `GET /aec/state` now also reports the S28 `lag` block.
+  - `GET /latency`, `POST /latency/client` (`routes.py:1274`, `:1319`) — the per-turn waterfall that stitches model/STT/TTS/playback marks under one request id (P1-19; `backend/services/latency.py`).
+  - `POST /prewarm`, `GET /prewarm/stats` (`routes.py:1765`, `:1791`) — connection pre-warm control and counters (P0-12).
   - `POST /task/stop` — F20: cancels ONE identified job (or the newest still-running one) at its next checkpoint; an idle stop cancels nothing.
   - `POST /approvals/reset` — invalidates a pending consent, clears the pending screen plan and interrupts live registered requests before a supervisor replacement.
   - `GET /health` — liveness plus identity (`instance_id`, `pid`, `protocol`, `build`, `auth` fingerprint).
   - `GET`/`POST /screen-answer` — F30 publish-or-patch with capture-generation and revision guards (a stale patch gets 409 instead of clobbering a newer answer).
   - `GET`/`POST /research-result` — deep-research report delivery for the research overlay.
   - `GET`/`POST /research-progress` — F28 out-of-band research progress and incremental evidence.
-  - `GET /settings`, `POST /settings/model`, `POST /settings/chat-model`, `POST /settings/provider`, `GET /providers/{id}/models` — the model-registry surface for all six roles; listings are masked (`has_key` booleans only) and selections are capability-validated.
+  - `GET /settings`, `POST /settings/model`, `POST /settings/chat-model`, `POST /settings/provider`, `POST /settings/provider/test` (`routes.py:1820`), `GET /providers/{provider_id}/models` — the model-registry surface for all **seven** roles (`chat`, `tts`, `vision`, `browser_tool`, `listening`, `planner`, `intent`); listings are masked (`has_key` booleans only) and selections are capability-validated.
 
 ### Core decision layer
 
@@ -326,11 +341,11 @@ This subsystem is off by default and must be enabled by saying or typing a phras
   - This is the main router for user intent.
   - Most important file in the repo for behavior changes.
 
-Routing order inside `process_message` is listed in "Route selection and the chat race" above (it changed and grew: memory phrases now run before everything, the G8 orchestrator route selection now precedes the legacy classifier, and there is a fourth branch — tool-search steps reroute to research). The deterministic nets are unchanged in intent:
+Routing order inside `process_message` is listed in "Route selection and the chat race" above (it changed and grew: memory phrases run before everything; **route selection and the `_ChatRacer` start moved ABOVE the task/code-tool/screen/research chain in P0-10, so the racer is no longer "legacy branch only"**; the G8 orchestrator route selection precedes the legacy classifier; and there is a fourth branch — tool-search steps reroute to research). The deterministic nets are unchanged in intent:
 
 1. Pending confirmation/follow-up gates (research confirm, task confirm, opencode confirm, browser clarification).
 2. `maybe_handle_screen_control_message(...)` (bypassed if prefixed with `command`).
-3. Legacy branch only: speculative `_ChatRacer` start, then `classify_intent(msg)`.
+3. Deterministic chat fast path (`JARVIS_CHAT_FASTPATH`, default on) — plain chat skips the LLM entirely; otherwise a speculative `_ChatRacer` start plus `classify_intent(msg)`. **Since S6 a classifier `chat` verdict is answered by the router's own `reply` field.**
 4. **Screen-question safety net**: if the verdict is `chat` or `research` and `is_screen_question(msg)` (deterministic regex in `screen_analyzer.py`), the verdict is rewritten to `region`/`screen`. tool/task verdicts are exempt because they carry structured steps the upgrade would discard.
 5. Racer holdback: any non-chat verdict cancels the speculative stream.
 6. **Fresh-info auto-search net**: a `chat` verdict that hits `should_search()` (pricing/cost/latest/news keywords) and is question-shaped but not greeting-like reroutes to `handle_research_intent` (quick-search tier), so stale chat answers are never served for current-world facts.
@@ -342,7 +357,7 @@ Important chat behavior:
 
 - The chat model is resolved per message by the model registry â€” a UI model switch takes effect on the next reply, no restart.
 - Provider chain (`_stream_chat_deltas` / `_ask_chat_nonstream`): the registry-selected provider goes first. `gemini` and `fireworks` use their dedicated clients; any other provider (openrouter, groq, a user-added custom provider) is carried by the OpenAI-compatible path via `get_provider_credentials`. An empty stream retries the SAME model non-stream before any provider fallback, and a terminal failure (auth/permission/validation) REFUSES instead of silently answering with a different model (F24/F49). The tail fallback chain is still Gemini -> Fireworks. Fallbacks are recorded for a UI warning (`_record_chat_fallback`, keys scrubbed).
-- Current selection per `data/jarvis_settings.json` (verified 2026-09-30, `revision` 16): chat = `gemini`/`gemini-3.5-flash-lite`, vision = `openrouter`/`google/gemini-2.5-flash-lite`, browser_tool = `openrouter`/`google/gemini-2.5-flash-lite`, tts = `fish`/`s2.1-pro-free`, listening = `whisper`/`whisper-local`. Reading only `.env` or `config.py` will tell you the wrong story — this file is the live truth.
+- Current selection per `data/jarvis_settings.json` (verified 2026-10-03, `revision` 61): chat = `gemini`/`gemini-3.5-flash-lite`, vision = `fireworks-2`/`accounts/fireworks/models/qwen3p8-max`, browser_tool = `fireworks-2`/`accounts/fireworks/models/deepseek-v4p1-flash`, **planner = `fireworks-2`/`accounts/fireworks/models/deepseek-v4p1-flash`**, **intent = `gemini`/`gemini-3.1-flash-lite`**, tts = `fish`/`s2.1-pro-free`, listening = `whisper`/`whisper-local`. `fireworks-2` is a **custom** provider entry in the settings file, distinct from the `fireworks` env provider. Reading only `.env` or `config.py` will tell you the wrong story — this file is the live truth.
 - Groq is NOT the chat provider: `grok_client`'s retired `llama-3.3-70b-versatile` default is gone (H8); callers pass explicit models.
 - Detects Hindi/Hinglish vs English and still forces English replies.
 - Uses short speech-oriented prompts when `voice_compact=True`.
@@ -374,9 +389,10 @@ Important command behavior:
 ### Intent router and deterministic nets
 
 - `backend/services/intent.py`
-  - `classify_intent(message, timeout_ms=3500)` routes every message to chat/tool/screen/region/research/task â€” no keyword pre-check.
-  - Hop 1 since F56 is the `(provider, model)` selected for the registry's `intent` role (UI model switcher) — including the local Ollama models, which is what makes routing free/offline and fast enough for the typed budget. The shipped chain follows as the fallback: OpenRouter `google/gemini-2.5-flash-lite` (fastest cloud hop since 2026-09-23) -> Gemini 3.5 Flash Lite direct (`GEMINI_INTENT_MODEL` / `GEMINI_BRAIN_MODEL`, 3s timeout, `no_retry`) -> Qwen 3.6 27B on Groq (`GROQ_INTENT_MODEL` / `GROQ_VISION_MODEL`) -> `chat` verdict on total failure. The selected provider is skipped in the chain, and the registry's env default for `intent` IS the OpenRouter hop, so an untouched install routes exactly as before. Chat is therefore never broken, but classifier throttles silently degrade to chat verdicts â€” which is exactly why the deterministic nets in `brain.py` exist.
-  - Each hop gets a slice of ONE monotonic deadline and is dispatched explicitly (`_classify_with_provider`: gemini/fireworks/groq have dedicated clients, everything else rides the generic OpenAI-compatible adapter with `single_attempt=True`, so a read timeout cannot be replayed under a spent budget). The prompt is length-capped (test asserts <2000 chars) and covers English/Hindi/Hinglish meaning, not keywords.
+  - `classify_intent(message, timeout_ms=3500)` routes every message to chat/tool/screen/region/research/task — no keyword pre-check. **Its JSON also carries a `reply` field since S6 `1fd635a`: on a `chat` verdict the brain speaks the router's own answer (`intent.py:60-61`, normalised `:100-110`, defaulted `:418-420`, consumed by `brain._finalize_chat_reply`), so a normal chat turn costs ONE LLM call, not two.**
+  - Hop 1 since F56 is the `(provider, model)` selected for the registry's `intent` role (UI model switcher) — including the local Ollama models, which is what makes routing free/offline and fast enough for the typed budget. The shipped chain follows as the fallback: OpenRouter `google/gemini-2.5-flash-lite` (fastest cloud hop since 2026-09-23) -> Gemini 3.5 Flash Lite direct (`GEMINI_INTENT_MODEL` / `GEMINI_BRAIN_MODEL`, 3s timeout, `no_retry`) -> Qwen 3.6 27B on Groq (`GROQ_INTENT_MODEL` / `GROQ_VISION_MODEL`) -> `chat` verdict on total failure. The selected provider is skipped in the chain, and the registry's env default for `intent` IS the OpenRouter hop, so an untouched install routes exactly as before. **The live override is `gemini/gemini-3.1-flash-lite`, so in practice hop 1 is Gemini today, not OpenRouter.** Chat is therefore never broken, but classifier throttles silently degrade to chat verdicts — which is exactly why the deterministic nets in `brain.py` exist.
+  - Each hop gets a slice of ONE monotonic deadline and is dispatched explicitly (`_classify_with_provider`: gemini/fireworks/groq have dedicated clients, everything else rides the generic OpenAI-compatible adapter with `single_attempt=True`, so a read timeout cannot be replayed under a spent budget). The prompt is length-capped (test asserts <2000 chars) and covers English/Hindi/Hinglish meaning, not keywords. **The budget is 3500 ms for typed turns but only `INTENT_BUDGET_VOICE_MS = 1200` for voice (`brain.py:3993-3994`).**
+  - **The module docstring (`intent.py:22-24`) still describes the old Gemini-first hop order and is stale.**
   - Note the practical limit F56 measured: a hop is bounded by its socket read timeout, not by a wall clock, so an endpoint that sends headers then stalls can take up to ~2x its slice.
 
 - `backend/services/web_task_routing.py`
@@ -403,18 +419,22 @@ Important command behavior:
 
 - `backend/services/browser_agent.py`
   - The default task engine (`config.TASK_ENGINE == 'browser_agent'`): a strong model drives the brave-control MCP daemon with vision grounding.
-  - Model comes from the registry `browser_tool` role (env default Fireworks `accounts/fireworks/models/qwen3p7-plus`; `data/jarvis_settings.json` currently overrides to `deepseek-v4-flash-vision-exp`), with `MAX_STEPS` (50) / `TIMEOUT` (480s) backstops and a stop event (`/task/stop`).
+  - Model comes from the registry `browser_tool` role (env default Fireworks `accounts/fireworks/models/qwen3p7-plus`; **`data/jarvis_settings.json` currently overrides to the custom provider `fireworks-2`/`accounts/fireworks/models/deepseek-v4p1-flash`**), with `MAX_STEPS` (50) / `TIMEOUT` (480s) backstops and a stop event (`/task/stop`). Resolution is per-turn via `_resolve_browser_tool_model`.
   - Every handoff is confirmation-gated in the brain before anything executes.
+  - **BA-00 (committed `ff86fc1`, 2026-10-03)**: turn-level instrumentation — `_Span` (bounded 64/turn ring, covers look/model/act/wait phases; NO `model.ttfb` span because POSTs are non-streaming) + `_SwStats` spans/census (`model_turns`, `wasted_turns`, `stale_refusals`, `stale_refusals_other`, `offscreen_refusals`, `look_count`, `image_tokens_est`, `upload_bytes_total`) uploaded per task via `_perf_record_task` into the `_PERF_MAX_SAMPLES=512` cross-task reservoir, published at `GET /latency` under the `browser_agent` block, and `_wasted_pct` flushed in the summary STOPWATCH line. Refusal/outcome classification for the census comes from `_ba00_classify_result` (exact virtual-tool error prefixes). Tests: `backend/tests/test_ba00_instrumentation.py` (24).
+  - **L-8 / BA-02 (committed `f3855bd`, 2026-10-03)**: `_model_turn_with_retries` fails FAST on deterministic HTTP rejections (status outside `_RETRYABLE_STATUS={408,409,425,429,500,502,503,504}` breaks after attempt 0 with a `model deterministic` STOPWATCH line) and retries only transient/transport errors (3-attempt budget kept); backoff honours the provider's `Retry-After` (capped `_RETRY_AFTER_CAP_S=10.0`) over the flat `_RETRY_GAP_S=0.5`; the final raise carries the provider's own message (`_provider_message`: JSON `error.message`/`message`/plain text, `_model_failure_message`), and bare errors without a provider response still retry. Tests: `backend/tests/test_ba02_retry_classification.py` (18).
+  - **L-6 (pooled MCP session, committed — see below — 2026-10-03)**: verified against current code first — every task built a fresh `BraveMcpClient`, paid initialize + notifications/initialized + a `tools/list` round trip, then closed, while the daemon stays warm (idempotent `ensure_brave_mcp_daemon`, watcher boot) and the tool list is code-static (`server.tool()` in `server.mjs`, client frozenset allowlist). So sequential tasks now share ONE pooled session (`_borrow_mcp_client`/`_return_mcp_client`, 180s idle TTL, checkout flag so concurrent tasks never share request ids — the second takes the legacy private path) plus a raw-def tool cache (dropped whenever the session is reborn, guarding daemon upgrades); the per-task `ensure_daemon` call STAYS (pool never skips a dead-daemon restart). Reuse is optimistic with no borrow-time health RTT — a restarted daemon heals inside the client (reconnect + exactly one replay, ONLY for proven-never-dispatched 404/invalid-session signals; mutation replay stays forbidden otherwise). Only real clients pool (factory-identity check), so patched-mock test paths behave byte-identically. Speculative navigation was verified but deliberately LEFT OUT (changes first-turn semantics, needs benchmark proof). While the user reads the confirmation prompt, a daemon thread prewarms session + cache (`prewarm_mcp_pool`, no navigation, never spawns the daemon), gated by `_browser_prewarm_due` (frozen contract executor wins, else `TASK_ENGINE`). Kill switches (default on): `JARVIS_MCP_POOL=0`, `JARVIS_MCP_PREWARM=0`. Tests: `backend/tests/test_l06_mcp_pool.py` (25).
 
 - `backend/services/brave_mcp_client.py`
   - Streamable-HTTP MCP client for the brave-control daemon (`BRAVE_MCP_PORT`, default 9570).
+  - **L-6 (2026-10-03)**: self-healing session — `_is_session_death` (HTTP 404 or invalid/unknown/expired-session messages, which prove the request never dispatched) triggers exactly one `reconnect()` (fresh TCP session + handshake, `reconnects` generation counter) plus one replay; every other failure propagates to the agent's retry policy untouched, so a possibly-committed mutation is never auto-replayed.
 
 - `backend/services/opencode_client.py`
   - The alternative engine (`JARVIS_TASK_ENGINE=opencode`): hard guards refuse to spawn anything unless that engine is selected.
 
 - `backend/services/task_agent/agent.py`
   - Connector-first task planning brain (heuristics -> model plan -> Windows control fallback).
-  - The model planner (`_model_plan`, `agent.py:578`) calls `ask_fireworks` (temperature 0.1, max_tokens 650, no model arg -> `FIREWORKS_MODEL` default `accounts/fireworks/models/deepseek-v4-flash-0731`). It no longer uses Groq â€” the old `llama-3.3-70b-versatile` planner 404'd after the model was retired.
+  - The model planner (`_model_plan`, **`agent.py:931`**) calls `ask_fireworks` (temperature 0.1, max_tokens 650, no model arg -> `FIREWORKS_MODEL` default `accounts/fireworks/models/deepseek-v4-flash-0731`). It no longer uses Groq — the old `llama-3.3-70b-versatile` planner 404'd after the model was retired.
   - BOTH no-plan fallbacks (empty-steps screen_action append in `_normalize_plan`, and the `plan_task` Windows-control fallback) are confirmation-gated (`requires_confirmation=True`), so an unstructured improvisation never runs unconfirmed.
   - Gathers structured context from editor, browser, and Windows connectors; uses UI Automation / OCR screen actions only as a fallback.
 
@@ -435,12 +455,12 @@ Important command behavior:
 - `backend/services/model_registry.py`
   - The single runtime source of truth for model selection across SEVEN roles: `chat`, `tts`, `vision`, `browser_tool`, `listening`, `planner`, `intent` (`VALID_ROLES`). The `intent` role (F56) is what `services/intent.py` classifies with.
   - Persisted overrides live in `data/jarvis_settings.json` (set from the UI model switcher, immediate effect, no restart); missing/corrupt settings degrade to env defaults.
-  - Env providers: `gemini`, `fireworks`, `groq`, `fish`, `gtts` (Google Translate TTS), `openrouter`, `whisper` (local), `inworld` (STT), `ollama` (the LOCAL server, F56 — key-less, base URL from `ollama_client`, model list live from `/api/tags`). Custom OpenAI-compatible providers are allowed for `chat`, `vision`, `browser_tool` and `planner` only (`intent` deliberately excluded: a user gateway should not sit on the first hop of every message).
+  - Env providers: `gemini`, `fireworks`, `groq`, `fish`, `gtts` (Google Translate TTS), `openrouter`, `whisper` (local), `inworld` (STT), `ollama` (the LOCAL server, F56 — key-less, base URL from `ollama_client`, model list live from `/api/tags`). Custom OpenAI-compatible providers are allowed for `chat`, `vision`, `browser_tool`, `planner` **and `intent`** only (`_ROLE_ALLOWS_CUSTOM`, `model_registry.py:111`) — this set CHANGED after the map was first written; the live `fireworks-2` custom provider is what carries the current selections.
   - Per-role allowlists: chat `{gemini, fireworks, openrouter, ollama}`; tts `{fish, gtts}`; vision and browser_tool `{gemini, fireworks, groq, openrouter}`; listening `{whisper, inworld}`; planner `{fireworks}` only; intent `{gemini, fireworks, groq, openrouter, ollama}`.
   - **F49 capability-aware selection**: every role declares what it REQUIRES (`chat` streaming, `tts` audio_output, `vision` vision_input, `browser_tool` tool_calling + structured_output + vision_input, `listening` speech_input, `planner` tool_calling + structured_output + streaming, `intent` structured_output) and a (provider, model) pair is only usable when those capabilities are positively established from the adapter floor, the provider record, model-family name rules, or capability metadata the provider published. Anything unknown FAILS CLOSED, resolution is validated at use time from one locked snapshot, and a persisted selection that stops validating surfaces as a `model_errors` entry in `GET /settings` instead of running.
   - The `ollama` provider floor advertises `tool_calling` + `structured_output` + `streaming` and NO `vision_input` (the installed local models are text-only), and its `_reasoning_for` entry declares `reasoning_effort="none"` — the one value that turns thinking off for a thinking model and is accepted by a non-thinking one (F56, measured).
   - API keys never leave the module — everything the routes return is masked (`has_key` booleans), and log lines are scrubbed.
-  - Current live selections (verified 2026-09-30, `revision` 16): chat `gemini`/`gemini-3.5-flash-lite`; tts `fish`/`s2.1-pro-free`; vision `openrouter`/`google/gemini-2.5-flash-lite`; browser_tool `openrouter`/`google/gemini-2.5-flash-lite`; listening `whisper`/`whisper-local`; no `planner` override (so the planner falls back to its env default). The file also carries an `observed_capabilities` map populated from live provider probes. Backup copies sit next to it (`*.bak-*`).
+  - Current live selections (verified 2026-10-03, `revision` 61): chat `gemini`/`gemini-3.5-flash-lite`; tts `fish`/`s2.1-pro-free`; vision `fireworks-2`/`accounts/fireworks/models/qwen3p8-max`; browser_tool `fireworks-2`/`accounts/fireworks/models/deepseek-v4p1-flash`; **planner `fireworks-2`/`accounts/fireworks/models/deepseek-v4p1-flash`** (an override now exists — the earlier "no planner override" note is obsolete); **intent `gemini`/`gemini-3.1-flash-lite`**; listening `whisper`/`whisper-local`. The file also carries an `observed_capabilities` map populated from live provider probes. Backup copies sit next to it (`*.bak-*`, written by P1-08).
 
 - `backend/services/gemini_client.py`
   - Google Gemini client â€” vision and the text brain, both in OpenAI-shaped format so cascade code is provider-agnostic.
@@ -477,7 +497,7 @@ One-line roles for the modules the G0-G11 work introduced that are not described
 - `backend/services/research_browser.py` (F27/F28) — one long-lived research browser worker; `submit`/`run` job API, per-task page cancellation, idle TTL.
 - `backend/services/intelligence_state.py` (F50) — backend authority layer: `run_effect`/`submit_effect` (one job runtime for every effect), `WorkerRegistry` (typed worker generations; stale publishes rejected), `DurableOwnership` (single-writer leases), `EventJournal` (one shared transactional history).
 - `backend/services/capability_contract.py` (F16) — immutable `ExecutionContract` (capability + selected executor + availability + grant + digest) that executors verify instead of re-reading configuration.
-- `backend/services/deadline.py` (F24) — one absolute monotonic deadline/cancellation handle plus a shared replay-eligibility classifier, propagated into urllib3 retries.
+- **`backend/core/deadline.py` (F24)** — one absolute monotonic deadline/cancellation handle plus a shared replay-eligibility classifier, propagated into urllib3 retries. **NOTE the path: it is `backend/core/deadline.py`, NOT `backend/services/deadline.py` — older revisions of this map named the wrong path.** `Deadline`, `classify_exception`, `budget_allows`, `BudgetedRetry`, `budget.seconds_for(handle, default)`. `backend/core/executor.py` uses it correctly (`budget.seconds_for(handle, timeout)`); **`backend/services/browser_agent.py` does NOT use it at all — it rolls its own `started` clock against `BROWSER_AGENT_TIMEOUT`.**
 - `backend/services/provenance.py` (F48) — observed/inferred/externally-checked provenance and corroboration accounting for research evidence.
 - `backend/services/productivity_connector.py` + `productivity_providers.py` (F14) — typed least-privilege calendar/mail/contact operations: services stay inert until confirmed, drafts are local, and sending needs a second per-effect consent bound to the draft hash and grant epoch.
 - `backend/services/tool_policy.py` (F17/F21) — dispatch-bound tool validation and secret masking; `code_grants.py` (F22) — scoped code grants + change journal.
@@ -489,9 +509,19 @@ One-line roles for the modules the G0-G11 work introduced that are not described
 - `backend/services/context_envelope.py` (F46) — bounded request-scoped context envelope with explicit omissions.
 - `backend/services/goal`-side helpers (F01/F03/F05) live in `backend/services/task_agent/` and `task_result.py` rather than as separate modules.
 - `backend/core/memory_store.py` (F06/F07/F09/F10) — the single SQLite store: facts/entities, events, commitments + scheduler daemon, skills. See the G9 bullet above.
-- `backend/whisper_daemon.py` (F52/F55) — the persistent local Whisper HTTP daemon (`/health`, `/warm`, `/transcribe`).
+- `backend/whisper_daemon.py` (F52/F55) — the persistent local Whisper HTTP daemon (`/health`, `/warm`, `/transcribe`). Model default is **medium** (`JARVIS_WHISPER_MODEL`, `bedd9e0`), transcription pinned to **English** (`JARVIS_WHISPER_LANGUAGE=en`, `8ae2294`).
 - `backend/services/google_tts.py` — the key-less Google Translate TTS engine (an interchangeable `tts` role engine alongside Fish).
 - `backend/services/quick_search.py` / `research_service.py` — the two research tiers (see the research flow).
+
+### Modules added by the S-series wave (2026-10-02/03)
+
+These post-date the Fable-5 work and are easy to miss:
+
+- `backend/services/event_bus.py` (S19, `a0ec729`) — dependency-free thread-safe pub/sub behind `GET /events`: `subscribe`/`unsubscribe`/`publish`/`snapshot`, bounded queue (64, drops oldest), optional cross-thread `wakeup`, plus a `reset()` test seam. A late or reconnecting subscriber gets a merged snapshot replayed first.
+- `backend/services/neural_vad.py` (S29, `acc366e`) — Silero-on-ONNX utterance endpointing with hysteresis (100 ms on / 200 ms off) and a `webrtcvad` fallback judge; `JARVIS_NEURAL_ENDPOINT=0` is the kill switch.
+- `backend/services/latency.py` (S1/S12) — the per-stage latency marker store behind `GET /latency` + `/latency/client`; `brain.py` writes ~20 `_mark_latency` sites and the P1-19 waterfall mark names live here.
+- `backend/services/prewarm.py` (P0-12) — connection pre-warm for the provider clients; wired into `main.py` and exposed as `/prewarm` + `/prewarm/stats`. Covers LLM providers, **not** the brave MCP daemon.
+- `backend/services/fish_voice.py` — also gained the S7 live WebSocket reply session (see the voice subsystem below).
 
 ### Active voice subsystem
 
@@ -505,16 +535,17 @@ One-line roles for the modules the G0-G11 work introduced that are not described
     - shutdown
     - continue/resume
     - normal setup (`POST /voice-setup/launch` — the app launches are now a typed backend job, not local `os.startfile` calls)
-  - Publishes real listening state to `POST /voice-state/publish` and reads task state from `/ui-state`.
+  - Publishes real listening state to `POST /voice-state/publish` and reads task state from the **`GET /events` push channel** (`_apply_pushed_state`, `_task_state_push_loop`, started in `start_voice_mode`), with the 1s `/ui-state` poll retained as a fallback if the channel drops (S19).
+  - **Since S18 `66bacbc` it keeps submitting utterances while a task runs** — the backend answers conversationally and queues action requests instead of refusing them.
 
 - `backend/services/listener.py`
   - Active conversation microphone capture.
   - Uses `speech_recognition` with `stream=True`.
-  - Uses `webrtcvad` to reject obvious noise and low-confidence captures.
-  - `JARVIS_STT_LANGUAGES` (default `en-IN,hi-IN`) is only iterated by the `google-or-groq` engine; the local whisper daemon passes no `language=` at all (whisper auto-detects) and Inworld gets an English hint.
+  - **Utterance endpointing is neural, not energy-based (S29 `acc366e`)**: `make_speech_endpoint` from `backend/services/neural_vad.py` (Silero on ONNX, hysteresis) owns speech start/end. `webrtcvad` survives only as `Vad(2)` inside `neural_vad.py` when the model is unavailable; `listener.py:119` still instantiates a coarse `Vad(1)` prefilter. Kill switch: `JARVIS_NEURAL_ENDPOINT=0`.
+  - `JARVIS_STT_LANGUAGES` defaults to **`en-IN` only** (English-only since `8ae2294`; it used to be `en-IN,hi-IN`), and the local whisper daemon **now passes `language=` explicitly** (`whisper_daemon.TRANSCRIBE_LANGUAGE`, default `en`) instead of letting Whisper auto-detect. Auto-detect on noisy/echo audio was hallucinating random-language sentences, which then looked like the user speaking them.
   - Engine order comes from `transcription.recognize_multilingual`: exactly ONE engine per turn — the registry-selected `listening`-role engine (P0-03, landed). The live setting is `whisper`/`whisper-local`, so the local daemon answers. A failed/hallucinated result is a failed turn; there is no fall-through to another engine.
   - Commits a transcript only through the F34 stabilizer (final window) and the STT hallucination gate. Since tag `simple-listening` the partial-window layer is gone: one utterance costs exactly one transcription of the complete audio.
-  - **Nothing blocking in the capture loop** (P1-03): the `/speak/stop` POST goes through the `_SpeakStopWorker` daemon thread and barge-in onset only notifies observers (`register_barge_in_hook`) on a daemon thread. The capture loop makes no transcription call at all. Do not add a synchronous HTTP call or a blocking engine call back into `_capture_audio`/`barge_in_on_speech_onset`.
+  - **Nothing blocking in the capture loop** (P1-03): the `/speak/stop` POST goes through the `_SpeakStopWorker` daemon thread and barge-in onset only notifies observers (`register_barge_in_hook`) on a daemon thread. The capture loop makes no transcription call at all. Do not add a synchronous HTTP call or a blocking engine call back into `_capture_audio`/`barge_in_on_speech_onset`. **`_SpeakStopWorker._deliver` re-dials a fresh socket when the keep-alive socket is dead (`_is_stale_socket`), so a barge-in stop is never lost (`9839fe8`); HTTP answers (401/403) are still not retried.**
   - The capture loop normalises everything to one sample rate (P1-05, `assert_single_rate_audio` at the STT entry) and frame ids are `(capture_token, index)` with `AecSignalPath.begin_capture()` clearing the cache per capture (P0-13).
   - Registers its recognizer with `backend/listener_state.py` so speaking/listening thresholds can be adjusted globally.
 
@@ -533,7 +564,7 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - Since G11/F50 this module's copy is authoritative only INSIDE the owning process: the voice worker publishes its real snapshot to `POST /voice-state/publish` and the backend serves that (newest generation wins, stale generations and expired snapshots rejected) — that fused snapshot is what the UI ultimately renders.
 
 - `backend/services/voice.py`
-  - Text-to-speech orchestrator. The ladder depends on the registry `tts` role engine, which makes it easy to misunderstand:
+  - Text-to-speech orchestrator. **Since S7 `066220c` the PRIMARY path is ONE live bidirectional Fish Audio WebSocket session per reply** (`fish_ws_begin_reply`/`fish_ws_session`/`fish_ws_end_reply` in `voice.py:13-21`, `_FishReplySession` in `fish_voice.py:93-94`, playback via `open_ws_reply`/`play_ws_reply` on the audio actor). `JARVIS_FISH_WS` is the kill switch (tests force it to 0 via `backend/tests/conftest.py`). The HTTP ladder below is now the **fallback**:
     - **the selected engine is tried first** — Fish Audio (`speak_fish_audio`, streaming PCM through the single `audio_actor`, with next-chunk prefetch pipelining), or the key-less `google_tts` engine
     - local `pyttsx3`/SAPI5 second (with a silent-playback sanity check)
     - ElevenLabs for short chunks (`JARVIS_REMOTE_TTS_CHAR_LIMIT`)
@@ -549,7 +580,7 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - The F32 pre-write generation/stale-chunk re-check and the `_spoken_bytes` cursor accounting are load-bearing (P0-08's resume path reads them). Do not "simplify" either.
 
 - `backend/services/fish_voice.py`
-  - Fish Audio TTS client: registry `tts` role model resolution (env default `FISH_MODEL`, default `s2.1-pro-free`), PCM streaming playback, prefetch/warm-up, output-device selection.
+  - Fish Audio TTS client: registry `tts` role model resolution (env default `FISH_MODEL`, default `s2.1-pro-free`), PCM streaming playback, prefetch/warm-up, output-device selection. **Since S7 it also owns the live WebSocket reply session** (`fish_voice.py:67-69`, `open_ws_reply` `:230`, `play_ws_reply` `:302`); the older per-HTTP-POST path still exists but is no longer primary.
 
 - `backend/services/google_tts.py`
   - The zero-cost, key-less Google Translate TTS engine, selectable as the `tts` role engine (`gtts` provider). Splits text at the endpoint's ~200-character limit and time-stretches 1.5x with ffmpeg `atempo` (pitch preserved). It deliberately reuses `fish_voice`'s playback primitives so there is still exactly ONE playback owner (F32).
@@ -569,8 +600,8 @@ One-line roles for the modules the G0-G11 work introduced that are not described
   - Uses a dedicated recognizer with its own thresholds, `backend/services/wake_engine.py` keyword spotting (F36) and fuzzy phrase matching as the fallback.
   - Applies a fixed watcher energy threshold from `JARVIS_WATCHER_ENERGY_THRESHOLD`, clamped against the shared idle threshold.
   - Pre-loads Anaconda and Ollama CUDA v12 DLL search paths dynamically to enable local CUDA GPU speech transcription.
-  - Uses a local GPU-accelerated `faster-whisper` (medium) model running with greedy decoding (temperature=0.0), VAD filtering, disabled repetition conditioning, and a wake-bias prompt applied ONLY to wake transcription (`X-Jarvis-Purpose: wake`); a persistent `whisper_daemon.py` child keeps the model warm, binds its port before loading, and reports `ready`/`loading` honestly (F55).
-  - STT goes through `transcription.recognize_multilingual`'s registry-selected engine ladder (Inworld by default, local Whisper over the resident daemon, then Google/Groq per language), and every committed transcript passes the STT hallucination gate (a prompt echo must never false-launch the stack).
+- Does NOT load a Whisper model in-process — `watcher.py:106` sets `whisper_model = None` because the model is hosted by the persistent daemon. Those decode settings now live in `whisper_daemon.py`: **medium** model (`:79`), cuda float16 / cpu int8 (`:145`/`:152`), `temperature=0.0` (`:246`), `beam_size=1` (`:255`), `vad_filter=True` (`:256`), `condition_on_previous_text=False` (`:257`), English-only (`:102`, applied `:249`); the wake-bias prompt (`watcher.py:843`, `:921`) is still wake-only via `X-Jarvis-Purpose: wake`.
+- STT goes through `transcription.recognize_multilingual`'s registry-selected engine — **but there is NO ladder since S5 `c7b2128`**: `watcher.py:934-948` runs exactly ONE engine, ONE pass, and its output IS the transcript; `_selected_engine()` (`:952`) resolves it. Another provider is contacted only if it is itself the selected listening engine. The live setting is `whisper`/`whisper-local`, so the resident daemon answers. Every committed transcript passes the STT hallucination gate (a prompt echo must never false-launch the stack).
   - Kills stale port-9999 backends before launching the stack, and boots the activity-tail console + brave MCP daemon in browser_agent mode.
 
 ### Screen-control subsystem
@@ -619,7 +650,7 @@ Risk handling:
 
 ## State Model
 
-Much state is still process-local module state, but the durable artifacts are no longer "only three". On disk today: `data/jarvis_settings.json` (model selections), `data/conversation_history.json`, `data/jarvis_memory.db` (the G9 SQLite store, plus `-wal`/`-shm`), `data/change_journal/` (F22 code-grant file backups), `data/runtime/` (per-process instance stamps), `data/logs/` (bounded supervisor child logs), `data/research_reports/` and the productivity connector's grant JSON — all under `data/`, which is gitignored in full.
+Much state is still process-local module state, but the durable artifacts are no longer "only three". On disk today: `data/jarvis_settings.json` (model selections, plus `jarvis_settings.json.bak-*` backups written by P1-08), `data/conversation_history.json` (created lazily — it may not exist on a fresh checkout), `data/jarvis_memory.db` (the G9 SQLite store, plus `-wal`/`-shm`), `data/change_journal/` (F22 code-grant file backups), `data/runtime/` (per-process instance stamps), `data/logs/` (bounded supervisor child logs), `data/chrome_profile_jarvis/` and `data/edge_profile_jarvis/` (browser profiles), `data/opencode_activity.log`, `data/opencode_server.log`, `data/research_reports/` and the productivity connector's grant JSON — all under `data/`, which is gitignored in full.
 
 ### Memory state
 
@@ -640,7 +671,7 @@ Location: `data/jarvis_settings.json`
 
 Location: `backend/api/routes.py`
 
-- `last_voice_message`, `last_voice_response`, `last_voice_log_id` â€” exists only so the frontend can poll and append the latest voice exchange into the visible chat log.
+- `last_voice_message`, `last_voice_response`, `last_voice_log_id` — the latest voice exchange for the UI. **No frontend file reads `/voice-log` at all**; `/ui-state` is the fused voice-state + voice-log read (`routes.py:936-971`). Since S19 the mirror is not the only path: state changes also go out over `GET /events`.
 
 ### Voice runtime state
 
@@ -659,7 +690,7 @@ Location: `backend/services/screen_state.py`
 
 Location: `backend/core/brain.py` + `backend/services/task_agent/agent.py` + `backend/services/approvals.py`
 
-- `_pending_opencode_task` / `_pending_confirmation` / `_pending_browser_clarification` (45s expiry windows, browser clarification 90s) — the arm-confirm-execute gates for task handoffs. Only one gate may be armed at a time.
+- `_pending_opencode_task` / `_pending_confirmation` / `_pending_browser_clarification` (45s expiry windows, browser clarification 90s) plus **`_pending_task_action`** (`task_agent/agent.py:141`, with `has_pending_task_confirmation()`) — the arm-confirm-execute gates for task handoffs. Only one gate may be armed at a time.
 - Deferred browser runs carry a generation id (F26/F03): a superseded run may not publish a result, arm a clarification or speak.
 - Approvals themselves are records in `backend/services/approvals.py`, invalidated by `/approvals/reset` before any supervisor replacement so a pending consent can never survive into a new worker.
 
@@ -678,6 +709,7 @@ Location: `backend/services/audio_actor.py`, `backend/services/echo_cancel.py`
 
 - One playback owner with a generation token (stale-generation PCM is dropped), the PCM ring plus spoken cursor for exact interrupted resumes, and the AEC reference ring. The API process renders audio while the voice process owns the microphone, so the reference crosses the process boundary through `GET /aec/reference`.
 - Since P0-07 the owner keeps ONE long-lived output stream (`blocksize=1024`, `latency="low"`) for the whole process instead of opening a device per sentence, and `abort()` cuts pending buffers where `stop()` drains them. Since P0-06 the player is woken by the ring condition variable rather than a 250 ms poll.
+- **S28 (`80c094e`) added real AEC alignment**: `DelayEstimator` cross-correlation lag lock, a joint last-5-frame compare window (`AEC_GATE_HISTORY_FRAMES`, `echo_cancel.py:108`), off-thread reference prefetch (`:109-111`), fp-exact overflow trim, and a `lag` block in `state()` now exposed by `GET /aec/state`. Tunable via eight `JARVIS_AEC_*` env vars (max lag, lag confirmations, gate history, prefetch, cache TTL, idle skip, breaker failures, breaker cooldown).
 - The AEC frame cache is keyed by `(capture_token, index)` and cleared per capture (P0-13); `RemoteAecTransport` (the backend-spoken-audio reference path) authenticates, re-probes when idle, expires cached spans by `mic_t_end` drift, and reports a breaker/auth failure in `state()` instead of pretending the reference is merely absent (P1-04).
 
 ## Environment Variables and What They Actually Affect
@@ -686,14 +718,14 @@ Do not put real secret values into docs or prompts. The important thing is the v
 
 ### API keys (all optional individually â€” features degrade per provider)
 
-- `GROQ_API_KEY` â€” Groq: intent-router last fallback classifier, an eligible screen-Q&A vision provider, STT fallback.
-- `GEMINI_API_KEY` â€” Gemini: intent primary classifier, chat/vision env-default provider, research per-site notes.
-- `FIREWORKS_API_KEY` â€” Fireworks: the ONLY allowed `planner` provider, and the browser-agent env default. NOTE: this account was suspended/failing on 2026-09-23, which is what pushed chat and vision onto OpenRouter.
-- `FISH_API_KEY` â€” Fish Audio TTS (the metered primary spoken-voice engine; the `gtts` engine needs no key at all).
-- `ELEVENLABS_API_KEY` â€” enables ElevenLabs TTS for short chunks.
-- `OPENROUTER_API_KEY` â€” OpenRouter: now a first-class provider for chat, vision and browser_tool (Cloudflare-fronted, so it stayed fast behind the VPN that broke direct Gemini).
-- `INWORLD_STT_API_KEY` â€” Inworld STT, the alternative `listening` engine.
-- `CLINE_API_KEY` â€” optional browser-agent provider.
+- `GROQ_API_KEY` — Groq: intent-router last fallback classifier, an eligible screen-Q&A vision provider.
+- `GEMINI_API_KEY` — Gemini: chat/vision env-default provider, research per-site notes, and the **live** `intent` hop 1.
+- `FIREWORKS_API_KEY` — Fireworks: the ONLY env provider allowed for `planner`, and the browser-agent env default. NOTE: this account was suspended/failing on 2026-09-23 and again on 2026-10-03 (HTTP 412), which is what pushed chat onto Gemini and the others onto OpenRouter/a custom `fireworks-2` entry. **Do not hide Gemini failures behind Fireworks.**
+- `FISH_API_KEY` — Fish Audio TTS (the metered primary spoken-voice engine; the `gtts` engine needs no key at all).
+- `ELEVENLABS_API_KEY` — enables ElevenLabs TTS for short chunks.
+- `OPENROUTER_API_KEY` — OpenRouter: a first-class provider for chat, vision and browser_tool (Cloudflare-fronted, so it stayed fast behind the VPN that broke direct Gemini).
+- `INWORLD_STT_API_KEY` — Inworld STT, the alternative `listening` engine.
+- `CLINE_API_KEY` — optional browser-agent provider.
 
 ### Model selection
 
@@ -702,13 +734,21 @@ Do not put real secret values into docs or prompts. The important thing is the v
 - `GEMINI_INTENT_MODEL` â€” intent-router Gemini override.
 - `GROQ_MODEL` â€” legacy Groq text default. The retired `llama-3.3-70b-versatile` is no longer referenced anywhere (H8).
 - `JARVIS_WHISPER_PORT` â€” local Whisper daemon port, default `8767` (also read by `whisper_daemon.py`).
-- `INWORLD_STT_MODEL` / `INWORLD_STT_URL` â€” Inworld STT model/endpoint for the `listening` role.
+- `INWORLD_STT_MODEL` / `INWORLD_STT_URL` — Inworld STT model/endpoint for the `listening` role.
+- `JARVIS_WHISPER_MODEL` — **local Whisper model size, default `medium`** (`whisper_daemon.py:79`, `watcher.py:799`; changed from `base` in `bedd9e0`). On CUDA medium decodes in ~1.5 s; on CPU-only it is far slower and `base` is the better setting.
+- `JARVIS_WHISPER_LANGUAGE` — **transcription language, default `en`** (`whisper_daemon.py:102`, applied at `:249`; `watcher.py:803`). English-only was deliberate (`8ae2294`): Whisper auto-detect hallucinated random-language sentences on noisy/echo audio and they were then treated as user speech.
+- `JARVIS_WHISPER_TRANSCRIBE_WAIT` — daemon transcribe wait, default `20` (`whisper_daemon.py:95`).
 - `GROQ_VISION_MODEL` â€” Groq vision/Qwen default, `qwen/qwen3.6-27b`; also the intent fallback model source.
 - `GROQ_INTENT_MODEL` â€” intent-router Groq override.
 - `FIREWORKS_MODEL` â€” Fireworks default model, `accounts/fireworks/models/deepseek-v4-flash-0731` (used by the task-agent planner).
 - `FIREWORKS_REASONING_EFFORT` â€” default `none`.
 - `FISH_MODEL` â€” Fish TTS model, default `s2.1-pro-free`.
-- `GROQ_STT_MODEL` / `GROQ_STT_URL` â€” Groq transcription model/endpoint.
+- `GROQ_STT_MODEL` / `GROQ_STT_URL` — Groq transcription model/endpoint.
+- `INTENT_OPENROUTER_MODEL` — the shipped OpenRouter hop for the classifier, default `google/gemini-2.5-flash-lite` (`services/intent.py:42`).
+- `GEMINI_THINKING_BUDGET` — Gemini thinking budget, default `auto` (`gemini_client.py:50`). **Set to `0`/off to stop paying for thinking; `gemini-3.5-flash-lite` 400s if you send an explicit `{"thinkingBudget": 0}`, so it is omitted entirely when the budget is 0 (`9839fe8`), and a 400 naming a bad argument replays once without `thinkingConfig`.**
+- `OPENROUTER_REASONING_EFFORT` — default `low` (`model_registry.py:654`).
+- `GROQ_REASONING_EFFORT` — default `none` (`grok_client.py:38`).
+- `JARVIS_OLLAMA_KEEP_ALIVE` / `JARVIS_OLLAMA_WARMUP_TIMEOUT` — F56 local-model keep-alive and warmup (`ollama_client.py:21`, `:17`).
 
 ### Task engine
 
@@ -718,22 +758,32 @@ Do not put real secret values into docs or prompts. The important thing is the v
 - `JARVIS_BROWSER_AGENT_MAX_STEPS` â€” safety backstop, default `50`.
 - `JARVIS_BROWSER_AGENT_TIMEOUT` â€” task timeout seconds, default `480`.
 - `JARVIS_BROWSER_AGENT_REASONING_EFFORT`, `JARVIS_BROWSER_AGENT_KEEP_LAST_IMAGES`, `JARVIS_BROWSER_AGENT_LOOK_WIDTH`, `JARVIS_BROWSER_AGENT_JPEG_QUALITY` â€” payload knobs.
-- `BRAVE_MCP_PORT` / `BRAVE_MCP_SERVER_DIR` â€” brave-control MCP daemon coordination.
-- `JARVIS_OPENCODE_PORT` / `JARVIS_OPENCODE_CMD` / `JARVIS_OPENCODE_TIMEOUT` â€” opencode engine (only when selected).
+- `BRAVE_MCP_PORT` / `BRAVE_MCP_SERVER_DIR` — brave-control MCP daemon coordination.
+- `JARVIS_OPENCODE_PORT` / `JARVIS_OPENCODE_CMD` / `JARVIS_OPENCODE_TIMEOUT` — opencode engine (only when selected).
+- `JARVIS_TASK_MAX_STEPS` — task-agent step cap, default `24` (`services/task_agent/agent.py:73`).
+- `JARVIS_OPENCODE_AUTO` (default `1`) / `JARVIS_OPENCODE_SERVE` (default `1`) — opencode auto-launch and serve mode (`opencode_client.py:43`, `:38`).
+- `JARVIS_BRAVE_MCP_READY_TIMEOUT` — how long to wait for the MCP daemon (`opencode_client.py:102`).
+- `JARVIS_PROJECT_DIR` — the project folder handed to a task (`opencode_client.py:522`).
+- `JARVIS_BROWSER_PRIVILEGED_JS` — browser-agent JS policy gate (`browser_agent.py:57`).
 
 ### Research browser
 
 - `JARVIS_RESEARCH_CHANNEL` â€” browser channel for research (`chrome` default; `msedge` used on this machine).
 - `JARVIS_RESEARCH_PROFILE` â€” headed browser profile dir, default `data/chrome_profile_jarvis`.
-- `JARVIS_RESEARCH_REPORTS` â€” deep-research report output dir.
+- `JARVIS_RESEARCH_REPORTS` — deep-research report output dir.
+- `JARVIS_RESEARCH_IDLE_TTL` — how long the shared research browser worker is retained before retiring (`services/research_browser.py:167`).
 
 ### Audio / microphone tuning
 
-- `JARVIS_STT_LANGUAGES` â€” comma-separated speech-recognition languages, default `en-IN,hi-IN`.
-- `JARVIS_IDLE_ENERGY_THRESHOLD` â€” main listener idle threshold.
-- `JARVIS_WATCHER_ENERGY_THRESHOLD` â€” watcher-only threshold.
-- `JARVIS_MIC_DEVICE_INDEX` / `JARVIS_MIC_NAME` â€” microphone selection.
-- `JARVIS_SPEECH_START_VAD_RATIO` / `JARVIS_FINAL_SPEECH_VAD_RATIO` â€” VAD ratios.
+- `JARVIS_STT_LANGUAGES` — comma-separated speech-recognition languages, **default `en-IN` only** (English-only since `8ae2294`; it used to be `en-IN,hi-IN`). Read by both `listener.py:69` and `watcher.py:78`.
+- `JARVIS_IDLE_ENERGY_THRESHOLD` — main listener idle threshold.
+- `JARVIS_WATCHER_ENERGY_THRESHOLD` — watcher-only threshold.
+- `JARVIS_MIC_DEVICE_INDEX` / `JARVIS_MIC_NAME` — microphone selection.
+- `JARVIS_SPEECH_START_VAD_RATIO` / `JARVIS_FINAL_SPEECH_VAD_RATIO` — VAD ratios.
+- **`JARVIS_PAUSE_THRESHOLD` — utterance-end pause, default `0.7` s** (`services/listener.py:55-56`; lowered from `1.2` in `bedd9e0`). This is env-overridable and is NOT a frozen constant — an earlier version of this map recorded the end-of-speech decision as frozen by an owner decision (P0-02 declined); that is no longer true.
+- `JARVIS_MAX_ENERGY_THRESHOLD` — loud-room ceiling, default `700` (`backend/listener_state.py:8`).
+- `JARVIS_STT_FINAL_TIMEOUT` — final-transcript budget, default `10` (`listener.py:287`).
+- **S29 neural endpointing** (`services/neural_vad.py:26-29`): `JARVIS_NEURAL_ENDPOINT` (default `1`; `0` reverts to `webrtcvad`), `JARVIS_VAD_SPEECH_ON` (`0.10`), `JARVIS_VAD_SPEECH_OFF` (`0.20`), `JARVIS_VAD_THRESHOLD` (`0.5`).
 
 ### TTS tuning
 
@@ -742,7 +792,11 @@ Do not put real secret values into docs or prompts. The important thing is the v
 - `JARVIS_REMOTE_TTS_CHAR_LIMIT` â€” max text length eligible for ElevenLabs.
 - `JARVIS_FISH_TTS_CHAR_LIMIT` â€” max chunk length for Fish.
 - `JARVIS_FISH_TTS_VOLUME_BOOST_DB` â€” Fish playback gain.
-- `JARVIS_TTS_OUTPUT_DEVICE` â€” Fish output device selection.
+- `JARVIS_TTS_OUTPUT_DEVICE` — Fish output device selection.
+- **`JARVIS_FISH_WS` — S7 live-WebSocket session kill switch, default ON** (`services/fish_voice.py:78`, `:88`). `backend/tests/conftest.py` forces it to `0` for the whole test run so no test opens a real Fish socket.
+- `JARVIS_GOOGLE_TTS_CHAR_LIMIT` — gTTS chunk limit, default `1800` (`services/voice.py:44`); `JARVIS_GOOGLE_TTS_SPEED` (`google_tts.py:140`).
+- `FISH_REFERENCE_ID` — Fish reference clip for AEC (`config.py:44`).
+- `JARVIS_EARCONS_ENABLED` / `JARVIS_REPLY_START_EARCON` — earcon toggles (`earcons.py:10`, `:20`).
 
 ### Voice runtime, AEC and wake detection (G10 / F31-F36)
 
@@ -750,16 +804,21 @@ Do not put real secret values into docs or prompts. The important thing is the v
 - `JARVIS_AEC_REMOTE` / `JARVIS_AEC_REMOTE_TIMEOUT` â€” let the voice process fetch the AEC reference from the API process over HTTP; this is required because the API process voices replies while the voice process owns the microphone. `JARVIS_AEC_REMOTE=0` is for an isolated local-only setup.
 - `JARVIS_WAKE_ENGINE` â€” `auto` (default) / openwakeword / fuzzy matching.
 - `JARVIS_WAKE_MODELS_DIR`, `JARVIS_WAKE_ONLINE_VERIFY`, `JARVIS_WAKE_PRE_ROLL_SECONDS` â€” wake-model directory, online whisper verification toggle, and how much audio is pre-rolled so the first syllable is not clipped.
-- `JARVIS_WHISPER_MODE` â€” `conversation` (default) or wake-oriented local Whisper use.
+- `JARVIS_WHISPER_MODE` — `conversation` (default) or wake-oriented local Whisper use.
+- **S28 AEC tuning — all eight knobs** (`services/echo_cancel.py:68-110`): `JARVIS_AEC_MAX_LAG` (`0.4`), `JARVIS_AEC_LAG_CONFIRMATIONS` (`3`), `JARVIS_AEC_GATE_HISTORY` (`5`), `JARVIS_AEC_PREFETCH` (`2.0`), `JARVIS_AEC_CACHE_TTL` (`0.25`), `JARVIS_AEC_IDLE_SKIP` (`1.5`), `JARVIS_AEC_BREAKER_FAILURES` (`3`), `JARVIS_AEC_BREAKER_COOLDOWN` (`15`).
+- `JARVIS_STT_CLOUD` — cloud STT toggle for the wake engine (`services/wake_engine.py:65`).
 
 ### Memory & continuity (G9)
 
 - `JARVIS_MEMORY_ENABLED` â€” default on; `0` makes every memory call a safe no-op (an empty store changes zero prompts).
-- `JARVIS_MEMORY_DB` â€” SQLite path, default `data/jarvis_memory.db`.
+- `JARVIS_MEMORY_DB` — SQLite path, default `data/jarvis_memory.db`.
+- `JARVIS_MEMORY_EVENT_RETENTION_DAYS` (default `30`) / `JARVIS_MEMORY_EVENT_MAX_ROWS` (default `5000`) — event-log pruning (`backend/core/memory_store.py:154`, `:157`; P1-16).
 
 ### Routing / orchestration
 
-- `JARVIS_ORCHESTRATOR_MODE` â€” `legacy` (default) or `orchestrator`. In `orchestrator` mode the native tool-use loop is tried first and the legacy routing (plus every deterministic net) still runs on a decline. Orchestrator parity is NOT established, so do not default this to `orchestrator`.
+- `JARVIS_ORCHESTRATOR_MODE` — `legacy` (default) or `orchestrator`. In `orchestrator` mode the native tool-use loop is tried first and the legacy routing (plus every deterministic net) still runs on a decline. Orchestrator parity is NOT established, so do not default this to `orchestrator`.
+- `JARVIS_INTENT_BUDGET_MS` (`3500`) / `JARVIS_INTENT_BUDGET_VOICE_MS` (`1200`) — classifier budgets, typed and voice (`backend/core/brain.py:817-818`).
+- **`JARVIS_CHAT_FASTPATH` — default ON** (`brain.py:828`): lets definitely-plain chat skip the classifier network call entirely (S6).
 
 ### Local control plane & security (G11 / F51)
 
@@ -780,11 +839,16 @@ Do not put real secret values into docs or prompts. The important thing is the v
 - `JARVIS_EXTERNAL_RUNTIME` â€” set by the watcher before launching Electron; tells `main.js` not to spawn backend and voice mode again.
 - `JARVIS_BACKEND_PORT` â€” backend port, default `9999`.
 - `JARVIS_BACKEND_PID` / `JARVIS_ELECTRON_PID` â€” passed to the voice process for targeted shutdown.
-- `JARVIS_WATCHER_CONTROL_PORT` â€” watcher HTTP control endpoint used by Electron stop.
+- `JARVIS_WATCHER_CONTROL_PORT` — watcher HTTP control endpoint used by Electron stop (default `8766`, `watcher.py:163`).
+- `JARVIS_DESKTOP_PATH` — desktop folder used by the voice worker (`voice_mode.py:945`).
+- `JARVIS_CHROME_PATH` / `JARVIS_EDGE_PATH` / `JARVIS_BRAVE_PATH` — browser binary overrides (`core/executor.py:152`, `:161`, `:170`).
+- `JARVIS_TOOL_COMMAND_TIMEOUT` / `JARVIS_TOOL_MAX_OUTPUT` / `JARVIS_TOOL_PAGE_CHARS` — native code-tool limits (`services/code_tools.py:74-75`, `:358`).
+- `JARVIS_CDP_URL`, `JARVIS_EDITOR_BRIDGE_URL` / `JARVIS_EDITOR_BRIDGE_TOKEN` — connector endpoints.
+- `JARVIS_PREWARM_INTERVAL` / `JARVIS_PREWARM_CONNECT_TIMEOUT` / `JARVIS_PREWARM_READ_TIMEOUT` — P0-12 pre-warm cadence and budgets (`services/prewarm.py:35-40`).
 
 ### Running the test suite
 
-The suite is no longer 17 modules. `backend/tests/` now holds **105 `test_*.py` modules** (the F01-F55 audit suites, the G3-G11 suites, the C1-C3 and H1-H9 review suites, the 13 `test_p*_*` modules added by the 2026-09-30 responsiveness wave, plus the original behaviour suites), and `tests/` holds 4 Node test files. The root `conftest.py` guards the developer's real `.env` against any test that would modify or delete it.
+The suite is no longer 17 modules. `backend/tests/` now holds **131 `test_*.py` modules** (the F01-F56 audit suites, the G3-G11 suites, the C1-C3 and H1-H9 review suites, the 26 `test_p*_*` modules added by the two responsiveness waves, the 9 `test_s*_*` modules from the 2026-10 S-series, plus the original behaviour suites), and `tests/` holds 4 Node test files. The root `conftest.py` guards the developer's real `.env` against any test that would modify or delete it; **`backend/tests/conftest.py` additionally forces `JARVIS_FISH_WS=0` for the whole run so no test opens a real Fish socket.**
 
 Run everything with the backend venv from the repo root (pytest is pinned in `requirements.txt`, and the root `conftest.py` is pytest-shaped):
 
@@ -792,13 +856,13 @@ Run everything with the backend venv from the repo root (pytest is pinned in `re
 & backend\venv\Scripts\python.exe -m pytest backend\tests -q
 ```
 
-The original 17-module unittest invocation still works and still names a useful fast subset:
+The original 17-module unittest invocation still names a useful fast subset and all 17 modules still exist — **but it no longer passes cleanly: at HEAD it reports `Ran 725 tests … FAILED (failures=5, errors=1)`** (e.g. `ERROR: test_stream_custom_provider_primary (test_model_registry.BrainChatModelResolutionTests)`). Use pytest for the authoritative run; treat the unittest path as a convenience subset, not a gate:
 
 ```
 & backend\venv\Scripts\python.exe -m unittest backend.tests.test_code_tools backend.tests.test_task_agent backend.tests.test_brain_gate backend.tests.test_voice_task_mute backend.tests.test_opencode_lifecycle backend.tests.test_browser_agent backend.tests.test_screen_control backend.tests.test_voice_mode_toggle backend.tests.test_chat_race backend.tests.test_voice_latency backend.tests.test_model_registry backend.tests.test_settings_routes backend.tests.test_fireworks_reasoning backend.tests.test_model_roles_wiring backend.tests.test_live_bugfixes backend.tests.test_websearch_interruption backend.tests.test_websearch_modes
 ```
 
-A single module runs as `python -m unittest backend.tests.test_screen_control`. The Node tests have no harness entry (`npm test` in `package.json` is still a stub) and are run directly:
+A single module runs as `python -m unittest backend.tests.test_screen_control`. The Node tests have no harness entry (`npm test` in `package.json` is still a stub) and are run directly. Note that two of them (`model-sidebar.test.js`, `research-overlay-href-scheme.test.js`) are renderer/DOM tests, not main-process policy layers:
 
 ```
 node --test tests\backend-request-policy.test.js
@@ -807,7 +871,9 @@ node --test tests\overlay-ipc-contract.test.js
 node --test tests\research-overlay-href-scheme.test.js
 ```
 
-On counts: the last full-suite figure recorded in this map is **2507 passed, 4 failed, 1 skipped (2026-09-30, 105 modules)**. Do not quote the old 512 (2026-09-11, 17 modules) figure. Wall time varies run-to-run (roughly 15s–300s) — the variance is known and comes from a few unmocked live network calls in `test_websearch_modes`, not from flaky assertions. The 4 failures in that run were `test_browser_agent.py` (×3) and `test_f02_goal_routing.py` (×1), which are **order-dependent** rather than broken: they pass in isolation. A number of other failures (`test_verification_uses_fireworks`, `test_verification_uses_groq`, `test_f37_groq_prerequisite`, the `test_g3_request_streaming` racer test, the `live_bugfixes` vision tests) also appear and disappear run-to-run; the reliable way to attribute a failure is to A/B it against a `git stash` of your own change rather than trusting a single run. Advice that survives all of that: run the full suite once per change, and confirm any new failure against HEAD before believing it is yours.
+On counts: the current collection is **2979 tests across 131 modules** (`pytest backend\tests --collect-only -q`). The last full-suite *pass* figure recorded in this map is **2802 passed, 5 failed, 1 skipped (2026-10-01, wave II)** and is necessarily stale — many commits and suites landed after it. Do not quote any older figure (512, 2507, or 2802) as current. Wall time varies run-to-run (roughly 15s–300s) — the variance is known and comes from a few unmocked live network calls in `test_websearch_modes`, not from flaky assertions.
+
+**Known non-existent suites:** an earlier version of this map told you to disregard failures in `test_verification_uses_fireworks` and `test_verification_uses_groq`. **Neither file exists anywhere in the repo** — that advice was wrong. Real intermittent failures include `test_browser_agent.py`, `test_f02_goal_routing.py` (order-dependent, pass in isolation), `test_f37_groq_prerequisite`, the `test_g3_request_streaming` racer test, and the `live_bugfixes` vision tests. `test_task_agent.py::PlannerSafetyTests::test_model_plan_uses_fireworks_not_grok` is a **settings-dependent** failure: the persisted planner selection is now the custom `fireworks-2` provider, so the test's expectation no longer matches the live configuration. The reliable way to attribute a failure is to A/B it against a `git stash` of your own change rather than trusting a single run. Advice that survives all of that: run the full suite once per change, and confirm any new failure against HEAD before believing it is yours.
 
 ## Non-Obvious Behaviors Another Model Should Know
 
@@ -821,9 +887,9 @@ It talks to Groq, not xAI Grok. Its former code default `llama-3.3-70b-versatile
 
 ### 3. The classifier can silently degrade — the deterministic nets exist because of it
 
-`classify_intent` lands on a `chat` verdict whenever its whole chain fails or throttles (today OpenRouter -> Gemini -> Groq), and it can genuinely misread screen questions as chat/research. Four deterministic backstops in `process_message` rewrite or reroute such verdicts: the screen-question net, the fresh-info auto-search net, the all-`search`-steps -> research reroute, and the web-task routing net. When changing routing, check the nets, not just the classifier branch.
+`classify_intent` lands on a `chat` verdict whenever its whole chain fails or throttles, and it can genuinely misread screen questions as chat/research. **Since F56 hop 1 is the registry-selected `intent` role (live: `gemini/gemini-3.1-flash-lite`) and the OpenRouter -> Gemini -> Groq order is only the shipped FALLBACK chain; since S6 the router's JSON also carries a `reply` and the brain SPEAKS it, so a `chat` verdict no longer means "fall through to the chat model".** Four deterministic backstops in `process_message` rewrite or reroute such verdicts: the screen-question net, the fresh-info auto-search net, the all-`search`-steps -> research reroute, and the web-task routing net. Plus `JARVIS_CHAT_FASTPATH` (default on) short-circuits definitely-plain chat before any network call. When changing routing, check the nets, not just the classifier branch.
 
-### 4. Voice-path defects: the three confirmed ones are FIXED (2026-09-30)
+### 4. Voice-path defects: the three confirmed ones are FIXED (2026-09-30) — and five more changes landed since
 
 The three defects that were confirmed present in the running code have all been fixed. This block is kept so a future session knows they were real, what the fixes are, and what to reach for when the voice path misbehaves again:
 
@@ -835,6 +901,14 @@ Two things found while fixing these, worth knowing:
 
 - The voice turn's request id was `voice-<epoch-ms>-<pid>` and **collided** when two turns were submitted inside one millisecond. Mostly theoretical before, but pre-emptive dispatch submits back-to-back and a reused id carrying a different message is a **409 conflict** at the request registry. It now carries a per-process counter, and `_TurnManager.start()` additionally pre-empts on a changed speaker so an id collision can never leave two turns registered.
 - **The listener's blocking work is gone but the async replacements are only as good as their timeouts**: `_SpeakStopWorker` (P1-03) and the turn manager's cancel both post from daemon threads, so a hung endpoint costs a thread, not the capture loop. If you see barge-in latency, look at `speak_stop_stats()` and the `barge_in_stop{ok,ms,status}` latency mark before changing any VAD constant.
+
+**Five later voice-path changes that this block originally did not mention (all 2026-10-02/03):**
+
+- **S28 AEC alignment** (`80c094e`) — `echo_cancel.py` grew ~350 lines: `DelayEstimator` cross-correlation lag lock, a joint last-5-frame compare window, off-thread reference prefetch, and a `lag` block in `state()`. If barge-in suppression misbehaves, look here before touching VAD constants.
+- **S29 neural endpointing** (`acc366e`) — utterance start/end is decided by `backend/services/neural_vad.py` (Silero on ONNX, 100 ms-on / 200 ms-off hysteresis), not by a fixed energy threshold. Kill switch `JARVIS_NEURAL_ENDPOINT=0`.
+- **Whisper medium + 0.7 s pause** (`bedd9e0`) — `PAUSE_THRESHOLD_SECONDS` is **0.7** via `JARVIS_PAUSE_THRESHOLD`, down from 1.2. On CPU-only, set `JARVIS_WHISPER_MODEL=base`.
+- **English-only transcription** (`8ae2294`) — `JARVIS_WHISPER_LANGUAGE=en`. Whisper no longer auto-detects, which is what stopped random-language hallucinations being treated as user speech.
+- **Barge-in stale-socket recovery** (`9839fe8`) — `_SpeakStopWorker._deliver` re-dials when the keep-alive socket is dead, so a stop is never silently dropped.
 
 ### 5. Screen control is not always active
 
@@ -858,18 +932,26 @@ Examples include:
 - the expected virtualenv path
 - the brave-control MCP server directory (`C:\Users\mayan\mcp-servers\brave-control`) — note a second copy is now vendored at `integrations/brave-control/`
 - the Chrome/Brave profile and Start Menu search roots used by `executor.launch_app`
+- **an Anaconda `Library\bin` DLL search path at `backend/watcher.py:20` AND `backend/whisper_daemon.py:61`** — runtime-critical, since that is how CUDA is found
+- `extract_pdf.py` paths
 
-### 9. Dependencies: `requirements.txt` is the proven set, `backend/requirements.txt` is legacy
+Note: there is **no hardcoded repo base path** — `config.py:9` derives `BASE_DIR` from `__file__`. The nearest literal is an `HTTP-Referer` hostname in `openrouter_client.py:103`.
 
-After H1, the root `requirements.txt` was regenerated by pip freeze from the working venv and now carries a header saying so — that IS the proven install set (numpy 1.26.4 ABI, pywinauto 0.6.9, the ~12 packages the old file omitted). `backend/requirements.txt` still exists, and neither file perfectly documents every runtime import; if something fails on a missing package, inspect the actual imports before trusting either file.
+### 9. Dependencies: `requirements.txt` is the proven set; `backend/requirements.txt` is a delegating shim
 
-### 10. The frontend is polling, not event-driven
+After H1, the root `requirements.txt` was regenerated by pip freeze from the working venv and now carries a header saying so — that IS the proven install set (numpy 1.26.4 ABI, pywinauto 0.6.9, the ~12 packages the old file omitted). **`backend/requirements.txt` is NOT a stale legacy list — it is a single line, `-r ../requirements.txt`, so installing from either path yields the same set.**
 
-Still no websocket â€” the renderer polls one adaptive `/ui-state` endpoint (fast while a request or voice activity is in flight, slower when idle, with failure backoff), plus separate polls for the `/screen-answer` and `/research-result` overlays. The one genuinely streaming path is `/ask/stream` (SSE).
+**Known gap:** the root file pins `onnxruntime==1.23.2` but has **no `silero-vad` entry**, while `backend/services/neural_vad.py:46` does `import silero_vad`. On a fresh install the default S29 endpointing path therefore **silently degrades to the `webrtcvad` judge**. Add the pin if you rebuild the environment.
+
+### 10. The frontend is polling, not event-driven — but a push channel now exists for the voice worker
+
+The renderer still polls one adaptive `/ui-state` endpoint (`renderer.js:569-610`, 120 ms active / 600 ms idle / backoff to 3 s), plus separate polls for the `/screen-answer` and `/research-result` overlays; `main.js` references `/events` nowhere. **But since S19 the backend exposes `GET /events`** (`routes.py:973`), an SSE channel fed by `backend/services/event_bus.py`, and the **voice worker already uses it** (`voice_mode._task_state_push_loop`). The renderer deliberately has not adopted it because a browser `EventSource` cannot attach the `X-Jarvis-Token` header.
+
+So there are now **two** streaming paths: `/ask/stream` (the reply deltas) and `/events` (state push).
 
 ### 11. Model selection is live and persisted
 
-`data/jarvis_settings.json` overrides env defaults for all SIX roles per message â€” reading only `.env`/`config.py` will give you the wrong picture of which model actually answers. The registry masks API keys; never log or echo them. `data/` is gitignored precisely because custom-provider keys live only there — never in `.env`, never in git.
+`data/jarvis_settings.json` overrides env defaults for all **SEVEN** roles per message â€” reading only `.env`/`config.py` will give you the wrong picture of which model actually answers. The registry masks API keys; never log or echo them. `data/` is gitignored precisely because custom-provider keys live only there — never in `.env`, never in git.
 
 ### 12. The local control plane FAILS CLOSED (this bites everyone once)
 
@@ -895,16 +977,18 @@ If another model is asked to make a specific kind of change, this is the shortes
 
 Start in:
 
-- `backend/core/brain.py` (`_build_chat_messages`, `_stream_chat_deltas`, `_resolve_chat_model`)
+- `backend/core/brain.py` (`_build_chat_messages`, `_stream_chat_deltas`, `_resolve_chat_model`, `_finalize_chat_reply`)
+- **`backend/services/intent.py` — since S6 the chat ANSWER can originate here, via the router JSON's `reply` field. A prompt change that only edits the chat model will not be the whole story.**
 - `backend/services/gemini_client.py`, `backend/services/fireworks_client.py`
 - `backend/services/model_registry.py` (provider/model selection)
+- The generic dispatch that carries openrouter/groq/custom-provider traffic: `backend/services/openai_compat_client.py`, `openrouter_client.py`, `grok_client.py`, `ollama_client.py`
 
 ### Change intent routing or the safety nets
 
 Start in:
 
-- `backend/services/intent.py` (classifier prompt + chain — **the real hop order is OpenRouter → Gemini direct → Groq**, sharing one monotonic budget via `_budget_timeout`; the module docstring's "Gemini first" description is stale, and the comment at line 286 is also mislabelled "3")
-- `backend/core/brain.py` (nets in `process_message`, `_ChatRacer`)
+- `backend/services/intent.py` (classifier prompt + chain — **hop 1 is the registry-selected `intent` role** (live `gemini/gemini-3.1-flash-lite`), then the shipped fallback chain OpenRouter → Gemini direct → Groq, sharing one monotonic budget via `_budget_timeout`; the module docstring's "Gemini first" description is stale). **Since S6 this file also owns the chat reply text.**
+- `backend/core/brain.py` (nets in `process_message`, `_ChatRacer`, the `JARVIS_CHAT_FASTPATH` fast path)
 - `backend/services/web_task_routing.py`, `backend/services/screen_analyzer.py` (deterministic predicates)
 
 ### Change websearch / research behavior
@@ -954,21 +1038,26 @@ Start in:
 Start in:
 
 - `backend/services/listener.py`
-- `backend/listener_state.py`
+- **`backend/services/neural_vad.py` — since S29 this owns the utterance-END decision that `listener.py` consults. It was missing from this list, which is why endpointing changes were hard to place.**
+- `backend/listener_state.py` (`selected_stt_engine()` — the S5 single-engine resolution)
+- `backend/whisper_daemon.py` (model size / language pins)
 - `backend/voice_mode.py` (the I/O worker; it must never import `backend.core.brain`)
-- `backend/services/audio_actor.py` (the single playback owner), `echo_cancel.py` (AEC), `transcript_stabilizer.py` (F34)
+- `backend/services/audio_actor.py` (the single playback owner), `echo_cancel.py` (AEC + S28 lag alignment), `transcript_stabilizer.py` (F34)
 - `backend/services/intelligence_state.py` (worker generations, playback ownership, event journal)
+- `backend/services/event_bus.py` (S19 state push)
 
 **Measure before you change anything here.** `/latency` (P1-19) already renders the whole turn as an ordered waterfall with p50/p90/max per step, sorted slowest-first, and it stitches the voice process's capture/STT/TTS marks into the backend's record under one `request_id`. If you are chasing latency, read that first: the marks (`speech_end`, `capture_end`, `stt_start`, `stt_done{engine}`, `http_in`, `racer_start`, `classify_done{hop}`, `first_token`, `provider_headers`, `tts_first_byte`, `playback_started`, `barge_in_stop{ok,ms,status}`) tell you which stage is actually slow instead of inviting a guess. `speak_stop_stats()` covers the P1-03 stop worker, and `voice_mode.TURNS.snapshot()` covers turn pre-emption.
 
-Two hard rules that have already bitten this area: nothing blocking may enter `_capture_audio` or `barge_in_on_speech_onset` (they run on the real-time capture thread), and `PAUSE_THRESHOLD_SECONDS` / the end-of-speech decision / `MAX_PHRASE_SECONDS` / `LISTEN_TIMEOUT_SECONDS` are frozen by an explicit owner decision (P0-02, declined).
+Two hard rules that have already bitten this area: nothing blocking may enter `_capture_audio` or `barge_in_on_speech_onset` (they run on the real-time capture thread), and `MAX_PHRASE_SECONDS` / `LISTEN_TIMEOUT_SECONDS` are frozen by an explicit owner decision (P0-02, declined).
+
+**`PAUSE_THRESHOLD_SECONDS` is NOT frozen.** An earlier version of this map listed it alongside those; that is obsolete. It is now `float(os.getenv("JARVIS_PAUSE_THRESHOLD", "0.7"))` — 0.7 s since `bedd9e0`, down from 1.2. And the **end-of-speech decision itself is no longer a fixed energy threshold at all** — S29 moved it to Silero-on-ONNX with hysteresis in `neural_vad.py`. Change endpointing there, not in `listener.py`.
 
 ### Change TTS or spoken reply behavior
 
 Start in:
 
-- `backend/services/voice.py` (the Fish -> local SAPI5 -> ElevenLabs -> local SAPI5 ladder)
-- `backend/services/fish_voice.py` (Fish PCM streaming)
+- `backend/services/voice.py` (**since S7 the primary path is ONE live Fish WebSocket session per reply** — `fish_ws_begin_reply`/`fish_ws_session`/`fish_ws_end_reply`; the HTTP ladder below it is the fallback)
+- `backend/services/fish_voice.py` (Fish PCM streaming **and** the S7 WebSocket session; kill switch `JARVIS_FISH_WS`)
 - `backend/services/google_tts.py` (the key-less `gtts` engine)
 - `backend/services/elevenlabs_voice.py`
 - `backend/services/earcons.py`
@@ -1043,11 +1132,11 @@ Start in:
 
 Start in:
 
-- `backend/tests/` — 120 unittest modules; per-feature suites are named `test_fNN_*` (Fable-5), `test_gNN_*` (G-groups), `test_cN_*` (review criticals), `test_hN_*` (review highs), `test_pNN_*` (priority/audit waves), plus 21 unnumbered feature suites (including `test_custom_provider_ui.py` and `test_stt_hallucination_gate.py`)
-- `tests/` — Node `node --test` suites
-- `conftest.py` — the `.env` session guard
+- `backend/tests/` — 131 unittest modules; per-feature suites are named `test_fNN_*` (Fable-5), `test_gNN_*` (G-groups), `test_cN_*` (review criticals), `test_hN_*` (review highs), `test_pNN_*` (responsiveness waves), `test_sNN_*` (the 2026-10 S-series), plus 28 unnumbered feature suites (including `test_custom_provider_ui.py`, `test_stt_hallucination_gate.py`, `test_simple_listening.py`, `test_voice_task_mute.py`, `test_live_chat_and_bargein_fixes.py`)
+- `tests/` — Node `node --test` suites (two are renderer/DOM tests, not main-process policy)
+- `conftest.py` (root) — the `.env` session guard; `backend/tests/conftest.py` — forces `JARVIS_FISH_WS=0`
 
-Do not quote a stale total from an older copy of this map. Two suites were already failing before any recent work — `test_verification_uses_fireworks` and `test_verification_uses_groq` — and they fail identically on unmodified code, so they are not a regression from your change.
+Do not quote a stale total from an older copy of this map. An older version claimed two suites were "already failing": `test_verification_uses_fireworks` and `test_verification_uses_groq`. **Neither file exists in this repository** — disregard that claim entirely. The genuine settings-dependent failure is `test_task_agent.py::PlannerSafetyTests::test_model_plan_uses_fireworks_not_grok`, because the persisted planner selection is now the custom `fireworks-2` provider.
 
 ## Minimal File Map
 
@@ -1056,7 +1145,7 @@ Top-level directories and files that matter:
 - `frontend/`
   - Electron renderer UI: `index.html`, `renderer.js`, `style.css`, plus the overlay renderers (`overlay_renderer.js`, `overlay_images_renderer.js`, `research_overlay_renderer.js`), the capsule (`capsule.html`, `capsule_renderer.js`, `capsule.css`, `capsule_main.js`), `preload.js`, and the `snapshot-v3.html` design snapshot
 - `backend/`
-  - Python backend (`main.py`, `api/routes.py`, `core/`, `services/`), `voice_mode.py`, `watcher.py`, `whisper_daemon.py`, `scripts/tail_activity.ps1`
+  - Python backend (`main.py`, `api/routes.py`, `core/`, `services/`), `voice_mode.py`, `watcher.py`, `whisper_daemon.py`, `listener_state.py`, `scripts/tail_activity.ps1`
 - `main.js`
   - Electron main process: window factory, IPC policy, managed-child supervision
 - `run_jarvis.bat`
@@ -1066,17 +1155,17 @@ Top-level directories and files that matter:
 - `run_jarvis_noisy.bat` / `run_watcher_noisy.bat`
   - the same two launchers with loud-room mic thresholds preset
 - `tests/`
-  - Node (`node --test`) suites for the Electron/main-process policy layers
+  - Node (`node --test`) suites; `backend-request-policy` and `overlay-ipc-contract` cover main-process policy, while `model-sidebar` and `research-overlay-href-scheme` are renderer/DOM tests. `npm test` is still a stub — run them directly.
 - `integrations/brave-control/`
   - vendored copy of the brave-control MCP server (`server.mjs` + `lib/`)
 - `integrations/jarvis-editor-bridge/`
   - VS Code-compatible editor bridge extension
 - `PROJECT_MAP.md`
   - this map
-- `AUDIT_IMPLEMENTATION_PROMPTS.html`
-  - the 2026-09-30 responsiveness-audit triage: the owner's decision per finding plus a self-contained implementation prompt for each, in phase order. **13 of the 43 items have now been implemented** (see "Responsiveness audit implementation state"); the remaining prompts are still the place to start for the rest.
+- `BROWSER_AGENT_AUDIT_BACKLOG.md`
+  - **the accepted 2026-10 browser-agent audit backlog** (36 items `BA-00`–`BA-35`): per-item problem, evidence, solution, acceptance criteria, invariants, a 10-case benchmark suite, and a section listing the five claims that were investigated and **dismissed as false**. Approved by the owner; implementation is underway commit-per-audit — `BA-00` (`ff86fc1`), `BA-02`/L-8 (`f3855bd`) and L-6 (pooled session, this session) are landed, the rest pending (next: L-15/`BA-03`, L-1/`BA-05`).
 - `codex.md`
-  - the project's running change log (newest entries at the bottom) — read it for the 2026-08/09 history this map summarises
+  - a change log (newest entries at the bottom) covering the 2026-08/09 history this map summarises. **It is NOT running: it is ~228 lines and its newest entry is the 2026-09-24 STT-hallucination fix.** The 2026-09-30/10-01 waves and the whole S-series are not in it — use the sections below instead.
 - `CODE_REVIEW_REPORT.txt` / `.pdf`
   - the 2026-09-23 independent code review (55 findings) this map's remediation section tracks
 - `screen_commands.log`
@@ -1084,7 +1173,7 @@ Top-level directories and files that matter:
 - `conftest.py`
   - pytest session guard for the real `.env`
 - `data/` (gitignored, all of it)
-  - `jarvis_settings.json` (+ backups), `conversation_history.json`, `jarvis_memory.db`, `change_journal/`, `runtime/`, `logs/`, `chrome_profile_jarvis/`, `research_reports/`
+  - `jarvis_settings.json` (+ `*.bak-*`), `jarvis_memory.db`, `change_journal/`, `runtime/`, `logs/`, `chrome_profile_jarvis/`, `edge_profile_jarvis/`, `research_reports/`, `opencode_activity.log`, `opencode_server.log`. Note `conversation_history.json` is created lazily and may be absent on a fresh checkout.
 
 Mostly non-runtime or secondary:
 
@@ -1093,21 +1182,30 @@ Mostly non-runtime or secondary:
 - `.audit_tmp/`, `_plan.txt`, `_repro*.py`, `_r3.txt`–`_r5.txt`, `.git-broken-20260914-154720/`
   - scratch/repro/backup leftovers from the audit work; not part of the runtime
 
-## Responsiveness Audit State (2026-09-29 triage — 13 of 43 implemented on 2026-09-30)
+## Responsiveness Audit State (2026-09-29 triage — 27 items implemented across two waves)
 
-A responsiveness audit produced 43 findings (P0-01…P1-19). The owner triaged every item; the decision and a pasteable implementation prompt for each lives in `AUDIT_IMPLEMENTATION_PROMPTS.html` at the repo root. **13 items have since been implemented, one at a time, in the phase order that document gives (P1-19 telemetry first)** — see "Responsiveness audit implementation state" below for the commit and the substance of each. The standing decisions below are recorded so a future session does not re-litigate them.
+A responsiveness audit produced 43 findings. The owner triaged every item. **27 items are now implemented** — 13 in the 2026-09-30 wave (`f37a519`…`6c89095`) and 14 in the 2026-10-01 wave (`2e85ebb`…`3b460d0`, each tagged per item). See "Responsiveness audit implementation state" below for commits and substance.
+
+**Two honesty notes about this section:**
+
+1. **The triage document no longer exists.** Older revisions of this map pointed at `AUDIT_IMPLEMENTATION_PROMPTS.html` for the per-item decisions and pasteable prompts. **That file was never committed to this repository** — it is absent from the working tree and from the entire git history. The owner's per-item decisions are therefore **not recoverable from the repo**; what survives is the standing-decision list below, the commit messages, and the per-item test suites.
+2. **The stated id range does not add up.** `P0-01…P0-13` is 13 ids and `P1-01…P1-19` is 19 — **32 ids, not 43**, and there is no `P2-*` id anywhere. So roughly 11 of the original 43 findings were never given an id that survives in any file here. Do not assume the id list is complete.
 
 **The owner's standing decisions:**
 
 - **P0-01 (slow Gemini over VPN) — no action.** The VPN was turned off, so the measured 7–45 s figure no longer applies. **Do not change the chat provider.** Re-measure once P1-19 telemetry exists. (Note: the audit's cited model `gemini-3.8-flash` was stale; the live selection is `gemini-3.5-flash-lite`.)
-- **P0-02 (1.2 s energy-only end-of-speech) — DECLINED, keep as is.** This is now a hard constraint: **no change may be made to `PAUSE_THRESHOLD_SECONDS`, the end-of-speech decision, `MAX_PHRASE_SECONDS`, or `LISTEN_TIMEOUT_SECONDS`.** Several planned items (P0-04, P1-05) carry explicit constraints to that effect.
-- **P0-03 (serial STT ladder) — implement, but as ONE engine only.** The cross-engine fallback chain and the Google/Groq language loop are to be removed. This also makes P0-04's partial-agreement early-exit meaningful, since both come from the same engine.
+- **P0-02 (1.2 s energy-only end-of-speech) — DECLINED at the time, but SINCE SUPERSEDED. This entry is the one standing decision that no longer holds.** It originally read "no change may be made to `PAUSE_THRESHOLD_SECONDS`, the end-of-speech decision, `MAX_PHRASE_SECONDS`, or `LISTEN_TIMEOUT_SECONDS`." As of `bedd9e0` and `acc366e` that is no longer true: `PAUSE_THRESHOLD_SECONDS` is **0.7 s** (env `JARVIS_PAUSE_THRESHOLD`) and the end-of-speech decision moved to Silero neural VAD in `backend/services/neural_vad.py`. `MAX_PHRASE_SECONDS` and `LISTEN_TIMEOUT_SECONDS` remain untouched. **Do not cite P0-02 as a reason to avoid touching endpointing.**
+- **P0-03 (serial STT ladder) — implement, but as ONE engine only. DONE, and reworked by S5 `c7b2128`.** The cross-engine fallback chain and the Google/Groq language loop are gone; `listener.py:443-476` and `watcher.py:934-948` each run exactly one engine whose output is final.
 - **P0-08 (barge-in does not cancel the backend turn) — implement, with one carve-out. IMPLEMENTED (`6c89095`).** The full generated reply **stays committed to history** after an interruption, because the owner wants to read what was missed. The audit's "store only the spoken prefix" suggestion is explicitly rejected; an additive `last_reply_interrupted` flag is the substitute. **Do not reverse the carve-out** — the reply text is untouched by design.
-- **P0-09 (classifier gating) — suggestion only, do not implement yet.** See the analysis in `AUDIT_IMPLEMENTATION_PROMPTS.html`; the short version is that a local Qwen3-0.6B via the existing Ollama client is the recommended candidate, used as a local-first / cloud-fallback cascade rather than a replacement, and only after a labelled evaluation set exists.
+- **P0-09 (classifier gating) — suggestion only, do not implement yet.** The short version is that a local model via the existing Ollama client is the recommended candidate, used as a local-first / cloud-fallback cascade rather than a replacement, and only after a labelled evaluation set exists.
 - **P0-07 — implement only if it measurably helps. IMPLEMENTED (`6d1bedc`) after the gate fired.** It was split into a measurement gate, an `abort()` fix to do regardless, and a persistent-output-stream refactor to do only if the gate justified it; the gate measured a 400 ms inter-sentence gap on a Bluetooth default device (and a 221 ms `stop()` drain), so **both** parts were done. If you change the device setup, re-run that gate before trusting the persistent stream.
 - **P1-17 (wake cold-start) and P1-18 (Whisper daemon settings) — SKIPPED.**
 
-Everything else (P0-04, P0-05, P0-06, P0-10…P0-13, P1-01…P1-16, P1-19) is approved for implementation, one item at a time, in the phase order given in the prompts document (P1-19 telemetry first). **Landed so far: P0-04, P0-05, P0-06, P0-07, P0-08, P0-13, P1-01, P1-02, P1-03, P1-04, P1-05, P1-09, P1-19.** Still pending from that list: P0-03 (its own decision above), P0-10…P0-12 and P1-06…P1-08, P1-10…P1-16.
+**Landed: 27 of 43.** Wave I (13): P0-04, P0-05, P0-06, P0-07, P0-08, P0-13, P1-01, P1-02, P1-03, P1-04, P1-05, P1-09, P1-19. Wave II (14): P0-03, P0-10, P0-11, P0-12, P1-06, P1-07, P1-08, P1-10, P1-11, P1-12, P1-13, P1-14, P1-15, P1-16.
+
+**Still open: none of the previously-listed items.** An earlier version of this map listed P0-03, P0-10…P0-12 and P1-06…P1-08, P1-10…P1-16 as "still pending" — **all 14 landed in wave II**, 120 lines further down in the same document. The only genuinely unresolved entries are P0-01 (no action), P0-09 (suggestion only), and P1-17/P1-18 (skipped).
+
+**One wave-I entry is superseded and should be read with care:** P0-04's partial-transcription layer (`_PartialWorker`, `test_p0_04_async_partials.py`) was **deleted outright** in `7afefc0` as part of the simple-listening change. Its measurement (capture loop 2.45 s → 0.05 s) was real at the time, but the code it describes no longer exists.
 
 ### Responsiveness audit implementation state (the 2026-09-30 wave)
 
@@ -1141,18 +1239,18 @@ Everything else (P0-04, P0-05, P0-06, P0-10…P0-13, P1-01…P1-16, P1-19) is ap
 If you need the shortest accurate summary possible, use this:
 
 - Electron provides the desktop shell and launches the backend/voice processes unless the watcher already did (`JARVIS_EXTERNAL_RUNTIME=1`). Model switches are live per message; nothing else hot-reloads.
-- FastAPI exposes `/ask`, `/ask/stream`, `/ask/status/{id}`, `/ask/cancel/{request_id}`, `/voice-log`, `/voice-mode`, `/voice-state` + `/voice-state/publish`, `/ui-state`, `/speak/stop|pause|resume|remaining`, `/latency` + `/latency/client`, `/aec/state|reference`, `/screen-answer`, `/research-result`, `/research-progress`, `/settings*` + `/providers/{id}/models`, `/task/stop`, `/approvals/reset`, `/voice-setup/launch`, `/health`. Everything except `/health` needs the per-launch `X-Jarvis-Token` (fails closed; `JARVIS_DEV_MODE=1` is the only bypass).
-- `backend/core/brain.py` is the central intent router. Memory phrases run first; then explicit task/code-tool handoffs, screen control, explicit research; then (if `JARVIS_ORCHESTRATOR_MODE=orchestrator`) the native tool-use orchestrator; then the legacy path: a speculative chat stream races the cloud classifier (OpenRouter Flash Lite -> Gemini Flash Lite -> Groq Qwen -> `chat` verdict, all hops sharing one deadline), and four deterministic backstops (screen-question net, fresh-info auto-search, all-search-steps -> research reroute, web-task routing) correct classifier misfires.
-- Chat is served by the model-registry-selected provider (currently `gemini/gemini-3.5-flash-lite`) with a same-model non-stream retry and a Gemini -> Fireworks tail — NOT Groq, whose old default model is retired. A terminal auth/validation failure refuses instead of substituting another model.
+- FastAPI exposes `/ask`, `/ask/stream`, `/ask/status/{id}`, `/ask/cancel/{request_id}`, **`/events` (SSE state push)**, `/voice-log`, `/voice-mode`, `/voice-state` + `/voice-state/publish`, `/ui-state`, `/speak/stop|pause|resume|remaining`, `/latency` + `/latency/client`, `/prewarm` + `/prewarm/stats`, `/aec/state|reference`, `/screen-answer`, `/research-result`, `/research-progress`, `/settings*` + `/providers/{provider_id}/models` + `/settings/provider/test`, `/task/stop`, `/approvals/reset`, `/voice-setup/launch`, `/health`, `/update-voice-log`. Everything except `/health` needs the per-launch `X-Jarvis-Token` (fails closed; `JARVIS_DEV_MODE=1` is the only bypass).
+- `backend/core/brain.py` is the central intent router. Memory phrases run first; then **route selection plus a speculative chat racer (moved above the task/code-tool/screen/research chain in P0-10)**; then explicit task/code-tool handoffs, screen control, explicit research; then (if `JARVIS_ORCHESTRATOR_MODE=orchestrator`) the native tool-use orchestrator; then the legacy path: a speculative chat stream races the classifier (hop 1 = the registry-selected `intent` role, currently `gemini/gemini-3.1-flash-lite`; shipped fallback chain OpenRouter Flash Lite → Gemini Flash Lite → Groq Qwen → `chat` verdict, all hops sharing one deadline), and four deterministic backstops (screen-question net, fresh-info auto-search, all-search-steps → research reroute, web-task routing) correct classifier misfires. **Since S6 the router's JSON carries a `reply` and the brain speaks it, so a normal chat turn is ONE LLM call; `JARVIS_CHAT_FASTPATH` can also skip the network entirely for plain chat.**
+- Chat is served by the model-registry-selected provider (currently `gemini/gemini-3.5-flash-lite`) with a same-model non-stream retry and a Gemini → Fireworks tail — NOT Groq, whose old default model is retired. A terminal auth/validation failure refuses instead of substituting another model.
 - Web lookups default to the Brave AI-Overview quick-search tier; "deepsearch" adds the multi-site research service with a glass-overlay report. Both tiers share one long-lived Playwright worker.
 - Screen Q&A ("What's on my screen?") runs the F37 eligible-provider vision cascade (registry selection first, bounded fallbacks, no credential-free dispatch) and shows floating desktop overlays.
 - `command ...` messages trigger browser actions or launch local Windows applications (via the `launch_app` resolver in executor, no shell fallback) with web URL fallback.
 - Multi-step web tasks hand off to the confirmation-gated browser agent (brave-control MCP daemon, 50-step/480s backstops); the opencode CLI is an opt-in engine selected by capability, and the executor choice is frozen in an F16 contract at consent time.
-- Voice mode is a pure I/O worker: it captures and transcribes, submits to `/ask/stream` with `speak=False`, publishes its listening state, and owns playback through the Fish Audio -> local SAPI5 -> ElevenLabs -> local SAPI5 ladder. The backend remains the single intelligence authority.
-- The watcher is a separate passive wake-word launcher running local GPU-accelerated Whisper via the resident `whisper_daemon` (port bound before model load), with the STT hallucination gate vetoing prompt echoes. It also supervises the full stack in `run_jarvis.bat` mode and distinguishes warm sleep from full shutdown.
+- Voice mode is a pure I/O worker: it captures and transcribes (**one STT engine per utterance, endpointing by Silero neural VAD**), submits to `/ask/stream` with `speak=False`, publishes its listening state, receives task state by **push over `/events`**, and owns playback through **one live Fish Audio WebSocket session per reply**, with the HTTP ladder (Fish → local SAPI5 → ElevenLabs → local SAPI5) as the fallback. The backend remains the single intelligence authority. **Since S18 it keeps accepting conversation while a task runs, queueing action requests rather than refusing them.**
+- The watcher is a separate passive wake-word launcher running local GPU-accelerated Whisper (**medium**, English-only) via the resident `whisper_daemon` (port bound before model load), with the STT hallucination gate vetoing prompt echoes and **no provider fallback ladder since S5**. It also supervises the full stack in `run_jarvis.bat` mode and distinguishes warm sleep from full shutdown.
 - Screen control is a distinct subsystem that combines direct command parsing, native UI Automation tree extraction, visual OCR text extraction, vision-model planning, and Windows input automation.
 - All screen control actions are logged with full details in `screen_commands.log`.
-- State is mostly in-memory module state; the durable artifacts are `data/jarvis_settings.json`, `data/conversation_history.json`, and the research reports.
+- State is mostly in-memory module state; the durable artifacts are `data/jarvis_settings.json` (revision 61, seven role selections), `data/jarvis_memory.db`, the browser profiles, and the research reports. Conversation history is mirrored best-effort by a debounced background writer (`backend/core/memory.py`) and flushed on shutdown.
 
 ## Recent Improvements (2026-08)
 
@@ -1204,21 +1302,23 @@ This change lives in the brave-control MCP server (`server.mjs`). It was origina
 
 ## Recent Improvements (2026-09)
 
-### Simple listening: partials removed, base Whisper + greedy decode (simple-listening, 2026-10-01)
+### Simple listening: partials removed, Whisper + greedy decode (simple-listening, 2026-10-01; model default revised twice since)
 
 Owner-requested latency pass on the speech-to-text path, made after **measuring**
 the real cost on the target laptop (RTX 3050 6 GB + i5-13420H), one 7.24 s English
 utterance, using the daemon's own transcribe flags:
 
+These are the numbers that justified choosing a model size **at the time**. Note the column labels are now HISTORICAL: `base` was the new default in this pass, but the owner immediately moved it back to `medium` (`bedd9e0`), which is the shipped default today (`JARVIS_WHISPER_MODEL`). On CPU-only, `base` is still the better setting — medium cpu int8 is 3.82× realtime.
+
 | configuration | model load | decode | speed |
 | --- | --- | --- | --- |
-| medium cuda float16 (previous default) | 3.66 s | 1.53 s | 0.21× realtime |
-| **base cuda float16 (new default)** | **0.53 s** | **0.42 s** | **0.06× realtime** |
+| medium cuda float16 | 3.66 s | 1.53 s | 0.21× realtime |
+| base cuda float16 (the default chosen in this pass, since revised back to medium) | 0.53 s | 0.42 s | 0.06× realtime |
 | tiny cuda float16 | 0.37 s | 0.37 s | 0.05× realtime |
 | medium cpu int8 (the fallback path) | 6.92 s | 27.65 s | 3.82× realtime |
 
 The perceived "speech → text" gap was three things stacked, and only one of them
-was STT: the fixed **1.2 s pause threshold** (`PAUSE_THRESHOLD_SECONDS`, paid on
+was STT: the fixed **pause threshold** (then 1.2 s, since reduced to 0.7 s; `PAUSE_THRESHOLD_SECONDS`, paid on
 every turn before STT even starts), the decode itself, and **queueing behind the
 live partials** (they shared the daemon's single `_lock` with the final request).
 Three changes, all reversible:
@@ -1398,3 +1498,69 @@ Every query answered "I'm having trouble connecting. Please try again." Root-cau
 ### STT hallucinations were being answered as user speech (2026-09-24)
 
 With the headset AEC degraded, 26 frames of Jarvis's own TTS were captured into the microphone and local Whisper transcribed the noise into memorised filler that the brain then answered as commands ("jarvis, a ver si te acuerdas de esto", "jervis, wake up, jervis, utho, jago, chalu", and "chalu, chalu, ..." loops — the wake-bias prompt echoed verbatim). Three fixes: (1) `whisper_daemon.py` had applied the wake-bias `INITIAL_PROMPT` to EVERY transcription — it is now opt-in via `X-Jarvis-Purpose: wake`, sent only by `watcher._transcribe_with_daemon`, so conversation transcription runs unbiased; (2) a deterministic `is_hallucinated_transcript()` gate in `backend/services/transcription.py` rejects prompt-vocabulary echoes (5+ tokens from the wake vocabulary), looped tokens/phrases, memorised silence phrases and filler-only utterances, while never rejecting real commands, short wake phrases, literal payloads or repeated safety words; (3) the gate is wired at every commit boundary — listener partial windows, each STT engine's accept inside `recognize_multilingual` (a hallucination falls through to the next engine), the final `listen()` commit belt, the watcher's `is_wake_word` (a prompt echo could otherwise false-LAUNCH the stack) and `_add_candidates`. `test_stt_hallucination_gate.py` (26 cases); adjacent suites 240 green.
+
+## Recent Improvements (2026-10)
+
+The S-series latency/intelligence wave. This is the newest work in the repo and the largest architectural change since F56. **Every one of these commits was previously absent from this map.**
+
+### S19 — state pushed over one event channel instead of polled (`a0ec729`)
+
+The voice worker used to ASK the backend "is a task running?" and "is voice enabled?" on a 1 s-cached poll, so a change landed up to a second late and the listener could hold off or mute wrongly. S19 pushes each change the moment it happens.
+
+- **`backend/services/event_bus.py`** (new) — dependency-free thread-safe pub/sub: `subscribe`/`unsubscribe`/`publish`/`snapshot`, bounded queue (64, drops OLDEST so a wedged reader cannot grow unbounded), optional cross-thread `wakeup`, and a `reset()` test seam. A late or reconnecting subscriber gets a merged snapshot replayed first.
+- **`GET /events`** (SSE) — one channel carrying `snapshot` then live `task_running` / `voice_enabled` / `voice_state`, with a 15 s `: ping` heartbeat. It is an **async generator that holds no thread-pool slot**, so unlike the chat streams it cannot starve barge-in.
+- **Emitters** — `brain.set_opencode_task_running`, `listener_state.set_voice_input_enabled`, and `routes.publish_voice_state` → `_emit_voice_activity` (change-detected, so the 1 s heartbeat never floods the channel).
+- **`voice_mode.py`** — `_apply_pushed_state` folds pushed truth into the two poll caches (refreshing their TTLs); `_task_state_push_loop` reconnects with backoff. **The 1 s polls stay as the fallback** if the channel drops.
+- The Electron renderer can adopt `/events` in place of its `/ui-state` poll; that swap is deliberately left to the UI layer (a browser `EventSource` cannot send the auth header). Tests: `backend/tests/test_s19_event_channel.py` (17).
+
+### English-only whisper transcription (`8ae2294`)
+
+`whisper_daemon.TRANSCRIBE_LANGUAGE` (default `en`, override `JARVIS_WHISPER_LANGUAGE`) is now passed as `language=` to `model.transcribe`; `watcher.WHISPER_LANGUAGE` applies the same pin on the in-process fallback. `RECOGNITION_LANGUAGES` defaults to `("en-IN",)` in both `watcher.py` and `services/listener.py`.
+
+Root cause of the reported "Telugu" transcripts: Whisper **auto-detect** hallucinating random-language sentences on noisy/echo audio, not translation. The brain then answered them as user speech.
+
+### Whisper medium + a 0.7 s utterance-end pause (`bedd9e0`)
+
+`whisper_daemon.MODEL_SIZE` and `watcher.WHISPER_MODEL_SIZE` default `base`→**`medium`**; `listener.PAUSE_THRESHOLD_SECONDS` default `1.2`→**`0.7`**. Caveat: medium is fine on CUDA (~1.5 s decode) but much slower CPU-only — `JARVIS_WHISPER_MODEL=base` reverts. **This supersedes the P0-02 "frozen 1.2 s" standing decision above.**
+
+### Live chat 400s + a barge-in stop lost to a stale socket (`9839fe8`)
+
+- `_thinking_config()` now returns `None` (omitting `thinkingConfig`) when the budget is 0 — `gemini-3.5-flash-lite` rejects an explicit `{"thinkingBudget": 0}` with 400 INVALID_ARGUMENT. On a 400 naming a bad argument, `ask_gemini_chat` replays once without it.
+- `_SpeakStopWorker._deliver` re-dials a fresh socket immediately when the keep-alive socket is dead (`_is_stale_socket`), so a barge-in stop is never lost. HTTP answers (401/403) are still not retried.
+- Tests: `backend/tests/test_live_chat_and_bargein_fixes.py` (12).
+
+### S6 — one LLM call classifies the turn and answers it (`1fd635a`)
+
+The router's JSON now carries a `reply`, and the brain speaks it (`handle_chat(..., answered=router_reply)`). **A normal chat turn costs one LLM call instead of two.** Paired with `JARVIS_CHAT_FASTPATH` (default on), which lets definitely-plain chat skip the network entirely via `is_definitely_plain_chat`. Tests: `test_s06_router_answers_chat.py`.
+
+### S5 — one STT engine per utterance, its output final (`c7b2128`)
+
+`listener.py:443-476` and `watcher.py:934-948` each run exactly ONE engine, ONE pass; a failure sets `LAST_STT_FAILURE` and there is no fall-through. This is the final shape of P0-03.
+
+### S7 — one live Fish WebSocket session per reply (`066220c`)
+
+`fish_voice.py` gained `_FishReplySession`, `open_ws_reply` and `play_ws_reply`: one bidirectional Fish session per reply instead of an HTTP POST per chunk. The HTTP ladder survives as the fallback; `JARVIS_FISH_WS` is the kill switch and `backend/tests/conftest.py` forces it to 0 for the whole test run. Tests: `test_s07_fish_ws.py` (324 lines).
+
+### S18 — conversation continues during a task; actions queue (`66bacbc`)
+
+**The full voice mute is gone.** Committed utterances are submitted *while a task runs*; the backend answers conversationally and queues action requests (max 3 in flight) instead of refusing them. This relaxes the single-voice rule described in the 2026-08 entry above. `test_voice_task_mute.py` was rewritten.
+
+### S13 — delivered background results join the conversation history (`2ce627f`)
+
+A delivered async result becomes part of the history rather than an orphan spoken fragment. Tests: `test_s13_background_history.py`.
+
+### S29 — neural-VAD-driven utterance endpointing (`acc366e`)
+
+**NEW `backend/services/neural_vad.py`** (227 lines): Silero on ONNX with 100 ms-on / 200 ms-off hysteresis, wired into `listener.py` (`make_speech_endpoint`). `webrtcvad` survives only as the no-model fallback judge. Kill switch `JARVIS_NEURAL_ENDPOINT=0`. **This is the second supersession of the P0-02 end-of-speech standing decision.** Tests: `test_s29_neural_endpointing.py`.
+
+### S28 — AEC alignment: lag estimation, joint window, off-thread prefetch (`80c094e`)
+
+`echo_cancel.py` grew ~350 lines: `DelayEstimator` cross-correlation lag lock, a joint last-5-frame compare window (`AEC_GATE_HISTORY_FRAMES`), off-thread reference prefetch, fp-exact overflow trim, and a `lag` block in `state()` now surfaced by `GET /aec/state`. Tunable via eight `JARVIS_AEC_*` vars. Tests: `test_s28_aec_alignment.py`.
+
+### S1 + S12 + S23 + S26 + S27 — voice-path latency & clarity batch (`8d89dae`)
+
+One commit carrying five audit items: a whole-word gate on memory search; a spoken-style `voice_compact` prompt with a minute-precision time note; a smoothed TTS output limiter (removes ~6 dB per-chunk jumps); pooled keep-alive sessions for fireworks/grok/gemini with prewarm warming the clients' own pools; and explicit reasoning controls (Gemini `thinkingConfig`, Groq `reasoning_effort=none`, OpenRouter via the registry snapshot). Tests: `test_s27_reasoning_controls.py`.
+
+### F56 — local Ollama models as selectable brains (`f004e36`, `cfd1f7f`)
+
+Tag `local-models`. Documented in full at the top of this map ("Local models as selectable brains"). `cfd1f7f` additionally fixes the active checkmark in the INTENT CLASSIFIER MODEL list.

@@ -17,6 +17,38 @@ from backend.services.opencode_client import BRAVE_MCP_PORT, BRAVE_MCP_TOKEN
 _DEFAULT_URL = "http://127.0.0.1:%d/mcp" % BRAVE_MCP_PORT
 _INITIALIZE_ID = 1
 
+#: L-6: the ONLY failures a request may be replayed after. An HTTP 404 on a
+#: sessioned POST, or a JSON-RPC error naming the session itself, proves the
+#: server rejected the request BEFORE dispatch — so replaying it after a
+#: fresh handshake cannot double-execute a mutation. Every other failure
+#: (500s, timeouts, transport drops) still propagates untouched: the
+#: agent's own retry policy owns those, and a possibly-committed mutation
+#: is never auto-replayed after an ambiguous failure.
+_SESSION_DEAD_MARKERS = (
+    "invalid session",
+    "unknown session",
+    "session not found",
+    "session expired",
+    "no such session",
+    "session closed",
+)
+
+
+def _is_session_death(exc):
+    """True when *exc* proves the daemon forgot our MCP session."""
+    try:
+        status = int(getattr(getattr(exc, "response", None),
+                             "status_code", None))
+    except (TypeError, ValueError):
+        status = None
+    if status == 404:
+        return True
+    try:
+        message = ("%s" % exc).lower()
+    except Exception:
+        return False
+    return any(marker in message for marker in _SESSION_DEAD_MARKERS)
+
 
 class BraveMcpClient:
     """Minimal MCP client over requests.Session, one shared browser session.
@@ -34,6 +66,10 @@ class BraveMcpClient:
         self._session_id = None
         self._next_id = _INITIALIZE_ID
         self._last_mcp_ms = 0
+        #: L-6: successful session re-handshakes performed by reconnect().
+        #: Lets pool owners tell a reborn session (tool cache is suspect)
+        #: from the one they cached against.
+        self.reconnects = 0
         #: F38: non-text content blocks of the LAST call, preserved verbatim
         #: instead of being discarded. An image the daemon returned INLINE
         #: (rather than writing ``path``) used to reach the agent as the bare
@@ -115,7 +151,31 @@ class BraveMcpClient:
             timeout=self.timeout,
         )
 
-    def _request(self, method, params=None):
+    def reconnect(self):
+        """Drop the dead session and hand-shake a fresh one (L-6).
+
+        Used when the daemon was restarted or upgraded underneath us: the
+        old session id 404s, so a new initialize is the only way back.
+        The TCP session is replaced too — a keep-alive connection to the
+        dead daemon is not worth reusing. Raises when the fresh handshake
+        fails, leaving _session_id None so pool owners drop this client.
+        """
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+        self._session_id = None
+        try:
+            self.connect()
+        except Exception:
+            self._session_id = None
+            raise
+        self.reconnects += 1
+        logging.info("[BRAVE-MCP] session re-established (reconnect #%d)",
+                     self.reconnects)
+
+    def _request(self, method, params=None, _healed=False):
         self._next_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -123,20 +183,30 @@ class BraveMcpClient:
             "id": self._next_id,
             "params": params or {},
         }
-        _sw_t0 = time.monotonic()
-        response = self.session.post(
-            self.base_url,
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        self._last_mcp_ms = int((time.monotonic() - _sw_t0) * 1000)
-        response.raise_for_status()
-        body = self._parse_body(response, payload["id"])
-        error = body.get("error")
-        if error is not None:
-            raise RuntimeError(error.get("message", str(error)))
-        return body.get("result", {})
+        try:
+            _sw_t0 = time.monotonic()
+            response = self.session.post(
+                self.base_url,
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            self._last_mcp_ms = int((time.monotonic() - _sw_t0) * 1000)
+            response.raise_for_status()
+            body = self._parse_body(response, payload["id"])
+            error = body.get("error")
+            if error is not None:
+                raise RuntimeError(error.get("message", str(error)))
+            return body.get("result", {})
+        except Exception as exc:
+            # L-6: exactly ONE re-handshake + replay, and only for proven
+            # never-dispatched requests (see _SESSION_DEAD_MARKERS). A
+            # second session-death, or any other failure, propagates to
+            # the agent's own retry policy untouched.
+            if not _healed and _is_session_death(exc):
+                self.reconnect()
+                return self._request(method, params, _healed=True)
+            raise
 
     def list_tools(self):
         """Return the tool descriptors [{name, description, input_schema}]."""

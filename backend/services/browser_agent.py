@@ -4870,7 +4870,7 @@ def _is_clarifying_question(text):
 
 
 def _agent_loop(client, task_description, started, stats=None, job=None,
-                checkpoint=None):
+                checkpoint=None, cached_tools=None):
     """Run the model/tool loop; returns the final TaskResult.
 
     The end-of-task STOPWATCH summary is emitted on EVERY exit path -
@@ -4880,6 +4880,9 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
     *checkpoint* (F08) is the suspended run being resumed: its verified
     progress is restored into the session and its committed actions are handed
     to the model as a do-not-repeat list.
+
+    *cached_tools* (L-6) are raw tools/list defs from the pool cache: the
+    inner loop advertises them without another wire round trip.
     """
     if stats is None:
         stats = _SwStats()
@@ -4890,7 +4893,7 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
     try:
         result = _agent_loop_inner(client, task_description, started, stats,
                                    job=job, checkpoint=checkpoint,
-                                   trace=trace)
+                                   trace=trace, cached_tools=cached_tools)
     finally:
         _emit_summary(stats, started)
     if result is not None:
@@ -4902,11 +4905,17 @@ def _agent_loop(client, task_description, started, stats=None, job=None,
 
 
 def _agent_loop_inner(client, task_description, started, stats, job=None,
-                      checkpoint=None, trace=None):
-    try:
-        tool_defs = client.list_tools()
-    except Exception as exc:
-        return _fail_and_log("tools/list failed: %s" % exc)
+                      checkpoint=None, trace=None, cached_tools=None):
+    if cached_tools is not None:
+        # L-6: the pool already knows the daemon's tool list (code-static),
+        # so the task starts without a tools/list round trip.
+        tool_defs = list(cached_tools)
+    else:
+        try:
+            tool_defs = client.list_tools()
+        except Exception as exc:
+            return _fail_and_log("tools/list failed: %s" % exc)
+        _note_pooled_tools(client, tool_defs)
     # Allowlist the daemon tools BEFORE the model ever sees them.
     tool_defs = [
         tool for tool in tool_defs
@@ -5076,6 +5085,206 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
     return _fail_and_log("exceeded max steps (%d)" % config.BROWSER_AGENT_MAX_STEPS)
 
 
+# ── L-6: pooled MCP session + tool-list cache ─────────────────────────────
+# Verified 2026-10-03 against current code: every task built a fresh
+# BraveMcpClient, paid initialize + notifications/initialized (2 RTTs) plus a
+# tools/list round trip, then closed the session — while the daemon itself
+# stays warm across tasks (ensure_brave_mcp_daemon is idempotent, the
+# watcher boots it at startup) and the tool list is code-static (server.mjs
+# defines tools via server.tool(); the client allowlist is a frozenset).
+# So the pool keeps ONE connected session across sequential tasks and
+# remembers the raw tool defs; the per-task ensure_daemon call STAYS (it is
+# what restarts a dead daemon — the pool never skips it).
+#
+# Deliberate deviations from the audit sketch, all safety-driven:
+# - No borrow-time health-check RTT. Reuse is optimistic; a restarted daemon
+#   surfaces as a session-death signal that BraveMcpClient heals itself
+#   (reconnect + exactly one replay of the proven-never-dispatched request).
+# - Concurrent tasks never share a session (request ids would collide):
+#   the pool hands out ONE client at a time (checkout flag); a second live
+#   task takes the legacy private-client path (connect + close, as before).
+# - Only REAL clients are pooled. Tests patch browser_agent.BraveMcpClient,
+#   so the factory-identity check below routes every mock down the legacy
+#   path and the existing suite behaves byte-identically to before.
+# - The tool cache is dropped whenever the session is reborn (reconnects
+#   generation check): a daemon upgrade may have changed the tool list.
+# - Speculative navigation (navigating while the model drafts turn 0) is
+#   OUT of scope: it changes first-turn task semantics and needs benchmark
+#   proof first.
+# Kill switches (default on): JARVIS_MCP_POOL=0 disables pooling,
+# JARVIS_MCP_PREWARM=0 disables the confirmation-gap prewarm.
+_TRUE_CLIENT_CLS = BraveMcpClient
+_POOL_LOCK = threading.Lock()
+_POOLED_CLIENT = None
+_POOLED_KEY = None
+_POOLED_LAST_USE = 0.0
+_POOLED_IN_USE = False
+_POOL_IDLE_TTL_S = 180.0
+_CACHED_TOOL_DEFS = None  # (pool key, reconnects generation, [raw defs])
+
+
+def _pool_enabled():
+    return str(os.getenv("JARVIS_MCP_POOL", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _prewarm_enabled():
+    return str(os.getenv("JARVIS_MCP_PREWARM", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _borrow_mcp_client(timeout):
+    """Check out an MCP client: (client, cached_tools_or_None, pooled).
+
+    Pooled clients are returned to the slot via _return_mcp_client (never
+    closed); legacy clients (patched factory in tests, pool disabled, or a
+    second concurrent task) are private and must be closed by the caller.
+    NEVER raises pool bookkeeping errors — a broken pool degrades to a
+    private client, never to a failed task.
+    """
+    factory = BraveMcpClient
+    if not _pool_enabled() or factory is not _TRUE_CLIENT_CLS:
+        client = factory(timeout=timeout)
+        client.connect()
+        return client, None, False
+    global _POOLED_CLIENT, _POOLED_KEY, _POOLED_LAST_USE, _POOLED_IN_USE
+    global _CACHED_TOOL_DEFS
+    now = time.monotonic()
+    stale = None
+    with _POOL_LOCK:
+        if _POOLED_CLIENT is not None and not _POOLED_IN_USE:
+            if now - _POOLED_LAST_USE <= _POOL_IDLE_TTL_S:
+                _POOLED_IN_USE = True
+                client = _POOLED_CLIENT
+                cached = _CACHED_TOOL_DEFS
+                if (cached is None or cached[0] != _POOLED_KEY
+                        or cached[1] != client.reconnects):
+                    cached = None
+                try:
+                    client.timeout = timeout
+                except Exception:
+                    pass
+                return client, (cached[2] if cached else None), True
+            stale = _POOLED_CLIENT
+            _POOLED_CLIENT = None
+            _POOLED_KEY = None
+            _CACHED_TOOL_DEFS = None
+    if stale is not None:
+        try:
+            stale.close()
+        except Exception:
+            pass
+    client = factory(timeout=timeout)
+    client.connect()
+    try:
+        key = (client.base_url, client.token)
+    except Exception:
+        return client, None, False
+    with _POOL_LOCK:
+        if _POOLED_CLIENT is None:
+            _POOLED_CLIENT = client
+            _POOLED_KEY = key
+            _POOLED_LAST_USE = time.monotonic()
+            _POOLED_IN_USE = True
+            return client, None, True
+    return client, None, False
+
+
+def _return_mcp_client(client, pooled):
+    """Return a borrowed client: pooled ones go back to the slot, the rest
+    are closed exactly as before. A client whose session died unrecoverably
+    (_session_id None after a failed reconnect) is dropped, never re-pooled.
+    """
+    if client is None:
+        return
+    if not pooled:
+        try:
+            client.close()
+        except Exception:
+            pass
+        return
+    global _POOLED_CLIENT, _POOLED_KEY, _POOLED_IN_USE, _POOLED_LAST_USE
+    global _CACHED_TOOL_DEFS
+    drop = True
+    with _POOL_LOCK:
+        if client is _POOLED_CLIENT:
+            try:
+                alive = client._session_id is not None
+            except Exception:
+                alive = False
+            if alive:
+                _POOLED_IN_USE = False
+                _POOLED_LAST_USE = time.monotonic()
+                drop = False
+            else:
+                _POOLED_CLIENT = None
+                _POOLED_KEY = None
+                _CACHED_TOOL_DEFS = None
+    if drop:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _note_pooled_tools(client, raw_defs):
+    """Remember a fresh tools/list for the pooled client (L-6 cache fill)."""
+    global _CACHED_TOOL_DEFS
+    try:
+        with _POOL_LOCK:
+            if (client is not None and client is _POOLED_CLIENT
+                    and _POOLED_KEY is not None):
+                _CACHED_TOOL_DEFS = (
+                    _POOLED_KEY, client.reconnects, list(raw_defs))
+    except Exception:
+        pass
+
+
+def reset_mcp_pool():
+    """Close and forget the pooled session (tests; never used by tasks)."""
+    global _POOLED_CLIENT, _POOLED_KEY, _POOLED_LAST_USE, _POOLED_IN_USE
+    global _CACHED_TOOL_DEFS
+    with _POOL_LOCK:
+        pooled, _POOLED_CLIENT = _POOLED_CLIENT, None
+        _POOLED_KEY = None
+        _CACHED_TOOL_DEFS = None
+        _POOLED_IN_USE = False
+        _POOLED_LAST_USE = 0.0
+    if pooled is not None:
+        try:
+            pooled.close()
+        except Exception:
+            pass
+
+
+def prewarm_mcp_pool(timeout=None):
+    """Warm the pooled session + tool cache on the CALLER's thread (L-6).
+
+    Meant to run on a daemon thread while the user reads the confirmation
+    prompt, so connect + tools/list happen inside the approval gap instead
+    of after "yes". Best effort and side-effect free: no navigation, no task
+    state, never spawns the daemon (a down daemon just fails fast here and
+    the real task path ensures + connects as before). NEVER raises.
+    """
+    try:
+        if not _prewarm_enabled():
+            return
+        tmo = (timeout if timeout is not None
+               else config.BROWSER_AGENT_TOOL_TIMEOUT)
+        with _POOL_LOCK:
+            if (_POOLED_CLIENT is not None and time.monotonic()
+                    - _POOLED_LAST_USE <= _POOL_IDLE_TTL_S):
+                return  # already warm (or held by a live task — warm enough)
+        client, cached, pooled = _borrow_mcp_client(tmo)
+        try:
+            if cached is None:
+                _note_pooled_tools(client, client.list_tools())
+        finally:
+            _return_mcp_client(client, pooled)
+    except Exception:
+        pass
+
+
 def run_browser_task(task_description, job=None, resume_from=None):
     """Run one browser-automation task end to end. NEVER raises: returns a
     TaskResult (str-compatible: str() is the model's final summary, or
@@ -5101,12 +5310,17 @@ def run_browser_task(task_description, job=None, resume_from=None):
         _STOP_REQUESTED.clear()
     owns_job = job is None
     client = None
+    pooled = False
+    cached_tools = None
     try:
         try:
             if not ensure_brave_mcp_daemon():
                 return TaskResult.failed("brave MCP daemon could not be started")
-            client = BraveMcpClient(timeout=config.BROWSER_AGENT_TOOL_TIMEOUT)
-            client.connect()
+            # L-6: sequential tasks reuse one pooled session + tool cache
+            # (initialize/handshake/list_tools paid once); the ensure above
+            # still runs every task so a dead daemon is restarted first.
+            client, cached_tools, pooled = _borrow_mcp_client(
+                timeout=config.BROWSER_AGENT_TOOL_TIMEOUT)
         except Exception as exc:
             return TaskResult.failed(str(exc))
         if owns_job:
@@ -5121,12 +5335,10 @@ def run_browser_task(task_description, job=None, resume_from=None):
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         append_activity_line("\n=== %s === %s ===\n" % (stamp, task_description))
         return _agent_loop(client, task_description, started, stats, job=job,
-                           checkpoint=checkpoint)
+                           checkpoint=checkpoint, cached_tools=cached_tools)
     finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+        # L-6: pooled clients go back to the slot; private ones are closed
+        # exactly as before.
+        _return_mcp_client(client, pooled)
         if owns_job and job is not None:
             job.finish()
