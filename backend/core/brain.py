@@ -3433,6 +3433,159 @@ def split_stop_and_redirect(msg):
     return stop_half, redirect
 
 
+#: R7 — a correction REVISES the pending/armed request instead of adding a
+#: new one. "That was meant to be a check (whether folder Malik exists)",
+#: "I meant check, not create", "actually just look" — the old create idea
+#: is thrown away, its yes dies with it, and the replacement runs its own
+#: route (read-only checks need no approval).
+_CORRECTION_RE = re.compile(
+    r"\bthat\s+was\s+(?:meant\s+to\s+be|supposed\s+to\s+be)\b"
+    r"|\bi\s+meant\s+(?:to\s+)?(?:check|look|see|verify|inspect|list|"
+    r"create|make|write)\b"
+    r"|\bactually\s+(?:just\s+)?(?:check|look|see|verify|inspect|list)\b"
+    r"|\bno\s*,?\s*i\s+meant\s+(?:check|look|see)\b"
+    r"|\bcorrection\s*:",
+    re.IGNORECASE,
+)
+
+#: R7 — the replacement KIND carried by the correction: check-family words
+#: mean a read-only inspect; create-family words mean a write.
+_CORRECTION_CHECK_RE = re.compile(
+    r"\bcheck\b|\bverify\b|\bconfirm\b|\bsee\b|\bshow\b|\blist\b|"
+    r"\binspect\b|\blook\b|\bexist\w*\b|\bquick\s+look\b",
+    re.IGNORECASE,
+)
+_CORRECTION_CREATE_RE = re.compile(
+    r"\bcreate\b|\bmake\b|\bwrite\b|\bsave\b",
+    re.IGNORECASE,
+)
+
+
+def is_correction(msg):
+    """R7: True when the turn revises the previous request, not a new one."""
+    return bool(_CORRECTION_RE.search(msg or ""))
+
+
+def _cancel_armed_gates(reason):
+    """R7: kill every armed approval + held clarification so the old yes dies.
+
+    Returns True when SOMETHING was actually armed (a create was pending),
+    False when there was nothing to cancel.
+    """
+    global _pending_opencode_task, _pending_confirmation
+    cancelled = False
+    try:
+        from backend.services.task_agent import agent as _ta
+        if _ta.has_pending_task_confirmation():
+            cancelled = True
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            if _pending_opencode_task:
+                cancelled = True
+    except Exception:
+        pass
+    try:
+        with _confirmation_lock:
+            if _pending_confirmation:
+                cancelled = True
+    except Exception:
+        pass
+    try:
+        from backend.services import approvals as _ap
+        if _ap.pending() is not None:
+            cancelled = True
+    except Exception:
+        pass
+    if not cancelled:
+        return False
+    try:
+        from backend.services.task_agent import agent as _ta2
+        _ta2.cancel_pending_task_confirmation(
+            reason or "revised by correction")
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            _pending_opencode_task = None
+    except Exception:
+        pass
+    try:
+        with _confirmation_lock:
+            _pending_confirmation = None
+    except Exception:
+        pass
+    try:
+        from backend.services import approvals as _ap2
+        _ap2.cancel(reason or "revised by correction")
+    except Exception:
+        pass
+    try:
+        _clear_browser_clarification()
+    except Exception:
+        pass
+    return True
+
+
+def handle_correction(msg, from_voice=False, voice_compact=False):
+    """R7: replace the old request with the corrected one — never add.
+
+    Cancels every armed gate (the old yes dies), marks the superseded
+    notebook record, then routes the CORRECTION text itself: a check-shaped
+    correction runs read-only immediately; anything else falls through to
+    normal routing. A correction with nothing pending is just its own
+    request — also routed, never refused.
+    """
+    text = (msg or "").strip()
+    was_pending = _cancel_armed_gates("revised by correction: %s" % text[:120])
+    try:
+        snap = notebook_snapshot()
+        reqs = snap.get("requests") or []
+        if reqs:
+            notebook_mark_state(reqs[-1].get("id"), "superseded")
+    except Exception:
+        pass
+    if _CORRECTION_CHECK_RE.search(text) and not _CORRECTION_CREATE_RE.search(text):
+        try:
+            from backend.services.task_agent import agent as _ta
+            plan = _ta.plan_task(text, _ta.gather_context())
+            steps = plan.get("steps") or [] if isinstance(plan, dict) else []
+            if steps and all(
+                    str(s.get("tool") or "") in (
+                        "code.list_directory", "code.read_file")
+                    for s in steps if isinstance(s, dict)):
+                result = _ta.execute_plan(plan, _ta.gather_context())
+                reply = str(result or "")
+                return ("Sir, understood — checking instead. %s" % reply
+                        if reply else
+                        "Sir, understood — checking instead. Nothing to show.")
+        except Exception as exc:
+            logging.warning("[CORRECTION] Replacement check failed: %s", exc)
+    if was_pending:
+        return ("Sir, understood — I dropped the earlier request and will "
+                "take this one instead. %s" % text)
+    return None
+    """R6: split "stop X and do Y" into (stop_half, redirect_half).
+
+    Returns (None, None) when the turn is not a compound. The stop half must
+    contain a real stop phrase; the redirect half must be non-trivial text.
+    "Did you stop it?" (status) never splits — it has no redirect half.
+    """
+    if not msg or not msg.strip():
+        return None, None
+    match = _STOP_AND_REDIRECT_RE.match(msg.strip())
+    if not match:
+        return None, None
+    stop_half = (match.group("stop") or "").strip()
+    redirect = (match.group("redirect") or "").strip()
+    if len(redirect) < 3:
+        return None, None
+    if is_status_question(msg):
+        return None, None
+    return stop_half, redirect
+
+
 def _browser_quiescent():
     """R6: True when no browser work is observably in flight.
 
@@ -4572,6 +4725,24 @@ def _process_message_inner(
                 return held_reply
     except Exception as exc:
         logging.warning("[STOP] Held redirect release failed: %s", exc)
+
+    # ── R7: correction replaces, never adds ──
+    # "That was meant to be a check" kills the armed create preview (its yes
+    # dies with it) and routes the correction as the ONE live request. Runs
+    # before the confirmation gates so the old preview can never eat it as
+    # an "unclear" answer — and before status so "that was meant to be..."
+    # is never misread as a status question.
+    try:
+        if is_correction(msg):
+            print("[CORRECTION] Revision replaces pending request:", msg)
+            correction_reply = handle_correction(
+                msg, from_voice=from_voice, voice_compact=voice_compact)
+            if correction_reply is not None:
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, correction_reply)
+                return correction_reply
+    except Exception as exc:
+        logging.warning("[CORRECTION] Revision handling failed: %s", exc)
 
     # ── R6: "stop X and do Y" splits into control + held redirect ──
     # The stop half signals the worker NOW through the control path; the

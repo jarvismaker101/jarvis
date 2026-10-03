@@ -2771,6 +2771,21 @@ def arm_task_confirmation(plan, context, task_text="", preview=""):
     return record
 
 
+def cancel_pending_task_confirmation(reason=""):
+    """R7: drop the armed task preview WITHOUT running anything.
+
+    The correction path calls this so the old yes dies with the old plan —
+    a later "yes" can never authorize the superseded effect.
+    """
+    global _pending_task_action
+    with _task_confirm_lock:
+        _pending_task_action = None
+    try:
+        approvals.cancel(reason or "cancelled")
+    except Exception:
+        pass
+
+
 def confirmation_prompt(plan):
     """The byte-identical confirmation preview for *plan* (F02).
 

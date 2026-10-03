@@ -929,5 +929,45 @@ class R14NoActionVoiceTests(unittest.TestCase):
             bool(brain._ACTION_CLAIM_RE.search("Quick lookup for that, sir.")))
 
 
+class R7CorrectionReplacesTests(unittest.TestCase):
+    """R7: "that was meant to be a check" revises, never adds."""
+
+    def test_detector(self):
+        self.assertTrue(brain.is_correction(
+            "that was meant to be a check whether folder Malik exists"))
+        self.assertTrue(brain.is_correction("actually just check it"))
+        self.assertFalse(brain.is_correction(
+            "stop the browser task and create a folder named x"))
+
+    def test_correction_kills_armed_preview(self):
+        from backend.services.task_agent import agent as _ta
+        plan = {"ok": True, "requires_confirmation": True,
+                "command_text": "create file q.txt with hello",
+                "steps": [{"tool": "code.write_file",
+                           "args": {"path": "q.txt", "content": "hello"},
+                           "risk": "safe"}]}
+        _ta.arm_task_confirmation(plan, {}, task_text="create file q.txt")
+        self.assertTrue(_ta.has_pending_task_confirmation())
+        reply = brain.process_message(
+            "that was a mistake, actually just check whether folder "
+            "Malik exists",
+            sync_voice=False)
+        self.assertFalse(_ta.has_pending_task_confirmation())
+        self.assertNotIn("confirm task", (reply or "").lower())
+
+    def test_stale_yes_cannot_run_superseded_plan(self):
+        from backend.services.task_agent import agent as _ta
+        plan = {"ok": True, "requires_confirmation": True,
+                "command_text": "create file q.txt with hello",
+                "steps": [{"tool": "code.write_file",
+                           "args": {"path": "q.txt", "content": "hello"},
+                           "risk": "safe"}]}
+        _ta.arm_task_confirmation(plan, {}, task_text="create file q.txt")
+        brain.process_message(
+            "that was meant to be a check whether folder Malik exists",
+            sync_voice=False)
+        self.assertIsNone(_ta.consume_task_confirmation("yes"))
+
+
 if __name__ == "__main__":
     unittest.main()
