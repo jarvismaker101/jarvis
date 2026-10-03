@@ -17,12 +17,26 @@ from backend.services import research_browser
 
 
 class _FakePage:
-    def __init__(self, context, name=""):
+    def __init__(self, context, name="", url=""):
         self.context = context
         self.name = name
+        self._url = url
         self.closed = False
         #: Records every attribute read so a test can prove a call was made.
         self.calls = []
+
+    async def close(self):
+        self.closed = True
+        self.context.closed.append(self)
+
+    @property
+    def url(self):
+        return self._url
+
+    async def goto(self, *args, **kwargs):
+        self.calls.append(("goto", args, kwargs))
+        if args:
+            self._url = args[0]
 
     async def close(self):
         self.closed = True
@@ -43,11 +57,17 @@ class _FakeContext:
     def __init__(self):
         self.pages = []
         self.closed = []
+        # Playwright persistent contexts spawn with one default blank page.
+        self.pages.append(_FakePage(self, "default-blank", url="about:blank"))
 
     async def new_page(self):
         page = _FakePage(self, "page-%d" % len(self.pages))
         self.pages.append(page)
         return page
+
+    @property
+    def _all_pages(self):
+        return self.pages
 
 
 def _start_worker():
@@ -99,7 +119,7 @@ class AsyncJobTests(unittest.TestCase):
             return page.name
 
         name = self.worker.run(body, task_id="job-a")
-        self.assertEqual(name, "page-0")
+        self.assertEqual(name, "default-blank")
         self.assertTrue(self.worker._context.pages[0].closed)
 
     def test_timeout_cancels_the_job_and_closes_only_its_pages(self):
@@ -147,7 +167,8 @@ class AsyncJobTests(unittest.TestCase):
                 self.worker.close_task_pages("keep-a"), self.loop)
             future.result(5)
             closed = {page.name for page in self.worker._context.closed}
-            self.assertIn("page-0", closed)
+            # keep-a adopted the default blank tab; keep-b opened its own.
+            self.assertIn("default-blank", closed)
             self.assertNotIn("page-1", closed)
         finally:
             release.set()
@@ -255,6 +276,60 @@ class ShutdownOwnershipTests(unittest.TestCase):
         worker._thread.start()
         stop.set()
         self.assertTrue(worker.shutdown(wait=2))
+
+
+class BlankTabReuseTests(unittest.TestCase):
+    """Live bug: every lookup opened a second tab (the persistent context's
+    default about:blank was never touched) and cleanup closed only tracked
+    pages — so one blank tab survived every task."""
+
+    def setUp(self):
+        self.worker, self.loop, self.thread = _start_worker()
+
+    def tearDown(self):
+        _stop_worker(self.worker, self.loop, self.thread)
+
+    def test_new_page_reuses_the_default_blank_tab(self):
+        async def body(task):
+            first = await task.new_page()
+            second = await task.new_page()
+            return first, second
+
+        first, second = self.worker.run(body, task_id="reuse")
+        # First call adopts the default blank tab; the second has no blank
+        # left, so it opens a real new page.
+        self.assertEqual(first.name, "default-blank")
+        self.assertEqual(second.name, "page-1")
+        self.assertEqual(len(self.worker._context.pages), 2)
+
+    def test_no_blank_tab_survives_the_job(self):
+        async def body(task):
+            page = await task.new_page()
+            await page.goto("https://example.com")
+            return "ok"
+
+        self.assertEqual(self.worker.run(body, task_id="clean"), "ok")
+        for page in self.worker._context.pages:
+            self.assertTrue(page.closed, page.name)
+
+    def test_a_real_url_page_is_never_mistaken_for_blank(self):
+        busy = _FakePage(self.worker._context, "busy",
+                         url="https://example.com")
+        self.worker._context.pages.append(busy)
+
+        async def body(task):
+            return await task.new_page()
+
+        page = self.worker.run(body, task_id="other")
+        # The default blank is adopted (not the busy page); the busy page
+        # stays open — it may belong to a concurrent task.
+        self.assertEqual(page.name, "default-blank")
+        self.assertFalse(busy.closed)
+
+    def test_submit_reuses_the_blank_tab_too(self):
+        seen = self.worker.submit(lambda page: page.name)
+        self.assertEqual(seen, "default-blank")
+        self.assertTrue(self.worker._context.pages[0].closed)
 
 
 class QuickSearchAsyncTests(unittest.TestCase):

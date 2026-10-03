@@ -53,11 +53,62 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(here))
 
 
+def _known_folder_windows(folder_id):
+    """Resolve one Windows known-folder GUID, or None on any failure."""
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(wintypes.LPWSTR),
+        ]
+        shell32.SHGetKnownFolderPath.restype = wintypes.LONG
+        ole32.CoTaskMemFree.argtypes = [wintypes.LPVOID]
+        guid_bytes = uuid.UUID(folder_id).bytes_le
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(guid_bytes)
+        path_ptr = wintypes.LPWSTR()
+        if shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path_ptr)) != 0:
+            return None
+        path = path_ptr.value
+        try:
+            ole32.CoTaskMemFree(path_ptr)
+        except Exception:
+            pass
+        return path or None
+    except Exception:
+        return None
+
+
+#: FOLDERID_Desktop — the real desktop dir (often OneDrive-redirected, so
+#: ~/Desktop must never be assumed).
+_DESKTOP_FOLDER_ID = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
+
+
+def _real_desktop_dir():
+    """The machine's real Desktop dir, or None when it cannot be resolved."""
+    if os.name == "nt":
+        resolved = _known_folder_windows(_DESKTOP_FOLDER_ID)
+        if resolved:
+            return resolved
+    try:
+        home = os.path.expanduser("~")
+    except Exception:
+        return None
+    return os.path.join(home, "Desktop") if home else None
+
+
 def default_roots():
     """Roots a write/execution is allowed inside, by default.
 
     The system temp dir is included so scratch work and the test-suite keep
-    behaving; ``JARVIS_CODE_SCOPE=strict`` removes it.
+    behaving; ``JARVIS_CODE_SCOPE=strict`` removes it. The user's Desktop is
+    included because folder/file requests name it explicitly ("create a
+    folder on the desktop ...") and those requests are already user-explicit
+    AND spoken-previewed AND confirmation-gated — denying them after the
+    user confirmed is the worst outcome (consent given, work refused).
     """
     roots = [_repo_root(), os.getcwd()]
     try:
@@ -66,6 +117,12 @@ def default_roots():
         tmp = None
     if tmp:
         roots.append(tmp)
+    try:
+        desk = _real_desktop_dir()
+    except Exception:
+        desk = None
+    if desk:
+        roots.append(desk)
     configured = os.getenv(ROOTS_ENV, "")
     if configured.strip():
         roots = [p for p in (part.strip() for part in configured.split(os.pathsep))

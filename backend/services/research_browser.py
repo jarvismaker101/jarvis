@@ -190,6 +190,26 @@ class ResearchTask:
     async def new_page(self):
         if self.context is None:
             raise ResearchBrowserError("research task has no browser context")
+        # A persistent context always spawns with one default about:blank
+        # page. Reuse it instead of opening a second tab: every job used to
+        # call new_page() (leaving the blank tab behind — cleanup only
+        # closes tracked pages, so the blank survived every task).
+        try:
+            existing = await maybe_await(self.context.pages)
+        except Exception:
+            existing = None
+        if existing:
+            for page in list(existing):
+                if page in self._pages:
+                    continue
+                try:
+                    url = await maybe_await(page.url)
+                except Exception:
+                    url = ""
+                if url in ("about:blank", "", None):
+                    self._pages.append(page)
+                    self.worker._track_page(self.task_id, page)
+                    return page
         page = await maybe_await(self.context.new_page())
         # Tracked twice on purpose: under the task id so an outside cancel
         # can find it, and on the task itself so an unnamed job still gets
@@ -207,8 +227,31 @@ class ResearchTask:
                 pass
 
     async def close_pages(self):
+        # The task's tracked pages go — and so does any leftover blank page
+        # nobody ever adopted (e.g. the persistent context's default page
+        # from a run that predates the new_page() reuse above, or a blank
+        # opened by other means). Only about:blank is fair game: a page
+        # with a real URL may belong to a concurrent task sharing the
+        # context. Belts-and-braces on top of the reuse — never the only
+        # mechanism, so a regression in new_page() cannot strand tabs.
         await self.worker.close_task_pages(self.task_id)
         await self.close_own_pages()
+        try:
+            existing = await maybe_await(self.context.pages)
+        except Exception:
+            return
+        if not existing:
+            return
+        for page in list(existing):
+            try:
+                url = await maybe_await(page.url)
+            except Exception:
+                continue
+            if url in ("about:blank", "", None):
+                try:
+                    await maybe_await(page.close())
+                except Exception:
+                    pass
 
 
 class ResearchBrowserWorker:
@@ -444,9 +487,11 @@ class ResearchBrowserWorker:
     def submit(self, fn, task_id=None, timeout=None):
         """Run ``fn(page)`` synchronously ON the owner thread.
 
-        For job bodies that drive a single page. The page is opened and
-        tracked before *fn* runs and closed afterwards, so ``fn`` never
-        touches a Playwright object from a foreign thread.
+        For job bodies that drive a single page. The page is opened (reusing
+        the persistent context's default blank tab when it is still blank,
+        so jobs no longer strand an about:blank tab per run) and tracked
+        before *fn* runs and closed afterwards, so ``fn`` never touches a
+        Playwright object from a foreign thread.
 
         F27: if *fn* returns an awaitable it is AWAITED here on the owner loop
         instead of being returned un-awaited. The synchronous variant used to
@@ -460,7 +505,20 @@ class ResearchBrowserWorker:
         async def _job():
             holder["task"] = asyncio.current_task()
             self._last_used = time.monotonic()
-            page = await maybe_await(self._context.new_page())
+            task = ResearchTask(self, task_id)
+            task.context = self._context
+            try:
+                page = await task.new_page()
+            except Exception:
+                page = None
+            if page is None:
+                # No context page available: run the body pageless rather
+                # than failing the whole job on the open call.
+                try:
+                    return await maybe_await(fn(None))
+                finally:
+                    await task.close_pages()
+                return
             self._track_page(task_id, page)
             try:
                 result = fn(page)

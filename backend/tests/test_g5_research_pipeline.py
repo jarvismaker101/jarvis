@@ -45,17 +45,24 @@ def _await(value):
 
 # ── fakes for the warm browser worker (F27) ───────────────────────────────
 class FakePage:
-    def __init__(self):
+    def __init__(self, url=""):
         self.closed = False
+        self._url = url
 
     async def close(self):
         self.closed = True
+
+    @property
+    def url(self):
+        return self._url
 
 
 class FakeContext:
     def __init__(self):
         self.pages = []
         self.closed = False
+        # Like a real persistent context: one default blank page at spawn.
+        self.pages.append(FakePage(url="about:blank"))
 
     async def new_page(self):
         page = FakePage()
@@ -421,7 +428,9 @@ class WarmBrowserTests(unittest.TestCase):
         self.assertTrue(second)
         # ONE Chrome for both jobs — that is the whole point of the owner.
         self.assertEqual(fake_pw.playwright.chromium.launches, 1)
-        self.assertEqual(len(context.pages), 2)
+        # Both jobs reuse the context's default blank tab (no second tab
+        # per job), and every page is closed at the end of its job.
+        self.assertEqual(len(context.pages), 1)
         self.assertTrue(all(p.closed for p in context.pages))
         self.assertTrue(context.closed)
         self.assertFalse(worker.alive)
@@ -442,6 +451,7 @@ class WarmBrowserTests(unittest.TestCase):
             finally:
                 worker.shutdown()
 
+        # Both pages: the reused default blank + one real new page.
         self.assertEqual(len(context.pages), 2)
         self.assertTrue(all(p.closed for p in context.pages))
         self.assertEqual(worker._pages.get("t1"), None)

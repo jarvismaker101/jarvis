@@ -168,6 +168,24 @@ class ConcurrentEditTests(unittest.TestCase):
 
 
 class ExecAuthorityTests(unittest.TestCase):
+    def test_the_desktop_is_a_default_workspace_root(self):
+        # Live bug: "create a folder on the desktop ..." planned fine but
+        # was denied AFTER the user confirmed — Desktop was never a root.
+        desk = code_grants._real_desktop_dir()
+        if not desk:
+            self.skipTest("no desktop dir resolvable here")
+        self.assertIn(os.path.normpath(os.path.realpath(desk)),
+                      code_grants.default_roots())
+        self.assertTrue(code_grants.is_allowed(
+            os.path.join(desk, "Mayank Malik")))
+
+    def test_explicit_roots_still_replace_the_defaults(self):
+        with patch.dict(os.environ,
+                        {code_grants.ROOTS_ENV: tempfile.gettempdir()}):
+            self.assertEqual(code_grants.default_roots(),
+                             [os.path.normpath(
+                                 os.path.realpath(tempfile.gettempdir()))])
+
     def test_out_of_scope_execution_fails(self):
         with patch.dict(os.environ, {code_tools.CODE_EXEC_ENV: "0"}):
             result = code_tools.run_command("echo nope")
