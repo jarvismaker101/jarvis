@@ -1486,6 +1486,45 @@ def _commit_chat(role, text):
         add_message(role, text)
 
 
+#: R19 — how much of a tool-call summary one history entry carries. Bounded
+#: for the same reason S13 bounds background results: history is the model's
+#: conversation window, not a work log.
+_TOOL_SUMMARY_MAX = 240
+
+
+def _remember_tool_summary(kind, summary):
+    """R19: a completed tool call leaves one compact entry in history.
+
+    Delivered browser/opencode/research terminal results already join the
+    history as ``[background result]`` (S13). This covers the native engine,
+    which spoke a string and persisted only work events: local file/folder
+    work was never recallable ("what file did you just create?"). The
+    ``[<kind>]`` marker rides in-band so the model reads it as a work note,
+    not a conversational turn, and a repeat of the immediately-preceding
+    entry is not appended again (the S13 stacking guard).
+    """
+    text = re.sub(r"\s+", " ", str(summary or "")).strip()
+    if not text:
+        return
+    if len(text) > _TOOL_SUMMARY_MAX:
+        text = text[:_TOOL_SUMMARY_MAX].rstrip()
+        cut = text.rfind(" ")
+        if cut > 0:
+            text = text[:cut].rstrip(".,;:")
+        text += "…"
+    entry = "[%s] %s" % (kind, text)
+    try:
+        recent = get_history()[-1:]
+    except Exception:
+        recent = []
+    if recent and recent[0].get("content") == entry:
+        return
+    try:
+        add_message("assistant", entry)
+    except Exception as exc:
+        logging.warning("[R19] tool summary history write failed: %s", exc)
+
+
 def _record_native_task_outcome(fallback_text=""):
     """F07/F09 — persist the NATIVE engine's terminal TaskResult.
 
@@ -1493,9 +1532,11 @@ def _record_native_task_outcome(fallback_text=""):
     be thrown away: a verified native run could never become a skill and the
     work log only saw the opencode engine. The agent keeps the last result;
     this records it (trace and verification included) exactly once per turn.
+
+    R19: the same outcome also leaves a compact ``[task]`` note in the
+    conversation history, so a later turn can recall what was done instead
+    of the exchange living only in work events.
     """
-    if memory_store is None:
-        return
     try:
         result, task_text = _last_task_result()
     except Exception:
@@ -1506,11 +1547,24 @@ def _record_native_task_outcome(fallback_text=""):
     if status not in ("completed", "partial", "failed", "stopped",
                       "needs_input", "no_action", "refused", "known_failure"):
         return
+    summary = (getattr(result, "summary", "")
+               or getattr(result, "detail", "") or "")[:200]
+    # R19: the request is bounded tightly and the outcome headline gets the
+    # larger share, so the entry's cap can never truncate away what happened.
+    label = re.sub(r"\s+", " ", str(task_text or fallback_text or "")).strip()
+    outcome = re.sub(r"\s+", " ", str(summary or "")).strip()
+    if len(label) > 100:
+        label = label[:100].rsplit(" ", 1)[0] + "…"
+    if len(outcome) > 160:
+        outcome = outcome[:160].rsplit(" ", 1)[0] + "…"
+    _remember_tool_summary("task", " — ".join(
+        part for part in (label, outcome) if part))
+    if memory_store is None:
+        return
     try:
         memory_store.record_task_outcome(
             "task_agent", status, task_text or fallback_text,
-            summary=(getattr(result, "summary", "")
-                     or getattr(result, "detail", "") or "")[:200],
+            summary=summary,
             evidence=list(getattr(result, "evidence", None) or []),
             trace=list(getattr(result, "trace", None) or []),
             verification=list(getattr(result, "verification", None) or []),

@@ -8,12 +8,17 @@ saw the opencode engine.
 Pinned here: the agent keeps the last structured result, brain records it with
 trace/verification, a turn that ran nothing records nothing, and a stale
 result can never be attributed to a later turn.
+
+R19 adds the history half: the terminal native run also leaves one compact
+``[task]`` note in the conversation, so "what file did you create?" is
+recallable from history rather than only from work events.
 """
 
 import unittest
 from unittest import mock
 
 from backend.core import brain
+from backend.core import memory
 from backend.services.task_agent import agent
 
 
@@ -62,6 +67,10 @@ class RememberResultTests(unittest.TestCase):
 
 
 class BrainNativeOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        memory.clear_history()
+        self.addCleanup(memory.clear_history)
+
     def tearDown(self):
         agent._remember_task_result(None)
 
@@ -116,6 +125,74 @@ class BrainNativeOutcomeTests(unittest.TestCase):
         with mock.patch.object(brain.memory_store, "record_task_outcome",
                                side_effect=RuntimeError("db gone")):
             brain._record_native_task_outcome("x")  # must not raise
+
+
+class ToolHistoryTests(unittest.TestCase):
+    """R19 - a completed tool run leaves one compact note in the history."""
+
+    def setUp(self):
+        memory.clear_history()
+        self.addCleanup(memory.clear_history)
+
+    def tearDown(self):
+        agent._remember_task_result(None)
+
+    def _run(self, status, summary,
+             task_text="create a file called notes.txt"):
+        result = mock.Mock(status=status, summary=summary, detail="",
+                           evidence=[], trace=[], verification=[])
+        agent._remember_task_result(result, task_text)
+        with mock.patch.object(brain.memory_store, "record_task_outcome"):
+            brain._record_native_task_outcome(task_text)
+
+    def test_a_completed_native_run_joins_the_history(self):
+        self._run("completed", "Created notes.txt at C:\\Users\\me\\notes.txt")
+        self.assertEqual(
+            memory.get_history()[-1],
+            {"role": "assistant",
+             "content": "[task] create a file called notes.txt — "
+                        "Created notes.txt at C:\\Users\\me\\notes.txt"})
+
+    def test_a_needs_input_turn_is_recallable(self):
+        self._run("needs_input", "Ready to create notes.txt — shall I?")
+        self.assertIn(
+            "[task] create a file called notes.txt — Ready to create",
+            memory.get_history()[-1]["content"])
+
+    def test_the_note_is_bounded_and_keeps_the_outcome(self):
+        self._run("completed", "Created the file. " + ("more detail " * 40),
+                  task_text="x" * 300)
+        content = memory.get_history()[-1]["content"]
+        self.assertLessEqual(
+            len(content), len("[task] ") + brain._TOOL_SUMMARY_MAX + 1)
+        self.assertIn("Created the file.", content)
+
+    def test_a_repeat_does_not_stack(self):
+        self._run("completed", "Created notes.txt")
+        self._run("completed", "Created notes.txt")
+        entries = [m for m in memory.get_history()
+                   if m["content"].startswith("[task]")]
+        self.assertEqual(len(entries), 1)
+
+    def test_a_later_different_run_still_joins(self):
+        self._run("completed", "Created notes.txt")
+        self._run("completed", "Created todo.txt", task_text="create todo.txt")
+        self.assertEqual(len(memory.get_history()), 2)
+        self.assertIn("todo.txt", memory.get_history()[-1]["content"])
+
+    def test_a_turn_that_ran_nothing_records_nothing(self):
+        agent._remember_task_result(None)
+        brain._record_native_task_outcome("nothing ran")
+        self.assertEqual(memory.get_history(), [])
+
+    def test_an_unknown_status_records_nothing(self):
+        self._run("thinking", "still going")
+        self.assertEqual(memory.get_history(), [])
+
+    def test_the_marker_names_the_activity_kind(self):
+        brain._remember_tool_summary("research", "Found two sources.")
+        self.assertEqual(memory.get_history()[-1]["content"],
+                         "[research] Found two sources.")
 
 
 if __name__ == "__main__":
