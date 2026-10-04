@@ -5364,6 +5364,11 @@ def _process_message_inner(
             if not _screen_qa_busy.acquire(blocking=False):
                 return "Still analysing your screen, sir. One moment."
             try:
+                # Conversation continuity: a screen Q&A is a real exchange.
+                # Both halves land in history like any chat turn, so a
+                # follow-up ("research the release date of this volume") can
+                # resolve its referent instead of asking what it refers to.
+                add_message("user", msg)
                 # F30 — register the capture generation BEFORE the slow vision
                 # call, so a late answer from an earlier question can be
                 # rejected rather than replacing this one.
@@ -5377,6 +5382,10 @@ def _process_message_inner(
                         pass
                 result = analyze_screen(msg)
                 tip = result.get("tip") or "I couldn't analyse the screen, sir."
+                # The spoken tip is the assistant half of the exchange; it
+                # rides the normal commit rule (commit_response).
+                if commit_response:
+                    _commit_chat("assistant", tip)
                 evidence = result.get("evidence", [])
                 topic = result.get("topic", "")
                 grounding_links = result.get("grounding_links", [])

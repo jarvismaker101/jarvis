@@ -522,6 +522,26 @@ class ScreenQuestionNetTests(unittest.TestCase):
         analyze.assert_called_once()
         self.assertEqual(response, "You are looking at a code editor.")
 
+    def test_screen_turn_is_committed_to_history(self):
+        """Both halves of a screen Q&A land in history.
+
+        A follow-up like "research the release date of this volume" must be
+        able to resolve what "this" refers to; previously only the voice log
+        saw the exchange and the chat model asked "which volume?".
+        """
+        verdict = {"intent": "screen", "steps": [], "task_description": "",
+                   "query": ""}
+        with patch.object(brain, "classify_intent", return_value=verdict), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "analyze_screen",
+                          return_value=self._screen_result()), \
+             patch.object(brain, "push_screen_answer", return_value="answer-1"), \
+             patch.object(brain, "add_message") as add:
+            brain.process_message("what's on my screen jarvis", sync_voice=False)
+        add.assert_any_call("user", "what's on my screen jarvis")
+        add.assert_any_call("assistant", "You are looking at a code editor.")
+
     def test_control_verb_stays_chat(self):
         with patch.object(brain, "classify_intent", return_value=self._chat_verdict()), \
              patch.object(brain, "maybe_handle_screen_control_message", return_value=None), \
