@@ -31,6 +31,76 @@ def _inworld_response(transcript="hello jarvis", status_code=200):
     return response
 
 
+class SarvamRequestShapeTests(unittest.TestCase):
+    """recognize_sarvam posts the documented Saaras v4 request exactly."""
+
+    def setUp(self):
+        self.audio = _make_audio()
+
+    def _sarvam_response(self, transcript="hello jarvis"):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "request_id": "test-request-id",
+            "transcript": transcript,
+            "language_code": "en-IN",
+        }
+        return response
+
+    def test_posts_saaras_v4_with_subscription_key(self):
+        with patch.object(transcription, "SARVAM_API_KEY", "test-sarvam-key"), \
+             patch.object(
+                 transcription._session, "post",
+                 return_value=self._sarvam_response("hello jarvis"),
+             ) as post:
+            result = transcription.recognize_sarvam(self.audio)
+
+        self.assertEqual(result, "hello jarvis")
+        post.assert_called_once()
+        _args, kwargs = post.call_args
+        self.assertEqual(
+            kwargs["headers"], {"api-subscription-key": "test-sarvam-key"})
+        self.assertEqual(kwargs["data"]["model"], "saaras:v4")
+        self.assertEqual(kwargs["data"]["language_code"], "unknown")
+        self.assertEqual(kwargs["files"]["file"][2], "audio/wav")
+        self.assertEqual(kwargs["timeout"], transcription.SARVAM_STT_TIMEOUT)
+
+    def test_language_hint_uses_bcp47(self):
+        with patch.object(transcription, "SARVAM_API_KEY", "k"), \
+             patch.object(
+                 transcription._session, "post",
+                 return_value=self._sarvam_response(),
+             ) as post:
+            transcription.recognize_sarvam(self.audio, language="en-IN")
+        self.assertEqual(
+            post.call_args[1]["data"]["language_code"], "en-IN")
+
+    def test_missing_key_raises_request_error(self):
+        with patch.object(transcription, "SARVAM_API_KEY", ""):
+            with self.assertRaises(sr.RequestError) as ctx:
+                transcription.recognize_sarvam(self.audio)
+            self.assertIn("SARVAM_API_KEY", str(ctx.exception))
+
+    def test_empty_transcript_is_unknown_value(self):
+        with patch.object(transcription, "SARVAM_API_KEY", "k"), \
+             patch.object(
+                 transcription._session, "post",
+                 return_value=self._sarvam_response("   "),
+             ):
+            with self.assertRaises(sr.UnknownValueError):
+                transcription.recognize_sarvam(self.audio)
+
+    def test_http_error_raises_request_error(self):
+        bad = Mock()
+        bad.status_code = 401
+        bad.json.return_value = {"error": {"message": "bad key", "code": 401}}
+        bad.text = "unauthorized"
+        with patch.object(transcription, "SARVAM_API_KEY", "k"), \
+             patch.object(transcription._session, "post", return_value=bad):
+            with self.assertRaises(sr.RequestError):
+                transcription.recognize_sarvam(self.audio)
+
+
 class InworldRequestShapeTests(unittest.TestCase):
     """recognize_inworld builds the documented API request exactly."""
 

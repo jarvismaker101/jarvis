@@ -67,6 +67,7 @@ from backend.services.transcription import (
     is_hallucinated_transcript,
     recognize_google_or_groq,
     recognize_inworld,
+    recognize_sarvam,
 )
 
 LISTEN_TIMEOUT_SECONDS = 8
@@ -953,6 +954,16 @@ def recognize_candidates(audio):
     text = None
     if engine == "whisper":
         text = _transcribe_local_once(audio)
+    elif engine == "sarvam":
+        try:
+            text = recognize_sarvam(audio, language="en")
+        except sr.UnknownValueError:
+            text = None
+        except Exception as exc:
+            print(f"[WATCHER] Sarvam recognition error: {exc}")
+            text = None
+        if text:
+            print(f"[HEARD:sarvam] {text}")
     elif engine == "inworld":
         try:
             text = recognize_inworld(audio, language="en")

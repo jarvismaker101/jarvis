@@ -31,6 +31,12 @@ INWORLD_STT_URL = os.getenv(
     "https://api.inworld.ai/stt/v1/transcribe",
 )
 INWORLD_STT_MODEL = os.getenv("INWORLD_STT_MODEL", "inworld/inworld-stt-1")
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+SARVAM_STT_URL = os.getenv(
+    "SARVAM_STT_URL",
+    "https://api.sarvam.ai/speech-to-text",
+)
+SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v4")
 
 #: P0-12 — latency-critical CONNECT budget for a cloud STT call. The socket is
 #: pre-warmed at VAD onset, so a cold handshake here means the warm did not run;
@@ -51,6 +57,18 @@ INWORLD_STT_READ_TIMEOUT_SECONDS = float(
 INWORLD_STT_TIMEOUT = (
     INWORLD_STT_CONNECT_TIMEOUT_SECONDS,
     INWORLD_STT_READ_TIMEOUT_SECONDS,
+)
+#: Sarvam STT timeout pair. Same one-engine-per-turn rule as Inworld: these
+#: two numbers ARE the worst case of a Sarvam turn. Plain ``float`` reads —
+#: an unset-but-present empty string falls back to the default.
+SARVAM_STT_CONNECT_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_SARVAM_STT_CONNECT_TIMEOUT",
+              str(STT_CONNECT_TIMEOUT_SECONDS)) or STT_CONNECT_TIMEOUT_SECONDS)
+SARVAM_STT_READ_TIMEOUT_SECONDS = float(
+    os.getenv("JARVIS_SARVAM_STT_READ_TIMEOUT", "10") or 10)
+SARVAM_STT_TIMEOUT = (
+    SARVAM_STT_CONNECT_TIMEOUT_SECONDS,
+    SARVAM_STT_READ_TIMEOUT_SECONDS,
 )
 LOCAL_WHISPER_PORT = int(os.getenv("JARVIS_WHISPER_PORT", "8767"))
 LOCAL_WHISPER_URL = f"http://127.0.0.1:{LOCAL_WHISPER_PORT}"
@@ -272,6 +290,53 @@ def recognize_inworld(audio_data, language=None, prompts=None):
     return transcript
 
 
+def recognize_sarvam(audio_data, language=None):
+    """Transcribe via Sarvam STT (Saaras v4, transcribe-only).
+
+    POSTs the utterance WAV as multipart ``file`` with ``model=saaras:v4``
+    and ``language_code`` in BCP-47 form ("unknown" when not given), keyed
+    by the ``api-subscription-key`` header. Returns the transcript string,
+    or raises ``sr.UnknownValueError`` (empty) / ``sr.RequestError``.
+    """
+    if not SARVAM_API_KEY:
+        raise sr.RequestError("SARVAM_API_KEY is missing for Sarvam STT")
+
+    wav_bytes = audio_data.get_wav_data()
+    api_language = _api_language(language)
+    language_code = ("%s-IN" % api_language) if api_language else "unknown"
+
+    try:
+        response = _session.post(
+            SARVAM_STT_URL,
+            headers={"api-subscription-key": SARVAM_API_KEY},
+            data={"model": SARVAM_STT_MODEL, "language_code": language_code},
+            files={"file": ("speech.wav", wav_bytes, "audio/wav")},
+            timeout=SARVAM_STT_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise sr.RequestError(f"Sarvam STT request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        try:
+            detail = (response.json().get("error") or {}).get("message")
+        except ValueError:
+            detail = None
+        raise sr.RequestError(
+            f"Sarvam STT failed: {response.status_code} "
+            f"{str(detail or response.text)[:200]}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise sr.RequestError("Sarvam STT returned invalid JSON") from exc
+
+    transcript = (payload.get("transcript") or "").strip()
+    if not transcript:
+        raise sr.UnknownValueError()
+    return transcript
+
+
 def prewarm_target():
     """P0-12 — the STT session to pre-warm, or None when there is nothing to warm.
 
@@ -282,7 +347,16 @@ def prewarm_target():
     never duplicated here — one connection per (host, port) is what the pool
     actually holds, which is exactly what the dedupe in ``prewarm.targets()``
     relies on.
+
+    Sarvam's warm is a plain GET against the transcribe host (no audio is
+    sent — a 4xx still warms the TLS session).
     """
+    if SARVAM_API_KEY:
+        return {
+            "name": "sarvam-stt",
+            "url": SARVAM_STT_URL,
+            "headers": {"api-subscription-key": SARVAM_API_KEY},
+        }
     if INWORLD_STT_API_KEY:
         return {
             "name": "inworld-stt",

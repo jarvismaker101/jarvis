@@ -69,6 +69,7 @@ ENV_PROVIDERS = {
     "openrouter": {"name": "OpenRouter"},
     "whisper": {"name": "Local Whisper"},
     "inworld": {"name": "Inworld STT"},
+    "sarvam": {"name": "Sarvam STT"},
     # [F56] The local Ollama server: models run on THIS machine. It needs no
     # .env entry and no account, so it is registered as an env-style provider
     # whose credential is a placeholder (see _credentials_from) and whose
@@ -95,7 +96,7 @@ _ROLE_ALLOWED_ENV = {
     "tts": {"fish", "gtts"},
     "vision": {"gemini", "fireworks", "groq", "openrouter"},
     "browser_tool": {"gemini", "fireworks", "groq", "openrouter"},
-    "listening": {"whisper", "inworld"},
+    "listening": {"whisper", "inworld", "sarvam"},
     # F49 (G8): the planner drives the native tool-use orchestrator; it
     # MUST be a model with native tool calling + structured output, so the
     # allowlist is narrow and capability-validated below.
@@ -188,6 +189,7 @@ PROVIDER_CAPABILITIES = {
     "gtts": frozenset(("audio_output",)),
     "whisper": frozenset(("speech_input",)),
     "inworld": frozenset(("speech_input",)),
+    "sarvam": frozenset(("speech_input",)),
     # [F56] The local Ollama server speaks the OpenAI-compatible dialect, so
     # the generic adapter carries it: streaming text, native tool calls and
     # JSON structured output are adapter facts. VISION is deliberately NOT
@@ -740,6 +742,8 @@ def _credentials_from(provider, settings):
         return (None, None)
     if pid == "inworld":
         return (os.getenv("INWORLD_STT_API_KEY") or None, None)
+    if pid == "sarvam":
+        return (os.getenv("SARVAM_API_KEY") or None, None)
     if pid == "ollama":
         # [F56] The local Ollama server has NO credential — but the generic
         # OpenAI-compatible adapter (and brain's "a provider with no usable
@@ -1603,6 +1607,12 @@ def list_provider_models(provider_id):
         # network needed to list, so a missing key still lists fine — the
         # UI gates selectability on the masked has_key flag.
         m = str(os.getenv("INWORLD_STT_MODEL", "") or "").strip() or "inworld/inworld-stt-1"
+        return [{"id": m, "display": m}]
+    if pid == "sarvam":
+        # Same static-option shape as Inworld: the Saaras v4 model id comes
+        # from the env (same read as transcription.py); missing key still
+        # lists, selectability is gated on has_key.
+        m = str(os.getenv("SARVAM_STT_MODEL", "") or "").strip() or "saaras:v4"
         return [{"id": m, "display": m}]
     if pid == "ollama":
         # [F56] Local, key-less, live: whatever is installed right now.

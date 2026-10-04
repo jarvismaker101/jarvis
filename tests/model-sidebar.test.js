@@ -152,13 +152,14 @@ const SETTINGS = {
     { id: "openrouter", name: "OpenRouter", kind: "env", has_key: true, source: "env" },
     { id: "whisper", name: "Local Whisper", kind: "env", has_key: false, source: "env" },
     { id: "inworld", name: "Inworld STT", kind: "env", has_key: true, source: "env" },
+    { id: "sarvam", name: "Sarvam STT", kind: "env", has_key: true, source: "env" },
   ],
   role_allowed: {
     chat: ["gemini", "fireworks"],
     tts: ["fish", "gtts"],
     vision: ["gemini", "fireworks", "groq", "openrouter"],
     browser_tool: ["gemini", "fireworks", "groq", "openrouter"],
-    listening: ["inworld", "whisper"],
+    listening: ["inworld", "sarvam", "whisper"],
     planner: ["fireworks"],
   },
   last_fallback: null,
@@ -177,6 +178,7 @@ const MODELS = {
   openrouter: [{ id: "google/gemma-4-31b-it:free", display: "gemma-4-31b-it:free" }],
   whisper: [{ id: "whisper-local", display: "whisper-local" }],
   inworld: [{ id: "inworld/inworld-stt-1", display: "inworld/inworld-stt-1" }],
+  sarvam: [{ id: "saaras:v4", display: "saaras:v4" }],
 };
 
 // Every role the backend registry can resolve, with the provider/model the
@@ -184,7 +186,7 @@ const MODELS = {
 const ROLE_CASES = [
   { role: "chat", listId: "model-provider-list", provider: "gemini", model: "gemini-2.5-flash", allowed: ["gemini", "fireworks"] },
   { role: "tts", listId: "tts-provider-list", provider: "fish", model: "s2.1-pro-free", allowed: ["fish", "gtts"] },
-  { role: "listening", listId: "listening-provider-list", provider: "inworld", model: "inworld/inworld-stt-1", allowed: ["whisper", "inworld"] },
+  { role: "listening", listId: "listening-provider-list", provider: "inworld", model: "inworld/inworld-stt-1", allowed: ["whisper", "inworld", "sarvam"] },
   { role: "vision", listId: "vision-provider-list", provider: "gemini", model: "gemini-2.5-flash", allowed: ["gemini", "fireworks", "groq", "openrouter"] },
   { role: "browser_tool", listId: "browser-provider-list", provider: "fireworks", model: "accounts/fireworks/models/qwen3p7-plus", allowed: ["gemini", "fireworks", "groq", "openrouter"] },
   { role: "planner", listId: "planner-provider-list", provider: "fireworks", model: "accounts/fireworks/models/qwen3p7-plus", allowed: ["fireworks"] },

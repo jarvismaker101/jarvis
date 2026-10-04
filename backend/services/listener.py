@@ -28,6 +28,7 @@ from backend.services.transcription import (
     recognize_google_or_groq,
     recognize_inworld,
     recognize_local_whisper,
+    recognize_sarvam,
 )
 # [F33] onset detection runs on the echo-cancelled mic window; [F34]
 # downstream actions may only consume committed transcripts.
@@ -303,7 +304,7 @@ def _cloud_stt_policy():
 #: engine remains a SELECTION that can be turned on later rather than a
 #: capability this change deletes.
 LOCAL_STT_ENGINE = "whisper"
-CLOUD_STT_ENGINES = frozenset({"inworld", "google-or-groq"})
+CLOUD_STT_ENGINES = frozenset({"inworld", "sarvam", "google-or-groq"})
 
 
 def _engine_for_listening_role():
@@ -319,7 +320,7 @@ def _engine_for_listening_role():
         )
     except Exception:
         selected = "inworld"
-    if selected in (LOCAL_STT_ENGINE, "google-or-groq"):
+    if selected in (LOCAL_STT_ENGINE, "sarvam", "google-or-groq"):
         return selected
     # Anything unexpected (including the shipped default) is Inworld.
     return "inworld"
@@ -395,6 +396,31 @@ def _transcribe_with_engine(engine, audio):
             return (text, normalized, language), label, None
         return None, label, reason
 
+    if engine == "sarvam":
+        # Sarvam (Saaras v4), with the same English hint as Inworld
+        # (conversation text must stay roman/English script).
+        label = "sarvam"
+        try:
+            text = recognize_sarvam(audio, language="en")
+        except sr.UnknownValueError:
+            return None, label, "no-speech"
+        except Exception as exc:
+            return None, label, str(exc) or type(exc).__name__
+        normalized = _normalize_text(text)
+        if not normalized:
+            return None, label, "empty transcript"
+        if is_hallucinated_transcript(normalized):
+            print(f"[LISTENER] Ignoring STT hallucination: {normalized}")
+            return None, label, "hallucination"
+        if any("" <= ch <= "" for ch in text):
+            # The English hint was ignored. There is no second engine to
+            # fall back to (P0-03): an unwanted script is a failed turn.
+            print("[LISTENER] Sarvam STT returned non-English script")
+            return None, label, "non-english-script"
+        print(f"[HEARD:sarvam] {normalized}")
+        LAST_STT_ENGINE = label   # [PERF] P1-19
+        return (text, normalized, "auto"), label, None
+
     # Inworld, with an English hint (conversation text must stay roman/English
     # script). Also the engine for any unexpected provider value.
     label = "inworld"
@@ -432,9 +458,9 @@ def selected_stt_engine():
     """
     engine = _engine_for_listening_role()
     if _cloud_stt_policy() != "on":
-        # F34: local-only. Inworld and Google/Groq are cloud engines; with the
-        # policy off they are never called - a local failure produces no
-        # transcript instead of an upload.
+        # F34: local-only. Inworld, Sarvam and Google/Groq are cloud engines;
+        # with the policy off they are never called - a local failure produces
+        # no transcript instead of an upload.
         print("[LISTENER] Cloud STT disabled by policy - local whisper only")
         engine = LOCAL_STT_ENGINE
     return engine

@@ -911,12 +911,12 @@ function _renderProvidersForRole(listId, activeModel, expandedSet, role) {
     return;
   }
   for (const p of visibleProviders) {
-    // Listening role: Inworld needs INWORLD_STT_API_KEY — without it the
-    // option renders disabled instead of selectable. Providers that need no
-    // credential at all (local whisper, the free Google TTS fallback) report
-    // has_key=false as their NORMAL state, so that must never render as a
-    // grey "no key" row or gate selection.
-    const keyGated = role === "listening" && p.id === "inworld" && !p.has_key;
+    // Listening role: Inworld and Sarvam need their API keys — without them
+    // the option renders disabled instead of selectable. Providers that need
+    // no credential at all (local whisper, the free Google TTS fallback)
+    // report has_key=false as their NORMAL state, so that must never render
+    // as a grey "no key" row or gate selection.
+    const keyGated = role === "listening" && (p.id === "inworld" || p.id === "sarvam") && !p.has_key;
     const keyless = _isKeylessProvider(role, p.id);
     const isOpen = !keyGated && expandedSet.has(p.id);
     const sec = document.createElement("div");

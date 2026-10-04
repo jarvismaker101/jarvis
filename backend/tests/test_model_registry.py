@@ -203,7 +203,7 @@ class ListProvidersTests(ModelRegistryTestBase):
         self.assertNotIn("sk-secret-1", blob)
         self.assertNotIn("api_key", blob)
         # [F56] "ollama" (the local, key-less server) joined the env providers.
-        self.assertEqual([p["id"] for p in providers], ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter", "whisper", "inworld", "ollama", "acme"])
+        self.assertEqual([p["id"] for p in providers], ["gemini", "fireworks", "groq", "fish", "gtts", "openrouter", "whisper", "inworld", "sarvam", "ollama", "acme"])
         by_id = {p["id"]: p for p in providers}
         self.assertTrue(by_id["gemini"]["has_key"])
         self.assertTrue(by_id["fireworks"]["has_key"])
@@ -643,11 +643,11 @@ class ListeningRoleTests(ModelRegistryTestBase):
         )
         self.assertEqual(
             model_registry.get_allowed_providers_for_role("listening"),
-            ["inworld", "whisper"],
+            ["inworld", "sarvam", "whisper"],
         )
         self.assertEqual(
             model_registry.get_role_allowed_map()["listening"],
-            ["inworld", "whisper"],
+            ["inworld", "sarvam", "whisper"],
         )
 
     def test_listening_default_is_inworld_when_unset(self):
