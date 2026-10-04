@@ -2135,6 +2135,12 @@ class _ChatRacer:
 
         def _drain():
             buf = ""
+            # R14 follow-up: characters of `buf` already yielded live. The
+            # sentence flush emits only the not-yet-spoken tail, so a delta
+            # that completes a buffered sentence can never replay the words
+            # the user already heard ("Loud" + "Loud and clear, sir."
+            # duplicated the first word).
+            emitted = 0
             while True:
                 item = self._queue.get()
                 if item is self._sentinel:
@@ -2143,17 +2149,17 @@ class _ChatRacer:
                             gated = _strip_unverified_action_claims(buf, "chat")
                         except Exception:
                             gated = buf
-                        # Only emit when nothing was cut: the common case is
-                        # benign fragments ("a", "b") whose gated form EQUALS
-                        # the buffer (nothing claim-shaped), in which case we
-                        # must NOT reduplicate what was already yielded. A
-                        # cut claim ("I will get that created" -> fallback)
-                        # is redelivered here in gated form — live speech
-                        # pauses rather than lies.
                         if (gated and str(gated).strip()
-                                and str(gated) != buf
                                 and len(str(gated).split()) != len(buf.split())):
+                            # A cut claim ("I will get that created" ->
+                            # fallback) is redelivered in gated form: live
+                            # speech pauses rather than lies, and the prefix
+                            # already spoken cannot be unsaid.
                             yield gated
+                        else:
+                            tail = buf[emitted:]
+                            if tail.strip():
+                                yield tail
                     break
                 piece = str(item or "")
                 buf += piece
@@ -2168,16 +2174,26 @@ class _ChatRacer:
                     except Exception:
                         gated = head
                     # Byte-identical passthrough when nothing was cut (the
-                    # overwhelming case — preserves "Hello "+"sir." spacing).
-                    # A cut sentence is HELD in buf for the sentinel flush
-                    # above, which redelivers it in gated form.
+                    # overwhelming case — preserves "Hello "+"sir." spacing):
+                    # only the part not already streamed is emitted. A cut
+                    # sentence replaces the head and is HELD in buf for the
+                    # next flush, which redelivers it in gated form.
                     if gated and str(gated).strip():
                         if len(str(gated).split()) == len(head.split()):
-                            yield head
+                            tail = head[emitted:]
+                            if tail.strip():
+                                yield tail
                         else:
                             buf = str(gated) + (" " if buf[:1].isspace() else "") + buf
+                    emitted = 0
                 else:
-                    yield piece
+                    # Byte-identical passthrough of everything not yet
+                    # emitted (normally just this piece; after a cut claim,
+                    # the held gated replacement goes out here, in order).
+                    tail = buf[emitted:]
+                    if tail:
+                        yield tail
+                    emitted = len(buf)
         return _drain()
 
     def cancel(self):
