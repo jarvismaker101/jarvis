@@ -435,7 +435,10 @@ _CODE_TOOL_COMMAND_TOKENS = (
 # model promised work no tool ever did).
 _CODE_TOOL_FILLER_RE = re.compile(
     r"^(?:(?:now|ok|okay|so|then|please|just|actually|well|hey|hi|hello|"
-    r"jarvis|sir)\b[\s,.-]*)+",
+    r"jarvis|sir)\b[\s,.-]*|"
+    # R20: a request wrapped in a question ("can you create ...", "could
+    # you make ...") is the same requested effect, not small talk.
+    r"(?:can|could|would|will)\s+(?:you|u)\b[\s,]*)+",
     re.IGNORECASE,
 )
 
@@ -542,6 +545,12 @@ def is_code_tool_request(text):
             return True
         if re.search(r"\b(?:inside|into|within|there)\b", routed):
             return True
+
+    # R20: a compound folder+file creation is an effect shape, not a phrase.
+    # "can you create a folder ... inside that folder create a file ... write
+    # hello" must reach the task path from ANY sentence opening.
+    if _folder_file_create_plan(text) is not None:
+        return True
 
     # R5: local inspect/existence shape — checked FIRST, before the web
     # "look up" branch in _heuristic_plan can claim it. A bare local folder
@@ -776,7 +785,8 @@ def _heuristic_plan(command, context):
                 "summary": "Need the folder.",
                 "requires_confirmation": False,
                 "steps": [],
-                "response": _folder_hint_clarification(inspect_hint, command),
+                "response": _folder_hint_clarification(
+                    inspect_hint, command, verb="check"),
             }
         return _code_tool_plan(
             "code.list_directory", {"path": resolved},
@@ -824,6 +834,14 @@ def _heuristic_plan(command, context):
                  "content": _r1_content},
                 "Writing the file.",
             )
+
+    # ── R20 compound folder+file creation (effect shape, any phrasing) ──
+    # "create a folder named history ... and inside that folder create a txt
+    # file ... write hello" is ONE intent with two effects: the folder is the
+    # file's parent. One plan, one confirmation gate covering both.
+    _compound = _folder_file_create_plan(raw)
+    if _compound is not None:
+        return _compound
 
     # ── Native code-tools heuristics (short-circuit; no LLM needed) ──
     # "read <file>", "show me <file>", "what's in <file>" -> read_file
@@ -1162,6 +1180,36 @@ _INSPECT_FOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: R20 — an explicitly NAMED inspect target beats the bare word "folder".
+#: "folder by the name X", "folder named/called X", "is there a folder X".
+_INSPECT_NAMED_CUE_RE = re.compile(
+    r"\b(?:folder|directory)\s+"
+    r"(?:by\s+the\s+name(?:\s+of)?|by\s+name|named|called)\s+"
+    r"([a-z0-9_ .\-]{1,60}?)"
+    r"(?=\s*(?:,|;|\bexists?\b|\bis\s+there\b|\bon\b|\bin\b|\bat\b|$))"
+    r"|\b(?:is\s+there|exists?)\s+(?:a\s+|an\s+)?(?:folder|directory)"
+    r"\s+(?:named\s+|called\s+|by\s+the\s+name(?:\s+of)?\s+)?"
+    r"([a-z0-9_ .\-]{1,60}?)(?=\s*(?:,|;|\bon\b|\bin\b|\bat\b|$))",
+    re.IGNORECASE,
+)
+
+
+def _inspect_named_target(routed):
+    """R20: the exact folder name an inspect/existence phrase carries.
+
+    The R5 pronoun shortcut ("... folder ..." -> ask which folder) used to
+    fire before the named matcher, so "check if there is a folder by the
+    name Mayank Malik" lost the name and asked a create-file question.
+    """
+    match = _INSPECT_NAMED_CUE_RE.search(routed or "")
+    if not match:
+        return None
+    name = next((g for g in match.groups() if g), "") or ""
+    name = name.strip().strip("\"'")
+    if name and not _is_path_like(name):
+        return name
+    return None
+
 
 def _local_inspect_folder(routed):
     """R5: the folder target of a local inspect/existence request, or None.
@@ -1174,6 +1222,8 @@ def _local_inspect_folder(routed):
     "Create a directory listing" is NOT an inspect request — "listing" there
     is the THING being created, not the act of listing. The inspect verb
     must not sit inside a create/make/write shaped turn.
+
+    R20: a named target resolves BEFORE the bare "folder" pronoun shortcut.
     """
     if not routed or not _INSPECT_VERB_RE.search(routed):
         return None
@@ -1182,21 +1232,25 @@ def _local_inspect_folder(routed):
     hint = _located_write_folder(routed)
     if hint is not None:
         return hint
+    named = _inspect_named_target(routed)
+    if named is None:
+        # Named folder without the naming cue: "check whether malik exists",
+        # "see what is inside mayankmalik".
+        old = re.search(
+            r"(?:whether|if|named\s+(?:folder\s+)?|called\s+(?:folder\s+)?"
+            r"|folder\s+(?:named\s+|called\s+)?|inside\s+|in\s+folder\s+)"
+            r"([A-Za-z][\w\- ]{1,60}?)\s*(?:exists?|is\s+there|folder|directory|$)",
+            routed,
+            re.IGNORECASE,
+        )
+        if old:
+            candidate = old.group(1).strip().strip("\"'")
+            if candidate and not _is_path_like(candidate):
+                named = candidate
+    if named:
+        return ("named", named)
     if _INSPECT_FOLDER_RE.search(routed):
         return ("pronoun", "")
-    # Named folder without the folder word: "check whether malik exists",
-    # "see what is inside mayankmalik".
-    named = re.search(
-        r"(?:whether|if|named\s+(?:folder\s+)?|called\s+(?:folder\s+)?"
-        r"|folder\s+(?:named\s+|called\s+)?|inside\s+|in\s+folder\s+)"
-        r"([A-Za-z][\w\- ]{1,60}?)\s*(?:exists?|is\s+there|folder|directory|$)",
-        routed,
-        re.IGNORECASE,
-    )
-    if named:
-        name = named.group(1).strip().strip("\"'")
-        if name and not _is_path_like(name):
-            return ("named", name)
     return None
 
 
@@ -1456,18 +1510,40 @@ def _resolve_folder_hint(hint):
     return None
 
 
-def _folder_hint_clarification(hint, command_text=""):
-    """Ask which folder a located write means (never guess the location).
+def _folder_hint_clarification(hint, command_text="", verb="create"):
+    """Ask which folder a location hint means (never guess the location).
 
     R11: counted under the request — the SECOND failed ask for the same
     request stops instead of interrogating again.
+
+    R20: a CHECK asks about checking, never about creating a file. A named
+    target that does not resolve gets the honest absence (or names the real
+    candidate — R15), not a write-flavoured question.
     """
     if command_text and _clarify_note(command_text) > _CLARIFY_MAX_ASKS:
         _clarify_reset(command_text)
         return _clarify_stop_line()
     if hint and hint[0] == "named":
+        name = hint[1]
+        kind15, value15 = "none", ""
+        try:
+            kind15, value15 = resolve_folder_name(name)
+        except Exception:
+            kind15, value15 = "none", ""
+        if kind15 == "candidates" and value15:
+            if isinstance(value15, list):
+                shown = ", ".join(os.path.basename(str(p)) for p in value15[:3])
+            else:
+                shown = str(value15)
+            return ("Sir, no exact folder named '%s' — but this exists: %s."
+                    % (name, shown))
+        if verb == "check":
+            return "Sir, I could not find a folder named '%s'." % name
         return ("Which folder should I use, sir — I could not find "
-                "'%s'. Please say the full folder name." % hint[1])
+                "'%s'. Please say the full folder name." % name)
+    if verb == "check":
+        return ("Which folder should I check, sir? "
+                "Please say the folder name.")
     return ("Which folder should I create that file in, sir? "
             "Please say the folder name.")
 
@@ -1703,6 +1779,142 @@ def _folder_plan_path(raw):
     if re.search(r"\bdesktop\b", raw, re.IGNORECASE):
         return os.path.join(_known_folders()["desktop"], name)
     return name
+
+
+#: R20 — intent shape, not sentence opening. The requested EFFECT (create a
+#: folder AND a file inside it) is recognised wherever the verbs appear; a
+#: question wrapper ("can you create ...") never changes what is being asked.
+_QUESTION_AUX_RE = re.compile(
+    r"\b(?:can|could|would|will)\s+(?:you|u)\b", re.IGNORECASE)
+
+
+def _intent_flat(raw):
+    """R20: a detection-only copy with question auxiliaries/courtesy removed.
+
+    Names and content are ALWAYS extracted from the raw utterance — this copy
+    exists so the shape ("create folder ... create file inside it") is seen
+    through "can you ..." wrappers, not to rewrite the user's words.
+    """
+    flat = _QUESTION_AUX_RE.sub(" ", _normalize(raw))
+    flat = re.sub(r"\bplease\b", " ", flat)
+    return re.sub(r"\s+", " ", flat).strip()
+
+
+_FOLDER_CREATE_CLAUSE_RE = re.compile(
+    r"\b(?:create|make|set\s+up)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?"
+    r"(?:folder|directory)\b",
+    re.IGNORECASE,
+)
+_FILE_CREATE_CLAUSE_RE = re.compile(
+    r"\b(?:create|make|add|write)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:(?:text|txt|notepad|new|empty|blank|simple|small)\s+)?"
+    r"(?:file|txt)\b",
+    re.IGNORECASE,
+)
+#: A reference to the folder being created ("inside that folder", "in it").
+#: The determiner/pronoun matters: a bare "in english" is content, not a
+#: location, and must not bind an unrelated file clause to the folder.
+_INTENT_RELATION_RE = re.compile(
+    r"\b(?:inside|into|in|within|under)\s+"
+    r"(?:the|that|this|same|it|there)\b",
+    re.IGNORECASE,
+)
+#: One spoken name, stopping at the next clause boundary. Sentence periods
+#: are deliberately NOT boundaries: they are also extension dots inside a
+#: name ("hello world.txt").
+_NAME_TOKEN = (r"([A-Za-z0-9_ .\-]{1,60}?)"
+               r"(?=\s*(?:,|;|\band\b|\bon\b|\bin\b|\bat\b|\bwith\b|"
+               r"\bwrite\b|$))")
+
+
+def _folder_file_create_plan(raw):
+    """R20: "create a folder named X ... create a file inside it ... write Y".
+
+    One intent, two effects: the folder is the file's parent, so the plan is
+    create-folder then create-file and ONE confirmation covers both. Returns
+    None when the shape is absent or the folder is unnamed — a capability
+    question ("can you create a folder?") never becomes a plan.
+    """
+    flat = _intent_flat(raw)
+    folder_clause = _FOLDER_CREATE_CLAUSE_RE.search(flat)
+    if folder_clause is None:
+        return None
+    tail = flat[folder_clause.end():]
+    file_clause = _FILE_CREATE_CLAUSE_RE.search(tail)
+    if file_clause is None:
+        return None
+    # The file must belong to the folder being created ("inside that folder"
+    # / "inside it"), not merely appear in the same sentence. The reference
+    # may sit before or after its file clause, so the zone runs through a
+    # short window past it.
+    if not _INTENT_RELATION_RE.search(tail[:file_clause.end() + 80]):
+        return None
+    named_folder = re.search(
+        r"\b(?:named|called|by\s+the\s+name(?:\s+of)?|by\s+name|name\s+it|"
+        r"call\s+it)\s+" + _NAME_TOKEN, raw, re.IGNORECASE)
+    folder_name = named_folder.group(1).strip().strip("\"'") if named_folder \
+        else ""
+    if not folder_name or _is_path_like(folder_name):
+        return None
+    file_name = ""
+    named_file = re.search(
+        r"\bfile\s+(?:named\s+|called\s+|by\s+the\s+name(?:\s+of)?\s+)"
+        + _NAME_TOKEN, raw, re.IGNORECASE)
+    if not named_file:
+        named_file = re.search(
+            r"\bfile\s+([A-Za-z0-9_\- ]+?\.[A-Za-z0-9]{1,8})\b",
+            raw, re.IGNORECASE)
+    if named_file:
+        file_name = named_file.group(1).strip().strip("\"'")
+        if file_name:
+            file_name = os.path.basename(file_name)
+            if not re.search(r"\.\w{1,5}$", file_name):
+                file_name += ".txt"
+    file_name = file_name or _DEFAULT_TEXT_FILE_NAME
+    try:
+        folders = _known_folders()
+    except Exception:
+        folders = {}
+    base = None
+    for key in ("desktop", "documents", "downloads"):
+        if re.search(r"\b%s\b" % key, flat):
+            base = folders.get(key) or base
+            if base:
+                break
+    base = base or folders.get("desktop")
+    if not base:
+        return None
+    folder_path = os.path.join(base, folder_name)
+    content = _located_write_content(raw, "").strip()
+    steps = []
+    try:
+        folder_exists = os.path.isdir(folder_path)
+    except Exception:
+        folder_exists = False
+    if not folder_exists:
+        steps.append({
+            "tool": "code.create_folder",
+            "args": {"path": folder_path},
+            "risk": "safe",
+            "reason": "Creating the folder.",
+        })
+    steps.append({
+        "tool": "code.write_file",
+        "args": {
+            "path": os.path.join(folder_path, file_name),
+            "content": content,
+            "create_only": True,
+        },
+        "risk": "safe",
+        "reason": "Creating %s." % file_name,
+    })
+    return {
+        "ok": True,
+        "confidence": 0.9,
+        "summary": "Creating folder %s with %s." % (folder_path, file_name),
+        "requires_confirmation": True,
+        "steps": steps,
+    }
 
 
 def _multi_file_count(raw):

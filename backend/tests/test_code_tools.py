@@ -854,5 +854,124 @@ class CodeToolConfirmationGateTests(unittest.TestCase):
         self.assertIn("Edited the selection.", response)
 
 
+class R20IntentCreateAndCheckTests(unittest.TestCase):
+    """R20: the requested effect decides the route, not the sentence opening.
+
+    Live transcript: "jarvis, can you create a folder on desktop by the name
+    history and inside that folder can you create a txt file ... write
+    hello" never reached the task path (every create matcher was anchored to
+    a leading verb), so chat looped; and "check if there is a folder by the
+    name Mayank Malik" lost the name and was answered with "Which folder
+    should I create that file in".
+    """
+
+    COMPOUND = (
+        "jarvis, can you create a folder on desktop by the name history and "
+        "inside that folder can you create a txt file and inside that file "
+        "just write hello from jarvis.")
+    NAMED_CHECK = ("check if there is a folder by the name mayank malik on "
+                   "my desktop.")
+
+    def setUp(self):
+        agent._clarify_attempts.clear()
+        agent._pending_task_action = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.desktop = os.path.join(self._tmp.name, "Desktop")
+        os.makedirs(self.desktop)
+        self.folders = {
+            "desktop": self.desktop,
+            "documents": os.path.join(self._tmp.name, "Documents"),
+            "downloads": os.path.join(self._tmp.name, "Downloads"),
+            "home": self._tmp.name,
+        }
+
+    def test_question_wrapped_compound_create_routes(self):
+        self.assertTrue(agent.is_code_tool_request(self.COMPOUND))
+
+    def test_compound_create_plans_folder_then_file(self):
+        with patch.object(agent, "_known_folders",
+                          return_value=self.folders):
+            plan = agent._heuristic_plan(self.COMPOUND, {})
+        self.assertTrue(plan["requires_confirmation"])
+        self.assertEqual([s["tool"] for s in plan["steps"]],
+                         ["code.create_folder", "code.write_file"])
+        self.assertEqual(plan["steps"][0]["args"]["path"],
+                         os.path.join(self.desktop, "history"))
+        write = plan["steps"][1]["args"]
+        self.assertEqual(write["path"],
+                         os.path.join(self.desktop, "history", "hello.txt"))
+        self.assertIn("hello from jarvis", write["content"])
+        self.assertTrue(write["create_only"])
+
+    def test_compound_relation_after_the_file_clause(self):
+        text = ("can you make a folder called demo and create a file "
+                "inside it write hello")
+        with patch.object(agent, "_known_folders",
+                          return_value=self.folders):
+            plan = agent._folder_file_create_plan(text)
+        self.assertEqual([s["tool"] for s in plan["steps"]],
+                         ["code.create_folder", "code.write_file"])
+        self.assertEqual(plan["steps"][1]["args"]["path"],
+                         os.path.join(self.desktop, "demo", "hello.txt"))
+        self.assertEqual(plan["steps"][1]["args"]["content"], "hello")
+
+    def test_capability_question_never_becomes_a_plan(self):
+        with patch.object(agent, "_known_folders",
+                          return_value=self.folders):
+            self.assertIsNone(agent._folder_file_create_plan(
+                "can you create folders on my desktop?"))
+
+    def test_interrogative_simple_write_routes(self):
+        self.assertTrue(agent.is_code_tool_request(
+            "can you create a text file in mayankmalik and write hello"))
+
+    def test_named_inspect_target_beats_the_folder_pronoun(self):
+        self.assertEqual(
+            agent._local_inspect_folder(agent._normalize(self.NAMED_CHECK)),
+            ("named", "mayank malik"))
+        self.assertEqual(
+            agent._local_inspect_folder(agent._normalize(
+                "is there a folder named Malik")),
+            ("named", "malik"))
+        self.assertEqual(
+            agent._local_inspect_folder(agent._normalize(
+                "have a quick look at that folder")),
+            ("pronoun", ""))
+
+    def test_named_check_that_resolves_is_a_local_read(self):
+        target = os.path.join(self.desktop, "Mayank Malik")
+        with patch.object(agent, "_resolve_folder_hint",
+                          return_value=target):
+            plan = agent._heuristic_plan(self.NAMED_CHECK, {})
+        self.assertEqual(plan["steps"][0]["tool"], "code.list_directory")
+        self.assertEqual(plan["steps"][0]["args"]["path"], target)
+
+    def test_named_check_that_does_not_resolve_never_asks_to_create(self):
+        with patch.object(agent, "_resolve_folder_hint", return_value=None), \
+             patch.object(agent, "resolve_folder_name",
+                          return_value=("none", "")):
+            plan = agent._heuristic_plan(self.NAMED_CHECK, {})
+        self.assertEqual(plan["steps"], [])
+        self.assertIn("could not find a folder named", plan["response"])
+        self.assertNotIn("create that file", plan["response"])
+
+    def test_named_check_names_the_real_candidate(self):
+        candidate = os.path.join(self.desktop, "Mayank Malik")
+        with patch.object(agent, "_resolve_folder_hint", return_value=None), \
+             patch.object(agent, "resolve_folder_name",
+                          return_value=("candidates", [candidate])):
+            plan = agent._heuristic_plan(
+                "check if there is a folder named malik", {})
+        self.assertIn("Mayank Malik", plan["response"])
+        self.assertNotIn("create that file", plan["response"])
+
+    def test_unresolved_check_asks_about_checking(self):
+        with patch.object(agent, "_resolve_folder_hint", return_value=None):
+            plan = agent._heuristic_plan(
+                "have a quick look at that folder", {})
+        self.assertIn("Which folder should I check", plan["response"])
+
+
 if __name__ == "__main__":
     unittest.main()

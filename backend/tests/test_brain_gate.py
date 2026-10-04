@@ -462,6 +462,25 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
         handoff.assert_not_called()
         self.assertEqual(response, "task")
 
+    def test_question_wrapped_create_routes_to_task_message(self):
+        # R20 live transcript: "can you create a folder ... and inside that
+        # folder create a txt file ... write hello" fell through to chat
+        # because every create matcher was anchored to a leading verb.
+        msg = ("jarvis, can you create a folder on desktop by the name "
+               "history and inside that folder can you create a txt file "
+               "and inside that file just write hello from jarvis.")
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain, "classify_intent", return_value=self._chat_verdict()), \
+             patch.object(brain, "maybe_handle_screen_control_message", return_value=None), \
+             patch.object(brain, "handle_opencode_task") as handoff, \
+             patch.object(brain, "handle_task_message", return_value="preview") as task_msg, \
+             patch.object(brain, "handle_chat") as chat:
+            response = brain.process_message(msg, sync_voice=False)
+        task_msg.assert_called_once()
+        handoff.assert_not_called()
+        chat.assert_not_called()
+        self.assertEqual(response, "preview")
+
 
 class ScreenQuestionNetTests(unittest.TestCase):
     """Round 16: deterministic screen-question net fires when the cloud
