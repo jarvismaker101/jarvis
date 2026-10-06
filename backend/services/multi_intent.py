@@ -1,0 +1,196 @@
+"""Rank 2 — one utterance, many jobs: split a compound request into a chain.
+
+Pure, deterministic, stdlib-only (no codebase imports), so the brain and
+the workers can use it freely.
+
+The chain is an ordered list of steps whose kinds are ``screen``,
+``research`` and ``task``. A ``task`` step is always a FILE WRITE and is
+only allowed as the LAST step — so every chain has at most one approval
+pause and it lands at the end, with the earlier steps' output already in
+hand. Steps that refer back to earlier output ("about it", "whatever you
+find", "write your report in it") carry a ``consumes`` index; the brain's
+executor injects the earlier step's output into the later step's query or
+file content.
+
+Deliberately conservative: splitting is liberal, but a chain is accepted
+only when the pieces classify to distinct action kinds, no ``tool`` clause
+is present, and no task clause sits before the end. Anything else returns
+None and the turn keeps its normal single-intent routing.
+"""
+
+import re
+
+_MAX_STEPS = 4
+
+#: Clause separators: commas/semicolons, "and"/"then" families, and the
+#: common Hinglish connectors. Splitting is intentionally liberal — the
+#: strict chain acceptance below is what keeps single jobs intact.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:,\s*(?:and\s+|then\s+|so\s+|and\s+then\s+|after\s+that\s+)?"
+    r"|;\s*"
+    r"|\s+(?:and\s+then|and|then|after\s+that|afterwards|aur|phir"
+    r"|uske\s+baad)\s+)",
+    re.IGNORECASE,
+)
+
+#: First-person future talk ("I will look at my screen later and …") is
+#: conversation ABOUT future actions, not a request to act now.
+_FUTURE_TALK_RE = re.compile(
+    r"^\s*(?:i\s*(?:will|'ll|would|might|could)|maybe\s+i|we\s*(?:will|'ll))\b",
+    re.IGNORECASE,
+)
+
+_SCREEN_RE = re.compile(
+    r"\b(look at|check|see|read|watch|analyse|analyze|scan|view|examine)\b"
+    r"[^.?!,;]{0,40}\b(screen|monitor|display)\b"
+    r"|\bon (?:my|the) screen\b"
+    r"|\bwhat(?:'s| is) on (?:my|the) screen\b"
+    r"|\blook at (?:this|the) (?:video|image|picture|photo|window)\b",
+    re.IGNORECASE,
+)
+
+_RESEARCH_RE = re.compile(
+    r"\b(deep\s*research|deepsearch|deep\s+search|research|google|"
+    r"look\s+(?:it|this|that)\s+up|look\s+up|find\s+out|"
+    r"search\s+(?:on\s+|the\s+)?(?:internet|web|online)|"
+    r"(?:on|from)\s+the\s+internet|online|internet)\b",
+    re.IGNORECASE,
+)
+
+_TASK_WRITE_RE = re.compile(
+    r"\b(create|make|write|save|put|store)\b[^.?!]{0,60}"
+    r"\b(file|report|txt|text|document|note)\b"
+    r"|\bwrite (?:your|the|a) report\b"
+    r"|\bsave (?:it|this|that|the findings|the results|what you)\b",
+    re.IGNORECASE,
+)
+
+_TASK_ACTION_RE = re.compile(
+    r"\b(create|make|delete|move|rename|copy|edit|run|execute|install)\b"
+    r"[^.?!]{0,60}\b(folder|directory|script|code|command|program)\b",
+    re.IGNORECASE,
+)
+
+_TOOL_RE = re.compile(
+    r"\b(open|launch|play|start|go\s+to|navigate|visit)\b",
+    re.IGNORECASE,
+)
+
+#: The step refers back to the previous step's output.
+_ANAPHORA_RE = re.compile(
+    r"\b(about|on|of|from)\s+(it|this|that|them)\b"
+    r"|\b(whatever|what)\s+you\s+(?:find|see|get|learn)\b"
+    r"|\byour\s+(?:report|findings|research|answer|summary|results)\b"
+    r"|\bthe\s+(?:findings|results|report|research|answer|summary)\b"
+    r"|\bin\s+(?:it|that file)\b|\binto\s+(?:it|that file)\b"
+    r"|\b(save|write|put|store|add)\s+(it|this|that|them)\b"
+    r"|\b(research|google|look\s+up|find\s+out\s+about|search\s+for)\s+"
+    r"(it|this|that|them)\b",
+    re.IGNORECASE,
+)
+
+#: Anaphoric question whose referent is the thing just shown on screen.
+_DEICTIC_RES_RE = re.compile(
+    r"\b(what|which)\b[^.?!,;]{0,30}"
+    r"\b(it|this|that|these|those|error|video|movie|image|photo|song)\b",
+    re.IGNORECASE,
+)
+
+
+def split_clauses(text):
+    """Split *text* on conjunction boundaries into candidate clauses."""
+    parts = _CLAUSE_SPLIT_RE.split(text or "")
+    out = []
+    for part in parts:
+        part = (part or "").strip(" \t,;.")
+        if len(part) < 3:
+            continue
+        out.append(part)
+    return out
+
+
+def classify_clause(text):
+    """The single action kind of one clause, or None for a fragment.
+
+    Fragments (chatter, "tell me what you see", answers) return None and
+    are merged into the clause they continue.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _SCREEN_RE.search(t):
+        return "screen"
+    if _RESEARCH_RE.search(t):
+        return "research"
+    if _TASK_WRITE_RE.search(t) or _TASK_ACTION_RE.search(t):
+        return "task"
+    if _TOOL_RE.search(t):
+        return "tool"
+    return None
+
+
+def build_chain(text):
+    """Parse *text* into a step chain, or None when it is a single job.
+
+    Accepted only when >= 2 steps survive merging, the kinds are distinct,
+    no tool clause is present, and a task (file write) clause, if any, is
+    last.
+    """
+    raw = (text or "").strip()
+    if not raw or _FUTURE_TALK_RE.match(raw):
+        return None
+    clauses = split_clauses(raw)
+    if len(clauses) < 2:
+        return None
+    merged = []
+    for clause in clauses:
+        kind = classify_clause(clause)
+        if kind is None:
+            if merged:
+                merged[-1]["text"] = merged[-1]["text"] + " and " + clause
+            continue
+        if merged and merged[-1]["kind"] == kind:
+            merged[-1]["text"] = merged[-1]["text"] + " and " + clause
+            continue
+        merged.append({"kind": kind, "text": clause})
+    if len(merged) < 2 or len(merged) > _MAX_STEPS:
+        return None
+    kinds = [m["kind"] for m in merged]
+    if "tool" in kinds:
+        return None
+    task_positions = [i for i, k in enumerate(kinds) if k == "task"]
+    if task_positions and task_positions != [len(kinds) - 1]:
+        return None
+    steps = []
+    for i, m in enumerate(merged):
+        consumes = []
+        if i > 0 and _ANAPHORA_RE.search(m["text"]):
+            consumes = [i - 1]
+        elif (i > 0 and merged[i - 1]["kind"] == "screen"
+              and m["kind"] == "research" and _DEICTIC_RES_RE.search(m["text"])):
+            consumes = [i - 1]
+        steps.append({"kind": m["kind"], "text": m["text"],
+                      "index": i, "consumes": consumes})
+    return {"ok": True, "steps": steps, "source": raw, "command_text": raw}
+
+
+_LABELS = {
+    "screen": "look at your screen",
+    "research": "research it online",
+    "task": "save it to a file",
+}
+
+
+def render_ack(plan, voice_compact=False):
+    """One coherent narrative for the whole chain — not per-step chatter."""
+    kinds = [s.get("kind") for s in (plan.get("steps") or [])]
+    n = len(kinds)
+    if n < 2:
+        return "On it, sir."
+    parts = ", ".join(_LABELS.get(k, k) for k in kinds)
+    tail = ("I'll ask before creating the file."
+            if kinds[-1] == "task" else
+            "I'll report back when it's done.")
+    if voice_compact:
+        return "Sir, on it in %d steps — %s. %s" % (n, parts, tail)
+    return "Sir, I'll do this in %d steps: %s. %s" % (n, parts, tail)

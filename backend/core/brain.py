@@ -48,6 +48,8 @@ from backend.services.gemini_client import (
 )
 from backend.services import jobs
 from backend.services import model_registry
+from backend.services import multi_intent
+from backend.services.task_agent import agent as task_agent_module
 from backend.services.openai_compat_client import (
     ask_openai_compat,
     ask_openai_compat_stream,
@@ -4456,6 +4458,294 @@ def _arm_confirmation(word):
         }
 
 
+# ── Rank 2: multi-intent chains (screen → research → file) ─────────────
+# One utterance can be several jobs. multi_intent.build_chain parses the
+# compound into ordered steps; this executor runs them on a worker thread,
+# injects each step's output into the next (screen observation → research
+# query → file content), and lands the single approval pause at the end:
+# the file write is only ARMED here — nothing is written until the user's
+# confirmation, which flows through the normal task gate.
+_MI_CHAIN_LOCK = threading.Lock()
+_mi_chain_active = False
+
+
+def _mi_clip(text, limit=600):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) > limit:
+        cut = text.rfind(" ", 0, limit - 3)
+        text = (text[:cut] if cut > 0 else text[:limit - 3]).rstrip() + "..."
+    return text
+
+
+def _mi_screen_step(step):
+    """Run one screen-analysis step; returns its result record."""
+    if not _screen_qa_busy.acquire(timeout=30):
+        return {"kind": "screen", "status": "failed",
+                "fragment": "I couldn't look at the screen — another "
+                            "screen analysis is running."}
+    try:
+        result = analyze_screen(step.get("text") or "") or {}
+    except Exception as exc:
+        return {"kind": "screen", "status": "failed",
+                "fragment": "I couldn't analyse the screen (%s)."
+                            % _mi_clip(exc, 80)}
+    finally:
+        _screen_qa_busy.release()
+    tip = str(result.get("tip") or "").strip()
+    topic = str(result.get("topic") or "").strip()
+    if not tip or "couldn't analyse the screen" in tip.lower():
+        return {"kind": "screen", "status": "failed",
+                "fragment": "I couldn't make sense of the screen."}
+    try:
+        if topic:
+            entity_ledger.record_entity(topic, topic, kind="topic",
+                                        source="screen")
+    except Exception:
+        pass
+    return {"kind": "screen", "status": "ok",
+            "fragment": "I looked at your screen.",
+            "output_query": topic or tip[:200],
+            "output_content": tip}
+
+
+def _mi_research_step(step, results):
+    """Run one research step synchronously on the chain worker thread."""
+    prior = results[step["consumes"][0]] if step.get("consumes") else None
+    base = ""
+    if prior and prior.get("status") == "ok":
+        base = str(prior.get("output_query")
+                   or prior.get("output_content") or "").strip()
+    clause = step.get("text") or ""
+    try:
+        if base:
+            query = base[:220]
+        else:
+            query = derive_research_query(clause)
+        deep = bool(re.search(r"\bdeep\s*(?:research|search)|deepsearch\b",
+                              clause, re.IGNORECASE))
+        _set_last_research_topic(query)
+        if deep:
+            overview = fetch_ai_overview_text(query)
+            result = run_research(query, pinned_overview=overview)
+        else:
+            result = run_quick_search(query)
+    except Exception as exc:
+        return {"kind": "research", "status": "failed",
+                "fragment": "I couldn't finish the research (%s)."
+                            % _mi_clip(exc, 100)}
+    if not isinstance(result, dict):
+        return {"kind": "research", "status": "failed",
+                "fragment": "The research came back empty."}
+    if result.get("stopped"):
+        return {"kind": "research", "status": "failed",
+                "fragment": "The research was stopped."}
+    summary = str(result.get("spoken_summary")
+                  or result.get("overview_text") or "").strip()
+    content = str(result.get("detailed_markdown") or summary or "").strip()
+    if not content:
+        return {"kind": "research", "status": "failed",
+                "fragment": "The research came back empty."}
+    if len(content) > 60000:
+        content = content[:60000]
+    if deep:
+        try:
+            push_research_result({
+                "query": result.get("query") or query,
+                "markdown": result.get("detailed_markdown") or "",
+                "videos": result.get("related_videos") or [],
+                "report_path": result.get("report_path") or "",
+                "visited_count": result.get("visited_count") or 0,
+                "failed_count": result.get("failed_count") or 0,
+            })
+        except Exception:
+            pass
+    return {"kind": "research", "status": "ok",
+            "fragment": summary[:200] or "Research done.",
+            "output_query": str(result.get("query") or query),
+            "output_content": content,
+            "spoken_summary": summary}
+
+
+def _mi_report_filename(clause):
+    """A safe .txt report name for the write step, from the clause."""
+    name = ""
+    match = re.search(
+        r"\b(?:named|called|by\s+the\s+name(?:\s+of)?|name\s+it)\s+"
+        r"([A-Za-z0-9_.\- ]{1,60})", clause or "", re.IGNORECASE)
+    if match:
+        name = match.group(1).strip().strip("\"'")
+        name = re.split(
+            r"\s+(?:with|and|in|on|for|to|about|containing|that|which)\b",
+            name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    if not name:
+        name = "jarvis_report.txt"
+    name = name.replace("\\", "/").split("/")[-1].strip()
+    if not re.search(r"\.\w{1,6}$", name):
+        name += ".txt"
+    return name or "jarvis_report.txt"
+
+
+def _mi_free_path(path):
+    """Never overwrite: "name.txt" -> "name (2).txt" when it exists."""
+    try:
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        for n in range(2, 51):
+            candidate = "%s (%d)%s" % (base, n, ext)
+            if not os.path.exists(candidate):
+                return candidate
+    except Exception:
+        pass
+    return path
+
+
+def _mi_task_step(msg, step, results):
+    """Compose the file write and arm the ONE approval; nothing runs now."""
+    clause = step.get("text") or ""
+    content = ""
+    for idx in step.get("consumes") or []:
+        prior = results[idx]
+        if prior.get("status") == "ok" and prior.get("output_content"):
+            content = str(prior["output_content"])
+            break
+    if not content:
+        try:
+            content = str(task_agent_module._located_write_content(
+                clause, "") or "").strip()
+        except Exception:
+            content = ""
+    if not content:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I don't have anything to put in that file yet."}
+    try:
+        folders = task_agent_module._known_folders() or {}
+    except Exception:
+        folders = {}
+    base = folders.get("desktop") or folders.get("home") or ""
+    if not base:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't find your Desktop folder."}
+    path = _mi_free_path(os.path.join(base, _mi_report_filename(clause)))
+    try:
+        if task_agent_module.has_pending_task_confirmation():
+            return {"kind": "task", "status": "failed",
+                    "fragment": "Another task is already waiting for your "
+                                "approval, so I left the file uncreated — "
+                                "ask me again once that is settled."}
+    except Exception:
+        pass
+    plan = {
+        "ok": True,
+        "confidence": 0.9,
+        "summary": "Creating %s with the findings."
+                   % os.path.basename(path),
+        "requires_confirmation": True,
+        "command_text": msg,
+        "steps": [{
+            "tool": "code.write_file",
+            "args": {"path": path, "content": content, "create_only": True},
+            "risk": "safe",
+            "reason": "Saving the findings to %s." % os.path.basename(path),
+        }],
+    }
+    try:
+        task_agent_module._arm_plan_confirmation(plan, {}, task_text=msg)
+        prompt = task_agent_module.confirmation_prompt(plan)
+    except Exception as exc:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't prepare the file write (%s)."
+                            % _mi_clip(exc, 80)}
+    return {"kind": "task", "status": "armed", "fragment": prompt,
+            "prompt": prompt, "path": path}
+
+
+def _run_multi_intent_chain(msg, plan):
+    """Execute the chain in order, then deliver ONE honest summary."""
+    global _mi_chain_active
+    results = []
+    try:
+        for step in plan.get("steps") or []:
+            blocked = [j for j in (step.get("consumes") or [])
+                       if j >= len(results)
+                       or results[j].get("status") != "ok"]
+            if blocked:
+                which = ", ".join(
+                    (plan["steps"][j].get("kind")
+                     if j < len(plan["steps"]) else "earlier")
+                    for j in blocked)
+                results.append({
+                    "kind": step.get("kind"), "status": "skipped",
+                    "fragment": "I skipped the %s step because the %s "
+                                "step didn't finish."
+                                % (step.get("kind"), which)})
+                continue
+            if step.get("kind") == "screen":
+                results.append(_mi_screen_step(step))
+            elif step.get("kind") == "research":
+                results.append(_mi_research_step(step, results))
+            elif step.get("kind") == "task":
+                results.append(_mi_task_step(msg, step, results))
+            else:
+                results.append({"kind": step.get("kind"),
+                                "status": "skipped",
+                                "fragment": "I skipped an unknown step."})
+    finally:
+        try:
+            _finish_multi_intent(plan, results)
+        finally:
+            with _MI_CHAIN_LOCK:
+                _mi_chain_active = False
+
+
+def _finish_multi_intent(plan, results):
+    armed = None
+    ok_bits = []
+    bad_bits = []
+    for r in results:
+        status = r.get("status")
+        if status == "armed":
+            armed = r
+        elif status == "ok":
+            if r.get("fragment"):
+                ok_bits.append(str(r["fragment"]))
+        else:
+            bad_bits.append(str(r.get("fragment") or ""))
+    if armed:
+        lead = " ".join(ok_bits).strip()
+        reply = ("Sir, " + (lead + " " if lead else "")
+                 + str(armed.get("prompt") or ""))
+        _notify_async_reply(_mi_clip(reply, 600))
+        return
+    if bad_bits:
+        reply = ("Sir, here is where it stands. "
+                 + " ".join(ok_bits + bad_bits))
+        _notify_async_reply(_mi_clip(reply, 600))
+        return
+    reply = "Sir, done. " + " ".join(ok_bits)
+    _notify_async_reply(_mi_clip(reply, 600))
+
+
+def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
+    """Ack the chain now, run it on a worker; returns the single ack line."""
+    global _mi_chain_active
+    with _MI_CHAIN_LOCK:
+        if _mi_chain_active:
+            return ("Sir, another chained task is already running — "
+                    "one moment.")
+        _mi_chain_active = True
+    try:
+        threading.Thread(
+            target=_run_multi_intent_chain, args=(msg, plan),
+            daemon=True).start()
+    except Exception as exc:
+        with _MI_CHAIN_LOCK:
+            _mi_chain_active = False
+        logging.warning("[CHAIN] worker start failed: %s", exc)
+        return None
+    return multi_intent.render_ack(plan, voice_compact=voice_compact)
+
+
 def _consume_confirmation(answer):
     """User answered a pending 'shall I look it up?' question.
 
@@ -5229,6 +5519,30 @@ def _process_message_inner(
                 return status_reply
         except Exception as exc:
             logging.warning("[STATUS] Grounded answer failed: %s", exc)
+
+    # ── Rank 2: one utterance, many jobs (screen → research → file) ──
+    # A compound request whose pieces classify to distinct action kinds
+    # becomes an ordered chain: ack once here, run the steps on a worker,
+    # and let the file write ask for its approval after the earlier steps
+    # finish. Single jobs never reach this gate (build_chain returns None),
+    # and the gates above keep priority: confirmations, corrections, stops
+    # and status answers are all consumed before a chain is considered.
+    if not msg.lower().startswith("command"):
+        try:
+            _chain = multi_intent.build_chain(msg)
+        except Exception as exc:
+            _chain = None
+            logging.warning("[CHAIN] split failed: %s", exc)
+        if _chain is not None:
+            chain_reply = handle_multi_intent(
+                msg, _chain, from_voice=from_voice,
+                voice_compact=voice_compact)
+            if chain_reply is not None:
+                print("[CHAIN] multi-intent chain:",
+                      [s.get("kind") for s in _chain.get("steps") or []])
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, chain_reply)
+                return chain_reply
 
     # ── [P0-10] Speculative chat racer — started HERE ────────────────────
     # This used to start after the whole predicate chain below (task request,
