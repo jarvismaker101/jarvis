@@ -15,6 +15,7 @@ import time
 
 from backend.services.fireworks_client import ask_fireworks
 from backend.services.task_agent.connectors import browser_cdp, editor_bridge, windows_connector
+from backend.services import adaptive_steps
 from backend.services import approvals
 from backend.services import code_tools
 from backend.services import productivity_connector
@@ -3019,6 +3020,240 @@ def _execute_step_structured(step, context):
         return f"{tool} failed: {exc}", None
 
 
+# ── Rank 3 (EX3): the adaptive step loop ────────────────────────────────────
+#
+# The old loop executed each step once and recorded the verdict. Rank 3
+# wraps every execution in do → check → diagnose → retry DIFFERENTLY:
+# a failed step's own evidence is diagnosed (slow page, covering popup,
+# missing target, sign-in wall, ...), and only a diagnosis with a fitting
+# recovery runner is retried. Every tactic runs at most once per step, so an
+# identical retry is impossible, and the caps in adaptive_steps are hard.
+
+#: Only these tools can be retried; the diagnosis layer filters further.
+ADAPTIVE_RETRY_TOOLS = frozenset({
+    "browser.search_web", "browser.open_url", "windows.screen_action",
+    "code.run_command",
+})
+
+
+def _step_failure_verdict(tool, args, text, structured):
+    """(failed, reason) — the evidence rules the closed loop always used.
+
+    Extracted unchanged so a retry is judged by exactly the same standard as
+    the first try: structured ok/error, the '<tool> failed:' text prefix, an
+    unknown-tool verdict, and the code-tool postconditions.
+    """
+    failed_prefix = f"{tool} failed:" if tool else "failed:"
+    if structured is not None and not structured.get("ok"):
+        return True, str(structured.get("error") or "the tool reported an error")
+    if (text or "").startswith(failed_prefix):
+        return True, text[len(failed_prefix):].strip() or "the tool reported an error"
+    if (text or "").startswith("Unknown task tool:"):
+        # Nothing ran: honest failure, never a silent ok.
+        return True, "unknown tool"
+    # DETERMINISTIC POSTCONDITIONS (code tools only): a reported ok for
+    # write_file/create_folder/apply_patch must leave the path behind; for
+    # run_command/run_script the ok/exit_code already is the verdict.
+    if structured is not None and structured.get("ok") \
+            and tool in ("code.write_file", "code.create_folder",
+                         "code.apply_patch"):
+        resolved = structured.get("path") or args.get("path") or ""
+        if resolved and not os.path.exists(resolved):
+            return True, "postcondition failed: %s missing" % resolved
+    return False, ""
+
+
+def _refresh_context_evidence(context):
+    """Re-gather tabs / active window / editor AFTER a failure (Rank 3).
+
+    The whole point of a smarter retry is seeing the world as it is NOW, not
+    as it was before the failed attempt.
+    """
+    try:
+        context["browser"] = browser_cdp.snapshot()
+    except Exception:
+        pass
+    try:
+        context["windows"] = windows_connector.snapshot()
+    except Exception:
+        pass
+    try:
+        context["editor"] = editor_bridge.snapshot(
+            active_window_title=_active_window_title(context))
+    except Exception:
+        pass
+    return context
+
+
+def _tab_for_url(context, url):
+    """The already-open tab whose host matches *url*, if any."""
+    def _host(value):
+        value = re.sub(r"^https?://", "", str(value or ""),
+                       flags=re.IGNORECASE)
+        return value.split("/")[0].split(":")[0].lower()
+
+    wanted = _host(url)
+    if not wanted:
+        return None
+    try:
+        tabs = (context.get("browser") or {}).get("tabs") or []
+    except Exception:
+        tabs = []
+    for tab in tabs:
+        if isinstance(tab, dict) and _host(tab.get("url")) == wanted:
+            return tab
+    return None
+
+
+def _recovery_resettle_wait(step, context, attempt_index):
+    """Give a slow page/app a beat, then look again before the retry."""
+    time.sleep(1.2)
+    _refresh_context_evidence(context)
+    return True
+
+
+def _recovery_refresh_evidence(step, context, attempt_index):
+    """Retry against freshly gathered evidence (no input sent anywhere)."""
+    _refresh_context_evidence(context)
+    return True
+
+
+def _recovery_alternate_route(step, context, attempt_index):
+    """Same goal, different route: a simpler search, or the open tab."""
+    tool = str(step.get("tool") or "")
+    args = step.get("args") if isinstance(step.get("args"), dict) else {}
+    if tool == "browser.search_web":
+        original = str(args.get("query") or "")
+        simplified = adaptive_steps.simplify_query(original)
+        if not simplified:
+            return False
+        # Never an identical retry: a query that cannot be simplified must
+        # fall through to no-retry instead of repeating the same search.
+        step["args"] = dict(args, query=simplified)
+        return True
+    if tool == "browser.open_url":
+        tab = _tab_for_url(context, args.get("url"))
+        tab_id = ""
+        if tab:
+            tab_id = str(tab.get("id") or tab.get("tab_id")
+                         or tab.get("targetId") or "")
+        if not tab_id:
+            return False
+        try:
+            result = browser_cdp.activate_tab(tab_id)
+        except Exception:
+            return False
+        return bool(isinstance(result, dict) and result.get("activated"))
+    return False
+
+
+def _recovery_dismiss_overlay(step, context, attempt_index):
+    """Escape a pop-up that covered an approved screen action.
+
+    Only for screen actions, and only while the FOREGROUND WINDOW is still
+    the one the plan was built against — if focus moved, an Escape would land
+    somewhere the user never approved, so the tactic refuses.
+    """
+    if str(step.get("tool") or "") != "windows.screen_action":
+        return False
+    expected = str(
+        (((context.get("windows") or {}).get("active_window") or {})
+         .get("hwnd")) or "")
+    if not expected:
+        return False
+    try:
+        now = windows_connector.get_active_window()
+    except Exception:
+        return False
+    if str(now.get("hwnd") or "") != expected:
+        return False
+    try:
+        from backend.services import screen_executor
+        screen_executor.press_keys(["esc"])
+        time.sleep(0.4)
+    except Exception as exc:
+        logging.warning("[RANK3] could not dismiss the overlay: %s", exc)
+        return False
+    _refresh_context_evidence(context)
+    return True
+
+
+_RECOVERY_RUNNERS = {
+    "resettle_wait": _recovery_resettle_wait,
+    "refresh_evidence": _recovery_refresh_evidence,
+    "alternate_route": _recovery_alternate_route,
+    "dismiss_overlay": _recovery_dismiss_overlay,
+}
+
+
+def _run_recovery_tactic(tactic, step, context, attempt_index):
+    """Run ONE recovery tactic. False means stop retrying (honest)."""
+    runner = _RECOVERY_RUNNERS.get(tactic)
+    if runner is None:
+        return False
+    try:
+        return bool(runner(step, context, attempt_index))
+    except Exception as exc:
+        logging.warning("[RANK3] recovery %s failed: %s", tactic, exc)
+        return False
+
+
+def _execute_step_adaptive(step, context):
+    """Rank 3 — do it, check it, and on a diagnosed failure try DIFFERENTLY.
+
+    Returns ``(text, structured, attempts, failed, reason, diagnosis)``.
+    ``attempts`` is the full trail (one entry per execution, with the tactic
+    that produced it), so callers can report exactly what was tried. A retry
+    happens only when the diagnosis says the cause is recoverable AND a
+    tactic that was not already used for this step fits the tool; the caps
+    are hard, and every attempt carries a distinct tactic identity, so an
+    identical retry is structurally impossible.
+    """
+    tool = str(step.get("tool") or "")
+    attempts = []
+    tried = set()
+    current_tactic = "initial"
+    text = ""
+    structured = None
+    failed = False
+    reason = ""
+    diagnosis = None
+    while True:
+        text, structured = _execute_step_structured(step, context)
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        failed, reason = _step_failure_verdict(tool, args, text, structured)
+        attempts.append({
+            "tactic": current_tactic,
+            "ok": not failed,
+            "why": (reason or "")[:200],
+            "signature": adaptive_steps.attempt_signature(
+                tool, args, current_tactic),
+        })
+        if not failed:
+            break
+        external = False
+        try:
+            external = bool(productivity_connector.is_productivity_tool(tool))
+        except Exception:
+            external = False
+        diagnosis = adaptive_steps.diagnose(
+            tool, text, structured, external_effect=external)
+        if len(attempts) >= adaptive_steps.MAX_TRIES_PER_STEP:
+            break
+        if not diagnosis["retryable"]:
+            break
+        tactic = next(
+            (item for item in adaptive_steps.tactics_for(
+                tool, diagnosis["class"]) if item not in tried), "")
+        if not tactic:
+            break
+        tried.add(tactic)
+        if not _run_recovery_tactic(tactic, step, context, len(attempts)):
+            break
+        current_tactic = tactic
+    return text, structured, attempts, failed, reason, diagnosis
+
+
 def _normalize_fs_path(path):
     """Normalize for dependency prefix matching (case-insensitive on
     Windows via normcase, separator-aware via normpath)."""
@@ -3654,35 +3889,53 @@ def _run_confirmed_steps(plan, context, task_text=""):
                 })
                 continue
 
-        text, structured = _execute_step_structured(step, context)
-        failed_prefix = f"{tool} failed:" if tool else "failed:"
-        reason = ""
-        failed = False
-        if structured is not None and not structured.get("ok"):
-            reason = str(structured.get("error") or "the tool reported an error")
-            failed = True
-        elif (text or "").startswith(failed_prefix):
-            reason = text[len(failed_prefix):].strip() or "the tool reported an error"
-            failed = True
-        elif (text or "").startswith("Unknown task tool:"):
-            # Nothing ran: honest failure, never a silent ok.
-            reason = "unknown tool"
-            failed = True
+        text, structured, attempts, failed, reason, diagnosis = \
+            _execute_step_adaptive(step, context)
 
-        # DETERMINISTIC POSTCONDITIONS (code tools only): a reported ok
-        # for write_file/create_folder/apply_patch must leave the path
-        # behind; for run_command/run_script the ok/exit_code already is
-        # the verdict.
-        if not failed and structured is not None and structured.get("ok") \
-                and tool in ("code.write_file", "code.create_folder",
-                             # F11: a patch is a write — it must leave the
-                             # patched file behind (dry_run writes nothing,
-                             # so the file simply still exists).
-                             "code.apply_patch"):
-            resolved = structured.get("path") or args.get("path") or ""
-            if resolved and not os.path.exists(resolved):
-                failed = True
-                reason = "postcondition failed: %s missing" % resolved
+        # Rank 3 — a write whose parent folder is missing is a PLAN problem,
+        # not a retry problem: the plan is one step short. Within the job's
+        # replan budget the missing folder becomes an explicit step and the
+        # changed effect set is re-approved — the old yes never authorizes a
+        # step the user never previewed.
+        if failed and tool == "code.write_file" and diagnosis \
+                and diagnosis.get("class") == adaptive_steps.PREREQ:
+            parent = os.path.dirname(str(args.get("path") or ""))
+            replans_used = int(plan.get("_adaptive_replans") or 0)
+            if parent and not os.path.exists(parent) \
+                    and adaptive_steps.can_replan(replans_used) \
+                    and plan.get("requires_confirmation"):
+                updated = dict(plan)
+                step_list = list(updated.get("steps") or [])
+                step_list.insert(index, {
+                    "tool": "code.create_folder",
+                    "args": {"path": parent},
+                    "risk": "safe",
+                    "reason": "create the folder the approved write needs",
+                })
+                for position in range(index + 1, len(step_list)):
+                    later = dict(step_list[position])
+                    deps = later.get("depends_on")
+                    if isinstance(deps, list):
+                        later["depends_on"] = [
+                            (dep + 1) if isinstance(dep, int)
+                            and not isinstance(dep, bool) and dep >= index
+                            else dep
+                            for dep in deps
+                        ]
+                    step_list[position] = later
+                updated["steps"] = step_list
+                updated["_adaptive_replans"] = replans_used + 1
+                try:
+                    _arm_plan_confirmation(updated, context,
+                                           task_text=task_text)
+                except Exception as exc:
+                    logging.warning(
+                        "[RANK3] could not re-arm the folder replan: %s", exc)
+                else:
+                    return TaskResult.needs_input(
+                        "The write needs a folder that is not there yet "
+                        "(%s). I will create it first. %s"
+                        % (parent, confirmation_prompt(updated)))
 
         if failed:
             if tool == "code.create_folder":
@@ -3690,13 +3943,18 @@ def _run_confirmed_steps(plan, context, task_text=""):
                 if folder_path:
                     failed_folders.append(
                         (folder_path, _normalize_fs_path(folder_path)))
+            outcome_reason = reason
+            if len(attempts) > 1:
+                outcome_reason = "%s (after %d tries)" % (reason,
+                                                          len(attempts))
             outcomes.append({
                 "tool": tool,
                 "status": "failed",
                 "result": text or "",
-                "reason": reason,
+                "reason": outcome_reason,
                 "goal": _goal_of(step),
-                "fragment": _fail_fragment(step, reason),
+                "attempts": attempts,
+                "fragment": _fail_fragment(step, outcome_reason),
             })
             _record_observation(observations, index, step, structured, text,
                                 "failed")
@@ -3710,6 +3968,7 @@ def _run_confirmed_steps(plan, context, task_text=""):
             "result": text or "",
             "reason": "",
             "goal": _goal_of(step),
+            "attempts": attempts,
             "fragment": _ok_fragment(step, text),
         })
         # F09: every executed step joins the verified trace; an ok step that
