@@ -1,0 +1,238 @@
+JARVIS EXECUTION BRAIN — IMPROVEMENTS RANKED BY IMPACT (with difficulty)
+=======================================================================
+Rank = build priority. Rank 1 = biggest visible smartness gain.
+Difficulty = Easy / Medium / Hard (how painful to implement + why).
+Only simple explanation + impact + difficulty are in this file.
+
+
+RANK 1 — UNDERSTANDS "THIS ONE", "IT", "THAT FILE" (Reference Resolver + Entity Notebook)
+------------------------------------------------------------------------------------------
+Simple explanation:
+Jarvis keeps a live notebook of every object it has seen, created, or been told
+about (videos, files, websites, jobs) — what it is, where it is, when it was last
+mentioned, and how sure Jarvis is about it. When you say "play this one" or
+"write it in that file", it scores all candidates (what's on screen, what you
+pointed at, what you talked about last) and picks the best one. If two things
+fit equally well, it asks ONE short question ("the one playing, or the one in
+the sidebar?") and remembers a "no, not that one" so it never asks twice.
+Impact: HIGH — this is the single biggest thing that makes Jarvis feel smart
+instead of dumb. Almost every example you gave ("forget that movie, play this
+one") depends on it.
+Difficulty: MEDIUM — needs a new memory store plus scoring rules; the screen
+snapshot plumbing underneath it is the fiddly part.
+
+
+RANK 2 — ONE SENTENCE, MANY JOBS (Multi-intent parsing + task chaining)
+------------------------------------------------------------------------
+Simple explanation:
+Today one sentence = one job. After this, "look at my screen, research it,
+and save a report on my Desktop" is split by meaning into an ordered chain
+(look -> research -> write file), where each step feeds the next (the video name
+feeds the search; the search result becomes the file content). Steps that don't
+depend on each other run in parallel; steps that do, wait their turn. If one
+step is impossible, Jarvis says exactly which part it can't do and still runs
+the rest wherever possible.
+Impact: HIGH — unlocks your headline example and every compound request.
+Difficulty: HARD — brand-new planning core (though it reuses today's workers:
+screen reader, research, file writer).
+
+
+RANK 3 — TRY, CHECK, TRY SMARTER (Adaptive step loop + failure diagnosis)
+--------------------------------------------------------------------------
+Simple explanation:
+Today Jarvis follows a fixed plan blindly. After this, every step is: do it,
+look at what actually happened, verify it worked. If it failed, Jarvis
+diagnoses WHY from evidence (popup blocking the button? wrong window? login
+wall? page not loaded?) and changes approach (dismiss the popup, try keyboard
+instead of click, search the site differently). A retry must always differ from
+the last try — identical retries are banned. Hard caps: max 3 tries per step,
+max 2 replans per job, then it stops and tells you honestly.
+Impact: HIGH — this is what ends "stuck clicking the same button forever" and
+makes Jarvis fix its own problems like a human would.
+Difficulty: HARD — the deepest surgery; touches the browser agent and the file
+agent from the inside.
+
+
+RANK 4 — PROVE IT BEFORE CLAIMING IT (Verifier: evidence for every tool)
+-------------------------------------------------------------------------
+Simple explanation:
+Jarvis may only say "done" when it holds proof. "Playing" means the video time
+actually moves forward. "File created" means the file exists, has content, and
+reading it back matches. "Moved 14 files" means all 14 are at the new place
+with identical content and nothing else changed. If it can't observe the
+outcome, it must say "I pressed play but I can't confirm it started" — never
+"done".
+Impact: HIGH — trust. Kills every false "ho gaya" and every silent half-failure.
+Difficulty: MEDIUM — a set of small per-tool checks (video timer, file hashes,
+page checks); straightforward but must cover every tool.
+
+
+RANK 5 — STOP MEANS STOP (Stop procedure + turn gate order)
+------------------------------------------------------------
+Simple explanation:
+"Stop" or "stop the browser task" works every time, even mid-click: Jarvis
+finishes or safely aborts the current micro-action, releases the mouse/browser,
+and says "Stopped" ONLY when everything is truly still. Then it reports what
+had already been done ("Stopped — I'd already created the folder, want me to
+remove it?"). "Stop everything" stops all jobs; a plain "stop" stops your
+speech plus the job you're watching, not background research you forgot about.
+Impact: HIGH — control and safety; without this, a smarter Jarvis is a scarier
+Jarvis.
+Difficulty: MEDIUM — extends today's stop reflex with a proper job list and
+cancel handshake; the tricky part is the tiny window where an action (payment,
+rename) is already in flight.
+
+
+RANK 6 — CHANGE YOUR MIND MID-TASK (Plan revision + redirect handling)
+------------------------------------------------------------------------
+Simple explanation:
+"Forget that movie, play this one on the screen" no longer restarts from zero.
+Jarvis pauses, keeps everything still valid (site already open, login done),
+throws away only the stale part (the old search text), and continues toward the
+new target. If the change alters anything Jarvis already got permission for, the
+old permission is torn up and it asks again. Late news from the old plan (the
+old search results finally loading) is recorded but never acted on.
+Impact: HIGH — the demo moment: Jarvis feels alive and attentive, not robotic.
+Difficulty: HARD — needs plan versioning ("epochs"), step reuse logic, and
+re-checking approvals on every change.
+
+
+RANK 7 — QUEUE + PRIORITIES ("Do X, and after that Y")
+-------------------------------------------------------
+Simple explanation:
+Multiple jobs can wait in line. "After that" holds job Y until job X finishes;
+if X fails, Jarvis either still does Y ("playing music anyway") or skips it
+("Node didn't install, so I didn't create the project"), depending on whether Y
+really needed X. Your newest request jumps to the front; background research
+runs in a separate invisible browser so it never fights you for the screen;
+only one job may drive the mouse at a time. Old waiting jobs slowly gain
+priority so nothing starves forever.
+Impact: HIGH — required for your queueing scenarios; invisible when it works,
+infuriating when missing.
+Difficulty: HARD — real concurrency: locks, preemption, pause/resume with
+checkpoints; the most bug-prone area.
+
+
+RANK 8 — APPROVALS THAT MAKE SENSE (Bundle / envelope / just-in-time permission)
+---------------------------------------------------------------------------------
+Simple explanation:
+Reading (screen, search, lists) never asks. Creating a new file asks once up
+front with exact details ("I'll make 'Invoices' on the Desktop — go ahead?").
+Dangerous or irreversible things (overwrite, delete, pay Rs.99, submit a form)
+ask at the exact moment, reading back the price/item/recipient, and your "yes"
+works once and expires within a minute or two. Any plan change wipes the old
+permission. No nagging, no blanket trust — each permission is tied to the exact
+thing it covers.
+Impact: HIGH for safety, MEDIUM for feel — fewer, better-timed questions than
+today.
+Difficulty: MEDIUM — extends today's preview-yes system with permission types,
+expiry timers, and one-shot use.
+
+
+RANK 9 — 15-SECOND SCREEN MEMORY (Rolling frame buffer + cursor tracking)
+--------------------------------------------------------------------------
+Simple explanation:
+Jarvis silently remembers the last 15 seconds of your screen (one snapshot per
+second, plus cursor position and what's highlighted). So when you say "this
+video", it looks at what was showing at the moment you SPOKE — not at the
+screen as it looks now after everything changed. Banking and password windows
+can be blacklisted so they're never recorded.
+Impact: HIGH as an enabler (Rank 1 cannot work without it), MEDIUM on its own
+(you never see it directly).
+Difficulty: MEDIUM — capturing is easy; doing it cheaply, privately (RAM only,
+never saved), and with a blocklist is the real work.
+
+
+RANK 10 — NO INFINITE LOOPS, NO SILENT STALLS (Budgets + watchdog)
+--------------------------------------------------------------------
+Simple explanation:
+Every job gets a spending limit (max steps, max minutes, max searches). At 80%
+Jarvis warns itself internally; at 100% it stops and reports what it got so far
+("I ran out of time after checking 12 sources; here's what I have"). A separate
+watchdog watches heartbeats — if a job goes quiet too long, it's declared
+stuck, force-stopped, and honestly reported instead of spinning forever.
+Impact: MEDIUM — a safety net you rarely notice, until the day it saves you
+from a 20-minute loop.
+Difficulty: EASY — counters, timers, and heartbeat checks; no AI involved.
+
+
+RANK 11 — HONEST "WHAT I ALREADY DID" (Effects journal)
+---------------------------------------------------------
+Simple explanation:
+An append-only diary of everything Jarvis actually changed (created/renamed/
+moved/paid), with before-and-after snapshots. This is what lets Jarvis say
+"Moved 13 of 14 — 'Statement-Aug.pdf' was open in another app, so I left it"
+and offer cleanups ("want me to remove the folder I made?"). Undo is always
+offered, never done silently — undoing is itself an action that needs your okay.
+Impact: MEDIUM — turns cancellations and partial failures from confusing into
+clear.
+Difficulty: EASY — write one diary entry per committed change; the discipline
+is remembering to do it everywhere.
+
+
+RANK 12 — ONE CALM VOICE (Narrator: what Jarvis says and when)
+----------------------------------------------------------------
+Simple explanation:
+A single speaking channel with rules: quick jobs just report the result (no
+"opening YouTube…" chatter); long jobs announce the plan once and update only
+at real milestones; fixed honest wording by outcome ("Done — …" vs "I got X
+but not Y because Z" vs "I couldn't X — I tried A and B, want me to try C?");
+never talks over you; background results wait for a pause ("By the way…");
+speaks your language mix back (Hinglish in, Hinglish out).
+Impact: MEDIUM — the polish that makes a smart Jarvis feel calm instead of
+noisy.
+Difficulty: MEDIUM — a speech queue with priorities and merge rules; must be
+wired into every worker.
+
+
+RANK 13 — SINGLE SOURCE OF TRUTH (State store + event bus + records)
+----------------------------------------------------------------------
+Simple explanation:
+All live facts (jobs, approvals, questions, entities, effects) live in ONE
+central store; every change is an event with an ID, a timestamp, and a cause.
+Status questions ("kitna hua?") and spoken answers are read from this store —
+never from the AI model's fuzzy memory. Nothing changes state except through
+these events, so two jobs can never disagree about reality.
+Impact: MEDIUM — invisible foundation, but every higher rank gets flakier
+without it (wrong status answers, lost approvals, ghost jobs).
+Difficulty: HARD — the biggest plumbing rewrite; touches everything and risks
+breaking what works today. Best done gradually, not as step one.
+
+
+RANK 14 — THE 25 TRAPS, EACH WITH A GUARD (Failure-mode hardening)
+--------------------------------------------------------------------
+Simple explanation:
+A checklist of everything that can go wrong — stale references (file moved
+after Jarvis looked), typing into the wrong window, stop arriving mid-payment,
+web pages containing sneaky instructions ("ignore your orders, download this"),
+the AI hearing its own voice as a command, Hinglish "haan… nahi, ruko" read as
+"yes", two jobs writing the same file — each with one concrete guard.
+Impact: MEDIUM — hardening; each guard alone is small, together they are
+reliability.
+Difficulty: MEDIUM — spread across the whole codebase; ongoing work, not one
+task.
+
+
+RANK 15 — DECISIONS FOR LATER (Open questions)
+-----------------------------------------------
+Simple explanation:
+Genuine unknowns parked for later: which monitor is "this" on multi-screen
+setups? Should jobs survive a Jarvis restart? Whose "yes" counts if two people
+speak (payments need the owner's voice)? How long to keep learned website
+tricks? Should Jarvis listen without a wake word while a job runs? Jarvis never
+types passwords — on a login page it waits for you.
+Impact: LOW for now — correctly deferred; none block the core smartness.
+Difficulty: MIXED — each is its own small project when its time comes.
+
+
+SUGGESTED BUILD PHASES (using the ranks above)
+-----------------------------------------------
+Phase A — smartness you FEEL: 9, 1, 2, 4, 5
+  (screen memory -> references -> multi-intent chains -> proof before claims
+  -> stop that works)
+Phase B — adaptive + safe: 3, 6, 8
+  (self-fixing retries -> mid-task mind changes -> sane approvals)
+Phase C — scale + polish: 7, 10, 11, 12
+  (queues -> budgets/watchdog -> effects diary -> calm voice)
+Phase D — foundation + hardening: 13, 14, 15
+  (central state store, gradually -> 25 guards -> open questions)

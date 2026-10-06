@@ -13,6 +13,7 @@ import uuid
 import requests
 
 from backend.core import deadline as budget
+from backend.core import entity_ledger
 from backend.core.executor import execute_multiple
 from backend.core.memory import add_message, clear_history, get_history
 # G9: guarded import — the memory store is optional and import-safe
@@ -3634,6 +3635,14 @@ def notebook_record_entity(name, path, kind="folder", source="observed"):
         })
         while len(_notebook_entities) > _NOTEBOOK_ENTITIES_MAX:
             _notebook_entities.pop(0)
+    # Rank 1: every notebook entity also lands in the entity ledger (the
+    # richer store the reference resolver scores) — one funnel, no drift.
+    try:
+        entity_ledger.record_entity(name, canon, kind=str(kind),
+                                    source=str(source),
+                                    identifiers={"path": canon})
+    except Exception:
+        pass
 
 
 def notebook_focus_folder():
@@ -3843,6 +3852,63 @@ def handle_correction(msg, from_voice=False, voice_compact=False):
         return ("Sir, understood — I dropped the earlier request and will "
                 "take this one instead. %s" % text)
     return None
+
+
+#: Rank 1 — a reference correction revises the last BINDING, never the
+#: request. "No, not that one" / "I meant the other one" / "wrong file":
+#: the rejected entity becomes negative evidence and the same mention is
+#: re-resolved. Deliberately excludes R7's check/create verbs ("no, I meant
+#: check...") — those stay on the R7 correction path.
+_REFERENCE_CORRECTION_RE = re.compile(
+    r"\bnot\s+that\s+(one|file|folder|video|movie|thing)\b"
+    r"|\bi\s+meant\s+the\s+other\s+one\b"
+    r"|\bno\s*,?\s*not\s+that\b"
+    r"|\bwrong\s+(one|file|folder)\b",
+    re.IGNORECASE,
+)
+
+
+def handle_reference_correction(msg):
+    """Rank 1: reject the last-bound entity and re-resolve the same mention.
+
+    Returns the confirm/ask reply, or None when the turn is not a
+    reference correction or no binding exists to revise (caller falls
+    through to normal routing). Armed gates are cancelled — the old yes
+    dies with the rejected binding.
+    """
+    text = (msg or "").strip()
+    if not _REFERENCE_CORRECTION_RE.search(text):
+        return None
+    try:
+        binding = entity_ledger.get_last_binding()
+    except Exception:
+        return None
+    if not binding or not binding.get("entity_id"):
+        return None
+    _cancel_armed_gates("revised by reference correction: %s" % text[:120])
+    try:
+        snap = notebook_snapshot()
+        reqs = snap.get("requests") or []
+        if reqs:
+            notebook_mark_state(reqs[-1].get("id"), "superseded")
+    except Exception:
+        pass
+    entity_ledger.reject_entity(binding.get("entity_id"))
+    status, payload = entity_ledger.resolve_mention(
+        binding.get("text") or binding.get("mention") or "",
+        expected_kind=binding.get("expected_kind"),
+        constraints=binding.get("constraints"))
+    if status == "bound" and isinstance(payload, dict):
+        name = (payload.get("display_name") or
+                os.path.basename(str(payload.get("canon") or "")) or "that")
+        return "Sir, understood — I will use '%s' instead." % name
+    if status == "ask" and isinstance(payload, dict):
+        options = payload.get("options") or []
+        question = str(payload.get("question") or "").strip()
+        if options and question:
+            return "Sir, understood — not that one. %s" % question
+    return ("Sir, understood — not that one. "
+            "Could you tell me the exact name?")
     """R6: split "stop X and do Y" into (stop_half, redirect_half).
 
     Returns (None, None) when the turn is not a compound. The stop half must
@@ -5002,6 +5068,21 @@ def _process_message_inner(
                 return held_reply
     except Exception as exc:
         logging.warning("[STOP] Held redirect release failed: %s", exc)
+
+    # ── Rank 1: reference correction revises the last binding ──
+    # "No, not that one" / "I meant the other one" rejects the bound entity
+    # and re-resolves the same mention — never a new request, never a guess.
+    # Runs before R7 (different phrases, no overlap) and before the
+    # confirmation gates so it is never eaten as a yes/no answer.
+    try:
+        reference_reply = handle_reference_correction(msg)
+        if reference_reply is not None:
+            print("[REFERENCE] Binding revised:", msg)
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, reference_reply)
+            return reference_reply
+    except Exception as exc:
+        logging.warning("[REFERENCE] Revision handling failed: %s", exc)
 
     # ── R7: correction replaces, never adds ──
     # "That was meant to be a check" kills the armed create preview (its yes

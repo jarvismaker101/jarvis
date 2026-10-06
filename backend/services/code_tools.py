@@ -134,6 +134,16 @@ def write_file(path, content="", expected_hash=None, create_only=False):
         expect="create" if create_only else None)
     if result.get("ok") and result.get("restore_id"):
         result["content"] += " (restore id %s)" % result["restore_id"]
+    if result.get("ok"):
+        # Rank 1: a created/overwritten file becomes a ledger entity so
+        # "that file" / "the file you just made" resolve to it.
+        try:
+            from backend.core import brain as _brain
+            _brain.notebook_record_entity(
+                os.path.basename(resolved) or resolved, resolved,
+                kind="file", source="created")
+        except Exception:
+            pass
     return result
 
 
