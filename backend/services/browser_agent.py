@@ -241,6 +241,42 @@ def request_stop(job_id=None):
     return cancelled
 
 
+# ── Rank 5: what a stopped run had already done ──
+# A stopped TaskResult drops the session's committed effects, so the user
+# never hears what the run did before the stop ("Stop" that leaves silent
+# changes behind is exactly what "stop means stop" must not do). The loop
+# publishes a short report the moment it honours a stop; the brain's stop
+# finisher consumes it for its "Stopped" reply.
+_STOP_REPORT_LOCK = threading.Lock()
+_last_stop_report = ""
+
+
+def _publish_stop_report(session):
+    """Rank 5: remember the committed actions of a run being stopped."""
+    global _last_stop_report
+    try:
+        actions = [str(item) for item in
+                   ((session or {}).get("completed_actions") or [])]
+    except Exception:
+        actions = []
+    if not actions:
+        return
+    summary = "; ".join(item[:60] for item in actions[-5:])
+    if len(summary) > 240:
+        summary = summary[:237].rstrip() + "..."
+    with _STOP_REPORT_LOCK:
+        _last_stop_report = summary
+
+
+def consume_stop_report():
+    """Take (and clear) the last stopped run's already-done report."""
+    global _last_stop_report
+    with _STOP_REPORT_LOCK:
+        report = _last_stop_report
+        _last_stop_report = ""
+    return report
+
+
 def stop_requested():
     """Legacy poll: the shared flag OR any live browser job being cancelled."""
     if _STOP_REQUESTED.is_set():
@@ -5257,12 +5293,14 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
             except job_registry.Cancelled:
                 append_activity_line("stopped by user\n")
                 narrate_activity("Stopping")
+                _publish_stop_report(session)
                 return TaskResult.stopped()
         if _STOP_REQUESTED.is_set():
             # User pressed STOP: bail out gracefully - the browser stays
             # open, no tool error, the state resets via the caller.
             append_activity_line("stopped by user\n")
             narrate_activity("Stopping")
+            _publish_stop_report(session)
             return TaskResult.stopped()
         if deadline.expired():
             return _fail_and_log(
@@ -5325,10 +5363,12 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
             if job is not None and job.should_stop():
                 append_activity_line("stopped by user\n")
                 narrate_activity("Stopping")
+                _publish_stop_report(session)
                 return TaskResult.stopped()
             if _STOP_REQUESTED.is_set():
                 append_activity_line("stopped by user\n")
                 narrate_activity("Stopping")
+                _publish_stop_report(session)
                 return TaskResult.stopped()
             # Tool failures are delivered as tool results and the loop
             # CONTINUES - only model-call failures abort the task. A

@@ -1145,16 +1145,17 @@ def aec_reference(seconds: float = 0.5):
 
 
 @router.post("/task/stop")
-async def stop_task_route(job_id: str = "", kind: str = ""):
+async def stop_task_route(job_id: str = "", kind: str = "", scope: str = ""):
     """Stop ONE identified job at its next checkpoint (F20).
 
     [P1-14] Runs on the RESERVED control capacity (see CONTROL_LIMITER), so a
-    stop is never queued behind open chat streams.
+    stop is never queued behind open chat streams. Rank 5: scope="all" stops
+    EVERY work job (voice "stop everything"), still never the chat request.
     """
-    return await _on_control_plane(stop_task, job_id, kind)
+    return await _on_control_plane(stop_task, job_id, kind, scope)
 
 
-def stop_task(job_id: str = "", kind: str = ""):
+def stop_task(job_id: str = "", kind: str = "", scope: str = ""):
     """Stop ONE identified job at its next checkpoint (F20).
 
     *job_id* addresses a specific job; without one the NEWEST still-running job
@@ -1184,7 +1185,14 @@ def stop_task(job_id: str = "", kind: str = ""):
 
     cancelled = []
     try:
-        if kind:
+        if scope == "all":
+            # Rank 5 — the voice "stop everything": every work job, never
+            # the chat request (P1-11 semantics hold for the broad stop too).
+            for job in job_registry.live_jobs(
+                    exclude_kinds=(REQUEST_JOB_KIND,)):
+                cancelled.extend(job_registry.cancel_job(
+                    job.job_id, "stop everything requested"))
+        elif kind:
             # An explicit kind is authoritative — including kind="request".
             cancelled = job_registry.request_stop(
                 job_id or None, kinds=(kind,))

@@ -1043,6 +1043,14 @@ TASK_STOP_HI = (
     "task rok do", "task cancel karo", "kaam cancel karo", "kaam band",
 )
 
+#: Rank 5 — the broad stop: every work job, never the chat request. A
+#: separate control kind so "stop it" (ONE job) and "stop everything" (ALL
+#: work jobs) can never be confused.
+TASK_STOP_ALL_EN = (
+    "stop everything", "stop it all", "stop all tasks", "stop all jobs",
+    "stop everything now", "stop all the tasks", "stop all work",
+)
+
 APPROVAL_CANCEL_EN = (
     "cancel approval", "cancel the approval", "cancel that", "cancel that action",
     "cancel screen action", "cancel the screen action", "don't do that",
@@ -1110,6 +1118,7 @@ COMMAND_TAIL_TOKENS = frozenset((
 CONTROL_GRAMMAR = (
     ("speech_stop", (SPEECH_STOP_EN, SPEECH_STOP_HI)),
     ("task_stop", (TASK_STOP_EN, TASK_STOP_HI)),
+    ("task_stop_all", (TASK_STOP_ALL_EN, ())),
     ("approval_cancel", (APPROVAL_CANCEL_EN, APPROVAL_CANCEL_HI)),
     ("pause", (PAUSE_EN, PAUSE_HI)),
     ("continue", (tuple(CONTINUE_PHRASES), CONTINUE_HI)),
@@ -1213,6 +1222,7 @@ def control_owner(command):
         "pause": "speech",
         "continue": "speech",
         "task_stop": "task",
+        "task_stop_all": "task",
         "approval_cancel": "approval",
         "stop_research": "task",
         "sleep": "supervisor",
@@ -1278,7 +1288,7 @@ def is_cancel_approval(text):
     return classify_control(text) == "approval_cancel"
 
 
-def _deliver_stop_task():
+def _deliver_stop_task(all_jobs=False):
     """Deliver 'stop task' to the BACKEND (the one runtime that owns jobs).
 
     G11 / F50 — the old version called browser_agent/research/jobs module
@@ -1286,13 +1296,17 @@ def _deliver_stop_task():
     stop was a silent no-op against the real backend job. The authoritative
     kill switch is POST /task/stop (authed), which stops the browser agent,
     the research flow, interrupts live registered requests and cuts TTS.
+    Rank 5: "stop everything" posts scope=all, which cancels EVERY work job
+    (still never the chat request).
     """
     try:
         stop_speaking()
     except Exception:
         pass
-    ok, _ = _post_backend("/task/stop", {})
+    path = "/task/stop?scope=all" if all_jobs else "/task/stop"
+    ok, _ = _post_backend(path, {})
     print("🛑 Stop task delivered to backend: %s" % ("ok" if ok else "FAILED"))
+    return bool(ok)
 
 
 def _deliver_cancel_approval():
@@ -1557,6 +1571,8 @@ def dispatch_control(command):
         return _deliver_continue()
     if command == "task_stop":
         return _deliver_stop_task()
+    if command == "task_stop_all":
+        return _deliver_stop_task(all_jobs=True)
     if command == "approval_cancel":
         return _deliver_cancel_approval()
     if command == "stop_research":
@@ -1782,8 +1798,8 @@ def listener_thread():
                 print("🔴 Shutdown command received")
                 shutdown_everything()
                 break
-            if control in ("speech_stop", "task_stop", "approval_cancel",
-                           "pause", "continue", "sleep"):
+            if control in ("speech_stop", "task_stop", "task_stop_all",
+                           "approval_cancel", "pause", "continue", "sleep"):
                 print(f"🎛️ Control command: {control}")
                 dispatch_control(control)
                 continue
@@ -2029,7 +2045,8 @@ def handle_queued_item(text, turn=None):
     if control == "pause":
         _deliver_pause()
         return False
-    if control in ("speech_stop", "task_stop", "approval_cancel", "sleep"):
+    if control in ("speech_stop", "task_stop", "task_stop_all",
+                   "approval_cancel", "sleep"):
         print(f"🎛️ Control command: {control}")
         dispatch_control(control)
         return False

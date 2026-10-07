@@ -59,7 +59,7 @@ from backend.services.web_task_routing import is_web_shaped_task
 from backend.services.orchestrator import handle_message as orchestrator_handle_message
 from backend.services.orchestrator import select_route as orchestrator_select_route
 from backend.services.opencode_client import run_opencode_task, is_opencode_available, set_narration_enabled
-from backend.services.browser_agent import run_browser_task, request_stop as request_browser_task_stop
+from backend.services.browser_agent import run_browser_task, request_stop as request_browser_task_stop, consume_stop_report as consume_browser_stop_report
 from backend.services import browser_agent
 from backend.services import event_bus
 from backend.services.task_result import (
@@ -4416,6 +4416,187 @@ def handle_stop_research_request(from_voice=False):
     return "Stopped, sir."
 
 
+# ── Rank 5: STOP MEANS STOP ─────────────────────────────────────────────────
+# "stop the browser task" / "stop the research" keep their dedicated phrases
+# above. What reaches here is the GENERAL stop: a bare "stop" / "stop it" /
+# "ruko" and the broad "stop everything". A plain stop cuts speech and stops
+# the ONE job the user is watching (the newest live work job - never the chat
+# request, never older background work); "stop everything" stops every work
+# job. "Stopped" is only spoken once the cancelled work is observably still;
+# otherwise the user hears "Stopping" now and the honest report when it lands.
+_STOP_EVERYTHING_RE = re.compile(
+    r"\bstop\s+(?:everything|it\s+all|all(?:\s+(?:tasks?|jobs?|work))?|"
+    r"everything\s+now)\b", re.IGNORECASE)
+_BARE_STOP_RE = re.compile(
+    r"^(?:jarvis[,\s]*)?(?:please\s+|just\s+|now\s+|abhi\s+)*"
+    r"(?:stop|ruko)(?:[\s,]+(?:it|now|please|sir|jarvis|karo|kar|abhi))*"
+    r"[.!]*$", re.IGNORECASE)
+_STOP_NEGATION_RE = re.compile(
+    r"\b(?:dont|don't|do not|never|mat)\b", re.IGNORECASE)
+
+#: Rank 5 — how long the stop finisher waits for cancelled work to actually
+#: go quiet before it reports honestly that something is still moving.
+_STOP_QUIESCE_TIMEOUT_S = 8.0
+
+
+def is_stop_everything(text):
+    """True for the broad stop: "stop everything", "stop all tasks"."""
+    t = (text or "").strip()
+    return bool(_STOP_EVERYTHING_RE.search(t)) and \
+        not _STOP_NEGATION_RE.search(t)
+
+
+def is_bare_stop(text):
+    """True when the WHOLE utterance is just a stop control ("stop it")."""
+    t = (text or "").strip()
+    if not t or _STOP_NEGATION_RE.search(t):
+        return False
+    return bool(_BARE_STOP_RE.match(t))
+
+
+def _stop_targets_still(cancelled_ids, had_browser, research_was):
+    """Rank 5: are the things we stopped observably still?
+
+    Background jobs we did NOT touch never block the "Stopped" report — a
+    plain stop only promises silence for what it stopped.
+    """
+    try:
+        if research_was and _research_running:
+            return False
+    except Exception:
+        pass
+    if had_browser:
+        try:
+            if opencode_task_in_progress() or not _browser_quiescent():
+                return False
+        except Exception:
+            pass
+    try:
+        from backend.services import jobs as _jobs
+
+        for job_id in cancelled_ids or ():
+            job = _jobs.get_job(job_id)
+            if job is None:
+                continue
+            if job.killing and not job.wait_for_kill(0.5):
+                return False
+            if not job.cancelled:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _stop_report_text():
+    """Rank 5: "Stopped, sir." plus what the stopped run had already done."""
+    report = ""
+    try:
+        report = consume_browser_stop_report()
+    except Exception:
+        report = ""
+    if report:
+        return ("Stopped, sir. I had already %s. Nothing is moving now."
+                % report)
+    return "Stopped, sir."
+
+
+def _finish_stop_reply(cancelled_ids, had_browser, research_was):
+    """Wait (bounded) for the stopped work to go quiet, then report once."""
+    deadline = time.time() + _STOP_QUIESCE_TIMEOUT_S
+    while time.time() < deadline:
+        if _stop_targets_still(cancelled_ids, had_browser, research_was):
+            break
+        time.sleep(0.2)
+    if _stop_targets_still(cancelled_ids, had_browser, research_was):
+        _notify_async_reply(_stop_report_text())
+    else:
+        _notify_async_reply(
+            "Sir, I asked it to stop, but something is still moving. Give "
+            "it a moment — if it stays stuck, tell me and I will cut it "
+            "hard.")
+
+
+def handle_stop_message(msg, from_voice=False):
+    """Rank 5 — the unified stop.
+
+    Order: cut speech NOW, cancel the right job(s) NOW, then say "Stopped"
+    only when the cancelled work is truly still (synchronously when it
+    already is, otherwise "Stopping" now and the report lands async).
+    """
+    want_all = is_stop_everything(msg)
+    cancelled = []
+    try:
+        from backend.services import jobs as _jobs
+
+        if want_all:
+            for job in list(_jobs.live_jobs(exclude_kinds=("request",))):
+                cancelled.extend(
+                    _jobs.cancel_job(job.job_id,
+                                     reason="stop everything requested"))
+        else:
+            cancelled = _jobs.request_stop(
+                None, reason="stop requested",
+                exclude_kinds=("request",))
+    except Exception as exc:
+        logging.warning("[STOP] job cancellation failed: %s", exc)
+    had_browser = False
+    try:
+        had_browser = bool(opencode_task_in_progress())
+    except Exception:
+        pass
+    research_was = False
+    try:
+        research_was = bool(_research_running)
+    except Exception:
+        pass
+    if had_browser or want_all:
+        try:
+            request_browser_task_stop()
+            invalidate_browser_runs("stop requested")
+        except Exception:
+            pass
+    if research_was:
+        try:
+            request_research_stop()
+        except Exception:
+            pass
+    try:
+        set_narration_enabled(False)
+    except Exception:
+        pass
+    try:
+        from backend.services.voice import stop_speaking
+
+        stop_speaking()
+    except Exception:
+        pass
+    if from_voice:
+        def _post(path):
+            try:
+                requests.post(
+                    f"http://127.0.0.1:{BACKEND_PORT}{path}",
+                    json={}, timeout=1.5,
+                )
+            except Exception:
+                pass
+        for path in ("/task/stop", "/speak/stop"):
+            try:
+                threading.Thread(target=_post, args=(path,), daemon=True).start()
+            except Exception:
+                pass
+    if _stop_targets_still(cancelled, had_browser, research_was):
+        # Everything is already still: "Stopped" is true right now.
+        return _stop_report_text()
+    try:
+        threading.Thread(
+            target=_finish_stop_reply,
+            args=(list(cancelled), had_browser, research_was),
+            daemon=True).start()
+    except Exception:
+        pass
+    return "Stopping, sir."
+
+
 def is_deepsearch_request(text):
     """True when the user explicitly asked for the deep multi-site mode.
 
@@ -5800,6 +5981,20 @@ def _process_message_inner(
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, response)
         return response
+
+    # ── Rank 5: bare "stop" / "stop everything" — the general stop ──
+    # Runs AFTER the dedicated research/browser phrases (they keep their
+    # exact path) and BEFORE the confirmation gates, so a stop is never
+    # eaten as an unclear answer to an armed preview.
+    try:
+        if is_bare_stop(msg) or is_stop_everything(msg):
+            print("[STOP] General stop:", msg)
+            response = handle_stop_message(msg, from_voice=from_voice)
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, response)
+            return response
+    except Exception as exc:
+        logging.warning("[STOP] General stop failed: %s", exc)
 
     # ── Pending 'shall I look it up?' answer — consume before any routing ──
     # R12: a STATUS question ("is it done?", "are you doing X?") is never a
