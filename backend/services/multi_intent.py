@@ -85,7 +85,20 @@ _ANAPHORA_RE = re.compile(
     r"|\bin\s+(?:it|that file)\b|\binto\s+(?:it|that file)\b"
     r"|\b(save|write|put|store|add)\s+(it|this|that|them)\b"
     r"|\b(research|google|look\s+up|find\s+out\s+about|search\s+for)\s+"
-    r"(it|this|that|them)\b",
+    r"(it|this|that|them)\b"
+    # Live fix: "search this youtube creator", "find anything about that
+    # stream" — the search verb and the pointer need not be adjacent.
+    r"|\b(search|searches|searching|find|research|google|look\s+up)\b"
+    r"[^.?!,;]{0,32}\b(it|this|that|these|those|them)\b",
+    re.IGNORECASE,
+)
+
+#: After a screen step, a research clause that points at a screen object
+#: ("this streamer", "the creator", "that video") is about what was seen.
+_SCREEN_REF_RE = re.compile(
+    r"\b(it|this|that|these|those)\b"
+    r"|\bthe\s+(?:same|stream|streamer|creator|channel|video|song|movie|"
+    r"guy|person|content)\b",
     re.IGNORECASE,
 )
 
@@ -167,7 +180,9 @@ def build_chain(text):
         if i > 0 and _ANAPHORA_RE.search(m["text"]):
             consumes = [i - 1]
         elif (i > 0 and merged[i - 1]["kind"] == "screen"
-              and m["kind"] == "research" and _DEICTIC_RES_RE.search(m["text"])):
+              and m["kind"] == "research"
+              and (_DEICTIC_RES_RE.search(m["text"])
+                   or _SCREEN_REF_RE.search(m["text"]))):
             consumes = [i - 1]
         steps.append({"kind": m["kind"], "text": m["text"],
                       "index": i, "consumes": consumes})

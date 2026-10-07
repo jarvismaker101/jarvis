@@ -858,6 +858,166 @@ def force_research(query):
     return False
 
 
+# ── Live fix: search-shaped requests + offered-search follow-ups ─────────────
+# "can you search about this stream", "find anything about that stream",
+# "don't ask any questions, just search it" and "execute it" used to fall to
+# chat, which could only keep asking. A search-shaped message is a search;
+# "execute it / just do it" consumes the search Jarvis last offered.
+
+_SEARCH_SHAPED_VERB_RE = re.compile(
+    r"\b(search|searching|look\s+(?:it|this|that|them)\s+up|look\s+up|"
+    r"google|research|find\s+(?:anything|something|it|this|that|out))\b",
+    re.IGNORECASE,
+)
+_SEARCH_TOOL_GUARD_RE = re.compile(
+    r"\b(open|launch|play|pause|close|go\s+to|navigate|visit|click|type|"
+    r"press|scroll|switch)\b",
+    re.IGNORECASE,
+)
+_SEARCH_APP_GUARD_RE = re.compile(
+    r"\b(?:in|on|using|with)\s+(?:chrome|edge|brave|the\s+browser)\b",
+    re.IGNORECASE,
+)
+_SEARCH_HOWTO_GUARD_RE = re.compile(
+    r"^\s*(?:how\s+(?:do|to|can|would|should|does)\b|"
+    r"what\s+is\s+the\s+best\s+way\b|can\s+you\s+(?:teach|show|tell)\b)",
+    re.IGNORECASE,
+)
+_SEARCH_PAST_GUARD_RE = re.compile(r"^\s*(?:did|have|has|had|why\s+did)\b",
+                                   re.IGNORECASE)
+_SEARCH_FUTURE_GUARD_RE = re.compile(
+    r"^\s*(?:i\s+(?:will|'ll|would|might|could|may)|maybe\s+i|"
+    r"we\s+(?:will|'ll))\b",
+    re.IGNORECASE,
+)
+
+
+def is_search_shaped_message(msg):
+    """True when the message asks for a web search, however it is phrased.
+
+    Deliberately conservative: how-to questions, past/future talk, and
+    tool-style phrases ("open youtube and search…") keep their normal route.
+    """
+    t = str(msg or "").strip()
+    if not t:
+        return False
+    if (_SEARCH_HOWTO_GUARD_RE.match(t) or _SEARCH_PAST_GUARD_RE.match(t)
+            or _SEARCH_FUTURE_GUARD_RE.match(t)):
+        return False
+    if _SEARCH_TOOL_GUARD_RE.search(t) or _SEARCH_APP_GUARD_RE.search(t):
+        return False
+    return bool(_SEARCH_SHAPED_VERB_RE.search(t))
+
+
+_NO_ASK_RE = re.compile(
+    r"\b(?:don'?t|dont|do\s+not|no)\s+(?:ask|questions?)\b"
+    r"|\bno\s+questions?\b|\bwithout\s+asking\b",
+    re.IGNORECASE,
+)
+
+_EXECUTE_IT_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?\s*[,.]?\s*)?(?:now\s+|just\s+|pl[sz]\s+)?"
+    r"(?:execute(?:\s+it)?|do\s+it|run\s+it|go\s+ahead|"
+    r"(?:just\s+)?search\s+(?:it|for\s+it)|kar\s*do|kar\s*de|"
+    r"chala\s*do)\b",
+    re.IGNORECASE,
+)
+
+#: A chat reply that OFFERS a search ("I can search that…", "shall I look
+#: it up?"). Matches both word orders.
+_OFFER_RE = re.compile(
+    r"\b(?:shall|should|would\s+you\s+like|do\s+you\s+want|want\s+me\s+to|"
+    r"i\s+can|i\s+could|let\s+me\s+know\s+if)\b[^.!?]{0,90}"
+    r"\b(?:search|searched|research|google|find|look\s+up)\b"
+    r"|\b(?:search|searched|research|google|find|look\s+up)\b"
+    r"[^.!?]{0,90}"
+    r"\b(?:shall|would\s+you\s+like|want\s+me\s+to|do\s+you\s+want)\b",
+    re.IGNORECASE,
+)
+
+_offer_lock = threading.Lock()
+_last_offer = None
+_OFFER_TTL = 180.0
+
+
+def _search_request_query(msg):
+    """The concrete web query for a search-shaped message, or "".
+
+    Deictic messages ("just search it", "about this stream") resolve from
+    the screen/entity ledger; concrete messages go through the normal
+    derivation. The pointer text is never returned as the query.
+    """
+    cleaned = _NO_ASK_RE.sub(" ", str(msg or "")).strip(" ,.").strip()
+    return _resolve_search_query(cleaned or msg)
+
+
+def _handle_search_shaped(msg, from_voice=False, voice_compact=False):
+    """Route a search-shaped request to research with a real query."""
+    query = _search_request_query(msg)
+    if not query:
+        return ("Sir, I could not tell what to search for — name it once "
+                "and I will search immediately.")
+    print("[SEARCH] Shaped request -> research:", query)
+    return handle_research_intent(query, from_voice=from_voice,
+                                  voice_compact=voice_compact, derived=True)
+
+
+def _remember_chat_offer(user_msg, reply):
+    """Remember a search Jarvis OFFERED but has not started. Never raises."""
+    global _last_offer
+    try:
+        text = str(reply or "")
+        if not text or not _OFFER_RE.search(text):
+            return
+        query = _resolve_reference_query(user_msg)
+        with _offer_lock:
+            _last_offer = {
+                "kind": "search",
+                "text": str(user_msg or ""),
+                "query": query,
+                "at": time.time(),
+                "expires": time.time() + _OFFER_TTL,
+            }
+        print("[OFFER] Search offered — awaiting go-ahead")
+    except Exception:
+        pass
+
+
+def _consume_offered_action(msg):
+    """Run the last offered search when the user says "execute it"."""
+    global _last_offer
+    try:
+        t = str(msg or "")
+        wants_execute = bool(_EXECUTE_IT_RE.search(t))
+        no_ask_search = bool(_NO_ASK_RE.search(t)
+                             and _SEARCH_SHAPED_VERB_RE.search(t))
+        if not (wants_execute or no_ask_search):
+            return None
+        with _offer_lock:
+            offer = dict(_last_offer) if _last_offer else None
+        if not offer:
+            return None
+        if time.time() > float(offer.get("expires") or 0.0):
+            with _offer_lock:
+                _last_offer = None
+            return None
+        with _offer_lock:
+            _last_offer = None
+        if offer.get("kind") != "search":
+            return None
+        query = str(offer.get("query") or "")
+        if not query:
+            query = _search_request_query(str(offer.get("text") or ""))
+        if not query:
+            return ("Sir, I still need the name — say it once and I will "
+                    "search immediately.")
+        print("[OFFER] Executing offered search:", query)
+        return handle_research_intent(query, derived=True)
+    except Exception as exc:
+        logging.warning("[OFFER] consume failed: %s", exc)
+        return None
+
+
 # ── [PERF] deterministic "definitely plain chat" fast path ───────────────────
 # The intent classifier is a cloud round trip (one 3-hop call with a 3.5s
 # budget) that sits in front of EVERY message, and nothing it produces is
@@ -1125,6 +1285,13 @@ def derive_research_query(raw_query):
             f"carrying over last topic {_last_research_topic!r}"
         )
         return _last_research_topic
+    if _is_deictic_query(query):
+        resolved = _resolve_reference_query(query)
+        if resolved:
+            print(f"[RESEARCH] Deictic query ({query!r}) -> {resolved!r}")
+            return resolved
+        print(f"[RESEARCH] Deictic query ({query!r}) has no referent")
+        return ""
     return query
 
 
@@ -1171,6 +1338,130 @@ def _is_reference_only(query):
         if token not in _REFERENCE_ONLY_TOKENS
     ]
     return not leftovers
+
+
+# ── Live fix: deictic search queries ("this stream", "that creator") ─────────
+# A search must never be handed a bare pointer. "this stream" resolves to the
+# thing last visible on screen (or the matching ledger entity); when nothing
+# concrete exists, the caller asks ONE short question instead of searching
+# the pointer text.
+
+#: Generic media nouns that carry no subject on their own.
+_GENERIC_MEDIA_TOKENS = {
+    "stream", "streamer", "streaming", "livestream", "creator", "youtuber",
+    "youtube", "yt", "channel", "video", "videos", "song", "movie",
+    "content", "clip", "series", "guy", "person", "dude", "thing", "name",
+    "title", "topic", "subject", "anything", "something", "use", "using",
+}
+
+#: Words that carry no referent by themselves.
+_DEREF_FILLERS = _REFERENCE_ONLY_TOKENS | _GENERIC_MEDIA_TOKENS | {
+    "on", "in", "to", "for", "from", "with", "the", "a", "an", "just",
+    "now", "find", "found", "searching", "looking", "look", "up", "please",
+    "my", "your", "this", "that", "it", "them", "these", "those", "about",
+    "do", "don", "t", "dont", "not", "ask", "asking", "question",
+    "questions", "pls", "plz", "execute", "executing", "run", "running",
+}
+
+_screen_topic_lock = threading.Lock()
+_last_screen_topic = {"text": "", "at": 0.0}
+_SCREEN_TOPIC_TTL = 900.0
+
+
+def _set_last_screen_topic(topic):
+    """Remember what the last screen analysis saw. Never raises."""
+    global _last_screen_topic
+    try:
+        text = str(topic or "").strip()
+        if not text:
+            return
+        with _screen_topic_lock:
+            _last_screen_topic = {"text": text, "at": time.time()}
+    except Exception:
+        pass
+
+
+def _get_last_screen_topic():
+    """The last screen topic inside its TTL, else ""."""
+    try:
+        with _screen_topic_lock:
+            state = dict(_last_screen_topic)
+        if state.get("text") and (time.time() - float(state.get("at") or 0.0)
+                                  < _SCREEN_TOPIC_TTL):
+            return str(state["text"])
+    except Exception:
+        pass
+    return ""
+
+
+def _is_deictic_query(query):
+    """True when the text is only a pointer + generic media noun
+    ("that youtube creator name", "this stream") with no real subject."""
+    if not query or not query.strip():
+        return True
+    tokens = [t for t in re.split(r"[\W_]+", query.lower()) if t]
+    if not tokens or len(tokens) > 12:
+        return False
+    return not [t for t in tokens if t not in _DEREF_FILLERS]
+
+
+def _resolve_reference_query(text):
+    """Bind "this stream" / "that creator" to a concrete subject.
+
+    Deterministic, never a guess: the entity ledger (recorded screen topics,
+    videos, sites), then the last screen topic, then the most recent topic
+    entity, then the last researched topic. Returns "" when nothing real is
+    available — callers must ask once instead of searching the deictic text.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    media_kinds = {"topic", "video", "movie", "website", "url", "site"}
+    try:
+        verdict, ent = entity_ledger.resolve_mention(raw)
+        if verdict == "bound" and isinstance(ent, dict):
+            kind = str(ent.get("kind") or "")
+            name = str(ent.get("display_name")
+                       or ent.get("canon") or "").strip()
+            if kind in media_kinds and name and not _is_deictic_query(name):
+                return name
+    except Exception:
+        pass
+    topic = _get_last_screen_topic()
+    if topic and not _is_deictic_query(topic):
+        return topic
+    try:
+        ent = entity_ledger.focus_head(kind="topic")
+        if ent:
+            name = str(ent.get("display_name")
+                       or ent.get("canon") or "").strip()
+            if name and not _is_deictic_query(name):
+                return name
+    except Exception:
+        pass
+    if _last_research_topic and not _is_deictic_query(_last_research_topic):
+        return str(_last_research_topic)
+    return ""
+
+
+def _resolve_search_query(text):
+    """The best concrete web query for *text*, or "" when only a pointer
+    exists. Concrete text goes through the normal derivation; deictic text
+    is resolved from the ledger/screen and never searched verbatim."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    local = _heuristic_research_query(t)
+    if local and not _is_deictic_query(local):
+        q = derive_research_query(t)
+        return q if (q and not _is_deictic_query(q)) else local
+    resolved = _resolve_reference_query(t)
+    if resolved:
+        return resolved
+    q = derive_research_query(t)
+    if q and not _is_deictic_query(q):
+        return q
+    return ""
 
 
 def _heuristic_research_query(raw_query):
@@ -4173,6 +4464,13 @@ def handle_research_intent(research_query, from_voice=False, voice_compact=False
         try:
             try:
                 query = research_query if derived else derive_research_query(research_query)
+                if not query:
+                    # Live fix: never type a bare pointer ("this stream")
+                    # into the web — ask once, with nothing to guess at.
+                    _notify_async_reply(
+                        "Sir, I could not tell what to search for — name it "
+                        "once and I will look it up immediately.")
+                    return
                 _set_last_research_topic(query)
                 if deep:
                     # F28: progress and evidence are wired immediately — the
@@ -4468,6 +4766,11 @@ def _arm_confirmation(word):
 _MI_CHAIN_LOCK = threading.Lock()
 _mi_chain_active = False
 
+#: Live fix: remember the last finished chain so the SAME request arriving
+#: seconds later answers from that run instead of silently re-running it.
+_chain_memory_lock = threading.Lock()
+_last_chain_run = None
+
 
 def _mi_clip(text, limit=600):
     text = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -4500,6 +4803,7 @@ def _mi_screen_step(step):
         if topic:
             entity_ledger.record_entity(topic, topic, kind="topic",
                                         source="screen")
+            _set_last_screen_topic(topic)
     except Exception:
         pass
     return {"kind": "screen", "status": "ok",
@@ -4517,10 +4821,14 @@ def _mi_research_step(step, results):
                    or prior.get("output_content") or "").strip()
     clause = step.get("text") or ""
     try:
-        if base:
+        if base and not _is_deictic_query(base):
             query = base[:220]
         else:
-            query = derive_research_query(clause)
+            query = _resolve_search_query(clause)
+        if not query:
+            return {"kind": "research", "status": "failed",
+                    "fragment": "I could not tell which streamer or item you "
+                                "meant — name it and I will search at once."}
         deep = bool(re.search(r"\bdeep\s*(?:research|search)|deepsearch\b",
                               clause, re.IGNORECASE))
         _set_last_research_topic(query)
@@ -4698,6 +5006,29 @@ def _run_multi_intent_chain(msg, plan):
                 _mi_chain_active = False
 
 
+def _chain_signature(plan):
+    """Stable identity for a chain request (for repeat detection)."""
+    try:
+        source = str(plan.get("source") or plan.get("command_text") or "")
+        return re.sub(r"\s+", " ", source.lower()).strip()
+    except Exception:
+        return ""
+
+
+def _record_chain_run(plan, reply):
+    """Remember the last finished chain so a repeat answers from it."""
+    global _last_chain_run
+    try:
+        sig = _chain_signature(plan)
+        if not sig:
+            return
+        with _chain_memory_lock:
+            _last_chain_run = {"sig": sig, "at": time.time(),
+                               "reply": str(reply or "")}
+    except Exception:
+        pass
+
+
 def _finish_multi_intent(plan, results):
     armed = None
     ok_bits = []
@@ -4707,32 +5038,50 @@ def _finish_multi_intent(plan, results):
         if status == "armed":
             armed = r
         elif status == "ok":
-            if r.get("fragment"):
-                ok_bits.append(str(r["fragment"]))
+            frag = str(r.get("fragment") or "")
+            # Honesty: say what was actually searched, so a resolved query
+            # (or a bad one) is visible in the report instead of hidden.
+            if r.get("kind") == "research" and r.get("output_query"):
+                q = _mi_clip(str(r["output_query"]), 120)
+                if q and q.lower() not in frag.lower():
+                    frag = 'I searched "%s" — %s' % (q, frag)
+            if frag:
+                ok_bits.append(frag)
         else:
             bad_bits.append(str(r.get("fragment") or ""))
     if armed:
         lead = " ".join(ok_bits).strip()
         reply = ("Sir, " + (lead + " " if lead else "")
                  + str(armed.get("prompt") or ""))
-        _notify_async_reply(_mi_clip(reply, 600))
-        return
-    if bad_bits:
+    elif bad_bits:
         reply = ("Sir, here is where it stands. "
                  + " ".join(ok_bits + bad_bits))
-        _notify_async_reply(_mi_clip(reply, 600))
-        return
-    reply = "Sir, done. " + " ".join(ok_bits)
-    _notify_async_reply(_mi_clip(reply, 600))
+    else:
+        reply = "Sir, done. " + " ".join(ok_bits)
+    reply = _mi_clip(reply, 600)
+    _record_chain_run(plan, reply)
+    _notify_async_reply(reply)
 
 
 def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
     """Ack the chain now, run it on a worker; returns the single ack line."""
     global _mi_chain_active
+    sig = _chain_signature(plan)
     with _MI_CHAIN_LOCK:
         if _mi_chain_active:
+            with _chain_memory_lock:
+                last = dict(_last_chain_run) if _last_chain_run else None
+            if last and sig and last.get("sig") == sig:
+                return ("Sir, already on that one — I will report the "
+                        "moment it is done.")
             return ("Sir, another chained task is already running — "
                     "one moment.")
+        with _chain_memory_lock:
+            last = dict(_last_chain_run) if _last_chain_run else None
+        if (last and sig and last.get("sig") == sig
+                and time.time() - float(last.get("at") or 0.0) < 150.0):
+            return _mi_clip("Sir, I did that a moment ago — "
+                            + str(last.get("reply") or ""), 400)
         _mi_chain_active = True
     try:
         threading.Thread(
@@ -5544,6 +5893,44 @@ def _process_message_inner(
                     sync_voice_log(voice_log_message, chain_reply)
                 return chain_reply
 
+    # ── Live fix: offered search + search-shaped requests ──
+    # "execute it / just do it / don't ask questions" consumes the search
+    # Jarvis last offered (instead of falling into chat); a search-shaped
+    # request ("can you search about this stream", "find anything about
+    # that stream") routes to research with its referent resolved from the
+    # screen/entity ledger. Runs after the chain gate (compound turns keep
+    # priority) and before the classifier, so the ask-loop cannot start.
+    if not msg.lower().startswith("command"):
+        try:
+            offered_reply = _consume_offered_action(msg)
+        except Exception as exc:
+            logging.warning("[OFFER] consume gate failed: %s", exc)
+            offered_reply = None
+        if offered_reply is not None:
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, offered_reply)
+            return offered_reply
+        try:
+            # The cheap pure-regex check runs first (P0-10 ordering: a
+            # non-search message must not run task predicates before the
+            # racer). Explicit task/code-tool requests keep the task gate
+            # priority: "task search python decorators" is a task.
+            _search_shaped = False
+            if is_search_shaped_message(msg):
+                _search_shaped = not (
+                    is_explicit_task_request(msg)
+                    or is_code_tool_request(msg)
+                    or is_task_request(msg))
+        except Exception:
+            _search_shaped = False
+        if _search_shaped:
+            search_reply = _handle_search_shaped(
+                msg, from_voice=from_voice, voice_compact=voice_compact)
+            if search_reply is not None:
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, search_reply)
+                return search_reply
+
     # ── [P0-10] Speculative chat racer — started HERE ────────────────────
     # This used to start after the whole predicate chain below (task request,
     # code tools, screen control, explicit research, route selection), and every
@@ -5837,6 +6224,16 @@ def _process_message_inner(
                     _commit_chat("assistant", tip)
                 evidence = result.get("evidence", [])
                 topic = result.get("topic", "")
+                # Live fix: the topic of every screen answer becomes a real
+                # entity, so a later "search this stream" resolves to the
+                # streamer/video actually seen instead of asking again.
+                if topic:
+                    try:
+                        entity_ledger.record_entity(topic, topic, kind="topic",
+                                                    source="screen")
+                        _set_last_screen_topic(topic)
+                    except Exception:
+                        pass
                 grounding_links = result.get("grounding_links", [])
                 show_images = result.get("show_images", False)
                 region = result.get("region")
@@ -5986,6 +6383,7 @@ def _process_message_inner(
                 stream=stream_reply,
                 answered=router_reply,
             )
+            _remember_chat_offer(msg, response)
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, response)
             return response
@@ -6014,6 +6412,7 @@ def _process_message_inner(
                 prebuilt=prebuilt,
                 live_stream=live_stream,
             )
+            _remember_chat_offer(msg, response)
         else:
             response = handle_chat(
                 msg,
@@ -6021,6 +6420,7 @@ def _process_message_inner(
                 commit_response=commit_response,
                 stream=stream_reply,
             )
+            _remember_chat_offer(msg, response)
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, response)
         return response

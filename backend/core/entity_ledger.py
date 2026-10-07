@@ -34,11 +34,12 @@ _REJECTION_TTL = 600   # a rejection stops counting after 10 minutes
 _KIND_SUBSTITUTES = {
     "file": {"file", "document"},
     "document": {"document", "file"},
-    "video": {"video", "movie"},
-    "movie": {"movie", "video"},
-    "website": {"website", "url", "site"},
-    "url": {"url", "website", "site"},
-    "site": {"site", "website", "url"},
+    "video": {"video", "movie", "topic"},
+    "movie": {"movie", "video", "topic"},
+    "website": {"website", "url", "site", "topic"},
+    "url": {"url", "website", "site", "topic"},
+    "site": {"site", "website", "url", "topic"},
+    "topic": {"topic", "video", "movie", "website", "url", "site"},
 }
 
 #: How much each provenance source is trusted (spec §3b.3).
@@ -71,12 +72,17 @@ _MENTION_NOUN_KIND = {
     "website": "website", "site": "site", "webpage": "website",
     "report": "file", "document": "document", "photo": "file",
     "image": "file", "song": "file",
+    "stream": "topic", "streamer": "topic", "livestream": "topic",
+    "creator": "topic", "youtuber": "topic", "channel": "topic",
+    "content": "topic", "topic": "topic",
 }
 
 _DEMONSTRATIVE_RE = re.compile(
-    r"\b(this|that)\s+(one|file|files|folder|folders|directory|"
+    r"\b(this|that)\s+(?:(?:youtube|yt|the)\s+)?"
+    r"(one|file|files|folder|folders|directory|"
     r"directories|video|movie|website|site|report|document|photo|"
-    r"image|song)\b",
+    r"image|song|stream|streamer|livestream|creator|youtuber|"
+    r"channel|content|topic)\b",
     re.IGNORECASE,
 )
 _BARE_PRONOUN_RE = re.compile(r"\b(it|that|them)\b", re.IGNORECASE)
