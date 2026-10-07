@@ -5342,12 +5342,53 @@ def _clear_pending_folder_name():
         pass
 
 
+def _mi_file_request(clause):
+    """(file_name, content) for a file the clause asks for INSIDE the folder.
+
+    "…create a txt file by the name info and inside that txt file write
+    hello from jarvis" -> ("info.txt", "hello from jarvis"). Empty when the
+    clause asks for no file.
+    """
+    text = str(clause or "")
+    match = re.search(
+        r"\bfile\s+(?:named\s+|called\s+|by\s+the\s+name(?:\s+of)?\s+)"
+        r"([A-Za-z0-9_ .\-]{1,60}?)(?=\s*(?:,|;|\band\b|\bon\b|\bin\b|"
+        r"\bat\b|\bwith\b|\bwrite\b|$))",
+        text, re.IGNORECASE)
+    rest = text[match.end():] if match else text
+    try:
+        content = str(task_agent_module._located_write_content(rest, "")
+                      or "").strip()
+    except Exception:
+        content = ""
+    content = re.sub(
+        r"\s+(?:inside|in|into)\s+(?:the|that|this)\s+"
+        r"(?:txt\s+|text\s+)?file\.?$", "", content,
+        flags=re.IGNORECASE).strip()
+    if not content:
+        return "", ""
+    if match:
+        name = match.group(1).strip().strip("\"'")
+        if not re.search(r"\.\w{1,5}$", name):
+            name += ".txt"
+    else:
+        name = ("info.txt" if re.search(r"\b(?:txt|text)\b", text,
+                                        re.IGNORECASE) else "notes.txt")
+    name = _mi_safe_folder_name(name)
+    if not name:
+        return "", ""
+    return name, content
+
+
 def _mi_folder_task_step(msg, clause, step=None, results=None):
     """Arm a folder creation; an unnamed folder asks instead of guessing.
 
     Live fix: "whichever name you find … by that name" is named from the
     research findings (one bounded LLM extraction); when no name can be
     extracted the ask is remembered so "name it X" completes it.
+    Live fix 2: "…and inside that folder create a txt file by the name
+    info and write hello" arms BOTH steps in the one plan — the folder and
+    the file inside it — so the follow-up file work is never dropped.
     """
     name = _mi_folder_name(clause)
     if not name and results:
@@ -5397,6 +5438,19 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
             "reason": "Creating the folder %s." % name,
         }],
     }
+    file_name, file_content = _mi_file_request(clause)
+    if file_name and file_content:
+        file_path = os.path.join(path, file_name)
+        plan["summary"] = ("Creating the folder %s and writing %s inside it."
+                           % (name, file_name))
+        plan["steps"].append({
+            "tool": "code.write_file",
+            "args": {"path": file_path, "content": file_content,
+                     "create_only": True},
+            "risk": "safe",
+            "reason": "Writing %s inside it with: %s"
+                      % (file_name, _mi_clip(file_content, 80)),
+        })
     try:
         task_agent_module._arm_plan_confirmation(plan, {}, task_text=msg)
         prompt = task_agent_module.confirmation_prompt(plan)
@@ -6871,6 +6925,28 @@ def _process_message_inner(
                     sync_voice_log(voice_log_message, held)
                 return held
             description = intent.get("task_description") or msg
+            # Live fix: a file/folder task ("create a text file inside that
+            # folder and write …") is NATIVE work — it goes to the code-tool
+            # planner (where "that folder" resolves from the notebook), never
+            # to the browser handoff default.
+            try:
+                code_like = (is_code_tool_request(msg)
+                             and not is_web_shaped_task(msg))
+            except Exception:
+                code_like = False
+            if code_like:
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                print("[TASK] Code-shaped task intent -> native task path:", msg)
+                response = handle_task_message(msg, voice_compact=voice_compact)
+                _record_native_task_outcome(msg)
+                _disarm_other_gates_if_task_gate_armed()
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, response)
+                return response
             print("[INTENT] task intent:", description)
             response = handle_opencode_task(
                 description,

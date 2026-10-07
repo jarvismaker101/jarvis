@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,12 @@ HEADLINE = (
     "jarvis, look at my screen at this video, and do a deep research "
     "about it on internet, and whatever you find create a txt file on "
     "desktop and write your report in it"
+)
+LIVE_FOLDER_FILE = (
+    "look at my screen and find out about this website im currently on , "
+    "tell me what are its benefits and then create a folder on my desktop "
+    "byt the name of this website and inside that folder create a txt file "
+    "by the name info and inside that txt file write hello from jarvis"
 )
 
 
@@ -89,6 +96,12 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIn("folder", ack.lower())
         self.assertNotIn("file", ack.lower())
         self.assertIn("creating it", ack.lower())
+
+    def test_ack_mentions_the_file_inside_the_folder(self):
+        plan = multi_intent.build_chain(LIVE_FOLDER_FILE)
+        self.assertIsNotNone(plan)
+        ack = multi_intent.render_ack(plan)
+        self.assertIn("with a file inside", ack.lower())
 
 
 class ChainExecutorTests(unittest.TestCase):
@@ -240,6 +253,41 @@ class ChainExecutorTests(unittest.TestCase):
         self.assertEqual(step["tool"], "code.create_folder")
         self.assertTrue(step["args"]["path"].endswith("Leonardo da Vinci"))
 
+    def test_folder_chain_with_a_file_inside_arms_both_steps(self):
+        captured = {}
+
+        def fake_quick(query):
+            return {"query": query,
+                    "spoken_summary": "Assesly is an AI assessment platform."}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        plan = multi_intent.build_chain(LIVE_FOLDER_FILE)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research", "task"])
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "An AI assessment dashboard.",
+                "topic": "AI assessment platform dashboard",
+                "creator": ""}), \
+             patch.object(brain, "run_quick_search", side_effect=fake_quick), \
+             patch.object(brain, "_extract_name_from_findings",
+                          return_value="Assesly"), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm):
+            brain._run_multi_intent_chain(LIVE_FOLDER_FILE, plan)
+        steps = captured["plan"]["steps"]
+        self.assertEqual([s["tool"] for s in steps],
+                         ["code.create_folder", "code.write_file"])
+        self.assertTrue(steps[0]["args"]["path"].endswith("Assesly"))
+        self.assertTrue(steps[1]["args"]["path"].endswith("info.txt"))
+        self.assertIn("hello from jarvis", steps[1]["args"]["content"])
+        self.assertIn("info.txt", captured["plan"]["summary"])
+
     def test_pending_folder_name_answer_arms_the_folder(self):
         captured = {}
 
@@ -361,6 +409,35 @@ class ChainGateTests(unittest.TestCase):
             brain.process_message("look at my screen and tell me what you see",
                                   sync_voice=False)
         handler.assert_not_called()
+
+
+class FolderReferenceTests(unittest.TestCase):
+    """Live fix: after the chain creates a folder, "that folder" resolves."""
+
+    def setUp(self):
+        brain._notebook_entities.clear()
+        self.addCleanup(brain._notebook_entities.clear)
+
+    def _seed_folder(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        brain.notebook_record_entity("assesly", tmp, kind="folder",
+                                     source="created")
+        return tmp
+
+    def test_that_folder_resolves_to_the_chain_created_folder(self):
+        tmp = self._seed_folder()
+        hint = task_agent._located_write_folder(
+            "create a txt file inside that folder and write hello from "
+            "jarvis")
+        self.assertEqual(task_agent._resolve_folder_hint(hint), tmp)
+
+    def test_specified_folder_also_resolves(self):
+        tmp = self._seed_folder()
+        hint = task_agent._located_write_folder(
+            "create a text file inside the specified folder and write "
+            "hello from jarvis")
+        self.assertEqual(task_agent._resolve_folder_hint(hint), tmp)
 
 
 class NameExtractionTests(unittest.TestCase):

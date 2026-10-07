@@ -207,7 +207,10 @@ _FOLDER_CLAUSE_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
 def _step_label(step):
     """What this step will actually do — folder jobs never say "file"."""
     kind = step.get("kind")
-    if kind == "task" and _FOLDER_CLAUSE_RE.search(step.get("text") or ""):
+    text = step.get("text") or ""
+    if kind == "task" and _FOLDER_CLAUSE_RE.search(text):
+        if re.search(r"\bfile\b", text, re.IGNORECASE):
+            return "create a folder with a file inside"
         return "create a folder"
     return _LABELS.get(kind, kind)
 

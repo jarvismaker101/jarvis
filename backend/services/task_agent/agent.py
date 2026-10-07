@@ -440,7 +440,12 @@ _CODE_TOOL_FILLER_RE = re.compile(
     r"jarvis|sir)\b[\s,.-]*|"
     # R20: a request wrapped in a question ("can you create ...", "could
     # you make ...") is the same requested effect, not small talk.
-    r"(?:can|could|would|will)\s+(?:you|u)\b[\s,]*)+",
+    r"(?:can|could|would|will)\s+(?:you|u)\b[\s,]*|"
+    # Live fix: a reminder-correction ("i also asked you to create ...")
+    # is the same requested effect, not chatter about the past.
+    r"i\s+(?:also\s+|already\s+)?(?:asked|told|want(?:ed)?)\s+"
+    r"(?:you|u)(?:\s+to)?\b[\s,.-]*|"
+    r"you\s+(?:were|are)\s+supposed\s+to\b[\s,.-]*)+",
     re.IGNORECASE,
 )
 
@@ -459,7 +464,7 @@ _CODE_TOOL_PRONOUN_STARTS = ("me", "us", "him", "her", "them", "it")
 # named ("create a text file inside that folder ...").
 _CODE_TOOL_LOCATION_RE = re.compile(
     r"\b(?:inside|into|in|within|under)\s+"
-    r"(?:(?:the|this|that|my|our)\s+)?"
+    r"(?:(?:the|this|that|my|our|same|specified|previous)\s+)+"
     r"(folder|directory)(?:\s+(?:named|called)\s+([a-z0-9_ .\-]+))?",
     re.IGNORECASE,
 )
@@ -1571,6 +1576,12 @@ def _located_write_content(raw, content_after):
         content = (match.group(1) or "").strip().strip("\"'")
         content = re.sub(r"^(?:it\s+)?(?:as\s+)?", "", content,
                          flags=re.IGNORECASE).strip()
+        # "write hello from jarvis inside the file" — the trailing
+        # destination phrase is not content.
+        content = re.sub(
+            r"\s+(?:inside|in|into)\s+(?:the|that|this)\s+"
+            r"(?:txt\s+|text\s+)?file\.?$", "", content,
+            flags=re.IGNORECASE).strip()
         if content:
             return content
     return (content_after or "").strip()

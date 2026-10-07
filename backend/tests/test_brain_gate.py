@@ -481,6 +481,41 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
         chat.assert_not_called()
         self.assertEqual(response, "preview")
 
+    def test_file_task_intent_goes_native_not_browser(self):
+        # Live bug: the classifier said "task" for a file write, and the
+        # configured browser default swallowed it — the file half died in
+        # the browser handoff.
+        msg = ("i also asked you to create a txt file inside that folder "
+               "and write hello from jarvis inside the file")
+        verdict = {"intent": "task",
+                   "task_description": ("Create a text file inside the "
+                                        "specified folder and write hello "
+                                        "from jarvis into it.")}
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain, "classify_intent", return_value=verdict), \
+             patch.object(brain, "maybe_handle_screen_control_message", return_value=None), \
+             patch.object(brain, "handle_opencode_task") as handoff, \
+             patch.object(brain, "handle_task_message", return_value="preview") as task_msg, \
+             patch.object(brain, "handle_chat") as chat:
+            response = brain.process_message(msg, sync_voice=False)
+        task_msg.assert_called_once()
+        handoff.assert_not_called()
+        chat.assert_not_called()
+        self.assertEqual(response, "preview")
+
+    def test_web_task_intent_still_hands_off_to_browser(self):
+        msg = "Go to 1hd.to website, search for One Piece Movie Red, and play it"
+        verdict = {"intent": "task", "task_description": msg}
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain, "classify_intent", return_value=verdict), \
+             patch.object(brain, "maybe_handle_screen_control_message", return_value=None), \
+             patch.object(brain, "handle_opencode_task", return_value="confirm?") as handoff, \
+             patch.object(brain, "handle_task_message") as task_msg:
+            response = brain.process_message(msg, sync_voice=False)
+        handoff.assert_called_once()
+        task_msg.assert_not_called()
+        self.assertEqual(response, "confirm?")
+
 
 class ScreenQuestionNetTests(unittest.TestCase):
     """Round 16: deterministic screen-question net fires when the cloud
