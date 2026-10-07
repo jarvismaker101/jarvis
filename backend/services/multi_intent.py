@@ -50,7 +50,7 @@ _SCREEN_RE = re.compile(
 )
 
 _RESEARCH_RE = re.compile(
-    r"\b(deep\s*research|deepsearch|deep\s+search|research|google|"
+    r"\b(deep\s*research|deepsearch|deep\s+search|research|google|search|"
     r"look\s+(?:it|this|that)\s+up|look\s+up|find\s+out|"
     r"search\s+(?:on\s+|the\s+)?(?:internet|web|online)|"
     r"(?:on|from)\s+the\s+internet|online|internet)\b",
@@ -195,17 +195,33 @@ _LABELS = {
     "task": "save it to a file",
 }
 
+_FOLDER_CLAUSE_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
+
+
+def _step_label(step):
+    """What this step will actually do — folder jobs never say "file"."""
+    kind = step.get("kind")
+    if kind == "task" and _FOLDER_CLAUSE_RE.search(step.get("text") or ""):
+        return "create a folder"
+    return _LABELS.get(kind, kind)
+
 
 def render_ack(plan, voice_compact=False):
     """One coherent narrative for the whole chain — not per-step chatter."""
-    kinds = [s.get("kind") for s in (plan.get("steps") or [])]
+    steps = plan.get("steps") or []
+    kinds = [s.get("kind") for s in steps]
     n = len(kinds)
     if n < 2:
         return "On it, sir."
-    parts = ", ".join(_LABELS.get(k, k) for k in kinds)
-    tail = ("I'll ask before creating the file."
-            if kinds[-1] == "task" else
-            "I'll report back when it's done.")
+    parts = ", ".join(_step_label(s) for s in steps)
+    folder_last = (kinds[-1] == "task"
+                   and _FOLDER_CLAUSE_RE.search(steps[-1].get("text") or ""))
+    if folder_last:
+        tail = "I'll ask before creating it."
+    elif kinds[-1] == "task":
+        tail = "I'll ask before creating the file."
+    else:
+        tail = "I'll report back when it's done."
     if voice_compact:
         return "Sir, on it in %d steps — %s. %s" % (n, parts, tail)
     return "Sir, I'll do this in %d steps: %s. %s" % (n, parts, tail)

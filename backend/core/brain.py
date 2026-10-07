@@ -1361,7 +1361,25 @@ _DEREF_FILLERS = _REFERENCE_ONLY_TOKENS | _GENERIC_MEDIA_TOKENS | {
     "my", "your", "this", "that", "it", "them", "these", "those", "about",
     "do", "don", "t", "dont", "not", "ask", "asking", "question",
     "questions", "pls", "plz", "execute", "executing", "run", "running",
+    # Live fix: a correction is still a pointer — "not the video, i wanted
+    # you to search about the creator of this video" names no subject of
+    # its own and must resolve (never be searched verbatim).
+    "i", "wanted", "meant", "asked",
 }
+
+#: The reference asks for an ATTRIBUTE of the on-screen media (its maker),
+#: not for the media itself — "search about this creator".
+_CREATOR_ATTR_RE = re.compile(
+    r"\b(?:content\s+)?(?:creator|channel|uploader|youtuber|streamer|"
+    r"author|maker)\b"
+    r"|\bwho\s+(?:made|created|owns|runs|posted|is\s+behind)\b",
+    re.IGNORECASE,
+)
+
+#: Attribute-talk words that are still pointers in this context ("the
+#: channel that MADE this video").
+_CREATOR_POINTER_EXTRA = {"made", "created", "posted", "owns", "runs",
+                          "behind", "no"}
 
 _screen_topic_lock = threading.Lock()
 _last_screen_topic = {"text": "", "at": 0.0}
@@ -1394,6 +1412,35 @@ def _get_last_screen_topic():
     return ""
 
 
+_last_screen_creator = {"text": "", "at": 0.0}
+
+
+def _set_last_screen_creator(creator):
+    """Remember the media maker the last screen analysis saw. Never raises."""
+    global _last_screen_creator
+    try:
+        text = str(creator or "").strip()
+        if not text:
+            return
+        with _screen_topic_lock:
+            _last_screen_creator = {"text": text, "at": time.time()}
+    except Exception:
+        pass
+
+
+def _get_last_screen_creator():
+    """The last screen creator inside its TTL, else ""."""
+    try:
+        with _screen_topic_lock:
+            state = dict(_last_screen_creator)
+        if state.get("text") and (time.time() - float(state.get("at") or 0.0)
+                                  < _SCREEN_TOPIC_TTL):
+            return str(state["text"])
+    except Exception:
+        pass
+    return ""
+
+
 def _is_deictic_query(query):
     """True when the text is only a pointer + generic media noun
     ("that youtube creator name", "this stream") with no real subject."""
@@ -1416,6 +1463,17 @@ def _resolve_reference_query(text):
     raw = str(text or "").strip()
     if not raw:
         return ""
+    # Live fix: "search about this creator" / "not the video, the creator
+    # of this one" asks for the MAKER seen on screen — never the video topic.
+    # The pointer check ignores the deictic length cap: a rambling correction
+    # is still a pointer when every token is a filler.
+    if _CREATOR_ATTR_RE.search(raw):
+        creator = _get_last_screen_creator()
+        if creator and not _is_deictic_query(creator):
+            tokens = [t for t in re.split(r"[\W_]+", raw.lower()) if t]
+            allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
+            if not [t for t in tokens if t not in allowed]:
+                return creator
     media_kinds = {"topic", "video", "movie", "website", "url", "site"}
     try:
         verdict, ent = entity_ledger.resolve_mention(raw)
@@ -1451,6 +1509,13 @@ def _resolve_search_query(text):
     t = str(text or "").strip()
     if not t:
         return ""
+    # Live fix: an attribute request about the on-screen media ("...the
+    # creator of this video") resolves to the creator name even when the
+    # sentence is long or rambling — it is never searched verbatim.
+    if _CREATOR_ATTR_RE.search(t) and _get_last_screen_creator():
+        resolved = _resolve_reference_query(t)
+        if resolved:
+            return resolved
     local = _heuristic_research_query(t)
     if local and not _is_deictic_query(local):
         q = derive_research_query(t)
@@ -4977,6 +5042,7 @@ def _mi_screen_step(step):
         _screen_qa_busy.release()
     tip = str(result.get("tip") or "").strip()
     topic = str(result.get("topic") or "").strip()
+    creator = str(result.get("creator") or "").strip()
     if not tip or "couldn't analyse the screen" in tip.lower():
         return {"kind": "screen", "status": "failed",
                 "fragment": "I couldn't make sense of the screen."}
@@ -4985,11 +5051,14 @@ def _mi_screen_step(step):
             entity_ledger.record_entity(topic, topic, kind="topic",
                                         source="screen")
             _set_last_screen_topic(topic)
+        if creator:
+            _set_last_screen_creator(creator)
     except Exception:
         pass
     return {"kind": "screen", "status": "ok",
             "fragment": "I looked at your screen.",
             "output_query": topic or tip[:200],
+            "output_creator": creator,
             "output_content": tip}
 
 
@@ -5001,6 +5070,13 @@ def _mi_research_step(step, results):
         base = str(prior.get("output_query")
                    or prior.get("output_content") or "").strip()
     clause = step.get("text") or ""
+    # Live fix: a clause that asks for the creator is about the MAKER read
+    # on screen — search that name, never the video topic again.
+    if prior is not None and _CREATOR_ATTR_RE.search(clause):
+        creator = str(prior.get("output_creator") or "").strip() \
+            or _get_last_screen_creator()
+        if creator and not _is_deictic_query(creator):
+            base = creator
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]
@@ -6419,14 +6495,22 @@ def _process_message_inner(
                     _commit_chat("assistant", tip)
                 evidence = result.get("evidence", [])
                 topic = result.get("topic", "")
+                creator = result.get("creator", "")
                 # Live fix: the topic of every screen answer becomes a real
                 # entity, so a later "search this stream" resolves to the
-                # streamer/video actually seen instead of asking again.
+                # streamer/video actually seen instead of asking again. The
+                # creator name is remembered separately, so "search about
+                # this creator" searches the MAKER, not the video.
                 if topic:
                     try:
                         entity_ledger.record_entity(topic, topic, kind="topic",
                                                     source="screen")
                         _set_last_screen_topic(topic)
+                    except Exception:
+                        pass
+                if creator:
+                    try:
+                        _set_last_screen_creator(creator)
                     except Exception:
                         pass
                 grounding_links = result.get("grounding_links", [])

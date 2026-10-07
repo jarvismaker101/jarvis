@@ -35,6 +35,12 @@ OFFER_REPLY = "I can perform that web search immediately, sir."
 CHAIN_1 = "look at my screen and search this youtube creator on internet."
 CHAIN_2 = ("whatever youtube creator name do you see on my screen, i want "
            "you to search that youtube creator name on internet.")
+CREATOR = "AI Explained"
+CREATOR_ASK = ("look at my screen ther is a video about grok bot it also "
+               "shows its content creator name and i want you to search "
+               "about this creator on internet and tell me what you find")
+CREATOR_CORRECTION = ("not the video i wanted you to search about the "
+                      "creator of this video")
 
 
 class LiveFixBase(unittest.TestCase):
@@ -48,6 +54,7 @@ class LiveFixBase(unittest.TestCase):
         brain._last_offer = None
         brain._last_chain_run = None
         brain._last_screen_topic = {"text": "", "at": 0.0}
+        brain._last_screen_creator = {"text": "", "at": 0.0}
         brain._last_research_topic = None
         task_agent._pending_task_action = None
         entity_ledger.reset()
@@ -55,6 +62,8 @@ class LiveFixBase(unittest.TestCase):
         self.addCleanup(setattr, brain, "_last_offer", None)
         self.addCleanup(setattr, brain, "_last_chain_run", None)
         self.addCleanup(setattr, brain, "_last_screen_topic",
+                        {"text": "", "at": 0.0})
+        self.addCleanup(setattr, brain, "_last_screen_creator",
                         {"text": "", "at": 0.0})
         self.addCleanup(setattr, brain, "_last_research_topic", None)
 
@@ -249,6 +258,43 @@ class ChainLiveFixTests(LiveFixBase):
         finally:
             brain._mi_chain_active = False
         self.assertIn("already on that one", reply)
+
+
+class CreatorResolutionTests(LiveFixBase):
+    """Live fix: "search about this creator" searches the MAKER on screen."""
+
+    def test_chain_research_searches_the_creator_name(self):
+        captured = {}
+
+        def fake_quick(query):
+            captured["query"] = query
+            return {"query": query, "spoken_summary": "About the creator."}
+
+        plan = multi_intent.build_chain(CREATOR_ASK)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research"])
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A video about Grok Bot.", "topic": "Grok Bot video",
+                "creator": CREATOR}), \
+             patch.object(brain, "run_quick_search", side_effect=fake_quick):
+            brain._run_multi_intent_chain(CREATOR_ASK, plan)
+        self.assertEqual(captured.get("query"), CREATOR)
+        self.assertEqual(brain._get_last_screen_creator(), CREATOR)
+
+    def test_corrected_followup_searches_the_creator(self):
+        self._seed_screen()
+        brain._set_last_screen_creator(CREATOR)
+        for text in (CREATOR_CORRECTION,
+                     "search about this creator on the internet",
+                     "i meant the channel that made this video, search it"):
+            self.assertEqual(brain._search_request_query(text), CREATOR, text)
+
+    def test_without_a_known_creator_the_topic_stays_the_fallback(self):
+        self._seed_screen()
+        self.assertEqual(
+            brain._resolve_reference_query("search about this creator"),
+            TITLE)
 
 
 if __name__ == "__main__":

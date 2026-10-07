@@ -380,5 +380,73 @@ def _async_return(value):
     return _inner
 
 
+class _DeadNewPageContext:
+    """A context that looks alive but every new_page dies like a closed
+    browser (the user closed the window without Playwright flagging it)."""
+
+    def __init__(self):
+        self.pages = []
+        self.closed = []
+
+    async def new_page(self):
+        raise RuntimeError(
+            "Target page, context or browser has been closed")
+
+    async def close(self):
+        pass
+
+
+class RelaunchTests(unittest.TestCase):
+    """Live fix: a closed browser is reopened, not reported as a snag."""
+
+    def setUp(self):
+        self.worker, self.loop, self.thread = _start_worker()
+        self.worker._playwright = object()
+        self.launches = []
+
+    def tearDown(self):
+        _stop_worker(self.worker, self.loop, self.thread)
+
+    def _fake_launch(self):
+        async def fake(playwright, *, profile_dir, channel, headless,
+                       args=()):
+            self.launches.append(channel)
+            return _FakeContext(), "chrome"
+        return patch.object(research_browser, "launch_persistent_context",
+                            fake)
+
+    def test_a_closed_context_is_reopened_for_the_next_job(self):
+        old = _FakeContext()
+
+        def is_closed():
+            return True
+
+        old.is_closed = is_closed
+        self.worker._context = old
+
+        async def body(task):
+            page = await task.new_page()
+            return page.name
+
+        with self._fake_launch():
+            name = self.worker.run(body, task_id="reopen")
+        self.assertEqual(name, "default-blank")
+        self.assertEqual(len(self.launches), 1)
+        self.assertIsNot(self.worker._context, old)
+
+    def test_a_mid_job_close_error_reopens_and_retries_once(self):
+        self.worker._context = _DeadNewPageContext()
+
+        async def body(task):
+            page = await task.new_page()
+            return page.name
+
+        with self._fake_launch():
+            name = self.worker.run(body, task_id="retry")
+        self.assertEqual(name, "default-blank")
+        self.assertEqual(len(self.launches), 1)
+        self.assertNotIsInstance(self.worker._context, _DeadNewPageContext)
+
+
 if __name__ == "__main__":
     unittest.main()

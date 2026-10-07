@@ -200,6 +200,10 @@ _ANALYSIS_PROMPT = (
     "when it is your own knowledge or reading-between-the-lines.\n"
     '  "topic" — The main subject/topic visible or discussed on screen '
     "(2-5 words, used for fetching related images and links).\n"
+    '  "creator" — The exact name of the person, channel or account that '
+    "made the main video/media visible on screen (YouTube channel name, "
+    "uploader, streamer handle). Empty string when no media or no name is "
+    "visible.\n"
     '  "show_images" — true ONLY if showing 1-2 images would genuinely help '
     "the user understand this (e.g. identifying an object, landmark, artwork, "
     "celebrity, product, chart). Otherwise false — most UI/screen questions "
@@ -699,6 +703,7 @@ def analyze_screen(question: str) -> dict:
             clean_evidence.append(checked)
 
     topic = (parsed.get("topic") or "").strip()
+    creator = (parsed.get("creator") or "").strip()[:120]
     show_images = bool(parsed.get("show_images", False))
 
     # Source URLs, when the provider grounds its answer at all. Search
@@ -710,6 +715,7 @@ def analyze_screen(question: str) -> dict:
         "tip": tip,
         "evidence": clean_evidence,
         "topic": topic,
+        "creator": creator,
         "grounding_links": grounding_links,
         "show_images": show_images,
         "region": (capture.get("region") or None) if region_question else None,

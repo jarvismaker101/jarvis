@@ -80,6 +80,16 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIn("ask", ack.lower())
         self.assertIn("screen", ack.lower())
 
+    def test_ack_says_folder_for_a_folder_task(self):
+        plan = multi_intent.build_chain(
+            "research the strongest current ai model and then create a "
+            "folder on my desktop by that model name which you found")
+        self.assertIsNotNone(plan)
+        ack = multi_intent.render_ack(plan)
+        self.assertIn("folder", ack.lower())
+        self.assertNotIn("file", ack.lower())
+        self.assertIn("creating it", ack.lower())
+
 
 class ChainExecutorTests(unittest.TestCase):
     """Rank 2: the worker runs the steps and arms ONE file-write approval."""

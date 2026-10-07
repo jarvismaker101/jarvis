@@ -163,6 +163,32 @@ async def maybe_await(value):
     return value
 
 
+def _context_is_closed(context):
+    """True when the warm browser context is gone (user closed the window).
+
+    Playwright's ``BrowserContext.is_closed()`` is authoritative when it
+    exists; test fakes without the full API are assumed alive so they keep
+    exercising the reuse path.
+    """
+    if context is None:
+        return True
+    checker = getattr(context, "is_closed", None)
+    if not callable(checker):
+        return False
+    try:
+        verdict = checker()
+    except Exception:
+        return True
+    return verdict if isinstance(verdict, bool) else False
+
+
+def _is_closed_error(exc):
+    """The Playwright error raised when the browser was closed mid-call."""
+    text = str(exc or "").lower()
+    return ("has been closed" in text or "browser closed" in text
+            or "context or browser" in text)
+
+
 def _idle_ttl():
     raw = os.getenv("JARVIS_RESEARCH_IDLE_TTL")
     if not raw:
@@ -187,7 +213,7 @@ class ResearchTask:
         self.context = None
         self._pages = []
 
-    async def new_page(self):
+    async def new_page(self, _retried=False):
         if self.context is None:
             raise ResearchBrowserError("research task has no browser context")
         # A persistent context always spawns with one default about:blank
@@ -210,7 +236,16 @@ class ResearchTask:
                     self._pages.append(page)
                     self.worker._track_page(self.task_id, page)
                     return page
-        page = await maybe_await(self.context.new_page())
+        try:
+            page = await maybe_await(self.context.new_page())
+        except Exception as exc:
+            # The window was closed between the liveness check and this call
+            # (or mid-job): reopen the warm context once and retry.
+            recover = getattr(self.worker, "_recover_context", None)
+            if recover is None or _retried or not _is_closed_error(exc):
+                raise
+            self.context = await recover()
+            return await self.new_page(_retried=True)
         # Tracked twice on purpose: under the task id so an outside cancel
         # can find it, and on the task itself so an unnamed job still gets
         # its pages closed when it ends.
@@ -273,6 +308,8 @@ class ResearchBrowserWorker:
         self._lock = threading.RLock()
         self._pages = {}
         self._context = None
+        self._playwright = None
+        self._relaunch_lock = None
         self._broker_session_id = None
         #: F27: bounded admission for concurrent jobs on the one owner loop.
         self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
@@ -281,6 +318,50 @@ class ResearchBrowserWorker:
     @property
     def alive(self):
         return self._thread is not None and self._thread.is_alive()
+
+    async def _ensure_context(self, playwright):
+        """A live persistent context, relaunching when the window was closed.
+
+        The user may close the browser between jobs; the worker is then left
+        holding a dead BrowserContext. Instead of failing the next job with
+        "Target page, context or browser has been closed", the same warm
+        worker reopens the persistent context on the same profile.
+        """
+        context = self._context
+        if context is not None and not _context_is_closed(context):
+            return context
+        if playwright is None:
+            raise ResearchBrowserError(
+                "research browser is closed and there is no Playwright "
+                "handle to reopen it with")
+        if self._relaunch_lock is None:
+            self._relaunch_lock = asyncio.Lock()
+        async with self._relaunch_lock:
+            context = self._context
+            if context is not None and not _context_is_closed(context):
+                return context
+            if context is not None:
+                logging.warning(
+                    "[RESEARCH] warm browser was closed; reopening it now")
+                try:
+                    await maybe_await(context.close())
+                except Exception:
+                    pass
+            context, channel_used = await launch_persistent_context(
+                playwright,
+                profile_dir=self.profile_dir,
+                channel=self.channel,
+                headless=False,
+                args=LAUNCH_ARGS,
+            )
+            self.channel_used = channel_used
+            self._context = context
+            return context
+
+    async def _recover_context(self):
+        """Force a fresh context after a dead-browser error mid-job."""
+        self._context = None
+        return await self._ensure_context(self._playwright)
 
     def start(self, timeout=60.0):
         with self._lock:
@@ -322,24 +403,18 @@ class ResearchBrowserWorker:
         playwright = None
         try:
             playwright = await async_playwright().start()
-            context, channel_used = await launch_persistent_context(
-                playwright,
-                profile_dir=self.profile_dir,
-                channel=self.channel,
-                headless=False,
-                args=LAUNCH_ARGS,
-            )
-            self.channel_used = channel_used
+            self._playwright = playwright
+            await self._ensure_context(playwright)
         except Exception as exc:  # noqa: BLE001 - surfaced to the submitting thread
             self._error = "%s: %s" % (type(exc).__name__, exc)
             self._ready.set()
+            self._playwright = None
             if playwright is not None:
                 try:
                     await playwright.stop()
                 except Exception:
                     pass
             return
-        self._context = context
         self._ready.set()
         # F47: this worker is now the OWNER of the profile — the broker
         # refuses any other actor that tries to claim the same persistent
@@ -364,7 +439,9 @@ class ResearchBrowserWorker:
                         continue
                     break
         finally:
+            final_context = self._context
             self._context = None
+            self._playwright = None
             if self._broker_session_id:
                 try:
                     from backend.services import browser_session_broker
@@ -374,7 +451,8 @@ class ResearchBrowserWorker:
                     pass
                 self._broker_session_id = None
             try:
-                await maybe_await(context.close())
+                if final_context is not None:
+                    await maybe_await(final_context.close())
             except Exception:
                 pass
             try:
@@ -462,6 +540,11 @@ class ResearchBrowserWorker:
         async def _job():
             holder["task"] = asyncio.current_task()
             self._last_used = time.monotonic()
+            try:
+                self._context = await self._ensure_context(self._playwright)
+            except Exception as exc:
+                raise ResearchBrowserError(
+                    "could not open the research browser: %s" % exc)
             task = ResearchTask(self, task_id)
             task.context = self._context
             try:
@@ -505,6 +588,10 @@ class ResearchBrowserWorker:
         async def _job():
             holder["task"] = asyncio.current_task()
             self._last_used = time.monotonic()
+            try:
+                self._context = await self._ensure_context(self._playwright)
+            except Exception:
+                self._context = None
             task = ResearchTask(self, task_id)
             task.context = self._context
             try:
