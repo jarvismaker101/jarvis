@@ -5165,9 +5165,78 @@ def _mi_free_path(path):
     return path
 
 
+#: A chain task clause that creates a FOLDER, not a file.
+_MI_FOLDER_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
+
+
+def _mi_folder_name(clause):
+    """The explicit folder name in the clause, or "" when it is unnamed."""
+    match = re.search(
+        r"\b(?:named|called|name\s+it)\s+([A-Za-z0-9_.\- ]{1,60})",
+        clause or "", re.IGNORECASE)
+    if not match:
+        return ""
+    name = match.group(1).strip().strip("\"'")
+    name = re.split(
+        r"\s+(?:with|and|in|on|for|to|about|containing|that|which)\b",
+        name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    return name.replace("\\", "/").split("/")[-1].strip(" .")
+
+
+def _mi_folder_task_step(msg, clause):
+    """Arm a folder creation; an unnamed folder asks instead of guessing."""
+    name = _mi_folder_name(clause)
+    if not name:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I have the findings, but I couldn't tell what "
+                            "to name the folder — tell me the exact name "
+                            "and I'll create it."}
+    try:
+        folders = task_agent_module._known_folders() or {}
+    except Exception:
+        folders = {}
+    base = folders.get("desktop") or folders.get("home") or ""
+    if not base:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't find your Desktop folder."}
+    path = _mi_free_path(os.path.join(base, name))
+    try:
+        if task_agent_module.has_pending_task_confirmation():
+            return {"kind": "task", "status": "failed",
+                    "fragment": "Another task is already waiting for your "
+                                "approval, so I left the folder uncreated — "
+                                "ask me again once that is settled."}
+    except Exception:
+        pass
+    plan = {
+        "ok": True,
+        "confidence": 0.9,
+        "summary": "Creating the folder %s." % name,
+        "requires_confirmation": True,
+        "command_text": msg,
+        "steps": [{
+            "tool": "code.create_folder",
+            "args": {"path": path},
+            "risk": "safe",
+            "reason": "Creating the folder %s." % name,
+        }],
+    }
+    try:
+        task_agent_module._arm_plan_confirmation(plan, {}, task_text=msg)
+        prompt = task_agent_module.confirmation_prompt(plan)
+    except Exception as exc:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't prepare the folder creation (%s)."
+                            % _mi_clip(exc, 80)}
+    return {"kind": "task", "status": "armed", "fragment": prompt,
+            "prompt": prompt, "path": path}
+
+
 def _mi_task_step(msg, step, results):
     """Compose the file write and arm the ONE approval; nothing runs now."""
     clause = step.get("text") or ""
+    if _MI_FOLDER_RE.search(clause):
+        return _mi_folder_task_step(msg, clause)
     content = ""
     for idx in step.get("consumes") or []:
         prior = results[idx]

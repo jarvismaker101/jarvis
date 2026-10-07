@@ -163,6 +163,44 @@ class ChainExecutorTests(unittest.TestCase):
         self.assertTrue(self.messages)
         self.assertIn("confirm task", self.messages[-1].lower())
 
+    def test_folder_chain_arms_folder_creation(self):
+        text = ("research the Zephyr 900 drone and create a folder called "
+                "zephyr_files on my desktop")
+        captured = {}
+
+        def fake_quick(query):
+            return {"query": query, "spoken_summary": "The Zephyr 900."}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        with patch.object(brain, "run_quick_search", side_effect=fake_quick), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm):
+            self._run_chain(text)
+        step = captured["plan"]["steps"][0]
+        self.assertEqual(step["tool"], "code.create_folder")
+        self.assertTrue(step["args"]["path"].endswith("zephyr_files"))
+
+    def test_unnamed_folder_chain_asks_instead_of_writing_a_file(self):
+        text = ("research the strongest current ai model and then create a "
+                "folder on my desktop by that model name which you found")
+
+        def fake_quick(query):
+            return {"query": query, "spoken_summary": "The strongest is X."}
+
+        with patch.object(brain, "run_quick_search", side_effect=fake_quick), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation") as arm:
+            self._run_chain(text)
+        arm.assert_not_called()
+        self.assertTrue(self.messages)
+        self.assertIn("name the folder", self.messages[-1].lower())
+
     def test_screen_failure_skips_dependent_steps_and_arms_nothing(self):
         with patch.object(brain, "analyze_screen", return_value={
                 "tip": "I couldn't analyse the screen, sir."}), \
