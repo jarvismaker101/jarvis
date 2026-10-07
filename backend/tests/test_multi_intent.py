@@ -55,6 +55,24 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIsNone(multi_intent.build_chain(
             "open youtube and research the news"))
 
+    def test_open_ai_is_a_company_not_a_tool_verb(self):
+        # Live transcript: "…talking about anthropic and open ai, find out
+        # about it on internet" — the splitter read "open" as a browser
+        # verb and rejected the chain, so the message became a literal
+        # research of the whole sentence.
+        text = ("jarvis what is this video on my screen talking about "
+                "anthropic and open ai , find out about it on internet")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research"])
+        self.assertIsNone(multi_intent.classify_clause("open ai"))
+        self.assertIsNone(multi_intent.classify_clause("openai"))
+        self.assertEqual(multi_intent.classify_clause("open youtube"),
+                         "tool")
+        self.assertEqual(multi_intent.classify_clause("visit openai.com"),
+                         "tool")
+
     def test_task_before_the_end_blocks_the_chain(self):
         text = ("create a file called x.txt with hello and research "
                 "the news")

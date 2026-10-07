@@ -503,6 +503,31 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
         chat.assert_not_called()
         self.assertEqual(response, "preview")
 
+    def test_meant_reaction_correction_routes_to_research_not_chat(self):
+        # Live transcript: "no i meant the reactions to that release you
+        # just researched for me" fell to chat, which answered from stale
+        # context. The correction restates the previous request — research.
+        msg = ("no i meant the reactions to that release you just "
+               "researched for me")
+        brain._last_research_topic = "OpenAI AI math results"
+        self.addCleanup(setattr, brain, "_last_research_topic", None)
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain, "classify_intent",
+                          return_value=self._chat_verdict()), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "handle_research_intent",
+                          return_value="lookup") as research, \
+             patch.object(brain, "handle_chat") as chat:
+            response = brain.process_message(msg, sync_voice=False)
+        research.assert_called_once()
+        self.assertEqual(
+            research.call_args.args[0],
+            "reactions to OpenAI AI math results")
+        self.assertTrue(research.call_args.kwargs.get("derived"))
+        chat.assert_not_called()
+        self.assertEqual(response, "lookup")
+
     def test_web_task_intent_still_hands_off_to_browser(self):
         msg = "Go to 1hd.to website, search for One Piece Movie Red, and play it"
         verdict = {"intent": "task", "task_description": msg}

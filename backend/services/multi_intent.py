@@ -72,7 +72,9 @@ _TASK_ACTION_RE = re.compile(
 )
 
 _TOOL_RE = re.compile(
-    r"\b(open|launch|play|start|go\s+to|navigate|visit)\b",
+    # "Open AI" / "OpenAI" is a company name, not the browser verb — but a
+    # real tool clause ("open youtube", "open the browser") still counts.
+    r"\b(?:open(?!\s+ai\b)|launch|play|start|go\s+to|navigate|visit)\b",
     re.IGNORECASE,
 )
 

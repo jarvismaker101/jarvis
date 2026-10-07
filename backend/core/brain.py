@@ -1273,6 +1273,9 @@ def derive_research_query(raw_query):
     if refined:
         print(f"[RESEARCH] Refined to last name: {refined!r} <- {raw_query!r}")
         return refined
+    reaction = _reaction_query(raw_query)
+    if reaction:
+        return reaction
     query = None
     meta_candidate = False
     try:
@@ -1375,6 +1378,9 @@ _GENERIC_MEDIA_TOKENS = {
     "youtube", "yt", "channel", "video", "videos", "song", "movie",
     "content", "clip", "series", "guy", "person", "dude", "thing", "name",
     "title", "topic", "subject", "anything", "something", "use", "using",
+    "reaction", "reactions", "response", "responses", "feedback",
+    "thoughts", "opinions", "release", "releases", "announcement",
+    "announcements", "update", "updates", "launch", "news",
 }
 
 #: Words that carry no referent by themselves.
@@ -1577,6 +1583,124 @@ def _resolve_reference_query(text):
     return ""
 
 
+# ── Live fix: reactions/opinions about the last researched subject ──────────
+# "find out how people are reacting to that release from openai" and the
+# follow-up correction "no i meant the reactions to that release you just
+# researched for me" must both search the SAME concrete subject the earlier
+# research produced — not the sentence around it, and never a bare pointer.
+
+#: "find out how people are reacting to X", "search for what users are
+#: saying about X".
+_REACTION_LEAD_RE = re.compile(
+    r"\b(?:find\s+out|search|google|look\s+up|research)\b"
+    r"(?:\s+(?:about|for|on))?\s+"
+    r"(?:(?:how|what)\s+)?"
+    r"(?:people|users|everyone|folks|netizens|the\s+internet|the\s+community|"
+    r"twitter|x|reddit)?\s*(?:are|is|'s)?\s*"
+    r"(?:reacting|responding|saying|feeling|thinking|thoughts|opinions?|"
+    r"reactions?)\s+(?:to|about|on|regarding)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+#: "the reactions to X" (a correction after the fact, no lead verb).
+_REACTION_SHORT_RE = re.compile(
+    r"\b(?:reactions?|responses?|feedback|thoughts|opinions?)\s+"
+    r"(?:to|about|on|regarding)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+#: A deictic media noun ("that release", "this announcement") refers to the
+#: last researched/screen subject; a named subject is used as-is.
+_DEICTIC_MEDIA_RE = re.compile(
+    r"^(?:that|this|the|its)\s+"
+    r"(?:release|announcement|update|news|video|launch|event|topic|model|"
+    r"thing|it|one)\b",
+    re.IGNORECASE,
+)
+
+#: "…you just researched for me" — the trailing back-reference is not part
+#: of the subject.
+_REFERENT_TAIL_RE = re.compile(
+    r"\s+(?:you|u)\s+(?:just\s+)?"
+    r"(?:researched|searched|found|looked\s+up|mentioned|showed|saw|told)"
+    r"(?:\s+(?:me|about\s+it))?(?:\s+(?:for\s+me|earlier|before))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _reaction_referent():
+    """The concrete subject last researched/screened, or "".
+
+    A stored sentence that is itself a search instruction ("find out how
+    people are reacting…") is not a real subject and is skipped.
+    """
+    for candidate in (globals().get("_last_research_topic"),
+                      _get_last_screen_topic()):
+        text = str(candidate or "").strip()
+        if not text or _META_QUERY_RE.search(text):
+            continue
+        if _REACTION_LEAD_RE.search(text):
+            continue
+        if _is_deictic_query(text):
+            continue
+        return text
+    return ""
+
+
+def _reaction_query(text):
+    """Rewrite an opinion/reaction request into a concrete web query.
+
+    "find out how people are reacting to that release from openai" ->
+    "reactions to <last researched subject>". Returns "" when the message
+    is not a reaction request or no real referent exists — callers fall
+    back to the normal derivation (and, for a bare pointer, ask once).
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = _REACTION_LEAD_RE.search(raw) or _REACTION_SHORT_RE.search(raw)
+    if not match:
+        return ""
+    subject = _REFERENT_TAIL_RE.sub("", match.group(1)).strip(" ,.!?")
+    if not subject:
+        return ""
+    if _DEICTIC_MEDIA_RE.match(subject):
+        referent = _reaction_referent()
+        if not referent:
+            print(f"[RESEARCH] Reaction pointer {subject!r} has no referent")
+            return ""
+        # The stored subject may already be an opinion query ("reactions to
+        # X") — never stack "reactions to reactions to X".
+        if re.match(r"(?i)^(?:reactions?|responses?|feedback|thoughts|"
+                    r"opinions?)\b", referent):
+            print(f"[RESEARCH] Reaction query reused: {referent!r}")
+            return referent[:220]
+        query = ("reactions to %s" % referent)[:220]
+        print(f"[RESEARCH] Reaction query: {query!r} <- {raw!r}")
+        return query
+    query = ("reactions to %s" % subject)[:220]
+    print(f"[RESEARCH] Reaction query: {query!r} <- {raw!r}")
+    return query
+
+
+def _meant_refinement_query(text):
+    """A correction ("no i meant the reactions to that release you just
+    researched") that restates the PREVIOUS request in clearer words is
+    that request — not chat. Returns the concrete query, or "".
+
+    Only fires when the sentence carries a reaction/opinion verb and the
+    rewrite resolves to a real subject; anything else keeps its route.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if not re.match(r"(?i)^\s*(?:no[,.! ]+|actually[,.! ]+|sorry[,.! ]+)?"
+                    r"(?:i|what)\s+(?:meant|said|was\s+asking|am\s+asking)\b",
+                    raw):
+        return ""
+    return _reaction_query(raw)
+
+
 def _resolve_search_query(text):
     """The best concrete web query for *text*, or "" when only a pointer
     exists. Concrete text goes through the normal derivation; deictic text
@@ -1589,6 +1713,13 @@ def _resolve_search_query(text):
     refined = _refine_last_name_query(t)
     if refined:
         return refined
+    # Live fix: "find out how people are reacting to that release from
+    # openai" / "the reactions to that release you just researched" — the
+    # opinion is about the last researched subject, never about the
+    # sentence itself.
+    reaction = _reaction_query(t)
+    if reaction:
+        return reaction
     # Live fix: an attribute request about the on-screen media ("...the
     # creator of this video") resolves to the creator name when it is a
     # PURE pointer. A clause with its own subject ("creator of monalisa")
@@ -6528,6 +6659,23 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, offered_reply)
             return offered_reply
+        # A correction that restates the previous request ("no i meant the
+        # reactions to that release you just researched") is that request.
+        # Without this it fell to chat, which answered from stale context.
+        try:
+            meant_query = _meant_refinement_query(msg)
+        except Exception as exc:
+            meant_query = ""
+            logging.warning("[MEANT] refinement gate failed: %s", exc)
+        if meant_query:
+            print("[MEANT] Correction restates the request -> research:",
+                  meant_query)
+            meant_reply = handle_research_intent(
+                meant_query, from_voice=from_voice,
+                voice_compact=voice_compact, derived=True)
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, meant_reply)
+            return meant_reply
         try:
             # The cheap pure-regex check runs first (P0-10 ordering: a
             # non-search message must not run task predicates before the

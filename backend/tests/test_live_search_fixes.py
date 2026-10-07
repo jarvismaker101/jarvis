@@ -45,6 +45,10 @@ JAMES = "James Dark"
 REFINE_ASK = ("ok but you searched a different man by that same name , i "
               "want you to seach the youtube content creator by that name")
 MONALISA_ASK = "search on the internet about the creator of monalisa"
+RELEASE_ASK = ("find out how people are reacting to that release from "
+               "openai")
+RELEASE_MEANT = ("no i meant the reactions to that release you just "
+                 "researched for me")
 
 
 class LiveFixBase(unittest.TestCase):
@@ -356,6 +360,78 @@ class ResearchRefinementTests(LiveFixBase):
              patch.object(brain, "handle_chat", return_value="chat"):
             reply = brain.process_message(REFINE_ASK, sync_voice=False)
         self.assertEqual(calls, ["James Dark youtube channel"])
+        self.assertIn("Quick lookup", reply)
+
+
+class ReactionQueryTests(LiveFixBase):
+    """Live fix: reactions/opinions about the last researched subject.
+
+    Transcript: after a chain researched OpenAI, "find out how people are
+    reacting to that release from openai" searched the sentence verbatim,
+    and the correction "no i meant the reactions to that release you just
+    researched for me" fell to chat, which answered from stale context.
+    """
+
+    def test_reaction_request_rewrites_to_the_researched_subject(self):
+        brain._set_last_research_topic("OpenAI AI math results")
+        self.assertEqual(brain._reaction_query(RELEASE_ASK),
+                         "reactions to OpenAI AI math results")
+        self.assertEqual(brain._resolve_search_query(RELEASE_ASK),
+                         "reactions to OpenAI AI math results")
+
+    def test_screen_topic_is_the_fallback_referent(self):
+        self._seed_screen()
+        self.assertEqual(brain._reaction_query(RELEASE_ASK),
+                         "reactions to " + TITLE)
+
+    def test_meant_correction_restates_the_same_request(self):
+        brain._set_last_research_topic("OpenAI AI math results")
+        self.assertEqual(brain._meant_refinement_query(RELEASE_MEANT),
+                         "reactions to OpenAI AI math results")
+
+    def test_no_stacking_when_the_stored_subject_is_already_reactions(self):
+        brain._set_last_research_topic("reactions to OpenAI AI math results")
+        self.assertEqual(brain._reaction_query(RELEASE_MEANT),
+                         "reactions to OpenAI AI math results")
+
+    def test_instruction_sentences_are_never_referents(self):
+        brain._set_last_research_topic(
+            "find out how people are reacting to that release from openai")
+        self.assertEqual(brain._reaction_query(RELEASE_MEANT), "")
+
+    def test_concrete_subject_keeps_its_own_words(self):
+        brain._set_last_research_topic("OpenAI AI math results")
+        self.assertEqual(
+            brain._reaction_query(
+                "search for what people are saying about the new OpenAI "
+                "o3 model"),
+            "reactions to the new OpenAI o3 model")
+
+    def test_without_a_referent_the_pointer_is_not_searched(self):
+        self.assertEqual(brain._reaction_query(RELEASE_ASK), "")
+        self.assertEqual(brain._meant_refinement_query(RELEASE_MEANT), "")
+
+    def test_plain_searches_are_untouched(self):
+        self.assertEqual(brain._reaction_query(
+            "search the best gaming laptop under 2000 dollars"), "")
+
+    def test_live_meant_correction_routes_to_research_not_chat(self):
+        brain._set_last_research_topic("OpenAI AI math results")
+        calls = []
+
+        def fake_research(query, **kwargs):
+            calls.append(query)
+            return "Quick lookup for that, sir."
+
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "chat"}), \
+             patch.object(brain, "handle_research_intent",
+                          side_effect=fake_research), \
+             patch.object(brain, "orchestrator_select_route",
+                          return_value="legacy"), \
+             patch.object(brain, "handle_chat", return_value="chat"):
+            reply = brain.process_message(RELEASE_MEANT, sync_voice=False)
+        self.assertEqual(calls, ["reactions to OpenAI AI math results"])
         self.assertIn("Quick lookup", reply)
 
 
