@@ -73,6 +73,23 @@ class ChainSplitTests(unittest.TestCase):
         self.assertEqual(multi_intent.classify_clause("visit openai.com"),
                          "tool")
 
+    def test_screen_deictic_research_splits_into_screen_then_research(self):
+        # Live transcript: "research about this verse on my screen from
+        # bhagwat gita and tell me what does it actually say" — one clause
+        # that both points at the screen and asks to research it. It was
+        # typed into the web verbatim; it must look first, then research.
+        text = ("research about this verse on my screen from bhagwat gita "
+                "and tell me what does it actually say")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research"])
+        self.assertEqual([s["consumes"] for s in plan["steps"]],
+                         [[], [0]])
+        # A screen-only single job still never becomes a chain.
+        self.assertIsNone(multi_intent.build_chain(
+            "look at my screen to see what verse im talking about"))
+
     def test_task_before_the_end_blocks_the_chain(self):
         text = ("create a file called x.txt with hello and research "
                 "the news")
@@ -387,6 +404,25 @@ class ChainExecutorTests(unittest.TestCase):
         arm.assert_not_called()
         self.assertIn("already waiting", self.messages[-1])
 
+    def test_screen_deictic_research_chain_searches_what_was_seen(self):
+        text = ("research about this verse on my screen from bhagwat gita "
+                "and tell me what does it actually say")
+        searches = []
+
+        def fake_quick(query, *args, **kwargs):
+            searches.append(query)
+            return {"query": query,
+                    "spoken_summary": "The verse speaks of knowledge."}
+
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A YouTube Short about Bhagavad Gita Chapter 4 "
+                       "verse 5.",
+                "topic": "Bhagavad Gita Chapter 4 verse 5",
+                "creator": ""}), \
+             patch.object(brain, "run_quick_search", side_effect=fake_quick):
+            self._run_chain(text)
+        self.assertEqual(searches, ["Bhagavad Gita Chapter 4 verse 5"])
+
     def test_concurrent_chain_is_refused(self):
         brain._mi_chain_active = True
         try:
@@ -399,7 +435,6 @@ class ChainExecutorTests(unittest.TestCase):
 
 class ChainGateTests(unittest.TestCase):
     """Rank 2: the brain gate routes a compound turn to the chain handler."""
-
     def setUp(self):
         brain._mi_chain_active = False
         brain._pending_confirmation = None

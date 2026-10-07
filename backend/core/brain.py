@@ -1380,7 +1380,8 @@ _GENERIC_MEDIA_TOKENS = {
     "title", "topic", "subject", "anything", "something", "use", "using",
     "reaction", "reactions", "response", "responses", "feedback",
     "thoughts", "opinions", "release", "releases", "announcement",
-    "announcements", "update", "updates", "launch", "news",
+    "announcements", "update", "updates", "launch", "verse",
+    "screen", "monitor", "display",
 }
 
 #: Words that carry no referent by themselves.
@@ -1701,6 +1702,68 @@ def _meant_refinement_query(text):
     return _reaction_query(raw)
 
 
+#: Consent/affirmation lead-ins that open a follow-up to something shown
+#: or researched ("yes, that is the verse I wanted you to research about").
+_CONSENT_LEAD_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|ya|yup|correct|right|exactly|perfect|sure|"
+    r"ok(?:ay)?|that(?:'s| is) (?:right|correct|it))\b[,.! ]*",
+    re.IGNORECASE,
+)
+
+#: Extra grammar words allowed in a pure back-reference (beyond the global
+#: pointer fillers) so "that is the verse I wanted you to research about"
+#: leaves no real subject behind.
+_BACKREF_EXTRA = {
+    "is", "was", "were", "are", "did", "do", "have", "had",
+    "yes", "yeah", "yep", "ya", "yup", "sure", "okay", "ok",
+    "wanted", "want", "asked", "told", "meant", "mean", "said",
+    "research", "searched", "search", "find", "found", "looking", "look",
+    "google", "deepsearch", "up", "out", "about", "for", "on", "in",
+    "to", "of", "from", "with", "the", "a", "an", "it", "its", "this",
+    "that", "these", "those", "i", "you", "me", "we", "one", "same",
+    "thing", "there",
+}
+
+
+def _is_backreference_text(text):
+    """True when *text* is a consent + pure back-reference shape ("yes
+    that is the verse i wanted you to research about") — all checks
+    except the resolution itself."""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    low = _CONSENT_LEAD_RE.sub("", raw).strip(" ,.!?")
+    if not low:
+        return False
+    if not re.search(r"\b(research|search|google|looking\s+up|look\s+up|"
+                     r"find\s+out|deepsearch)\b", low, re.IGNORECASE):
+        return False
+    if not re.search(r"\b(that|this|it|these|those)\b", low, re.IGNORECASE):
+        return False
+    tokens = [tok for tok in re.split(r"[\W_]+", low.lower()) if tok]
+    if not tokens or len(tokens) > 24:
+        return False
+    allowed = _DEREF_FILLERS | _BACKREF_EXTRA | _GENERIC_MEDIA_TOKENS
+    return not [tok for tok in tokens if tok not in allowed]
+
+
+def _backreference_query(text):
+    """Resolve a consent + pure back-reference ("yes that is the verse i
+    wanted you to research about") to what was last seen/researched.
+
+    Only when every content word is a pointer/generic noun; a sentence
+    that names its own subject keeps its normal route. Returns "" when
+    the message is not such a back-reference or nothing concrete exists.
+    """
+    raw = str(text or "").strip()
+    if not _is_backreference_text(raw):
+        return ""
+    resolved = _resolve_reference_query(raw)
+    if resolved:
+        print(f"[RESEARCH] Back-reference resolved: {resolved!r} <- {raw!r}")
+    return resolved
+
+
 def _resolve_search_query(text):
     """The best concrete web query for *text*, or "" when only a pointer
     exists. Concrete text goes through the normal derivation; deictic text
@@ -1720,6 +1783,17 @@ def _resolve_search_query(text):
     reaction = _reaction_query(t)
     if reaction:
         return reaction
+    # Live fix: "yes that is the verse i wanted you to research about" —
+    # a consent + pure back-reference names no subject of its own and must
+    # resolve to what was last seen/researched, never reach the classifier
+    # (which answered "verse research" and searched lab suppliers). With
+    # no referent the caller asks once instead of searching the sentence.
+    backref = _backreference_query(t)
+    if backref:
+        return backref
+    if _is_backreference_text(t):
+        print(f"[RESEARCH] Back-reference has no referent: {t!r}")
+        return ""
     # Live fix: an attribute request about the on-screen media ("...the
     # creator of this video") resolves to the creator name when it is a
     # PURE pointer. A clause with its own subject ("creator of monalisa")

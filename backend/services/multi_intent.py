@@ -174,6 +174,25 @@ def build_chain(text):
             merged[-1]["text"] = merged[-1]["text"] + " and " + clause
             continue
         merged.append({"kind": kind, "text": clause})
+    # Live fix: ONE clause that both points at the screen and asks to
+    # research it ("research about this verse on my screen from bhagwat
+    # gita and tell me what does it actually say") is really two jobs —
+    # look at the screen, then research what was seen. Without this the
+    # whole sentence was typed into the web.
+    if (len(merged) == 1 and merged[0]["kind"] == "screen"
+            and _RESEARCH_RE.search(merged[0]["text"])):
+        merged = [
+            {"kind": "screen", "text": merged[0]["text"]},
+            {"kind": "research", "text": merged[0]["text"]},
+        ]
+        steps = [
+            {"kind": "screen", "text": merged[0]["text"], "index": 0,
+             "consumes": []},
+            {"kind": "research", "text": merged[1]["text"], "index": 1,
+             "consumes": [0]},
+        ]
+        return {"ok": True, "steps": steps, "source": raw,
+                "command_text": raw}
     if len(merged) < 2 or len(merged) > _MAX_STEPS:
         return None
     kinds = [m["kind"] for m in merged]

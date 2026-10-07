@@ -49,6 +49,10 @@ RELEASE_ASK = ("find out how people are reacting to that release from "
                "openai")
 RELEASE_MEANT = ("no i meant the reactions to that release you just "
                  "researched for me")
+VERSE_ASK = ("research about this verse on my screen from bhagwat gita "
+             "and tell me what does it actually say")
+VERSE_CONFIRM = "yes that is the verse i wanted you to research about"
+VERSE_TOPIC = "Bhagavad Gita Chapter 4 verse 5"
 
 
 class LiveFixBase(unittest.TestCase):
@@ -433,6 +437,68 @@ class ReactionQueryTests(LiveFixBase):
             reply = brain.process_message(RELEASE_MEANT, sync_voice=False)
         self.assertEqual(calls, ["reactions to OpenAI AI math results"])
         self.assertIn("Quick lookup", reply)
+
+
+class BackReferenceTests(LiveFixBase):
+    """Live fix: "yes that is the verse i wanted you to research about".
+
+    The screen showed Bhagavad Gita Chapter 4 verse 5; the classifier
+    turned the consent into the query "verse research" (lab suppliers),
+    and later a chat fallback improvised a wrong verse. A pure
+    back-reference must resolve to what was last seen — never be
+    classified, never reach chat.
+    """
+
+    def test_consent_backreference_resolves_to_the_screen_topic(self):
+        brain._set_last_screen_topic(VERSE_TOPIC)
+        self.assertEqual(brain._backreference_query(VERSE_CONFIRM),
+                         VERSE_TOPIC)
+        self.assertEqual(brain._resolve_search_query(VERSE_CONFIRM),
+                         VERSE_TOPIC)
+
+    def test_short_consent_also_resolves(self):
+        brain._set_last_screen_topic(VERSE_TOPIC)
+        self.assertEqual(brain._resolve_search_query("yes research that"),
+                         VERSE_TOPIC)
+
+    def test_route_never_consults_the_classifier(self):
+        brain._set_last_screen_topic(VERSE_TOPIC)
+        calls = []
+
+        def fake_research(query, **kwargs):
+            calls.append(query)
+            return "Quick lookup for that, sir."
+
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "verse research"}) as cls, \
+             patch.object(brain, "handle_research_intent",
+                          side_effect=fake_research), \
+             patch.object(brain, "orchestrator_select_route",
+                          return_value="legacy"), \
+             patch.object(brain, "handle_chat", return_value="chat"):
+            reply = brain.process_message(VERSE_CONFIRM, sync_voice=False)
+        self.assertEqual(calls, [VERSE_TOPIC])
+        self.assertIn("Quick lookup", reply)
+        cls.assert_not_called()
+
+    def test_without_a_topic_it_asks_once(self):
+        self.assertEqual(brain._resolve_search_query(VERSE_CONFIRM), "")
+        with patch.object(brain, "handle_research_intent") as research, \
+             patch.object(brain, "orchestrator_select_route",
+                          return_value="legacy"), \
+             patch.object(brain, "handle_chat", return_value="chat"):
+            reply = brain.process_message(VERSE_CONFIRM, sync_voice=False)
+        research.assert_not_called()
+        self.assertIn("name it", reply.lower())
+
+    def test_own_subject_searches_are_not_backreferences(self):
+        brain._set_last_screen_topic(VERSE_TOPIC)
+        self.assertEqual(brain._backreference_query("research the news"),
+                         "")
+        self.assertEqual(
+            brain._backreference_query(
+                "search for that movie review on imdb"), "")
 
 
 if __name__ == "__main__":
