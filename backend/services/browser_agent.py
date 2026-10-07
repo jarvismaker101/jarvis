@@ -4514,6 +4514,13 @@ def _run_one_tool(client, history, call, session=None, stats=None):
                 image_b64 = None
             else:
                 result_text, image_b64 = outcome
+            if name == "verify_playing":
+                # RANK 4: keep the playback verdict - it is this task's media
+                # proof, or the honest record that no proof exists.
+                try:
+                    session["_media_verdict"] = result_text or ""
+                except Exception:
+                    pass
         except Exception as exc:
             # virtual handler unexpected failure -> return as tool error text
             result_text = _clip_result("virtual tool %s failed: %s" % (name, exc))
@@ -4953,6 +4960,33 @@ def _states_completion(text):
     return not _COMPLETION_NEGATION_RE.search(lowered[:40])
 
 
+#: RANK 4 — task descriptions whose goal is media PLAYBACK, which may only be
+#: called done with a PLAYING verdict from the verify_playing media probe.
+_MEDIA_GOAL_RE = re.compile(
+    r"\b(play|plays|playing|playback|watch|watching)\b", re.IGNORECASE)
+
+
+def _unproven_media_verdict(task_description, session):
+    """RANK 4 — (hedge, evidence) when a media task ends without playback proof.
+
+    Returns None when the goal is not media playback or when the task's own
+    verify_playing observation proved PLAYING. Anything else - a static,
+    paused, uncertain or never-taken probe - downgrades the completion to a
+    partial result instead of a false "done".
+    """
+    if not _MEDIA_GOAL_RE.search(task_description or ""):
+        return None
+    verdict = str((session or {}).get("_media_verdict") or "").strip()
+    if verdict.startswith("verify_playing: PLAYING"):
+        return None
+    if verdict:
+        return ("I could not confirm it started playing (%s)." % verdict,
+                verdict)
+    return ("I pressed play, but I could not confirm it started - ask me to "
+            "verify playback if you want me to check again.",
+            "no playback observation was made")
+
+
 # ── F08: suspended checkpoints ────────────────────────────────────────────
 # A clarifying question SUSPENDS a run. The audit found the old continuation
 # simply appended the answer to the description and started a NEW run, so
@@ -5262,6 +5296,17 @@ def _agent_loop_inner(client, task_description, started, stats, job=None,
                 append_activity_line("RESULT partial: %s\n" % (text or ""))
                 return TaskResult.partial(text or "", detail=text or "",
                                           evidence=failures)
+            # RANK 4: a media-playback goal is only 'done' when the task's
+            # own verify_playing probe proved PLAYING. Anything less becomes
+            # a partial with the honest hedge instead of a false "done".
+            unproven = _unproven_media_verdict(task_description, session)
+            if unproven:
+                hedge, proof_note = unproven
+                summary = re.sub(r"\s+", " ", ("%s %s" % (text or "", hedge))
+                                 ).strip()
+                append_activity_line("RESULT partial: %s\n" % summary)
+                return TaskResult.partial(summary, detail=text or "",
+                                          evidence=[proof_note])
             append_activity_line("RESULT ok: %s\n" % (text or ""))
             return TaskResult.completed(text or "", detail=text or "")
         history.append(

@@ -18,6 +18,7 @@ from backend.services.task_agent.connectors import browser_cdp, editor_bridge, w
 from backend.services import adaptive_steps
 from backend.services import approvals
 from backend.services import code_tools
+from backend.services import proof as proof_layer
 from backend.services import productivity_connector
 from backend.services import tool_policy
 from backend.services.context_envelope import budgeted_json
@@ -3060,6 +3061,12 @@ def _step_failure_verdict(tool, args, text, structured):
         resolved = structured.get("path") or args.get("path") or ""
         if resolved and not os.path.exists(resolved):
             return True, "postcondition failed: %s missing" % resolved
+        # RANK 4: the ok is only the CLAIM - check the world. A write whose
+        # content does not match what was written (or that left nothing to
+        # read back) is a FAILED step, not a done one.
+        verdict = proof_layer.prove_step(tool, args, structured)
+        if verdict and verdict.get("state") == proof_layer.FAILED:
+            return True, "postcondition failed: %s" % verdict.get("evidence")
     return False, ""
 
 
@@ -3962,6 +3969,27 @@ def _run_confirmed_steps(plan, context, task_text=""):
             _trace_step(trace, tool, args, reason or text, False)
             continue
 
+        # RANK 4: prove the effect before publishing it as an ok step. A
+        # proofable tool whose postcondition fails is a FAILED step carrying
+        # the proof as its reason - never a done fragment.
+        proof = proof_layer.prove_step(tool, args, structured)
+        if proof and proof.get("state") == proof_layer.FAILED:
+            proof_reason = "postcondition failed: %s" % proof.get("evidence")
+            outcomes.append({
+                "tool": tool,
+                "status": "failed",
+                "result": text or "",
+                "reason": proof_reason,
+                "goal": _goal_of(step),
+                "attempts": attempts,
+                "proof": proof,
+                "fragment": _fail_fragment(step, proof_reason),
+            })
+            _record_observation(observations, index, step, structured, text,
+                                "failed")
+            _trace_step(trace, tool, args, proof_reason, False)
+            continue
+
         outcomes.append({
             "tool": tool,
             "status": "ok",
@@ -3969,6 +3997,7 @@ def _run_confirmed_steps(plan, context, task_text=""):
             "reason": "",
             "goal": _goal_of(step),
             "attempts": attempts,
+            "proof": proof,
             "fragment": _ok_fragment(step, text),
         })
         # F09: every executed step joins the verified trace; an ok step that
@@ -3983,6 +4012,11 @@ def _run_confirmed_steps(plan, context, task_text=""):
                     verification.append(
                         "%s: %s" % (tool or "step",
                                     observation[:_TRACE_OBSERVATION_MAX]))
+        if proof and proof.get("state") == proof_layer.PROVED \
+                and len(verification) < _VERIFICATION_MAX:
+            # RANK 4: the filesystem's own proof joins the verification list.
+            verification.append(
+                "%s: %s" % (tool or "step", proof.get("evidence")))
         _record_observation(observations, index, step, structured, text, "ok")
 
     detail = "\n".join(
