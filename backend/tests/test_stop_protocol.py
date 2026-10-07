@@ -164,8 +164,8 @@ class BrowserStopReportTests(unittest.TestCase):
         browser_agent._publish_stop_report(
             {"completed_actions": ["open_url youtube.com", "click_mark Play"]})
         report = browser_agent.consume_stop_report()
-        self.assertIn("open_url youtube.com", report)
-        self.assertIn("click_mark Play", report)
+        self.assertIn("opened youtube.com", report)
+        self.assertIn("clicked Play", report)
         self.assertEqual(browser_agent.consume_stop_report(), "")
 
     def test_empty_session_publishes_nothing(self):

@@ -250,6 +250,29 @@ def request_stop(job_id=None):
 _STOP_REPORT_LOCK = threading.Lock()
 _last_stop_report = ""
 
+#: Past-tense verbs for the stop report, so the user hears what happened
+#: ("clicked Play"), not a tool name ("click_mark Play").
+_STOP_ACTION_VERBS = {
+    "open_url": "opened", "new_tab": "opened a tab at",
+    "click_mark": "clicked", "click_text": "clicked",
+    "click_point": "clicked", "press": "pressed",
+    "fill_mark": "filled in", "fill": "filled in",
+    "select_option": "selected in", "set_checked": "checked",
+    "scroll": "scrolled", "drag_drop": "dragged",
+    "switch_tab": "switched to", "write_file": "wrote",
+    "create_folder": "created",
+}
+
+
+def _humanize_stop_action(label):
+    label = (label or "").strip()
+    for tool, verb in _STOP_ACTION_VERBS.items():
+        if label.startswith(tool + " "):
+            return "%s %s" % (verb, label[len(tool) + 1:])
+        if label == tool:
+            return verb
+    return label.replace("_", " ")
+
 
 def _publish_stop_report(session):
     """Rank 5: remember the committed actions of a run being stopped."""
@@ -261,7 +284,8 @@ def _publish_stop_report(session):
         actions = []
     if not actions:
         return
-    summary = "; ".join(item[:60] for item in actions[-5:])
+    summary = "; ".join(_humanize_stop_action(item)[:60]
+                        for item in actions[-5:])
     if len(summary) > 240:
         summary = summary[:237].rstrip() + "..."
     with _STOP_REPORT_LOCK:
