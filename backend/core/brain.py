@@ -1267,17 +1267,34 @@ def derive_research_query(raw_query):
     """
     if not raw_query or not raw_query.strip():
         return raw_query
+    # Live fix: "you searched a different man by that same name, search the
+    # youtube content creator" refines the last researched NAME.
+    refined = _refine_last_name_query(raw_query)
+    if refined:
+        print(f"[RESEARCH] Refined to last name: {refined!r} <- {raw_query!r}")
+        return refined
     query = None
+    meta_candidate = False
     try:
         intent = classify_intent(raw_query, timeout_ms=3500)
         if intent.get("intent") in ("research", "tools"):
             candidate = str(intent.get("query") or "").strip()
             if candidate and candidate != raw_query.strip():
-                query = candidate[:220]
-                print(f"[RESEARCH] Derived query: {query!r} <- {raw_query!r}")
+                if _META_QUERY_RE.search(candidate):
+                    # Self-referential text is not a subject: asking beats
+                    # searching "the name previously searched".
+                    meta_candidate = True
+                    print(f"[RESEARCH] Rejected meta query {candidate!r}")
+                else:
+                    query = candidate[:220]
+                    print(f"[RESEARCH] Derived query: {query!r} <- {raw_query!r}")
     except Exception as exc:
         logging.warning("[RESEARCH] Query derivation failed: %s", exc)
     if not query:
+        if meta_candidate:
+            print(f"[RESEARCH] Meta-only request has no concrete subject: "
+                  f"{raw_query!r}")
+            return ""
         query = _heuristic_research_query(raw_query)
     if _is_reference_only(query) and _last_research_topic:
         print(
@@ -1303,7 +1320,13 @@ _last_research_topic = None
 
 
 def _set_last_research_topic(topic):
+    """Remember the last researched subject. A self-referential meta query
+    ("the name previously searched") is never a subject and is not stored,
+    so later "by that name" refinements cannot chain off garbage."""
     global _last_research_topic
+    text = str(topic or "").strip()
+    if not text or _META_QUERY_RE.search(text):
+        return
     _last_research_topic = topic
 
 _REFERENCE_ONLY_TOKENS = {
@@ -1379,7 +1402,25 @@ _CREATOR_ATTR_RE = re.compile(
 #: Attribute-talk words that are still pointers in this context ("the
 #: channel that MADE this video").
 _CREATOR_POINTER_EXTRA = {"made", "created", "posted", "owns", "runs",
-                          "behind", "no"}
+                          "behind", "no", "tell"}
+
+#: A correction pointing back at the last researched name ("you searched a
+#: different man by that same name, search the youtube creator").
+_NAME_REFINE_RE = re.compile(
+    r"\b(?:by|with)\s+(?:that|the\s+same|this)\s+name\b"
+    r"|\bsame\s+name\b"
+    r"|\bdifferent\s+(?:man|person|guy)\b",
+    re.IGNORECASE,
+)
+
+#: Self-referential meta text a classifier can emit instead of a real
+#: subject ("...the name previously searched"). Never searched, never
+#: stored as the last research topic.
+_META_QUERY_RE = re.compile(
+    r"\b(previously|earlier|mentioned|same\s+name|that\s+name|"
+    r"the\s+name\s+(?:you|previously|just)|different\s+(?:man|person|guy))\b",
+    re.IGNORECASE,
+)
 
 _screen_topic_lock = threading.Lock()
 _last_screen_topic = {"text": "", "at": 0.0}
@@ -1452,6 +1493,46 @@ def _is_deictic_query(query):
     return not [t for t in tokens if t not in _DEREF_FILLERS]
 
 
+def _creator_reference_query(text):
+    """The on-screen creator name when *text* is a pure pointer at the
+    maker ("search about this creator", "not the video, the creator of
+    this one") — else "". A clause with its own subject ("creator of
+    monalisa") is NOT a pointer and is derived normally."""
+    raw = str(text or "")
+    if not _CREATOR_ATTR_RE.search(raw):
+        return ""
+    creator = _get_last_screen_creator()
+    if not creator or _is_deictic_query(creator):
+        return ""
+    tokens = [t for t in re.split(r"[\W_]+", raw.lower()) if t]
+    allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
+    if [t for t in tokens if t not in allowed]:
+        return ""
+    return creator
+
+
+def _refine_last_name_query(text):
+    """A correction pointing at the last researched name refines the search
+    to that name's YouTube presence instead of searching the meta sentence
+    ("you searched a different man by that same name..."). Returns "" when
+    the turn is not such a correction."""
+    raw = str(text or "")
+    if not raw or not _last_research_topic:
+        return ""
+    if not _NAME_REFINE_RE.search(raw):
+        return ""
+    low = raw.lower()
+    if not re.search(r"\b(youtube|youtuber|channel|content\s+creator|"
+                     r"creator|streamer)\b", low):
+        return ""
+    topic = str(_last_research_topic).strip()
+    if not topic or _META_QUERY_RE.search(topic):
+        return ""
+    if re.search(r"\b(youtube|youtuber|channel)\b", low):
+        return ("%s youtube channel" % topic)[:220]
+    return ("%s creator" % topic)[:220]
+
+
 def _resolve_reference_query(text):
     """Bind "this stream" / "that creator" to a concrete subject.
 
@@ -1465,15 +1546,9 @@ def _resolve_reference_query(text):
         return ""
     # Live fix: "search about this creator" / "not the video, the creator
     # of this one" asks for the MAKER seen on screen — never the video topic.
-    # The pointer check ignores the deictic length cap: a rambling correction
-    # is still a pointer when every token is a filler.
-    if _CREATOR_ATTR_RE.search(raw):
-        creator = _get_last_screen_creator()
-        if creator and not _is_deictic_query(creator):
-            tokens = [t for t in re.split(r"[\W_]+", raw.lower()) if t]
-            allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
-            if not [t for t in tokens if t not in allowed]:
-                return creator
+    creator = _creator_reference_query(raw)
+    if creator:
+        return creator
     media_kinds = {"topic", "video", "movie", "website", "url", "site"}
     try:
         verdict, ent = entity_ledger.resolve_mention(raw)
@@ -1509,13 +1584,18 @@ def _resolve_search_query(text):
     t = str(text or "").strip()
     if not t:
         return ""
+    # Live fix: a correction pointing at the last researched name refines
+    # to that name's YouTube presence, never the meta sentence.
+    refined = _refine_last_name_query(t)
+    if refined:
+        return refined
     # Live fix: an attribute request about the on-screen media ("...the
-    # creator of this video") resolves to the creator name even when the
-    # sentence is long or rambling — it is never searched verbatim.
-    if _CREATOR_ATTR_RE.search(t) and _get_last_screen_creator():
-        resolved = _resolve_reference_query(t)
-        if resolved:
-            return resolved
+    # creator of this video") resolves to the creator name when it is a
+    # PURE pointer. A clause with its own subject ("creator of monalisa")
+    # falls through and is derived on its own terms.
+    creator_hit = _creator_reference_query(t)
+    if creator_hit:
+        return creator_hit
     local = _heuristic_research_query(t)
     if local and not _is_deictic_query(local):
         q = derive_research_query(t)
@@ -1550,7 +1630,10 @@ def _heuristic_research_query(raw_query):
             "i want you to ", "can you ", "could you ", "would you ",
             "find out about ", "find out more about ", "find about ", "look this up ",
             "look that up ", "look it up ", "look up ", "search for ", "search about ",
-            "search the web for ", "research about ", "research on ", "research ",
+            "search on the internet about ", "search on the internet for ",
+            "search on internet about ", "search the internet about ",
+            "search the internet for ", "search the web for ", "research about ",
+            "research on ", "research ",
             "google it ", "tell me about ", "tell me more about ", "what can you find about ",
             "what do you know about ", "what is ", "what are ", "who is ",
             "do a deepsearch on ", "do a deepsearch about ", "do a deepsearch for ",
@@ -5071,12 +5154,16 @@ def _mi_research_step(step, results):
                    or prior.get("output_content") or "").strip()
     clause = step.get("text") or ""
     # Live fix: a clause that asks for the creator is about the MAKER read
-    # on screen — search that name, never the video topic again.
+    # on screen — search that name, never the video topic again. A clause
+    # with its own subject ("the creator of monalisa") keeps its subject.
     if prior is not None and _CREATOR_ATTR_RE.search(clause):
         creator = str(prior.get("output_creator") or "").strip() \
             or _get_last_screen_creator()
         if creator and not _is_deictic_query(creator):
-            base = creator
+            tokens = [t for t in re.split(r"[\W_]+", clause.lower()) if t]
+            allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
+            if not [t for t in tokens if t not in allowed]:
+                base = creator
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]
@@ -5169,6 +5256,14 @@ def _mi_free_path(path):
 _MI_FOLDER_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
 
 
+def _mi_safe_folder_name(name):
+    """One filesystem-safe folder name (single component, bounded)."""
+    name = str(name or "").strip().strip("\"'")
+    name = re.sub(r"\s+", " ", name)
+    name = name.replace("\\", "/").split("/")[-1].strip(" .")
+    return name[:60]
+
+
 def _mi_folder_name(clause):
     """The explicit folder name in the clause, or "" when it is unnamed."""
     match = re.search(
@@ -5180,13 +5275,94 @@ def _mi_folder_name(clause):
     name = re.split(
         r"\s+(?:with|and|in|on|for|to|about|containing|that|which)\b",
         name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-    return name.replace("\\", "/").split("/")[-1].strip(" .")
+    return _mi_safe_folder_name(name)
 
 
-def _mi_folder_task_step(msg, clause):
-    """Arm a folder creation; an unnamed folder asks instead of guessing."""
+def _extract_name_from_findings(content):
+    """The single name the findings identify (person/channel), or "".
+
+    Bounded LLM extraction with strict JSON — a name or nothing, never an
+    invented guess. Returns "" on any failure so the caller can ask.
+    """
+    text = str(content or "").strip()
+    if len(text) < 20:
+        return ""
+    prompt = (
+        "From the research findings below, return the ONE person, artist, "
+        "creator or channel name that answers the request. Use the exact "
+        "name as written. If no single name is clearly identified, return "
+        "an empty string.\n\n"
+        "Reply STRICT JSON only: {\"name\": \"...\"}\n\n"
+        "===== FINDINGS =====\n" + text[:4000]
+    )
+    try:
+        result = _ask_chat_nonstream(
+            [{"role": "system",
+              "content": "Return strict JSON only. No markdown, no extra text."},
+             {"role": "user", "content": prompt}],
+            temperature=0.0, max_tokens=60)
+        if not result or not result.get("choices"):
+            return ""
+        raw = result["choices"][0].get("message", {}).get("content", "")
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return ""
+        name = str(json.loads(match.group(0)).get("name") or "").strip()
+    except Exception as exc:
+        logging.warning("[CHAIN] Name extraction failed: %s", exc)
+        return ""
+    if not name or len(name) > 60 or len(name.split()) > 5:
+        return ""
+    if _META_QUERY_RE.search(name) or not re.search(r"[A-Za-z]", name):
+        return ""
+    return _mi_safe_folder_name(name)
+
+
+_PENDING_FOLDER_TTL = 300.0
+_pending_folder_name = {"text": "", "at": 0.0}
+
+
+def _set_pending_folder_name(clause):
+    """Remember the folder ask so "name it X" can answer it. Never raises."""
+    global _pending_folder_name
+    try:
+        with _screen_topic_lock:
+            _pending_folder_name = {"text": str(clause or "")[:200],
+                                    "at": time.time()}
+    except Exception:
+        pass
+
+
+def _clear_pending_folder_name():
+    global _pending_folder_name
+    try:
+        with _screen_topic_lock:
+            _pending_folder_name = {"text": "", "at": 0.0}
+    except Exception:
+        pass
+
+
+def _mi_folder_task_step(msg, clause, step=None, results=None):
+    """Arm a folder creation; an unnamed folder asks instead of guessing.
+
+    Live fix: "whichever name you find … by that name" is named from the
+    research findings (one bounded LLM extraction); when no name can be
+    extracted the ask is remembered so "name it X" completes it.
+    """
     name = _mi_folder_name(clause)
+    if not name and results:
+        content = ""
+        for idx in (step or {}).get("consumes") or []:
+            if 0 <= idx < len(results):
+                prior = results[idx]
+                if prior.get("status") == "ok":
+                    content = str(prior.get("output_content") or "")
+                    if content:
+                        break
+        if content:
+            name = _extract_name_from_findings(content)
     if not name:
+        _set_pending_folder_name(clause)
         return {"kind": "task", "status": "failed",
                 "fragment": "I have the findings, but I couldn't tell what "
                             "to name the folder — tell me the exact name "
@@ -5228,15 +5404,51 @@ def _mi_folder_task_step(msg, clause):
         return {"kind": "task", "status": "failed",
                 "fragment": "I couldn't prepare the folder creation (%s)."
                             % _mi_clip(exc, 80)}
+    _clear_pending_folder_name()
     return {"kind": "task", "status": "armed", "fragment": prompt,
             "prompt": prompt, "path": path}
+
+
+def consume_pending_folder_name(msg):
+    """The user answers the folder-name ask ("name it james dark").
+
+    Returns the confirmation prompt when the message names the folder for
+    a remembered, unfulfilled folder request; None otherwise.
+    """
+    text = str(msg or "").strip()
+    if not text:
+        return None
+    try:
+        with _screen_topic_lock:
+            state = dict(_pending_folder_name)
+    except Exception:
+        return None
+    if not state.get("text"):
+        return None
+    if time.time() - float(state.get("at") or 0.0) > _PENDING_FOLDER_TTL:
+        return None
+    match = re.match(
+        r"^(?:ok(?:ay)?\s*[,.]?\s*)?(?:name\s+(?:it|the\s+folder)|"
+        r"call\s+(?:it|the\s+folder)|folder\s+name\s+(?:is|:))\s+(.+)$",
+        text, re.IGNORECASE)
+    if not match:
+        return None
+    name = _mi_safe_folder_name(match.group(1))
+    if not name:
+        return None
+    print("[CHAIN] Folder name answer:", name)
+    result = _mi_folder_task_step(
+        text, "create a folder named %s" % name)
+    if result.get("status") == "armed":
+        return result.get("prompt")
+    return result.get("fragment")
 
 
 def _mi_task_step(msg, step, results):
     """Compose the file write and arm the ONE approval; nothing runs now."""
     clause = step.get("text") or ""
     if _MI_FOLDER_RE.search(clause):
-        return _mi_folder_task_step(msg, clause)
+        return _mi_folder_task_step(msg, clause, step, results)
     content = ""
     for idx in step.get("consumes") or []:
         prior = results[idx]
@@ -6067,6 +6279,18 @@ def _process_message_inner(
     except Exception as exc:
         logging.warning("[CORRECTION] Revision handling failed: %s", exc)
 
+    # ── Live fix: "name it X" answers a pending folder-name ask ──
+    # The chain folder step asked WHICH name to use; the next turn names it
+    # instead of falling into chat ("I can certainly go by James Dark").
+    try:
+        folder_reply = consume_pending_folder_name(msg)
+        if folder_reply is not None:
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, folder_reply)
+            return folder_reply
+    except Exception as exc:
+        logging.warning("[CHAIN] Folder-name answer failed: %s", exc)
+
     # ── R8: one turn, two jobs (status + work) ──
     # "Are you doing the queued task? Also create a folder named x" is NOT
     # one queued blob: the question is answered from live state NOW, and the
@@ -6523,6 +6747,23 @@ def _process_message_inner(
 
         if intent_name == "research":
             research_q = intent.get("query") or intent.get("task_description") or msg
+            # Live fix: a name-refining correction keeps the last researched
+            # name; a self-referential classifier query is replaced by a
+            # concrete resolution or an honest ask — never searched.
+            refined = _refine_last_name_query(msg)
+            if refined:
+                print("[RESEARCH] Refined to last name:", refined)
+                research_q = refined
+            elif _META_QUERY_RE.search(str(research_q)):
+                concrete = _resolve_search_query(msg)
+                if not concrete:
+                    response = ("Sir, I could not tell what to search for — "
+                                "name it once and I will search immediately.")
+                    if from_voice and sync_voice:
+                        sync_voice_log(voice_log_message, response)
+                    return response
+                print("[RESEARCH] Meta query replaced:", concrete)
+                research_q = concrete
             print("[INTENT] research intent ->", research_q)
             response = handle_research_intent(
                 research_q,

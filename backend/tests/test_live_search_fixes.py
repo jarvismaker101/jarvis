@@ -41,6 +41,10 @@ CREATOR_ASK = ("look at my screen ther is a video about grok bot it also "
                "about this creator on internet and tell me what you find")
 CREATOR_CORRECTION = ("not the video i wanted you to search about the "
                       "creator of this video")
+JAMES = "James Dark"
+REFINE_ASK = ("ok but you searched a different man by that same name , i "
+              "want you to seach the youtube content creator by that name")
+MONALISA_ASK = "search on the internet about the creator of monalisa"
 
 
 class LiveFixBase(unittest.TestCase):
@@ -295,6 +299,64 @@ class CreatorResolutionTests(LiveFixBase):
         self.assertEqual(
             brain._resolve_reference_query("search about this creator"),
             TITLE)
+
+
+class ResearchRefinementTests(LiveFixBase):
+    """Live fix: name corrections refine the last researched NAME; a
+    self-referential classifier query is never searched or stored."""
+
+    def test_correction_refines_to_the_last_name(self):
+        brain._set_last_research_topic(JAMES)
+        self.assertEqual(brain._refine_last_name_query(REFINE_ASK),
+                         "James Dark youtube channel")
+        with patch.object(brain, "classify_intent",
+                          return_value={
+                              "intent": "research",
+                              "query": "YouTube content creator with the "
+                                       "name previously searched"}):
+            self.assertEqual(brain.derive_research_query(REFINE_ASK),
+                             "James Dark youtube channel")
+
+    def test_meta_queries_are_rejected_and_never_stored(self):
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "the name previously searched"}):
+            self.assertEqual(brain.derive_research_query("look into it"), "")
+        brain._set_last_research_topic(JAMES)
+        brain._set_last_research_topic(
+            "YouTube content creator with the name previously searched")
+        self.assertEqual(brain._last_research_topic, JAMES)
+
+    def test_named_subject_clause_is_not_replaced_by_screen_topic(self):
+        self._seed_screen()
+        brain._set_last_screen_creator(JAMES)
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "creator of Mona Lisa"}):
+            query = brain._resolve_search_query(MONALISA_ASK)
+        self.assertEqual(query, "creator of Mona Lisa")
+
+    def test_live_correction_routes_to_refined_query(self):
+        brain._set_last_research_topic(JAMES)
+        calls = []
+
+        def fake_research(query, **kwargs):
+            calls.append(query)
+            return "Quick lookup for that, sir."
+
+        with patch.object(brain, "classify_intent",
+                          return_value={
+                              "intent": "research",
+                              "query": "YouTube content creator with the "
+                                       "name previously searched"}), \
+             patch.object(brain, "handle_research_intent",
+                          side_effect=fake_research), \
+             patch.object(brain, "orchestrator_select_route",
+                          return_value="legacy"), \
+             patch.object(brain, "handle_chat", return_value="chat"):
+            reply = brain.process_message(REFINE_ASK, sync_voice=False)
+        self.assertEqual(calls, ["James Dark youtube channel"])
+        self.assertIn("Quick lookup", reply)
 
 
 if __name__ == "__main__":

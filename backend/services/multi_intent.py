@@ -89,7 +89,13 @@ _ANAPHORA_RE = re.compile(
     # Live fix: "search this youtube creator", "find anything about that
     # stream" — the search verb and the pointer need not be adjacent.
     r"|\b(search|searches|searching|find|research|google|look\s+up)\b"
-    r"[^.?!,;]{0,32}\b(it|this|that|these|those|them)\b",
+    r"[^.?!,;]{0,32}\b(it|this|that|these|those|them)\b"
+    # Live fix: "whichever name you find ... by that name" — the task
+    # clause consumes the research result even though "that name" is not
+    # the usual anaphora shape.
+    r"|\b(?:whichever|which|the)\s+(?:name|model|one)\b[^.?!,;]{0,40}\byou\b"
+    r"|\bby\s+that\s+name\b"
+    r"|\bthat\s+(?:model\s+)?name\b",
     re.IGNORECASE,
 )
 

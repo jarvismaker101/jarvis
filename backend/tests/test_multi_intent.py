@@ -103,6 +103,7 @@ class ChainExecutorTests(unittest.TestCase):
         brain._pending_browser_clarification = None
         brain._held_redirect = None
         brain._proactive_research_fired = False
+        brain._pending_folder_name = {"text": "", "at": 0.0}
         task_agent._pending_task_action = None
         entity_ledger.reset()
         self.addCleanup(entity_ledger.reset)
@@ -193,6 +194,8 @@ class ChainExecutorTests(unittest.TestCase):
             return {"query": query, "spoken_summary": "The strongest is X."}
 
         with patch.object(brain, "run_quick_search", side_effect=fake_quick), \
+             patch.object(brain, "_extract_name_from_findings",
+                          return_value=""), \
              patch.object(task_agent, "_known_folders",
                           return_value={"desktop": self._tmp.name}), \
              patch.object(task_agent, "_arm_plan_confirmation") as arm:
@@ -200,6 +203,74 @@ class ChainExecutorTests(unittest.TestCase):
         arm.assert_not_called()
         self.assertTrue(self.messages)
         self.assertIn("name the folder", self.messages[-1].lower())
+        self.assertTrue(brain._pending_folder_name.get("text"))
+
+    def test_folder_chain_names_the_folder_from_the_findings(self):
+        text = ("search on the internet about the creator of monalisa and "
+                "whichever name you find create a folder by that name on my "
+                "desktop")
+        captured = {}
+
+        def fake_quick(query):
+            return {"query": query,
+                    "spoken_summary": ("The Mona Lisa was painted by "
+                                       "Leonardo da Vinci.")}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["research", "task"])
+        self.assertEqual(plan["steps"][1]["consumes"], [0])
+        with patch.object(brain, "run_quick_search", side_effect=fake_quick), \
+             patch.object(brain, "_extract_name_from_findings",
+                          return_value="Leonardo da Vinci"), \
+             patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "creator of Mona Lisa"}), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm):
+            brain._run_multi_intent_chain(text, plan)
+        step = captured["plan"]["steps"][0]
+        self.assertEqual(step["tool"], "code.create_folder")
+        self.assertTrue(step["args"]["path"].endswith("Leonardo da Vinci"))
+
+    def test_pending_folder_name_answer_arms_the_folder(self):
+        captured = {}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        brain._set_pending_folder_name("create a folder by that name")
+        with patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm):
+            reply = brain.consume_pending_folder_name("name it james dark")
+        self.assertIsNotNone(reply)
+        self.assertIn("confirm", reply.lower())
+        step = captured["plan"]["steps"][0]
+        self.assertEqual(step["tool"], "code.create_folder")
+        self.assertTrue(step["args"]["path"].endswith("james dark"))
+        self.assertFalse(brain._pending_folder_name.get("text"))
+
+    def test_name_it_answer_never_falls_into_chat(self):
+        brain._set_pending_folder_name("create a folder by that name")
+        with patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          return_value=object()), \
+             patch.object(brain, "classify_intent") as classifier:
+            reply = brain.process_message("name it james dark",
+                                          sync_voice=False)
+        self.assertIn("confirm", reply.lower())
+        classifier.assert_not_called()
 
     def test_screen_failure_skips_dependent_steps_and_arms_nothing(self):
         with patch.object(brain, "analyze_screen", return_value={
@@ -290,6 +361,32 @@ class ChainGateTests(unittest.TestCase):
             brain.process_message("look at my screen and tell me what you see",
                                   sync_voice=False)
         handler.assert_not_called()
+
+
+class NameExtractionTests(unittest.TestCase):
+    """Live fix: the folder name comes from the findings, or not at all."""
+
+    def test_parses_a_name_from_findings(self):
+        reply = {"choices": [{"message": {
+            "content": '{"name": "Leonardo da Vinci"}'}}]}
+        with patch.object(brain, "_ask_chat_nonstream", return_value=reply):
+            self.assertEqual(
+                brain._extract_name_from_findings(
+                    "The Mona Lisa was painted by Leonardo da Vinci "
+                    "around 1503 in Florence."),
+                "Leonardo da Vinci")
+
+    def test_refuses_meta_or_overlong_names(self):
+        for payload in ('{"name": ""}',
+                        '{"name": "the name previously searched"}',
+                        '{"name": "one two three four five six words"}'):
+            reply = {"choices": [{"message": {"content": payload}}]}
+            with patch.object(brain, "_ask_chat_nonstream",
+                              return_value=reply):
+                self.assertEqual(
+                    brain._extract_name_from_findings(
+                        "long findings text about a creator of something "
+                        "clearly identified here"), "")
 
 
 if __name__ == "__main__":
