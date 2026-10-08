@@ -5754,6 +5754,83 @@ def _mi_needs_screen_extraction(clause, topic):
     return bool([t for t in specific if t[:4] not in topic_low])
 
 
+#: Possessive back-references ("research about THEIR release dates") — the
+#: subject is the item the screen step just identified; what follows is an
+#: ASPECT of it. The second, stateless vision call has no antecedent for the
+#: possessive (it lived in the previous call), so it cannot bind and asking
+#: "which part?" would be wrong — the identification already happened.
+_POSSESSIVE_BACKREF_RE = re.compile(
+    r"\b(?:their|its|his|her)\b"
+    r"|\bof\s+(?:these|those|them|it)\b"
+    r"|\b(?:uska|uski|uske|unka|unki|inka|inki|iska|iske)\b",
+    re.IGNORECASE,
+)
+
+#: Instruction tails that are not aspect words ("... and tell me what you find").
+_ASPECT_TAIL_RE = re.compile(
+    r"\b(?:and\s+)?(?:tell|show|give|send|let)\s+me\b.*$"
+    r"|\bwhat\s+you\s+(?:find|found|think|get|see)\b.*$",
+    re.IGNORECASE,
+)
+
+#: Grammar words that can never be an aspect of the subject.
+_ASPECT_STOP_TOKENS = _MI_CLAUSE_STOPWORDS | {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "you", "me", "i", "we", "they", "them", "their", "its", "his", "her",
+    "it", "this", "that", "these", "those", "about", "of", "for", "with",
+    "to", "on", "in", "from", "by", "and", "or", "please", "sir",
+    "video", "videos", "clip", "content", "thing", "name", "title",
+    "screen", "monitor", "display", "stream", "channel", "youtube", "yt",
+    "post", "posts",
+}
+
+
+def _mi_aspect_tokens(clause, subject):
+    """Content words the user added ABOUT the subject ("release dates")."""
+    text = _ASPECT_TAIL_RE.sub(" ", str(clause or "").lower())
+    text = re.sub(
+        r"\b(?:research|search|look\s+up|find\s+out|google|deepsearch)\b",
+        " ", text)
+    text = re.sub(r"\bon\s+(?:my|the)\s+screen\b", " ", text)
+    text = re.sub(r"\b(?:on|from|over)\s+the\s+internet\b", " ", text)
+    subject_low = str(subject or "").lower()
+    tokens = []
+    for token in re.split(r"[\W_]+", text):
+        if not token or token in _ASPECT_STOP_TOKENS:
+            continue
+        if len(token) >= 4 and token[:4] in subject_low:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def _mi_subject_aspect_query(clause, obs_id):
+    """Compose "subject + aspect" for a possessive back-reference.
+
+    "research about their release dates" after a screen step names the
+    subject ("their") in the observation the step just stored; only the
+    ASPECT words ("release dates") are new. Returns "" when anything is
+    unclear (no possessive, no stored primary label, no aspect words) so
+    the caller keeps the existing vision/ask flow.
+    """
+    if not obs_id or not _POSSESSIVE_BACKREF_RE.search(str(clause or "")):
+        return ""
+    obs = get_observation(obs_id)
+    if obs is None or not obs.items:
+        return ""
+    item = next((candidate for candidate in obs.items if candidate.primary),
+                obs.items[0])
+    if not item.label or not item.label_is_text or item.truncated:
+        return ""
+    if _is_generic_screen_topic(item.label):
+        return ""
+    aspect = _mi_aspect_tokens(clause, item.label)
+    if not aspect:
+        return ""
+    subject = _clean_screen_subject(item.label) or item.label
+    return " ".join([subject] + aspect)[:200]
+
+
 def _mi_screen_step(step):
     """Run one screen-analysis step; returns its result record."""
     if not _screen_qa_busy.acquire(timeout=30):
@@ -5822,42 +5899,52 @@ def _mi_research_step(step, results):
             and _mi_needs_screen_extraction(clause, base)):
         screen_content = str(prior.get("output_content") or "")
         obs_id = str(prior.get("output_obs_id") or "")
-        # Primary: the vision model identifies the exact thing the user
-        # pointed at — against the SAME stored observation the screen step
-        # captured (RANK 1), so a screen that changed in between cannot
-        # swap the subject. The chat-side extraction is only the fallback
-        # when no stored observation served the call.
-        extracted, vgrade = _mi_vision_screen_target(clause, obs_id=obs_id)
-        if vgrade is not None:
-            confident = _grade_confident(vgrade)
+        # A possessive back-reference ("research about their release dates")
+        # only ADDS an aspect to the subject the screen step just identified;
+        # compose it in code — the stateless second vision call has no
+        # antecedent for "their", and asking "which part?" would be wrong
+        # because the identification already happened.
+        composed = _mi_subject_aspect_query(clause, obs_id)
+        if composed:
+            print("[CHAIN] Subject + aspect query:", composed)
+            base = composed
         else:
-            confident = bool(extracted)
-        if not extracted and vgrade is None:
-            extracted, confident = _mi_extract_screen_query(
-                clause, base, screen_content)
-        if extracted and confident:
-            base = extracted
-        elif extracted:
-            question = ('Sir, is this what you mean — "%s"? Say yes and '
-                        "I'll research it, or correct me."
-                        % _mi_clip(extracted, 110))
-            _set_pending_screen_clarify(clause, base, screen_content,
-                                        obs_id=obs_id)
-            _arm_confirmation(clause, query=extracted, question=question)
-            print("[CHAIN] Screen subject unsure — asking before searching:",
-                  extracted)
-            return {"kind": "research", "status": "asked",
-                    "fragment": question}
-        else:
-            hint = _mi_clip(base or screen_content, 70)
-            question = ("Sir, I can see %s, but I couldn't tell exactly "
-                        "what to search for — tell me which part, and I'll "
-                        "research it." % hint)
-            _set_pending_screen_clarify(clause, base, screen_content,
-                                        obs_id=obs_id)
-            print("[CHAIN] Screen subject not extractable — asking once.")
-            return {"kind": "research", "status": "asked",
-                    "fragment": question}
+            # Primary: the vision model identifies the exact thing the user
+            # pointed at — against the SAME stored observation the screen
+            # step captured (RANK 1), so a screen that changed in between
+            # cannot swap the subject. The chat-side extraction is only the
+            # fallback when no stored observation served the call.
+            extracted, vgrade = _mi_vision_screen_target(clause, obs_id=obs_id)
+            if vgrade is not None:
+                confident = _grade_confident(vgrade)
+            else:
+                confident = bool(extracted)
+            if not extracted and vgrade is None:
+                extracted, confident = _mi_extract_screen_query(
+                    clause, base, screen_content)
+            if extracted and confident:
+                base = extracted
+            elif extracted:
+                question = ('Sir, is this what you mean — "%s"? Say yes and '
+                            "I'll research it, or correct me."
+                            % _mi_clip(extracted, 110))
+                _set_pending_screen_clarify(clause, base, screen_content,
+                                            obs_id=obs_id)
+                _arm_confirmation(clause, query=extracted, question=question)
+                print("[CHAIN] Screen subject unsure — asking before searching:",
+                      extracted)
+                return {"kind": "research", "status": "asked",
+                        "fragment": question}
+            else:
+                hint = _mi_clip(base or screen_content, 70)
+                question = ("Sir, I can see %s, but I couldn't tell exactly "
+                            "what to search for — tell me which part, and I'll "
+                            "research it." % hint)
+                _set_pending_screen_clarify(clause, base, screen_content,
+                                            obs_id=obs_id)
+                print("[CHAIN] Screen subject not extractable — asking once.")
+                return {"kind": "research", "status": "asked",
+                        "fragment": question}
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]

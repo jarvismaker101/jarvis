@@ -365,6 +365,91 @@ class BrainWiringTests(unittest.TestCase):
         pending = brain._get_pending_screen_clarify()
         self.assertEqual(pending.get("obs_id"), "O1")
 
+    ASPECT_LABEL = "I Tested Nano banana 2.1 vs GPT 2.5 (AI Image)"
+
+    def test_possessive_aspect_composes_instead_of_asking(self):
+        context_state.OBSERVATIONS.add(context_state.Observation(
+            id="O1", at=time.time(),
+            image_data_url="data:image/png;base64,SEED",
+            items=[_item(label=self.ASPECT_LABEL)]))
+        prior = {"kind": "screen", "status": "ok",
+                 "output_query": self.ASPECT_LABEL,
+                 "output_content": "A video comparing image models.",
+                 "output_obs_id": "O1"}
+        searches = []
+        with patch.object(brain, "analyze_screen",
+                          side_effect=AssertionError("no re-analysis")), \
+             patch.object(brain, "identify_on_screen",
+                          side_effect=AssertionError("no second vision call")), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=lambda q, *a, **k:
+                          searches.append(q) or {"query": q,
+                                                 "spoken_summary": "s"}):
+            result = brain._mi_research_step(
+                {"kind": "research", "consumes": [0],
+                 "text": "research about their release dates on the internet "
+                         "and tell me what you find"},
+                [prior])
+        self.assertEqual(searches,
+                         [self.ASPECT_LABEL + " release dates"])
+        self.assertEqual(result["status"], "ok")
+
+
+class SubjectAspectTests(unittest.TestCase):
+    """A possessive back-reference adds an ASPECT to the identified subject;
+    it is composed in code instead of being re-resolved by a vision call."""
+
+    LABEL = "I Tested Nano banana 2.1 vs GPT 2.5 (AI Image)"
+    CLAUSE = ("research about their release dates on the internet and "
+              "tell me what you find")
+
+    def setUp(self):
+        context_state.OBSERVATIONS.clear()
+
+    def tearDown(self):
+        context_state.OBSERVATIONS.clear()
+
+    def _seed(self, label=None, truncated=False):
+        context_state.OBSERVATIONS.add(context_state.Observation(
+            id="O1", at=time.time(), image_data_url="u",
+            items=[_item(label=label if label is not None else self.LABEL,
+                         truncated=truncated)]))
+
+    def test_possessive_composes_subject_and_aspect(self):
+        self._seed()
+        self.assertEqual(
+            brain._mi_subject_aspect_query(self.CLAUSE, "O1"),
+            self.LABEL + " release dates")
+
+    def test_without_a_possessive_the_vision_resolver_keeps_ownership(self):
+        self._seed()
+        self.assertEqual(
+            brain._mi_subject_aspect_query(
+                "research about these image generation models on my screen",
+                "O1"),
+            "")
+
+    def test_truncated_primary_label_is_never_composed(self):
+        self._seed(truncated=True)
+        self.assertEqual(
+            brain._mi_subject_aspect_query(self.CLAUSE, "O1"), "")
+
+    def test_generic_primary_label_is_never_composed(self):
+        self._seed(label="YouTube live chat message")
+        self.assertEqual(
+            brain._mi_subject_aspect_query(self.CLAUSE, "O1"), "")
+
+    def test_no_aspect_words_is_never_composed(self):
+        self._seed()
+        self.assertEqual(
+            brain._mi_subject_aspect_query(
+                "research about their video and tell me", "O1"),
+            "")
+
+    def test_missing_observation_is_never_composed(self):
+        self.assertEqual(
+            brain._mi_subject_aspect_query(self.CLAUSE, "O9"), "")
+
 
 if __name__ == "__main__":
     unittest.main()
