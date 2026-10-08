@@ -68,6 +68,7 @@ class LiveFixBase(unittest.TestCase):
         brain._last_screen_topic = {"text": "", "at": 0.0}
         brain._last_screen_creator = {"text": "", "at": 0.0}
         brain._last_research_topic = None
+        brain._pending_screen_clarify = None
         task_agent._pending_task_action = None
         entity_ledger.reset()
         self.addCleanup(entity_ledger.reset)
@@ -78,6 +79,7 @@ class LiveFixBase(unittest.TestCase):
         self.addCleanup(setattr, brain, "_last_screen_creator",
                         {"text": "", "at": 0.0})
         self.addCleanup(setattr, brain, "_last_research_topic", None)
+        self.addCleanup(setattr, brain, "_pending_screen_clarify", None)
 
     def _seed_screen(self):
         entity_ledger.record_entity(TITLE, TITLE, kind="topic",
@@ -499,6 +501,73 @@ class BackReferenceTests(LiveFixBase):
         self.assertEqual(
             brain._backreference_query(
                 "search for that movie review on imdb"), "")
+
+
+class ScreenSubjectTests(LiveFixBase):
+    """Live fix: research the SPECIFIC thing pointed at; ask when unsure.
+
+    The chain may propose a subject ("is this what you mean?"); the user
+    can confirm, decline, or correct it ("no not that, the image to the
+    left"), and a correction is re-read against the SAME screen report.
+    """
+
+    def test_confirmed_subject_is_researched(self):
+        brain._arm_confirmation("find the secret message",
+                                query="YouTube live chat hidden promo code")
+        calls = []
+
+        def fake_research(query, **kwargs):
+            calls.append(query)
+            return "Quick lookup for that, sir."
+
+        with patch.object(brain, "handle_research_intent",
+                          side_effect=fake_research):
+            reply = brain._consume_confirmation("yes")
+        self.assertEqual(calls, ["YouTube live chat hidden promo code"])
+        self.assertIn("Quick lookup", reply)
+
+    def test_redirect_re_reads_the_screen_report(self):
+        brain._arm_confirmation("find the secret message",
+                                query="YouTube live chat hidden promo code")
+        brain._set_pending_screen_clarify(
+            "find the secret message", "YouTube live chat message",
+            "Chat panel: left image shows a promo code.")
+        calls = []
+        with patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("left image promo code", True)) as ex, \
+             patch.object(brain, "handle_research_intent",
+                          side_effect=lambda q, **k:
+                          calls.append(q) or "Quick lookup for that, sir."):
+            reply = brain._consume_confirmation(
+                "no not that, the image to the left")
+        self.assertEqual(calls, ["left image promo code"])
+        self.assertEqual(ex.call_args.kwargs.get("correction"),
+                         "no not that, the image to the left")
+        self.assertIsNone(brain._pending_screen_clarify)
+
+    def test_pointer_answer_to_the_open_ask(self):
+        brain._set_pending_screen_clarify(
+            "find the secret message", "YouTube live chat message",
+            "Chat panel: left image shows a promo code.")
+        calls = []
+        with patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("left image promo code", True)), \
+             patch.object(brain, "handle_research_intent",
+                          side_effect=lambda q, **k:
+                          calls.append(q) or "Quick lookup for that, sir."):
+            reply = brain.consume_screen_research_clarify(
+                "the secret message they are talking about")
+        self.assertEqual(calls, ["left image promo code"])
+        self.assertIn("Quick lookup", reply)
+
+    def test_a_new_request_is_never_swallowed_by_the_clarify(self):
+        brain._set_pending_screen_clarify(
+            "find the secret message", "YouTube live chat message", "tip")
+        self.assertIsNone(
+            brain.consume_screen_research_clarify("open youtube and play a song"))
+        self.assertIsNone(
+            brain.consume_screen_research_clarify("search for laptops"))
+        self.assertIsNotNone(brain._get_pending_screen_clarify())
 
 
 if __name__ == "__main__":

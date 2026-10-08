@@ -161,7 +161,7 @@ def build_chain(text):
     if not raw or _FUTURE_TALK_RE.match(raw):
         return None
     clauses = split_clauses(raw)
-    if len(clauses) < 2:
+    if not clauses:
         return None
     merged = []
     for clause in clauses:

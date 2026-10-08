@@ -1382,6 +1382,8 @@ _GENERIC_MEDIA_TOKENS = {
     "thoughts", "opinions", "release", "releases", "announcement",
     "announcements", "update", "updates", "launch", "verse",
     "screen", "monitor", "display",
+    "live", "chat", "message", "messages", "comment", "comments",
+    "post", "posts",
 }
 
 #: Words that carry no referent by themselves.
@@ -5281,13 +5283,164 @@ def _llm_resolve_confirmation(original_message, answer):
         return None, None
 
 
-def _arm_confirmation(word):
+def _arm_confirmation(word, query=None, question=None):
     with _confirmation_lock:
         global _pending_confirmation
         _pending_confirmation = {
             "message": word,
             "expires": time.time() + CONFIRM_WINDOW_SECONDS,
+            "query": str(query or "").strip() or None,
+            "question": str(question or "").strip() or None,
         }
+
+
+# ── Live fix: screen-research confirmation ("is this what you mean?") ───────
+# When a screen step cannot pin down exactly what the user pointed at, Jarvis
+# asks ONE candidate question instead of researching a generic guess. The
+# ask can be confirmed ("yes"), declined ("no"), or corrected ("no not that,
+# the image to the left") — the correction is re-read against the SAME screen
+# observation, so no second screen analysis is needed.
+_pending_screen_clarify = None
+_SCREEN_CLARIFY_TTL = 240.0
+
+
+def _set_pending_screen_clarify(clause, topic, content):
+    global _pending_screen_clarify
+    try:
+        with _confirmation_lock:
+            _pending_screen_clarify = {
+                "clause": str(clause or ""),
+                "topic": str(topic or ""),
+                "content": str(content or ""),
+                "at": time.time(),
+            }
+    except Exception:
+        pass
+
+
+def _clear_pending_screen_clarify():
+    global _pending_screen_clarify
+    try:
+        with _confirmation_lock:
+            _pending_screen_clarify = None
+    except Exception:
+        pass
+
+
+def _get_pending_screen_clarify():
+    try:
+        with _confirmation_lock:
+            state = dict(_pending_screen_clarify) if _pending_screen_clarify \
+                else None
+    except Exception:
+        return None
+    if not state:
+        return None
+    if time.time() - float(state.get("at") or 0.0) > _SCREEN_CLARIFY_TTL:
+        return None
+    return state
+
+
+def _mi_extract_screen_query(clause, topic, content, correction=""):
+    """Read the SPECIFIC thing the user pointed at from the screen report.
+
+    Returns (query, confident). Both empty/False when the chat model is
+    unavailable or cannot name a concrete subject — callers then ask once
+    instead of researching a generic guess.
+    """
+    try:
+        screen_text = _mi_clip("%s %s" % (topic, content), 1400)
+        prompt = (
+            "A user asked Jarvis to research something shown on their "
+            "screen.\n"
+            f"===== WHAT THE SCREEN SHOWS =====\n{screen_text}\n"
+            f"===== WHAT THE USER SAID =====\n{clause}\n"
+        )
+        if correction:
+            prompt += f"===== USER'S CORRECTION =====\n{correction}\n"
+        prompt += (
+            "\nReturn STRICT JSON only:\n"
+            '{"query": "the precise web search query for the SPECIFIC thing '
+            'the user pointed at — use the actual names, words or text '
+            'visible on the screen, never a generic description", '
+            '"confident": true or false}\n'
+            "Use \"query\": null when the screen does not show what the "
+            "user means. Set \"confident\" to false when you are guessing."
+        )
+        messages = [
+            {"role": "system",
+             "content": "Return strict JSON only. No markdown, no extra "
+                        "text."},
+            {"role": "user", "content": prompt},
+        ]
+        result = _ask_chat_nonstream(messages, temperature=0.0,
+                                     max_tokens=160)
+        if not result or not result.get("choices"):
+            return "", False
+        raw = result["choices"][0].get("message", {}).get("content", "")
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return "", False
+        parsed = json.loads(match.group(0))
+        query = parsed.get("query")
+        confident = bool(parsed.get("confident"))
+        if not isinstance(query, str):
+            return "", False
+        query = query.strip().strip("\"'")[:220]
+        if (not query or _META_QUERY_RE.search(query)
+                or _is_deictic_query(query)):
+            return "", False
+        if query.lower() == str(clause or "").strip().lower():
+            return "", False
+        print(f"[CHAIN] Screen subject extracted ({'high' if confident else 'low'} "
+              f"confidence): {query!r}")
+        return query, confident
+    except Exception as exc:
+        logging.warning("[CHAIN] Screen subject extraction failed: %s", exc)
+        return "", False
+
+
+#: "no not that, the image to the left" — a redirect, not a refusal.
+_SCREEN_REDIRECT_RE = re.compile(
+    r"\b(?:not\s+(?:that|this|those|these|it|the\s+\w+)|instead|"
+    r"other\s+one|different|to\s+the\s+(?:left|right)|that\s+one|"
+    r"this\s+one|below|above|next\s+to|the\s+(?:image|video|item|one|"
+    r"thing)\s+(?:to\s+the\s+)?(?:left|right|above|below))\b",
+    re.IGNORECASE,
+)
+
+
+def _research_from_screen_correction(state, correction):
+    """Re-read the SAME screen report with the user's corrected pointer
+    ("no not that, the image to the left") and research the result."""
+    query, _ = _mi_extract_screen_query(
+        str(state.get("clause") or ""), str(state.get("topic") or ""),
+        str(state.get("content") or ""), correction=correction)
+    if not query:
+        return None
+    print("[RESEARCH] Corrected screen subject:", query)
+    return handle_research_intent(query, derived=True)
+
+
+def consume_screen_research_clarify(msg):
+    """The user answers the open screen-research ask ("which part?").
+
+    Only pointer-like replies are consumed; a fresh request keeps its
+    normal route (the pending state simply expires).
+    """
+    state = _get_pending_screen_clarify()
+    if not state:
+        return None
+    text = str(msg or "").strip()
+    if not text:
+        return None
+    if _confirmation_verdict(text) is not None:
+        return None  # yes/no is owned by the confirmation gate
+    if _SEARCH_SHAPED_VERB_RE.search(text) or _CHAT_ACTION_RE.search(text):
+        return None  # a new request, not a pointer correction
+    _clear_pending_screen_clarify()
+    print("[CHAIN] Screen clarification answered:", text)
+    return _research_from_screen_correction(state, text)
 
 
 # ── Rank 2: multi-intent chains (screen → research → file) ─────────────
@@ -5312,6 +5465,57 @@ def _mi_clip(text, limit=600):
         cut = text.rfind(" ", 0, limit - 3)
         text = (text[:cut] if cut > 0 else text[:limit - 3]).rstrip() + "..."
     return text
+
+
+def _is_generic_screen_topic(topic):
+    """True when a screen report's topic is a type description ("YouTube
+    live chat message"), not a concrete name — researching it as-is would
+    search 'whatever was seen' instead of the thing the user pointed at."""
+    text = str(topic or "").strip()
+    if not text or _is_deictic_query(text):
+        return True
+    tokens = [t for t in re.split(r"[\W_]+", text.lower()) if t]
+    if len(tokens) > 6:
+        return False
+    return not [t for t in tokens
+                if t not in _DEREF_FILLERS and t not in _GENERIC_MEDIA_TOKENS]
+
+
+#: Grammar words that survive instruction stripping but name nothing.
+_MI_CLAUSE_STOPWORDS = {
+    "does", "do", "did", "actually", "say", "says", "said", "mean",
+    "means", "tell", "what", "and", "or", "they", "are", "talking",
+    "explain", "understand", "summarise", "summarize", "please",
+}
+
+
+def _mi_clause_specific_tokens(clause):
+    """Content words the user named in a research clause ("secret",
+    "image generation models") after instruction words are stripped."""
+    text = str(clause or "").lower()
+    text = re.sub(
+        r"\b(?:research|search|look\s+up|find\s+out|google|deepsearch)\b",
+        " ", text)
+    text = re.sub(r"\bon\s+(?:my|the)\s+screen\b", " ", text)
+    text = re.sub(r"\b(?:on|from|over)\s+the\s+internet\b", " ", text)
+    text = re.sub(r"\bin\s+detail\b", " ", text)
+    tokens = [t for t in re.split(r"[\W_]+", text) if t]
+    return [t for t in tokens
+            if t not in _DEREF_FILLERS and t not in _GENERIC_MEDIA_TOKENS
+            and t not in _MI_CLAUSE_STOPWORDS]
+
+
+def _mi_needs_screen_extraction(clause, topic):
+    """True when the generic screen topic is not enough to search: either
+    the topic names nothing by itself, or the user named something the
+    topic does not mention."""
+    if _is_generic_screen_topic(topic):
+        return True
+    specific = _mi_clause_specific_tokens(clause)
+    if not specific:
+        return False
+    topic_low = str(topic or "").lower()
+    return bool([t for t in specific if t[:4] not in topic_low])
 
 
 def _mi_screen_step(step):
@@ -5369,6 +5573,37 @@ def _mi_research_step(step, results):
             allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
             if not [t for t in tokens if t not in allowed]:
                 base = creator
+    # Live fix: research the SPECIFIC thing the user pointed at, read from
+    # the screen report — not "whatever was seen". When the chat model can
+    # only guess, ask "is this what you mean?" instead of searching a
+    # generic topic; the user can confirm, decline, or correct the target.
+    if (prior is not None and prior.get("status") == "ok" and base
+            and not _CREATOR_ATTR_RE.search(clause)
+            and _mi_needs_screen_extraction(clause, base)):
+        screen_content = str(prior.get("output_content") or "")
+        extracted, confident = _mi_extract_screen_query(
+            clause, base, screen_content)
+        if extracted and confident:
+            base = extracted
+        elif extracted:
+            question = ('Sir, is this what you mean — "%s"? Say yes and '
+                        "I'll research it, or correct me."
+                        % _mi_clip(extracted, 110))
+            _set_pending_screen_clarify(clause, base, screen_content)
+            _arm_confirmation(clause, query=extracted, question=question)
+            print("[CHAIN] Screen subject unsure — asking before searching:",
+                  extracted)
+            return {"kind": "research", "status": "asked",
+                    "fragment": question}
+        else:
+            hint = _mi_clip(base or screen_content, 70)
+            question = ("Sir, I can see %s, but I couldn't tell exactly "
+                        "what to search for — tell me which part, and I'll "
+                        "research it." % hint)
+            _set_pending_screen_clarify(clause, base, screen_content)
+            print("[CHAIN] Screen subject not extractable — asking once.")
+            return {"kind": "research", "status": "asked",
+                    "fragment": question}
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]
@@ -5830,10 +6065,13 @@ def _finish_multi_intent(plan, results):
     armed = None
     ok_bits = []
     bad_bits = []
+    asked_bits = []
     for r in results:
         status = r.get("status")
         if status == "armed":
             armed = r
+        elif status == "asked":
+            asked_bits.append(str(r.get("fragment") or ""))
         elif status == "ok":
             frag = str(r.get("fragment") or "")
             # Honesty: say what was actually searched, so a resolved query
@@ -5850,6 +6088,9 @@ def _finish_multi_intent(plan, results):
         lead = " ".join(ok_bits).strip()
         reply = ("Sir, " + (lead + " " if lead else "")
                  + str(armed.get("prompt") or ""))
+    elif asked_bits:
+        lead = " ".join(ok_bits).strip()
+        reply = ((lead + " ") if lead else "") + " ".join(asked_bits)
     elif bad_bits:
         reply = ("Sir, here is where it stands. "
                  + " ".join(ok_bits + bad_bits))
@@ -5914,9 +6155,28 @@ def _consume_confirmation(answer):
     verdict = _confirmation_verdict(answer)
     llm_query = None
     if verdict == "no":
+        # Live fix: "no not that, the image to the left" is a REDIRECT, not
+        # a refusal — re-read the same screen report with the correction.
+        clarify = _get_pending_screen_clarify()
+        if clarify and _SCREEN_REDIRECT_RE.search(str(answer or "")):
+            _clear_pending_screen_clarify()
+            print("[RESEARCH] User corrected the target — re-reading the "
+                  "screen report.")
+            reply = _research_from_screen_correction(clarify, answer)
+            if reply:
+                return reply
+        _clear_pending_screen_clarify()
         print("[RESEARCH] User declined research (explicit negative, no model consult).")
         return "As you wish, sir. I'll just answer from what I know."
     if verdict == "yes":
+        pending_query = str(pending.get("query") or "").strip()
+        if pending_query:
+            # The question named exactly what will be searched ("is this
+            # what you mean?") — a yes confirms THAT subject.
+            _clear_pending_screen_clarify()
+            print("[RESEARCH] Confirmed by user — researching the confirmed "
+                  "subject:", pending_query)
+            return handle_research_intent(pending_query, derived=True)
         # The model may still refine the QUERY for a locally-affirmative
         # answer, but its verdict can only downgrade to a decline — it can
         # never manufacture consent, and never override the local "no" above.
@@ -5946,7 +6206,9 @@ def _consume_confirmation(answer):
         return handle_research_intent(orig_msg,
                                       deep=is_deepsearch_request(orig_msg))
     # Not a yes/no — the user rephrased or moved on. Drop the pending question
-    # and block re-asking for a window so we don't nag them repeatedly.
+    # and block re-asking for a window so we don't nag them repeatedly. An
+    # open screen-clarify ask is left for its own gate (the reply may be a
+    # corrected pointer, not an answer here).
     print("[RESEARCH] Confirmation answered with something else — research skipped.")
     _set_confirmation_cooldown()
     return None
@@ -6750,6 +7012,17 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, meant_reply)
             return meant_reply
+        # Answer to the open screen-research ask ("which part?") — a pointer
+        # correction is re-read against the SAME screen report.
+        try:
+            clarify_reply = consume_screen_research_clarify(msg)
+        except Exception as exc:
+            clarify_reply = None
+            logging.warning("[CHAIN] screen clarify gate failed: %s", exc)
+        if clarify_reply is not None:
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, clarify_reply)
+            return clarify_reply
         try:
             # The cheap pure-regex check runs first (P0-10 ordering: a
             # non-search message must not run task predicates before the

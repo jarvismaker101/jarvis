@@ -90,6 +90,19 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIsNone(multi_intent.build_chain(
             "look at my screen to see what verse im talking about"))
 
+    def test_screen_research_single_clause_without_a_tell_me_fragment(self):
+        # Live transcript: "research about these image generation models on
+        # my screen" — a ONE-clause message. The chain gate used to require
+        # at least two raw clauses, so this fell to the search net and the
+        # phrase was searched near-verbatim.
+        text = "research about these image generation models on my screen"
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research"])
+        self.assertEqual([s["consumes"] for s in plan["steps"]],
+                         [[], [0]])
+
     def test_task_before_the_end_blocks_the_chain(self):
         text = ("create a file called x.txt with hello and research "
                 "the news")
@@ -155,6 +168,8 @@ class ChainExecutorTests(unittest.TestCase):
         task_agent._pending_task_action = None
         entity_ledger.reset()
         self.addCleanup(entity_ledger.reset)
+        self.addCleanup(setattr, brain, "_pending_confirmation", None)
+        self.addCleanup(setattr, brain, "_pending_screen_clarify", None)
         self.messages = []
         self._orig_cb = brain._async_reply_callback
 
@@ -422,6 +437,62 @@ class ChainExecutorTests(unittest.TestCase):
              patch.object(brain, "run_quick_search", side_effect=fake_quick):
             self._run_chain(text)
         self.assertEqual(searches, ["Bhagavad Gita Chapter 4 verse 5"])
+
+    SECRET = ("what is this secret message they are talking about on my "
+              "screen research on the internet about it and tell me")
+
+    def _fake_quick(self, searches):
+        def fake(query, *args, **kwargs):
+            searches.append(query)
+            return {"query": query, "spoken_summary": "summary"}
+        return fake
+
+    def test_generic_screen_topic_asks_before_searching(self):
+        # Live transcript: the screen report's topic was the generic
+        # "YouTube live chat message" and it was researched as-is — the
+        # generic guess must become ONE candidate question instead.
+        searches = []
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A YouTube live chat discussing a hidden promo code.",
+                "topic": "YouTube live chat message", "creator": ""}), \
+             patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("YouTube live chat hidden promo "
+                                        "code", False)), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=self._fake_quick(searches)):
+            self._run_chain(self.SECRET)
+        self.assertEqual(searches, [])
+        pending = brain._pending_confirmation or {}
+        self.assertEqual(pending.get("query"),
+                         "YouTube live chat hidden promo code")
+        self.assertIn("is this what you mean", self.messages[-1])
+
+    def test_generic_screen_topic_searches_the_extracted_subject(self):
+        searches = []
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A YouTube live chat discussing a hidden promo code.",
+                "topic": "YouTube live chat message", "creator": ""}), \
+             patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("YouTube live chat hidden promo "
+                                        "code", True)), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=self._fake_quick(searches)):
+            self._run_chain(self.SECRET)
+        self.assertEqual(searches, ["YouTube live chat hidden promo code"])
+
+    def test_generic_screen_topic_asks_once_when_not_extractable(self):
+        searches = []
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A YouTube live chat discussing a hidden promo code.",
+                "topic": "YouTube live chat message", "creator": ""}), \
+             patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("", False)), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=self._fake_quick(searches)):
+            self._run_chain(self.SECRET)
+        self.assertEqual(searches, [])
+        self.assertIn("couldn't tell exactly", self.messages[-1])
+        self.assertIsNotNone(brain._get_pending_screen_clarify())
 
     def test_concurrent_chain_is_refused(self):
         brain._mi_chain_active = True
