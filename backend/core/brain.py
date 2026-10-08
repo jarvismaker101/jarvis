@@ -5722,6 +5722,11 @@ _MI_CLAUSE_STOPWORDS = {
     # Effort adjectives ("do a deep research about it") are not subjects.
     "deep", "deeper", "brief", "quick", "short", "detailed", "full",
     "proper", "little", "bit",
+    # Filler adverbs/quantifiers ("very", "some movie") name nothing.
+    "very", "really", "basically", "literally", "probably", "maybe",
+    "simply", "just", "much", "even", "still", "also", "then", "now",
+    "here", "there", "again", "ever", "quite", "some", "any", "few",
+    "many", "lot", "lots",
 }
 
 
@@ -5730,10 +5735,11 @@ def _mi_clause_specific_tokens(clause):
     "image generation models") after instruction words are stripped."""
     text = str(clause or "").lower()
     text = re.sub(
-        r"\b(?:research|search|look\s+up|find\s+out|google|deepsearch)\b",
+        r"\bresearch\w*\b|\bsearch\w*\b|\blook\s+up\b|\bfind\s+out\b"
+        r"|\bgoogle\w*\b|\bdeepsearch\b",
         " ", text)
     text = re.sub(r"\bon\s+(?:my|the)\s+screen\b", " ", text)
-    text = re.sub(r"\b(?:on|from|over)\s+the\s+internet\b", " ", text)
+    text = re.sub(r"\b(?:on|from|over)\s+(?:the\s+)?internet\b", " ", text)
     text = re.sub(r"\bin\s+detail\b", " ", text)
     tokens = [t for t in re.split(r"[\W_]+", text) if t]
     return [t for t in tokens
@@ -5782,6 +5788,13 @@ _ASPECT_STOP_TOKENS = _MI_CLAUSE_STOPWORDS | {
     "video", "videos", "clip", "content", "thing", "name", "title",
     "screen", "monitor", "display", "stream", "channel", "youtube", "yt",
     "post", "posts",
+    # Pointer nouns and medium words ask for nothing by themselves.
+    "internet", "web", "online",
+    "creator", "streamer", "uploader", "youtuber", "maker", "author",
+    "guy", "person", "dude",
+    # Look/touch verbs and determiners ("look at my screen") are not aspects.
+    "look", "at", "see", "check", "watch", "view", "examine", "scan",
+    "read", "analyse", "analyze", "my", "your", "our",
 }
 
 
@@ -5789,10 +5802,11 @@ def _mi_aspect_tokens(clause, subject):
     """Content words the user added ABOUT the subject ("release dates")."""
     text = _ASPECT_TAIL_RE.sub(" ", str(clause or "").lower())
     text = re.sub(
-        r"\b(?:research|search|look\s+up|find\s+out|google|deepsearch)\b",
+        r"\bresearch\w*\b|\bsearch\w*\b|\blook\s+up\b|\bfind\s+out\b"
+        r"|\bgoogle\w*\b|\bdeepsearch\b",
         " ", text)
     text = re.sub(r"\bon\s+(?:my|the)\s+screen\b", " ", text)
-    text = re.sub(r"\b(?:on|from|over)\s+the\s+internet\b", " ", text)
+    text = re.sub(r"\b(?:on|from|over)\s+(?:the\s+)?internet\b", " ", text)
     subject_low = str(subject or "").lower()
     tokens = []
     for token in re.split(r"[\W_]+", text):
@@ -5829,6 +5843,27 @@ def _mi_subject_aspect_query(clause, obs_id):
         return ""
     subject = _clean_screen_subject(item.label) or item.label
     return " ".join([subject] + aspect)[:200]
+
+
+def _mi_aspect_suffix(clause, subject, query, obs_id):
+    """Aspect words to append to an already-bound screen subject.
+
+    The aspect lives in the research clause ("their release dates") or, for
+    a purely deictic request ("research about it and tell me"), in the
+    observation's own utterance ("what is this video about dimensions").
+    Returns [] when nothing new asks a question about the subject — the
+    query then stays exactly the identified label, no invented words.
+    Tokens already present in *query* are dropped, so a composed query is
+    never doubled.
+    """
+    tokens = _mi_aspect_tokens(clause, subject)
+    if not tokens and obs_id:
+        obs = get_observation(obs_id)
+        if obs is not None:
+            tokens = _mi_aspect_tokens(
+                str(getattr(obs, "utterance", "") or ""), subject)
+    query_low = str(query or "").lower()
+    return [token for token in tokens if token[:4] not in query_low]
 
 
 def _mi_screen_step(step):
@@ -5874,6 +5909,10 @@ def _mi_screen_step(step):
 def _mi_research_step(step, results):
     """Run one research step synchronously on the chain worker thread."""
     prior = results[step["consumes"][0]] if step.get("consumes") else None
+    obs_id = str(prior.get("output_obs_id") or "") if prior else ""
+    creator_override = False
+    used_text_extractor = False
+    aspect_composed = False
     base = ""
     if prior and prior.get("status") == "ok":
         base = str(prior.get("output_query")
@@ -5890,6 +5929,7 @@ def _mi_research_step(step, results):
             allowed = _DEREF_FILLERS | _CREATOR_POINTER_EXTRA
             if not [t for t in tokens if t not in allowed]:
                 base = creator
+                creator_override = True
     # Live fix: research the SPECIFIC thing the user pointed at, read from
     # the screen report — not "whatever was seen". When the chat model can
     # only guess, ask "is this what you mean?" instead of searching a
@@ -5898,7 +5938,6 @@ def _mi_research_step(step, results):
             and not _CREATOR_ATTR_RE.search(clause)
             and _mi_needs_screen_extraction(clause, base)):
         screen_content = str(prior.get("output_content") or "")
-        obs_id = str(prior.get("output_obs_id") or "")
         # A possessive back-reference ("research about their release dates")
         # only ADDS an aspect to the subject the screen step just identified;
         # compose it in code — the stateless second vision call has no
@@ -5908,6 +5947,7 @@ def _mi_research_step(step, results):
         if composed:
             print("[CHAIN] Subject + aspect query:", composed)
             base = composed
+            aspect_composed = True
         else:
             # Primary: the vision model identifies the exact thing the user
             # pointed at — against the SAME stored observation the screen
@@ -5922,6 +5962,7 @@ def _mi_research_step(step, results):
             if not extracted and vgrade is None:
                 extracted, confident = _mi_extract_screen_query(
                     clause, base, screen_content)
+                used_text_extractor = bool(extracted)
             if extracted and confident:
                 base = extracted
             elif extracted:
@@ -5948,6 +5989,18 @@ def _mi_research_step(step, results):
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]
+            # RANK 10 (the code half): a request that only points at the
+            # screen ("...about dimensions, research it") carries its
+            # QUESTION apart from the subject. Append those aspect words to
+            # the identified label so the search is not just the thumbnail
+            # title. When the vision or text resolver already carried the
+            # user's own words, never compose again.
+            if not creator_override and not used_text_extractor \
+                    and not aspect_composed:
+                aspect = _mi_aspect_suffix(clause, base, query, obs_id)
+                if aspect:
+                    query = _mi_clip(" ".join([query] + aspect), 220)
+                    print("[CHAIN] Subject + aspect query:", query)
         else:
             query = _resolve_search_query(clause)
         if not query:
@@ -5993,7 +6046,7 @@ def _mi_research_step(step, results):
         except Exception:
             pass
     return {"kind": "research", "status": "ok",
-            "fragment": summary[:200] or "Research done.",
+            "fragment": _mi_clip(summary, 900) or "Research done.",
             "output_query": str(result.get("query") or query),
             "output_content": content,
             "spoken_summary": summary}
@@ -6437,7 +6490,7 @@ def _finish_multi_intent(plan, results):
                  + " ".join(ok_bits + bad_bits))
     else:
         reply = "Sir, done. " + " ".join(ok_bits)
-    reply = _mi_clip(reply, 600)
+    reply = _mi_clip(reply, 1400)
     _record_chain_run(plan, reply)
     _notify_async_reply(reply)
 
@@ -6460,7 +6513,7 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
         if (last and sig and last.get("sig") == sig
                 and time.time() - float(last.get("at") or 0.0) < 150.0):
             return _mi_clip("Sir, I did that a moment ago — "
-                            + str(last.get("reply") or ""), 400)
+                            + str(last.get("reply") or ""), 600)
         _mi_chain_active = True
     try:
         threading.Thread(

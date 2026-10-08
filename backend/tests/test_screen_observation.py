@@ -370,6 +370,7 @@ class BrainWiringTests(unittest.TestCase):
     def test_possessive_aspect_composes_instead_of_asking(self):
         context_state.OBSERVATIONS.add(context_state.Observation(
             id="O1", at=time.time(),
+            utterance="look at my screen",
             image_data_url="data:image/png;base64,SEED",
             items=[_item(label=self.ASPECT_LABEL)]))
         prior = {"kind": "screen", "status": "ok",
@@ -393,6 +394,64 @@ class BrainWiringTests(unittest.TestCase):
         self.assertEqual(searches,
                          [self.ASPECT_LABEL + " release dates"])
         self.assertEqual(result["status"], "ok")
+
+    def test_deictic_research_composes_the_screen_clause_aspect(self):
+        context_state.OBSERVATIONS.add(context_state.Observation(
+            id="O1", at=time.time(),
+            utterance="what is this video about dimensions on my screen",
+            image_data_url="data:image/png;base64,SEED",
+            items=[_item(label="YOU IN 7D?")]))
+        prior = {"kind": "screen", "status": "ok",
+                 "output_query": "YOU IN 7D?",
+                 "output_content": "A video is playing.",
+                 "output_obs_id": "O1"}
+        searches = []
+        with patch.object(brain, "analyze_screen",
+                          side_effect=AssertionError("no re-analysis")), \
+             patch.object(brain, "identify_on_screen",
+                          side_effect=AssertionError("no second vision call")), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=lambda q, *a, **k:
+                          searches.append(q) or {"query": q,
+                                                 "spoken_summary": "s"}):
+            result = brain._mi_research_step(
+                {"kind": "research", "consumes": [0],
+                 "text": "research about it and tell me"},
+                [prior])
+        self.assertEqual(searches, ["YOU IN 7D? dimensions"])
+        self.assertEqual(result["status"], "ok")
+
+    def test_research_fragment_keeps_the_full_answer(self):
+        prior = {"kind": "screen", "status": "ok",
+                 "output_query": "Some Video Title",
+                 "output_content": "A video."}
+        full = ("The video explains seven dimensional thinking and why "
+                "creators keep returning to it. It compares the geometry "
+                "with everyday intuition and closes with a practical demo. "
+                "Viewers remember the final example word for word.")
+        with patch.object(brain, "run_quick_search",
+                          return_value={"query": "Some Video Title",
+                                        "spoken_summary": full}):
+            result = brain._mi_research_step(
+                {"kind": "research", "consumes": [0],
+                 "text": "research about it on the internet and tell me"},
+                [prior])
+        self.assertEqual(result["fragment"], full)
+
+    def test_finish_reply_is_not_cut_at_the_old_limit(self):
+        messages = []
+        long_frag = "word " * 220
+        with patch.object(brain, "_record_chain_run"), \
+             patch.object(brain, "_notify_async_reply",
+                          side_effect=lambda text, spoken=None:
+                          messages.append(text)):
+            brain._finish_multi_intent({"source": "x"}, [
+                {"kind": "research", "status": "ok",
+                 "fragment": long_frag.strip(),
+                 "output_query": "some video"}])
+        self.assertTrue(messages)
+        self.assertGreater(len(messages[0]), 600)
+        self.assertTrue(messages[0].endswith("word"))
 
 
 class SubjectAspectTests(unittest.TestCase):
@@ -449,6 +508,46 @@ class SubjectAspectTests(unittest.TestCase):
     def test_missing_observation_is_never_composed(self):
         self.assertEqual(
             brain._mi_subject_aspect_query(self.CLAUSE, "O9"), "")
+
+
+class AspectSuffixTests(unittest.TestCase):
+    """The aspect may live in the screen clause when the request is deictic."""
+
+    def setUp(self):
+        context_state.OBSERVATIONS.clear()
+
+    def tearDown(self):
+        context_state.OBSERVATIONS.clear()
+
+    def test_aspect_comes_from_the_screen_clause_when_deictic(self):
+        context_state.OBSERVATIONS.add(context_state.Observation(
+            id="O1", at=time.time(),
+            utterance="what is this video about dimensions on my screen",
+            items=[_item(label="YOU IN 7D?")]))
+        self.assertEqual(
+            brain._mi_aspect_suffix("research about it and tell me",
+                                    "YOU IN 7D?", "YOU IN 7D?", "O1"),
+            ["dimensions"])
+
+    def test_aspect_already_in_the_query_is_not_doubled(self):
+        self.assertEqual(
+            brain._mi_aspect_suffix(
+                "research about their release dates", "Inception",
+                "Inception release dates", ""),
+            [])
+
+    def test_filler_words_are_never_aspects(self):
+        self.assertEqual(
+            brain._mi_aspect_suffix("what is this video very really about",
+                                    "YOU IN 7D?", "YOU IN 7D?", ""),
+            [])
+
+    def test_instruction_words_are_never_aspects(self):
+        self.assertEqual(
+            brain._mi_aspect_suffix(
+                "research about it on the internet and tell me",
+                "YOU IN 7D?", "YOU IN 7D?", ""),
+            [])
 
 
 if __name__ == "__main__":
