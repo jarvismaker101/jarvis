@@ -1312,7 +1312,7 @@ def derive_research_query(raw_query):
             return resolved
         print(f"[RESEARCH] Deictic query ({query!r}) has no referent")
         return ""
-    return query
+    return _carry_context_subject(raw_query, query)
 
 
 # Last successfully researched topic, so a Hinglish consent reply such as
@@ -1489,6 +1489,90 @@ def _get_last_screen_creator():
     except Exception:
         pass
     return ""
+
+
+_last_screen_report = {"topic": "", "tip": "", "creator": "", "at": 0.0}
+
+
+def _set_last_screen_report(topic="", tip="", creator=""):
+    """Remember the FULL last screen observation, so a later "research that
+    secret message" can resolve to what was actually identified on screen —
+    the title in the tip, not the 2-5-word topic label. Never raises."""
+    global _last_screen_report
+    try:
+        topic = str(topic or "").strip()
+        tip = str(tip or "").strip()
+        creator = str(creator or "").strip()
+        if not (topic or tip or creator):
+            return
+        with _screen_topic_lock:
+            _last_screen_report = {
+                "topic": topic, "tip": tip, "creator": creator,
+                "at": time.time(),
+            }
+    except Exception:
+        pass
+
+
+def _get_last_screen_report():
+    """The last screen report inside its TTL, else None."""
+    try:
+        with _screen_topic_lock:
+            state = dict(_last_screen_report)
+        if state and (time.time() - float(state.get("at") or 0.0)
+                      < _SCREEN_TOPIC_TTL):
+            return state
+    except Exception:
+        pass
+    return None
+
+
+def _screen_subject_candidates():
+    """Concrete subject strings from the last screen observation, best
+    first: a quoted title from the tip ("titled "Karna Vs Arjun Ko Secret
+    Message"") beats the short topic label."""
+    report = _get_last_screen_report()
+    if not report:
+        return []
+    out = []
+    tip = str(report.get("tip") or "")
+    for match in re.finditer(r"[\"\u201c\u2018']([^\"\u201d\u2019']{3,140})"
+                             r"[\"\u201d\u2019']", tip):
+        quoted = match.group(1).strip(" ,.;:-")
+        if quoted and not _is_deictic_query(quoted):
+            out.append(quoted)
+    topic = str(report.get("topic") or "").strip()
+    if topic and not _is_deictic_query(topic) and topic not in out:
+        out.append(topic)
+    return out
+
+
+def _carry_context_subject(raw, query):
+    """Bind a deictic research request to what was last seen on screen.
+
+    "i want to know that secret message research about it" must research
+    the TITLE the user is pointing at ("Karna Vs Arjun Ko Secret Message"),
+    not the generic fragment the classifier extracted ("secret message").
+    Only fires when the request contains a pointer word AND every content
+    word of the derived query already appears in a screen subject — so a
+    genuinely new subject ("the news", "laptop prices") passes through.
+    """
+    q = str(query or "").strip()
+    if not q:
+        return q
+    if not re.search(r"\b(?:that|this|it|these|those)\b", str(raw or ""),
+                     re.IGNORECASE):
+        return q
+    qt = [t for t in re.split(r"[\W_]+", q.lower())
+          if t and t not in _DEREF_FILLERS]
+    if not qt or len(qt) > 8:
+        return q
+    for subject in _screen_subject_candidates():
+        st = set(t for t in re.split(r"[\W_]+", subject.lower()) if t)
+        if set(qt) <= st and len(subject) > len(q) + 2:
+            print(f"[RESEARCH] Context carry: {q!r} -> {subject!r}")
+            return subject[:220]
+    return q
 
 
 def _is_deictic_query(query):
@@ -1806,14 +1890,27 @@ def _resolve_search_query(text):
     local = _heuristic_research_query(t)
     if local and not _is_deictic_query(local):
         q = derive_research_query(t)
-        return q if (q and not _is_deictic_query(q)) else local
+        return _carry_context_subject(
+            t, q if (q and not _is_deictic_query(q)) else local)
     resolved = _resolve_reference_query(t)
     if resolved:
         return resolved
     q = derive_research_query(t)
     if q and not _is_deictic_query(q):
-        return q
+        return _carry_context_subject(t, q)
     return ""
+
+
+#: Mid-sentence instruction chatter ("... , research about it i want to know
+#: the secret message") is not a subject. When the classifier is down the
+#: local heuristic used to leave it in, so the whole sentence was searched.
+_INSTRUCTION_RESIDUE_RE = re.compile(
+    r"\b(?:research|search|google|look\s+up|find\s+out)\b"
+    r"[^.?!,;]{0,24}?\b(?:it|this|that|them)\b"
+    r"|\bi\s+(?:want|wanted|would\s+like|need)\s+(?:to\s+)?know\b"
+    r"|\bi\s+want\s+you\s+to\b|\btell\s+me\b|\bplease\s+tell\b",
+    re.IGNORECASE,
+)
 
 
 def _heuristic_research_query(raw_query):
@@ -1853,7 +1950,25 @@ def _heuristic_research_query(raw_query):
                 break
         if not matched:
             break
+    # Live fix: an instruction that trails the pointing phrase ("this secret
+    # message short video on my screen , research about it i want to know
+    # the secret message") is scaffolding, not subject matter — cut it off
+    # and keep the phrase the user pointed at. Runs after the prefix strip,
+    # so a leading "i want to know" cannot shadow the trailing instruction.
+    residue = _INSTRUCTION_RESIDUE_RE.search(low)
+    if residue and residue.start() > 0:
+        left = low[:residue.start()].strip(" ,.!?")
+        if left:
+            low = left
     low = low.strip(" ,.!?")
+    if not low:
+        return raw_query
+    # The pointing phrase keeps its noun but sheds the bare pointer and the
+    # screen mention ("this ... short video on my scrren" -> "secret message
+    # short video") — a search never needs "this" or "on my screen".
+    low = re.sub(r"^\s*(?:this|that|the)\s+(?=\S)", "", low).strip(" ,.!?")
+    low = re.sub(r"\b(?:on|from)\s+(?:my|the)\s+scr+[ae]*n\b", " ", low)
+    low = re.sub(r"\s+", " ", low).strip(" ,.!?")
     if not low:
         return raw_query
     return low[:220]
@@ -5400,6 +5515,77 @@ def _mi_extract_screen_query(clause, topic, content, correction=""):
         return "", False
 
 
+def _clean_screen_subject(text):
+    """A vision answer to a search query — the exact name, nothing else."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    quoted = re.search(r"[\"\u201c\u2018']([^\"\u201d\u2019']{3,140})"
+                       r"[\"\u201d\u2019']", t)
+    if quoted:
+        t = quoted.group(1).strip()
+    else:
+        # A multi-word sentence ending in a period is a description, not a
+        # name/title — the focused prompt asks for names only, so this is
+        # the model not complying; the caller falls back and asks.
+        head = t.rstrip()
+        if head.endswith(".") and len(head.split()) > 8:
+            return ""
+    t = t.strip(" \t\"'\u201c\u201d\u2018\u2019`.,;:-\u2014")[:160].strip()
+    if len(t) < 3 or len(t.split()) > 14:
+        return ""
+    if re.search(r"(?i)\b(?:couldn'?t|cannot|can'?t|not\s+clear|unclear|"
+                 r"no\s+idea|nothing|doesn'?t\s+show)\b", t):
+        return ""
+    if _META_QUERY_RE.search(t) or _is_deictic_query(t):
+        return ""
+    return t
+
+
+def _mi_vision_screen_query(clause, correction=""):
+    """A FOCUSED vision call: ask the vision model what exact thing on the
+    screen the user means, instead of text-summarising the screen report
+    with the chat model.
+
+    Live fix: the chat-side extraction guessed "QTI The Secret Betr" for a
+    video whose title the vision model reads perfectly when asked directly.
+    The vision call is the primary resolver; a "" return means the caller
+    should fall back (chat extraction, then ask once). Never raises.
+    """
+    if not _screen_qa_busy.acquire(timeout=15):
+        return ""
+    try:
+        ask = _mi_clip(str(clause or "").strip(), 200)
+        if not ask:
+            return ""
+        if correction:
+            ask = ('%s (the user corrected themselves: "%s")'
+                   % (ask, _mi_clip(str(correction), 120)))
+        question = (
+            "Search-query task: the user wants me to research ONE specific "
+            "item visible on this screen. They are pointing at it with: "
+            '"%s". Identify that exact item and put ONLY its exact displayed '
+            'name or title into the "tip" field — no sentences, no quotes. '
+            "If the screen does not clearly show the item they mean, return "
+            'an empty "tip".' % ask
+        )
+        result = analyze_screen(question) or {}
+        for candidate in (result.get("tip"), result.get("topic")):
+            cleaned = _clean_screen_subject(candidate)
+            if cleaned and cleaned.lower() != ask.lower():
+                print(f"[CHAIN] Vision screen subject: {cleaned!r}")
+                return cleaned
+        return ""
+    except Exception as exc:
+        logging.warning("[CHAIN] Vision screen subject failed: %s", exc)
+        return ""
+    finally:
+        try:
+            _screen_qa_busy.release()
+        except Exception:
+            pass
+
+
 #: "no not that, the image to the left" — a redirect, not a refusal.
 _SCREEN_REDIRECT_RE = re.compile(
     r"\b(?:not\s+(?:that|this|those|these|it|the\s+\w+)|instead|"
@@ -5411,11 +5597,15 @@ _SCREEN_REDIRECT_RE = re.compile(
 
 
 def _research_from_screen_correction(state, correction):
-    """Re-read the SAME screen report with the user's corrected pointer
-    ("no not that, the image to the left") and research the result."""
-    query, _ = _mi_extract_screen_query(
-        str(state.get("clause") or ""), str(state.get("topic") or ""),
-        str(state.get("content") or ""), correction=correction)
+    """Re-read the SAME screen observation with the user's corrected pointer
+    ("no not that, the image to the left") and research the result. The
+    focused vision call is primary — the correction points at pixels."""
+    clause = str(state.get("clause") or "")
+    query = _mi_vision_screen_query(clause, correction=correction)
+    if not query:
+        query, _ = _mi_extract_screen_query(
+            clause, str(state.get("topic") or ""),
+            str(state.get("content") or ""), correction=correction)
     if not query:
         return None
     print("[RESEARCH] Corrected screen subject:", query)
@@ -5486,6 +5676,9 @@ _MI_CLAUSE_STOPWORDS = {
     "does", "do", "did", "actually", "say", "says", "said", "mean",
     "means", "tell", "what", "and", "or", "they", "are", "talking",
     "explain", "understand", "summarise", "summarize", "please",
+    # Effort adjectives ("do a deep research about it") are not subjects.
+    "deep", "deeper", "brief", "quick", "short", "detailed", "full",
+    "proper", "little", "bit",
 }
 
 
@@ -5545,6 +5738,7 @@ def _mi_screen_step(step):
             _set_last_screen_topic(topic)
         if creator:
             _set_last_screen_creator(creator)
+        _set_last_screen_report(topic, tip, creator)
     except Exception:
         pass
     return {"kind": "screen", "status": "ok",
@@ -5581,8 +5775,14 @@ def _mi_research_step(step, results):
             and not _CREATOR_ATTR_RE.search(clause)
             and _mi_needs_screen_extraction(clause, base)):
         screen_content = str(prior.get("output_content") or "")
-        extracted, confident = _mi_extract_screen_query(
-            clause, base, screen_content)
+        # Primary: a focused VISION call identifies the exact thing the
+        # user pointed at; the chat-side extraction is only the fallback
+        # (its provider is often down, and it guesses from the text report).
+        extracted = _mi_vision_screen_query(clause)
+        confident = bool(extracted)
+        if not extracted:
+            extracted, confident = _mi_extract_screen_query(
+                clause, base, screen_content)
         if extracted and confident:
             base = extracted
         elif extracted:
@@ -7372,6 +7572,7 @@ def _process_message_inner(
                         _set_last_screen_creator(creator)
                     except Exception:
                         pass
+                _set_last_screen_report(topic, tip, creator)
                 grounding_links = result.get("grounding_links", [])
                 show_images = result.get("show_images", False)
                 region = result.get("region")

@@ -103,6 +103,18 @@ class ChainSplitTests(unittest.TestCase):
         self.assertEqual([s["consumes"] for s in plan["steps"]],
                          [[], [0]])
 
+    def test_screen_typo_still_splits_the_chain(self):
+        # Live transcript: "on my scrren" (STT typo) dropped the screen
+        # clause, so the whole sentence went to the search net and was
+        # searched near-verbatim. The screen word tolerates its typos.
+        text = ("what is this secret message short video on my scrren , "
+                "research about it i want to know the secret message")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "research"])
+        self.assertEqual(plan["steps"][1]["consumes"], [0])
+
     def test_task_before_the_end_blocks_the_chain(self):
         text = ("create a file called x.txt with hello and research "
                 "the news")
@@ -493,6 +505,40 @@ class ChainExecutorTests(unittest.TestCase):
         self.assertEqual(searches, [])
         self.assertIn("couldn't tell exactly", self.messages[-1])
         self.assertIsNotNone(brain._get_pending_screen_clarify())
+
+    def test_vision_call_identifies_the_screen_subject(self):
+        # The focused vision call is the PRIMARY resolver: the screen step
+        # is analysed, then the vision model is asked what exact thing the
+        # user means. The chat-side extractor (which guessed "QTI The
+        # Secret Betr" live) must not be consulted when vision answers.
+        searches = []
+        reports = [
+            {"tip": "A YouTube Shorts video is playing.",
+             "topic": "YouTube live chat message", "creator": ""},
+            {"tip": "Karna Vs Arjun Ko Secret Message",
+             "topic": "Karna Vs Arjun", "creator": ""},
+        ]
+        with patch.object(brain, "analyze_screen",
+                          side_effect=reports), \
+             patch.object(brain, "_mi_extract_screen_query",
+                          side_effect=AssertionError("chat fallback used")), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=self._fake_quick(searches)):
+            self._run_chain(self.SECRET)
+        self.assertEqual(searches, ["Karna Vs Arjun Ko Secret Message"])
+
+    def test_vision_unavailable_falls_back_to_the_chat_extractor(self):
+        searches = []
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A YouTube live chat discussing a hidden promo code.",
+                "topic": "YouTube live chat message", "creator": ""}), \
+             patch.object(brain, "_mi_extract_screen_query",
+                          return_value=("YouTube live chat hidden promo "
+                                        "code", True)), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=self._fake_quick(searches)):
+            self._run_chain(self.SECRET)
+        self.assertEqual(searches, ["YouTube live chat hidden promo code"])
 
     def test_concurrent_chain_is_refused(self):
         brain._mi_chain_active = True

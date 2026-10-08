@@ -329,6 +329,7 @@ def play_ws_reply(session, is_current=None, earcon=None):
                 return
             yield chunk
 
+    full, failed = b"", True
     try:
         full, failed = _stream_pcm_to_actor(
             key, _chunks(), handle, out=opened)

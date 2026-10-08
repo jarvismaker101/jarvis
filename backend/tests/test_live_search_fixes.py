@@ -67,6 +67,8 @@ class LiveFixBase(unittest.TestCase):
         brain._last_chain_run = None
         brain._last_screen_topic = {"text": "", "at": 0.0}
         brain._last_screen_creator = {"text": "", "at": 0.0}
+        brain._last_screen_report = {"topic": "", "tip": "", "creator": "",
+                                     "at": 0.0}
         brain._last_research_topic = None
         brain._pending_screen_clarify = None
         task_agent._pending_task_action = None
@@ -78,6 +80,8 @@ class LiveFixBase(unittest.TestCase):
                         {"text": "", "at": 0.0})
         self.addCleanup(setattr, brain, "_last_screen_creator",
                         {"text": "", "at": 0.0})
+        self.addCleanup(setattr, brain, "_last_screen_report",
+                        {"topic": "", "tip": "", "creator": "", "at": 0.0})
         self.addCleanup(setattr, brain, "_last_research_topic", None)
         self.addCleanup(setattr, brain, "_pending_screen_clarify", None)
 
@@ -533,15 +537,15 @@ class ScreenSubjectTests(LiveFixBase):
             "find the secret message", "YouTube live chat message",
             "Chat panel: left image shows a promo code.")
         calls = []
-        with patch.object(brain, "_mi_extract_screen_query",
-                          return_value=("left image promo code", True)) as ex, \
+        with patch.object(brain, "_mi_vision_screen_query",
+                          return_value="left image promo code") as vision, \
              patch.object(brain, "handle_research_intent",
                           side_effect=lambda q, **k:
                           calls.append(q) or "Quick lookup for that, sir."):
             reply = brain._consume_confirmation(
                 "no not that, the image to the left")
         self.assertEqual(calls, ["left image promo code"])
-        self.assertEqual(ex.call_args.kwargs.get("correction"),
+        self.assertEqual(vision.call_args.kwargs.get("correction"),
                          "no not that, the image to the left")
         self.assertIsNone(brain._pending_screen_clarify)
 
@@ -550,8 +554,8 @@ class ScreenSubjectTests(LiveFixBase):
             "find the secret message", "YouTube live chat message",
             "Chat panel: left image shows a promo code.")
         calls = []
-        with patch.object(brain, "_mi_extract_screen_query",
-                          return_value=("left image promo code", True)), \
+        with patch.object(brain, "_mi_vision_screen_query",
+                          return_value="left image promo code"), \
              patch.object(brain, "handle_research_intent",
                           side_effect=lambda q, **k:
                           calls.append(q) or "Quick lookup for that, sir."):
@@ -568,6 +572,88 @@ class ScreenSubjectTests(LiveFixBase):
         self.assertIsNone(
             brain.consume_screen_research_clarify("search for laptops"))
         self.assertIsNotNone(brain._get_pending_screen_clarify())
+
+
+class ScreenContextCarryTests(LiveFixBase):
+    """Live fix: "i want to know that secret message research about it" —
+    the reference binds to what the screen identified earlier (the full
+    title), not to the generic fragment the classifier extracted."""
+
+    SUBJECT = "Karna Vs Arjun Ko Secret Message"
+
+    def _seed_report(self):
+        brain._set_last_screen_report(
+            "Karna Vs Arjun",
+            'The video is titled "%s".' % self.SUBJECT, "QTI")
+
+    def test_derived_fragment_carries_to_the_screen_subject(self):
+        self._seed_report()
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "secret message"}):
+            query = brain.derive_research_query(
+                "i want to know that secret message research about it "
+                "and tell me")
+        self.assertEqual(query, self.SUBJECT)
+
+    def test_carry_reaches_through_the_search_shaped_net(self):
+        self._seed_report()
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "chat", "query": ""}):
+            query = brain._resolve_search_query(
+                "i want to know that secret message research about it "
+                "and tell me")
+        self.assertEqual(query, self.SUBJECT)
+
+    def test_an_unrelated_subject_is_not_carried(self):
+        self._seed_report()
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "laptop prices"}):
+            query = brain.derive_research_query("research that laptop prices")
+        self.assertEqual(query, "laptop prices")
+
+    def test_without_a_deictic_pointer_nothing_carries(self):
+        self._seed_report()
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "secret message"}):
+            query = brain.derive_research_query("secret message")
+        self.assertEqual(query, "secret message")
+
+    def test_no_screen_report_leaves_the_fragment_alone(self):
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "research",
+                                        "query": "secret message"}):
+            query = brain.derive_research_query(
+                "i want to know that secret message research about it")
+        self.assertEqual(query, "secret message")
+
+
+class ScreenSubjectCleanTests(LiveFixBase):
+    """The focused vision answer is only a query when it reads as a name."""
+
+    def test_quoted_title_is_extracted(self):
+        self.assertEqual(
+            brain._clean_screen_subject(
+                'The exact title is "Karna Vs Arjun Ko Secret Message".'),
+            "Karna Vs Arjun Ko Secret Message")
+
+    def test_a_bare_name_passes(self):
+        self.assertEqual(brain._clean_screen_subject("Interstellar"),
+                         "Interstellar")
+
+    def test_a_description_sentence_is_rejected(self):
+        self.assertEqual(brain._clean_screen_subject(
+            "A YouTube live chat discussing a hidden promo code."), "")
+
+    def test_a_generic_topic_is_rejected(self):
+        self.assertEqual(
+            brain._clean_screen_subject("YouTube live chat message"), "")
+
+    def test_a_refusal_is_rejected(self):
+        self.assertEqual(brain._clean_screen_subject(
+            "I couldn't see anything like that on the screen."), "")
 
 
 if __name__ == "__main__":

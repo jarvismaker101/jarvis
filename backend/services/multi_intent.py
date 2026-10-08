@@ -40,11 +40,17 @@ _FUTURE_TALK_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The screen word tolerates the typos speech-to-text actually produces
+#: ("scrren", "scren", "screan") — a typo used to drop the screen clause
+#: entirely, so "research about it" never bound to it and the whole
+#: sentence was typed into the web.
+_SCREEN_WORD = r"(?:scr+[ae]*n|monitor|display)"
+
 _SCREEN_RE = re.compile(
     r"\b(look at|check|see|read|watch|analyse|analyze|scan|view|examine)\b"
-    r"[^.?!,;]{0,40}\b(screen|monitor|display)\b"
-    r"|\bon (?:my|the) screen\b"
-    r"|\bwhat(?:'s| is) on (?:my|the) screen\b"
+    r"[^.?!,;]{0,40}\b" + _SCREEN_WORD + r"\b"
+    r"|\bon (?:my|the) " + _SCREEN_WORD + r"\b"
+    r"|\bwhat(?:'s| is) on (?:my|the) " + _SCREEN_WORD + r"\b"
     r"|\blook at (?:this|the) (?:video|image|picture|photo|window)\b",
     re.IGNORECASE,
 )

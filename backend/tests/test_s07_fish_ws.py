@@ -189,6 +189,22 @@ class PlaybackTests(unittest.TestCase):
                 session, is_current=lambda: False)
         self.assertEqual(self.fed_chunks, [])
 
+    def test_a_mid_stream_device_error_reports_without_crashing(self):
+        # Live log: a PortAudio "device busy" error inside the stream used
+        # to raise UnboundLocalError from the error handler itself.
+        session = _FakeSession(chunks=(b"\x01\x00" * 100,))
+        session.feed("Only sentence.")
+        session.finish_text()
+        with patch.object(fish_voice, "_stream_pcm_to_actor",
+                          side_effect=RuntimeError("device busy")), \
+                patch.object(fish_voice, "_register_sounddevice_playback",
+                             return_value=None), \
+                patch.object(fish_voice, "_actor_heard_audio",
+                             return_value=False):
+            outcome = fish_voice.play_ws_reply(session)
+        self.assertFalse(outcome["audio_started"])
+        self.assertTrue(outcome["failed"])
+
 
 class _LiveStream:
     """A play_ws_reply stand-in that holds the stream open until released."""
