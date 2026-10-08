@@ -332,6 +332,9 @@ class BrainWiringTests(unittest.TestCase):
         searches = []
         with patch.object(brain, "identify_on_screen",
                           return_value=(self._fresh(), grade)), \
+             patch.object(brain, "compose_search_query",
+                          side_effect=lambda obs, req, fallback="":
+                          fallback), \
              patch.object(brain, "run_quick_search",
                           side_effect=lambda q, *a, **k:
                           searches.append(q) or {"query": q,
@@ -382,6 +385,9 @@ class BrainWiringTests(unittest.TestCase):
                           side_effect=AssertionError("no re-analysis")), \
              patch.object(brain, "identify_on_screen",
                           side_effect=AssertionError("no second vision call")), \
+             patch.object(brain, "compose_search_query",
+                          side_effect=lambda obs, req, fallback="":
+                          fallback), \
              patch.object(brain, "run_quick_search",
                           side_effect=lambda q, *a, **k:
                           searches.append(q) or {"query": q,
@@ -393,6 +399,32 @@ class BrainWiringTests(unittest.TestCase):
                 [prior])
         self.assertEqual(searches,
                          [self.ASPECT_LABEL + " release dates"])
+        self.assertEqual(result["status"], "ok")
+
+    def test_model_composed_query_is_used(self):
+        context_state.OBSERVATIONS.add(context_state.Observation(
+            id="O1", at=time.time(),
+            utterance="what is this video about dimensions on my screen",
+            image_data_url="data:image/png;base64,SEED",
+            items=[_item(label="YOU IN 7D?")]))
+        prior = {"kind": "screen", "status": "ok",
+                 "output_query": "YOU IN 7D?",
+                 "output_content": "A video is playing.",
+                 "output_obs_id": "O1"}
+        searches = []
+        with patch.object(brain, "analyze_screen",
+                          side_effect=AssertionError("no re-analysis")), \
+             patch.object(brain, "compose_search_query",
+                          return_value="YOU IN 7D? dimensions explained"), \
+             patch.object(brain, "run_quick_search",
+                          side_effect=lambda q, *a, **k:
+                          searches.append(q) or {"query": q,
+                                                 "spoken_summary": "s"}):
+            result = brain._mi_research_step(
+                {"kind": "research", "consumes": [0],
+                 "text": "research about it and tell me"},
+                [prior])
+        self.assertEqual(searches, ["YOU IN 7D? dimensions explained"])
         self.assertEqual(result["status"], "ok")
 
     def test_deictic_research_composes_the_screen_clause_aspect(self):
@@ -410,6 +442,9 @@ class BrainWiringTests(unittest.TestCase):
                           side_effect=AssertionError("no re-analysis")), \
              patch.object(brain, "identify_on_screen",
                           side_effect=AssertionError("no second vision call")), \
+             patch.object(brain, "compose_search_query",
+                          side_effect=lambda obs, req, fallback="":
+                          fallback), \
              patch.object(brain, "run_quick_search",
                           side_effect=lambda q, *a, **k:
                           searches.append(q) or {"query": q,
@@ -548,6 +583,57 @@ class AspectSuffixTests(unittest.TestCase):
                 "research about it on the internet and tell me",
                 "YOU IN 7D?", "YOU IN 7D?", ""),
             [])
+
+
+class ComposeSearchQueryTests(unittest.TestCase):
+    """The model writes the search phrase from the observation + request."""
+
+    def _obs(self):
+        return context_state.Observation(
+            id="O1", at=time.time(),
+            utterance="what is this movie about a cheeseburger",
+            answer="A man serves a burger to a woman.",
+            items=[_item(label="Ralph Fiennes Makes Anya Taylor-Joy A "
+                              "Cheeseburger | The Menu | Disney+ UK",
+                         kind="video", primary=True)])
+
+    def test_model_answer_becomes_the_query(self):
+        response = {"choices": [{"message": {
+            "content": "  The Menu movie cheeseburger scene explained \n"}}]}
+        with patch("backend.services.gemini_client.ask_gemini_chat",
+                   return_value=response) as model:
+            query = screen_analyzer.compose_search_query(
+                self._obs(), "research about it on internet and tell me",
+                "The Menu movie")
+        self.assertEqual(query,
+                         "The Menu movie cheeseburger scene explained")
+        sent = model.call_args[0][0]
+        self.assertIn("Ralph Fiennes", sent[1]["content"])
+        self.assertIn("The Menu movie", sent[1]["content"])
+
+    def test_scaffolding_never_reaches_a_search_box(self):
+        response = {"choices": [{"message": {
+            "content": "search on my screen for the movie please"}}]}
+        with patch("backend.services.gemini_client.ask_gemini_chat",
+                   return_value=response):
+            query = screen_analyzer.compose_search_query(
+                self._obs(), "research about it", "The Menu movie")
+        self.assertEqual(query, "The Menu movie")
+
+    def test_provider_failure_returns_the_deterministic_fallback(self):
+        with patch("backend.services.gemini_client.ask_gemini_chat",
+                   return_value={}):
+            query = screen_analyzer.compose_search_query(
+                self._obs(), "research about it", "The Menu movie")
+        self.assertEqual(query, "The Menu movie")
+
+    def test_no_observation_or_no_answer_keeps_the_fallback(self):
+        self.assertEqual(screen_analyzer.compose_search_query(
+            None, "research about it", "The Menu movie"), "The Menu movie")
+        with patch("backend.services.gemini_client.ask_gemini_chat",
+                   side_effect=AssertionError("must not call the model")):
+            self.assertEqual(screen_analyzer.compose_search_query(
+                context_state.Observation(id="O2"), "research", "x"), "x")
 
 
 if __name__ == "__main__":

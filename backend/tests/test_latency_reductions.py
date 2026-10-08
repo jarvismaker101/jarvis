@@ -48,6 +48,7 @@ class ChatFastPathTests(unittest.TestCase):
         "when is the match",
         "where is berlin",
         "command open youtube",
+        "give me the answer to this KBC question on my screen",
         "",
     )
 

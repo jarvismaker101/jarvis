@@ -117,6 +117,12 @@ _SCREEN_QUESTION_CUES = (
     "visible",
     "more",
     "about",
+    # "give me the answer to this KBC question on my screen" has a screen
+    # reference and an ask, but no wh-word — the ask IS the cue.
+    "answer",
+    "question",
+    "solve",
+    "quiz",
     "kya",
     "kaise",
     "kaun",
@@ -872,6 +878,103 @@ def reidentify(obs, correction, rejected=()):
 def get_observation(obs_id):
     """The stored observation with this id, or None (RAM only)."""
     return context_state.OBSERVATIONS.get(obs_id)
+
+
+# ---------------------------------------------------------------------------
+# RANK 10 — the model composes the search query from the observation
+# ---------------------------------------------------------------------------
+
+#: The query-writer job sheet. The model may merge the target with the
+#: user's question terms — it may never invent a name or write instructions.
+_QUERY_WRITER_SYSTEM = (
+    "You write ONE web search query for a voice assistant's browser. You "
+    "are given what is on the user's screen (exact text read from the "
+    "screen, item kinds, creators, and the vision model's description) and "
+    "the user's request. Compose the query that best finds exactly what the "
+    "user asked about. Rules: keep every name and title exactly as shown; "
+    "merge the user's question terms with the target (for example a movie "
+    "or video title plus the thing they asked about); never invent names, "
+    "people or dates; never include instruction words (research, search, "
+    "look up, tell me, on my screen, please, sir); output ONLY the query, "
+    "one line, under 120 characters. Never answer the question yourself."
+)
+
+#: Instruction scaffolding that must never reach a search box.
+_QUERY_SCAFFOLD_RE = re.compile(
+    r"\b(?:research|search|look\s*up|tell\s+me|on\s+my\s+screen|"
+    r"please|jarvis|sir)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_composed_query(text):
+    """First line, unquoted, scaffold-free — "" when nothing usable."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    line = raw.splitlines()[0].strip().strip("\"'`*# ")
+    line = re.sub(r"\s+", " ", line)
+    if len(line) < 2 or _QUERY_SCAFFOLD_RE.search(line):
+        return ""
+    if len(line) > 180:
+        cut = line.rfind(" ", 0, 177)
+        line = (line[:cut] if cut > 0 else line[:177]).rstrip() + "..."
+    return line
+
+
+def compose_search_query(observation, request_text, fallback=""):
+    """The model composes the query from the target description + request.
+
+    The observation carries what the eyes saw (exact item labels, kinds,
+    creators, the vision description); the request carries what the user
+    wants to know. The model merges them into one search phrase. Any
+    failure — provider down, malformed answer, leaked instruction words —
+    returns *fallback* (the caller's deterministic subject+aspect compose),
+    so a search never depends on the composer.
+    """
+    fallback = str(fallback or "").strip()
+    if observation is None:
+        return fallback
+    items = list(getattr(observation, "items", []) or [])
+    answer = str(getattr(observation, "answer", "") or "").strip()
+    if not items and not answer:
+        return fallback
+    try:
+        rows = []
+        for item in items[:6]:
+            bits = [str(getattr(item, "label", "") or "")]
+            kind = str(getattr(item, "kind", "") or "")
+            creator = str(getattr(item, "creator", "") or "")
+            if kind:
+                bits.append("(%s)" % kind)
+            if creator:
+                bits.append("by %s" % creator)
+            if getattr(item, "primary", False):
+                bits.append("[primary]")
+            if getattr(item, "truncated", False):
+                bits.append("[title cut off]")
+            rows.append(" ".join(b for b in bits if b))
+        seen = "SCREEN ITEMS (exact text read from the screen):\n" + \
+            ("\n".join("- " + row for row in rows) if rows else "- (none)")
+        if answer:
+            seen += "\nVISION DESCRIPTION: " + answer[:400]
+        question = str(getattr(observation, "utterance", "") or "").strip()
+        if question:
+            seen += "\nTHE USER THEN SAID: " + question[:300]
+        user = ("USER REQUEST: %s\nDETERMINISTIC GUESS: %s\n\n"
+                "Search query:" % (str(request_text or "")[:300],
+                                   fallback or "(none)"))
+        from backend.services.gemini_client import ask_gemini_chat
+        response = ask_gemini_chat(
+            [{"role": "system", "content": _QUERY_WRITER_SYSTEM},
+             {"role": "user", "content": seen + "\n\n" + user}],
+            temperature=0.1, max_tokens=60, timeout=(6, 12), no_retry=True)
+        if not response or not response.get("choices"):
+            return fallback
+        content = response["choices"][0].get("message", {}).get("content", "")
+        return _clean_composed_query(content) or fallback
+    except Exception:
+        return fallback
 
 
 def analyze_screen(question: str) -> dict:

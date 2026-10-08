@@ -72,6 +72,7 @@ from backend.services.research_service import run_research, request_stop as requ
 from backend.services.quick_search import run_quick_search, fetch_ai_overview_text
 from backend.services.screen_analyzer import analyze_screen, is_screen_question, is_region_question
 from backend.services.screen_analyzer import identify_on_screen, get_observation
+from backend.services.screen_analyzer import compose_search_query
 from backend.services.image_fetcher import build_explore_links, fetch_topic_images
 
 
@@ -5989,18 +5990,26 @@ def _mi_research_step(step, results):
     try:
         if base and not _is_deictic_query(base):
             query = base[:220]
-            # RANK 10 (the code half): a request that only points at the
-            # screen ("...about dimensions, research it") carries its
-            # QUESTION apart from the subject. Append those aspect words to
-            # the identified label so the search is not just the thumbnail
-            # title. When the vision or text resolver already carried the
-            # user's own words, never compose again.
+            # Deterministic fallback: the aspect the user asked about
+            # ("...about dimensions") appended to the identified subject.
             if not creator_override and not used_text_extractor \
                     and not aspect_composed:
                 aspect = _mi_aspect_suffix(clause, base, query, obs_id)
                 if aspect:
                     query = _mi_clip(" ".join([query] + aspect), 220)
                     print("[CHAIN] Subject + aspect query:", query)
+            # RANK 10: the MODEL composes the final search phrase — it gets
+            # the target description from the observation (exact on-screen
+            # text, kinds, creators, the vision description) and the user's
+            # request. The deterministic query above is its input hint and
+            # the fallback when the model is unavailable or breaks a rule.
+            if obs_id and not creator_override:
+                obs = get_observation(obs_id)
+                if obs is not None and getattr(obs, "items", None):
+                    composed_q = compose_search_query(obs, clause, query)
+                    if composed_q and composed_q != query:
+                        print("[CHAIN] Model-composed query:", composed_q)
+                    query = composed_q or query
         else:
             query = _resolve_search_query(clause)
         if not query:

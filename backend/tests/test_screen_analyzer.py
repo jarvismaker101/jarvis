@@ -15,6 +15,19 @@ class ScreenAnalyzerTests(unittest.TestCase):
             is_screen_question("on my screen there is something about Tesla, tell me more")
         )
 
+    def test_answer_ask_with_a_screen_reference_is_a_screen_question(self):
+        # Live transcript: the fast path swallowed this as plain chat because
+        # no wh-word was present; the ask itself ("the answer to this KBC
+        # question") is the cue.
+        self.assertTrue(
+            is_screen_question(
+                "give me the answer to this KBC question on my screen")
+        )
+
+    def test_screen_control_verbs_still_win_over_the_answer_cue(self):
+        self.assertFalse(
+            is_screen_question("click the answer button on my screen"))
+
 
 if __name__ == "__main__":
     unittest.main()
