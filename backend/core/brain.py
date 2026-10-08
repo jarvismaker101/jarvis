@@ -71,6 +71,7 @@ from backend import config
 from backend.services.research_service import run_research, request_stop as request_research_stop, clear_stop_request
 from backend.services.quick_search import run_quick_search, fetch_ai_overview_text
 from backend.services.screen_analyzer import analyze_screen, is_screen_question, is_region_question
+from backend.services.screen_analyzer import identify_on_screen, get_observation
 from backend.services.image_fetcher import build_explore_links, fetch_topic_images
 
 
@@ -5419,7 +5420,7 @@ _pending_screen_clarify = None
 _SCREEN_CLARIFY_TTL = 240.0
 
 
-def _set_pending_screen_clarify(clause, topic, content):
+def _set_pending_screen_clarify(clause, topic, content, obs_id=""):
     global _pending_screen_clarify
     try:
         with _confirmation_lock:
@@ -5427,6 +5428,9 @@ def _set_pending_screen_clarify(clause, topic, content):
                 "clause": str(clause or ""),
                 "topic": str(topic or ""),
                 "content": str(content or ""),
+                # RANK 1: the observation a correction re-asks on (RAM only;
+                # an expired observation simply falls back to a fresh look).
+                "obs_id": str(obs_id or ""),
                 "at": time.time(),
             }
     except Exception:
@@ -5542,48 +5546,86 @@ def _clean_screen_subject(text):
     return t
 
 
-def _mi_vision_screen_query(clause, correction=""):
-    """A FOCUSED vision call: ask the vision model what exact thing on the
-    screen the user means, instead of text-summarising the screen report
-    with the chat model.
+def _grade_confident(grade):
+    """Exact, single-fit, non-ambiguous vision bindings search silently."""
+    return bool(grade and grade.get("match") == "exact"
+                and not grade.get("ambiguous")
+                and (grade.get("n_fit") or 0) <= 1)
 
-    Live fix: the chat-side extraction guessed "QTI The Secret Betr" for a
-    video whose title the vision model reads perfectly when asked directly.
-    The vision call is the primary resolver; a "" return means the caller
-    should fall back (chat extraction, then ask once). Never raises.
+
+def _mi_vision_screen_target(clause, correction="", obs_id=""):
+    """(label, grade): the vision model resolves the pointed-at screen item.
+
+    RANK 1: when the screen step stored an observation, its SAME image is
+    re-used — no re-capture, so a Shorts feed that advanced between the
+    two calls cannot swap the subject — and the vision model resolves the
+    user's pointer against the item inventory. `grade` carries the match
+    quality so the caller can ask instead of guessing. `grade is None`
+    means the legacy focused-vision path answered (no stored
+    observation); bool(label) keeps the old confidence semantics there.
+    Never raises.
     """
     if not _screen_qa_busy.acquire(timeout=15):
-        return ""
+        return "", None
     try:
         ask = _mi_clip(str(clause or "").strip(), 200)
         if not ask:
-            return ""
+            return "", None
+        target = ask
         if correction:
-            ask = ('%s (the user corrected themselves: "%s")'
-                   % (ask, _mi_clip(str(correction), 120)))
+            target = ('%s (the user corrected themselves: "%s")'
+                      % (ask, _mi_clip(str(correction), 120)))
+        obs = get_observation(obs_id) if obs_id else None
+        if obs is not None and obs.image_data_url:
+            capture = {"image_data_url": obs.image_data_url,
+                       "region": obs.region,
+                       "mode": obs.mode or "full",
+                       "img_hash": obs.img_hash}
+            fresh, grade = identify_on_screen(
+                ask, target_text=target, image=capture,
+                mode=obs.mode or "full", rejected=obs.rejected)
+            label = ""
+            if fresh is not None and grade.get("ids"):
+                by_id = {item.id: item for item in fresh.items}
+                parts = [by_id[i].label for i in grade["ids"] if i in by_id]
+                label = _mi_clip(" ".join(p for p in parts if p), 160)
+            if (label and label.lower() != ask.lower()
+                    and not _META_QUERY_RE.search(label)
+                    and not _is_deictic_query(label)):
+                print("[CHAIN] Vision screen subject: %r (match=%s, n_fit=%s)"
+                      % (label, grade.get("match"), grade.get("n_fit")))
+                return label, grade
+            return "", grade
+        # Legacy path (no stored observation): focused vision question.
         question = (
             "Search-query task: the user wants me to research ONE specific "
             "item visible on this screen. They are pointing at it with: "
             '"%s". Identify that exact item and put ONLY its exact displayed '
             'name or title into the "tip" field — no sentences, no quotes. '
             "If the screen does not clearly show the item they mean, return "
-            'an empty "tip".' % ask
+            'an empty "tip".' % target
         )
         result = analyze_screen(question) or {}
         for candidate in (result.get("tip"), result.get("topic")):
             cleaned = _clean_screen_subject(candidate)
-            if cleaned and cleaned.lower() != ask.lower():
+            if cleaned and cleaned.lower() != target.lower():
                 print(f"[CHAIN] Vision screen subject: {cleaned!r}")
-                return cleaned
-        return ""
+                return cleaned, None
+        return "", None
     except Exception as exc:
         logging.warning("[CHAIN] Vision screen subject failed: %s", exc)
-        return ""
+        return "", None
     finally:
         try:
             _screen_qa_busy.release()
         except Exception:
             pass
+
+
+def _mi_vision_screen_query(clause, correction="", obs_id=""):
+    """String-only view of _mi_vision_screen_target (compat callers/tests)."""
+    return _mi_vision_screen_target(clause, correction=correction,
+                                    obs_id=obs_id)[0]
 
 
 #: "no not that, the image to the left" — a redirect, not a refusal.
@@ -5601,7 +5643,8 @@ def _research_from_screen_correction(state, correction):
     ("no not that, the image to the left") and research the result. The
     focused vision call is primary — the correction points at pixels."""
     clause = str(state.get("clause") or "")
-    query = _mi_vision_screen_query(clause, correction=correction)
+    query = _mi_vision_screen_query(clause, correction=correction,
+                                    obs_id=str(state.get("obs_id") or ""))
     if not query:
         query, _ = _mi_extract_screen_query(
             clause, str(state.get("topic") or ""),
@@ -5745,7 +5788,10 @@ def _mi_screen_step(step):
             "fragment": "I looked at your screen.",
             "output_query": topic or tip[:200],
             "output_creator": creator,
-            "output_content": tip}
+            "output_content": tip,
+            # RANK 1: the stored observation the research step re-reads
+            # (same image, item inventory) instead of re-capturing.
+            "output_obs_id": str(result.get("observation_id") or "")}
 
 
 def _mi_research_step(step, results):
@@ -5775,12 +5821,18 @@ def _mi_research_step(step, results):
             and not _CREATOR_ATTR_RE.search(clause)
             and _mi_needs_screen_extraction(clause, base)):
         screen_content = str(prior.get("output_content") or "")
-        # Primary: a focused VISION call identifies the exact thing the
-        # user pointed at; the chat-side extraction is only the fallback
-        # (its provider is often down, and it guesses from the text report).
-        extracted = _mi_vision_screen_query(clause)
-        confident = bool(extracted)
-        if not extracted:
+        obs_id = str(prior.get("output_obs_id") or "")
+        # Primary: the vision model identifies the exact thing the user
+        # pointed at — against the SAME stored observation the screen step
+        # captured (RANK 1), so a screen that changed in between cannot
+        # swap the subject. The chat-side extraction is only the fallback
+        # when no stored observation served the call.
+        extracted, vgrade = _mi_vision_screen_target(clause, obs_id=obs_id)
+        if vgrade is not None:
+            confident = _grade_confident(vgrade)
+        else:
+            confident = bool(extracted)
+        if not extracted and vgrade is None:
             extracted, confident = _mi_extract_screen_query(
                 clause, base, screen_content)
         if extracted and confident:
@@ -5789,7 +5841,8 @@ def _mi_research_step(step, results):
             question = ('Sir, is this what you mean — "%s"? Say yes and '
                         "I'll research it, or correct me."
                         % _mi_clip(extracted, 110))
-            _set_pending_screen_clarify(clause, base, screen_content)
+            _set_pending_screen_clarify(clause, base, screen_content,
+                                        obs_id=obs_id)
             _arm_confirmation(clause, query=extracted, question=question)
             print("[CHAIN] Screen subject unsure — asking before searching:",
                   extracted)
@@ -5800,7 +5853,8 @@ def _mi_research_step(step, results):
             question = ("Sir, I can see %s, but I couldn't tell exactly "
                         "what to search for — tell me which part, and I'll "
                         "research it." % hint)
-            _set_pending_screen_clarify(clause, base, screen_content)
+            _set_pending_screen_clarify(clause, base, screen_content,
+                                        obs_id=obs_id)
             print("[CHAIN] Screen subject not extractable — asking once.")
             return {"kind": "research", "status": "asked",
                     "fragment": question}

@@ -18,10 +18,14 @@ at most once, bounded — no provider is dispatched without a credential, and
 exceptions/malformed output advance instead of ending the call.
 """
 
+import base64
+import io
 import json
 import logging
 import re
+import time
 
+from backend.services import context_state
 from backend.services import gemini_client
 from backend.services import vision_cascade
 from backend.services.grok_client import ask_groq_vision
@@ -549,6 +553,327 @@ def _ask_screen_vision_cascade(prompt, image_data_url, max_completion_tokens=800
     return result if result is not None else {}
 
 
+# ---------------------------------------------------------------------------
+# RANK 1 (external redesign, Step 2): capture ONCE, keep the observation, and
+# let the VISION model resolve which on-screen item the user is pointing at.
+# The base F48 analysis prompt above still asks for the spoken answer and
+# evidence; the extra jobs below add the item inventory and pointer
+# resolution. A text-only model never picks screen targets.
+# ---------------------------------------------------------------------------
+
+#: The extra jobs appended to the F48 analysis prompt (RANK 1, report 1.6).
+_IDENTIFY_EXTRA = (
+    "\n\nALSO return an \"items\" array (up to 6) of separately nameable "
+    "things a user could want researched — playing or featured video, "
+    "image or thumbnail, post, comment, headline, product, model card, "
+    "verse or quote block, person, or window — most prominent first. Each "
+    "item needs: \"id\" (\"i1\", \"i2\", ...); \"label\" with the EXACT "
+    "displayed title or name copied character by character — never "
+    "paraphrase, translate, complete or correct the spelling; when the UI "
+    "cuts it off, copy what is visible and set \"truncated\" to true; when "
+    "no text is shown, describe it in at most 6 words and set "
+    "\"label_is_text\" to false; \"kind\"; \"creator\" with the exact "
+    "displayed channel or account name, otherwise empty; \"bbox\" as "
+    "[x0,y0,x1,y1] in a 0-1000 scale (left, top, right, bottom); and "
+    "\"primary\" true for the one playing, focused or central item.\n\n"
+    "POINTER PHRASE: \"{target_text}\"\n"
+    "SPATIAL HINT: {spatial}\n"
+    "REJECTED BY USER (never choose): {rejected}\n\n"
+    "Then say which item the POINTER PHRASE means: include \"target_ids\" "
+    "(list of item ids), \"n_fit\" (how many items plausibly fit), "
+    "\"match\" (exact, likely, guess or none) and \"why\" (at most 15 "
+    "words citing visible evidence). Prefer the item that is playing, "
+    "focused or central over items that merely share a word with the "
+    "phrase. When the pointer phrase is empty, use match \"none\" and an "
+    "empty target_ids list."
+)
+
+_IDENTIFY_REGION_NOTE = (
+    "The image I sent you is a CROPPED region of the user's screen near "
+    "their cursor/highlight — answer ONLY about what is inside it."
+)
+
+#: Instruction scaffolding that must never pass as an identified label or
+#: become a research query (report 1.10).
+_INSTRUCTION_SCAFFOLD_RE = re.compile(
+    r"\b(?:research|search|find\s+out|look\s+up)\b[^.]{0,24}?"
+    r"\b(?:about|for|it|this|that)\b|"
+    r"\bi\s+want\s+to\s+(?:know|research|find)\b|"
+    r"\btell\s+me\b|\bon\s+my\s+scr+[ae]*n\b|\bjarvis\b",
+    re.IGNORECASE,
+)
+
+#: Grammar/instruction words that name nothing by themselves.
+_GRADE_FILLERS = {
+    "this", "that", "these", "those", "it", "them", "the", "a", "an", "of",
+    "on", "in", "my", "screen", "video", "image", "picture", "thing", "one",
+    "item", "please", "sir", "about", "and", "for", "from", "me", "know",
+    "want", "research", "find", "out", "tell",
+}
+
+
+def _sanitize_label(value, limit=140):
+    """Screen text is DATA: strip control characters, collapse whitespace."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = " ".join(text.split())
+    return text[:limit].strip()
+
+
+def _clean_bbox(value):
+    try:
+        nums = [float(v) for v in value[:4]]
+    except Exception:
+        return (0, 0, 0, 0)
+    return tuple(max(0.0, min(1000.0, n)) for n in nums)
+
+
+def _clean_items(raw):
+    """The model's item inventory, sanitized and bounded (max 6)."""
+    if not isinstance(raw, list):
+        return []
+    items = []
+    seen = set()
+    for idx, entry in enumerate(raw[:6], start=1):
+        if not isinstance(entry, dict):
+            continue
+        item_id = _sanitize_label(entry.get("id"), 12) or ("i%d" % idx)
+        if item_id in seen:
+            item_id = "%s_%d" % (item_id, idx)
+        seen.add(item_id)
+        label = _sanitize_label(entry.get("label"))
+        label_is_text = bool(entry.get("label_is_text", True))
+        if not label and label_is_text:
+            continue
+        items.append(context_state.Item(
+            id=item_id,
+            label=label,
+            label_is_text=label_is_text,
+            truncated=bool(entry.get("truncated", False)),
+            kind=_sanitize_label(entry.get("kind"), 24).lower() or "other",
+            creator=_sanitize_label(entry.get("creator"), 120),
+            bbox=_clean_bbox(entry.get("bbox")),
+            primary=bool(entry.get("primary", False)),
+        ))
+    return items
+
+
+def _named_tokens(text):
+    """Content words the user named (for the "named word missing" cap)."""
+    return [t for t in re.findall(r"[a-z0-9]+", str(text or "").lower())
+            if len(t) >= 4 and t not in _GRADE_FILLERS]
+
+
+def grade_target(obs, parsed, target_text="", granularity="single"):
+    """Post-validate the vision model's target choice (report 1.6).
+
+    Returns {"ids", "n_fit", "match", "why", "ambiguous", "capped",
+    "labels"}. "match" is one of exact | likely | guess | none; an
+    ambiguous single-item request (2+ plausible items) is flagged instead
+    of silently binding one.
+    """
+    why = _sanitize_label(parsed.get("why"), 200)
+    match = str(parsed.get("match") or "").strip().lower()
+    if match not in ("exact", "likely", "guess", "none"):
+        match = "guess" if parsed.get("target_ids") else "none"
+    raw_ids = parsed.get("target_ids") or []
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    by_id = {item.id: item for item in (obs.items or [])}
+    ids = []
+    for raw_id in raw_ids:
+        sid = str(raw_id).strip()
+        if sid in by_id and sid not in ids:
+            ids.append(sid)
+    try:
+        n_fit = int(parsed.get("n_fit"))
+    except Exception:
+        n_fit = len(ids)
+    n_fit = max(0, min(9, n_fit))
+    capped = []
+    if not ids:
+        match = "none"
+    else:
+        chosen = [by_id[i] for i in ids]
+        if any(item.truncated or not item.label_is_text for item in chosen):
+            if match == "exact":
+                match = "likely"
+            capped.append("truncated_label")
+        if match == "exact" and not why:
+            match = "likely"
+            capped.append("no_why")
+        if any(_INSTRUCTION_SCAFFOLD_RE.search(item.label)
+               or item.label.strip().lower()
+               == str(obs.utterance or "").strip().lower()
+               for item in chosen):
+            match = "none"
+            ids = []
+            capped.append("scaffolded_label")
+        named = _named_tokens(target_text)
+        if ids and named and match in ("exact", "likely"):
+            haystack = (" ".join(by_id[i].label for i in ids)
+                        + " " + why).lower()
+            if not any(tok in haystack for tok in named):
+                if match == "exact":
+                    match = "likely"
+                capped.append("named_word_missing")
+    if match == "none":
+        ids = []
+        labels = []
+    else:
+        labels = [by_id[i].label for i in ids]
+    ambiguous = bool(n_fit >= 2 and granularity == "single")
+    return {"ids": ids, "n_fit": n_fit, "match": match, "why": why,
+            "ambiguous": ambiguous, "capped": capped, "labels": labels}
+
+
+def _dhash(image_data_url):
+    """64-bit difference hash of a capture ("" when it cannot be computed)."""
+    try:
+        from PIL import Image  # already a hard dependency of screen_capture
+        if not image_data_url or "," not in image_data_url:
+            return ""
+        raw = base64.b64decode(image_data_url.split(",", 1)[1])
+        gray = Image.open(io.BytesIO(raw)).convert("L").resize(
+            (9, 8), Image.LANCZOS)
+        pixels = gray.tobytes()
+        bits = 0
+        for row in range(8):
+            for col in range(8):
+                bits = (bits << 1) | (
+                    1 if pixels[row * 9 + col] > pixels[row * 9 + col + 1]
+                    else 0)
+        return "%016x" % bits
+    except Exception:
+        return ""
+
+
+def capture_observation(mode="full"):
+    """Capture the screen ONCE (RANK 1). Mode is explicit, never inferred."""
+    mode = str(mode or "full").lower()
+    if mode == "region":
+        capture = capture_region_around_cursor()
+    else:
+        mode = "full"
+        capture = capture_primary_screen()
+    data_url = str(capture.get("image_data_url") or "")
+    return {
+        "image_data_url": data_url,
+        "region": capture.get("region") or None,
+        "mode": mode,
+        "img_hash": _dhash(data_url),
+    }
+
+
+def _identify_prompt(utterance, target_text="", spatial="", rejected=(),
+                     mode="full"):
+    base = _ANALYSIS_PROMPT.format(question=utterance)
+    if str(mode or "full").lower() == "region":
+        base = _IDENTIFY_REGION_NOTE + "\n\n" + base
+    return base + _IDENTIFY_EXTRA.format(
+        target_text=_sanitize_label(target_text, 200) or "(none)",
+        spatial=_sanitize_label(spatial, 60) or "none",
+        rejected=", ".join(sorted(str(r) for r in (rejected or ()))) or "none",
+    )
+
+
+def _identify(utterance, target_text="", spatial="", rejected=(), image=None,
+              mode="full", granularity="single", attempts_out=None):
+    """(obs, grade, meta) - shared engine for RANK 1 identification."""
+    cap = image
+    if not cap:
+        try:
+            cap = capture_observation(mode)
+        except Exception as exc:  # capture failure is asked about, not guessed
+            return None, {
+                "ids": [], "n_fit": 0, "match": "none", "why": "",
+                "ambiguous": False, "capped": ["capture_failed"],
+                "labels": [], "error": "capture", "detail": str(exc),
+            }, {}
+    cap_mode = str(cap.get("mode") or mode or "full")
+    prompt = _identify_prompt(utterance, target_text, spatial, rejected,
+                              mode=cap_mode)
+    attempts = attempts_out if attempts_out is not None else {}
+    result = _ask_screen_vision_cascade(
+        prompt, str(cap.get("image_data_url") or ""),
+        max_completion_tokens=1100, attempts_out=attempts)
+    if not result or not result.get("choices"):
+        return None, {
+            "ids": [], "n_fit": 0, "match": "none", "why": "",
+            "ambiguous": False, "capped": ["vision_unavailable"],
+            "labels": [], "error": "vision",
+            "detail": vision_cascade.unavailable_reason(attempts) or "",
+        }, {"attempts": attempts, "cap": cap}
+    content = (result.get("choices") or [{}])[0].get(
+        "message", {}).get("content", "") or ""
+    parsed = _extract_json(content)
+    if not isinstance(parsed, dict):
+        parsed = {}
+    items = _clean_items(parsed.get("items"))
+    answer = str(parsed.get("answer") or parsed.get("tip") or "").strip()
+    obs = context_state.Observation(
+        id=context_state.OBSERVATIONS.next_id(),
+        at=time.time(),
+        mode=cap_mode,
+        utterance=str(utterance or ""),
+        answer=answer,
+        items=items,
+        rejected=set(str(r) for r in (rejected or ())),
+        image_data_url=str(cap.get("image_data_url") or ""),
+        img_hash=str(cap.get("img_hash") or ""),
+        region=cap.get("region") or None,
+        vision_provider=attempts.get("provider"),
+        vision_model=attempts.get("model"),
+        vision_attempts=list(attempts.get("attempts") or []),
+        vision_degraded=bool(attempts.get("degraded")),
+    )
+    context_state.OBSERVATIONS.add(obs)
+    grade = grade_target(obs, parsed, target_text=target_text,
+                         granularity=granularity)
+    meta = {"attempts": attempts, "parsed": parsed, "content": content,
+            "cap": cap, "grounding_links": result.get("grounding_links") or []}
+    return obs, grade, meta
+
+
+def identify_on_screen(utterance, target_text="", spatial="", rejected=(),
+                       image=None, mode="full", granularity="single",
+                       attempts_out=None):
+    """One vision call => one stored Observation + the graded target (RANK 1).
+
+    The vision model (which sees the pixels) resolves which on-screen item
+    the user means; the observation keeps the image, so later turns and
+    corrections re-ask on the SAME picture.
+    """
+    obs, grade, _meta = _identify(
+        utterance, target_text=target_text, spatial=spatial, rejected=rejected,
+        image=image, mode=mode, granularity=granularity,
+        attempts_out=attempts_out)
+    return obs, grade
+
+
+def reidentify(obs, correction, rejected=()):
+    """Re-ask vision on the SAME stored image (no new capture)."""
+    if obs is None or not getattr(obs, "image_data_url", ""):
+        return None, {
+            "ids": [], "n_fit": 0, "match": "none", "why": "",
+            "ambiguous": False, "capped": ["no_image"], "labels": [],
+            "error": "no_image",
+        }
+    capture = {"image_data_url": obs.image_data_url,
+               "region": getattr(obs, "region", None),
+               "mode": getattr(obs, "mode", "full"),
+               "img_hash": getattr(obs, "img_hash", "")}
+    merged = set(getattr(obs, "rejected", set()) or set())
+    merged.update(str(r) for r in (rejected or ()))
+    return identify_on_screen(
+        str(correction or ""), target_text=str(correction or ""),
+        image=capture, mode=getattr(obs, "mode", "full"), rejected=merged)
+
+
+def get_observation(obs_id):
+    """The stored observation with this id, or None (RAM only)."""
+    return context_state.OBSERVATIONS.get(obs_id)
+
+
 def analyze_screen(question: str) -> dict:
     """Capture the screen and ask Gemini Vision about it.
 
@@ -564,88 +889,74 @@ def analyze_screen(question: str) -> dict:
     - ``region`` (dict|None) — captured region bounds when the question
       pointed at a specific area
     - ``observed_at`` (str|None) — when the screenshot was captured
+    - ``observation_id`` (str) — the stored Observation this answer came
+      from (RANK 1); corrections re-ask on its image instead of a new
+      capture.
 
     No provider precondition here: the vision cascade attempts the selected
     provider and its eligible fallbacks, and reports unavailable only when
     none of them can serve the request.
     """
     region_question = is_region_question(question)
-    try:
-        if region_question:
-            capture = capture_region_around_cursor()
-            region_note = (
-                "The image I sent you is a CROPPED region of the user's screen "
-                "near their cursor/highlight — answer ONLY about what is inside it."
-            )
-        else:
-            capture = capture_primary_screen()
-            region_note = ""
-    except RuntimeError as exc:
-        logging.warning("[SCREEN-QA] Capture failed: %s", exc)
-        observed_at = None
-        return {
-            "tip": "I couldn't capture your screen, sir. Please try again.",
-            "evidence": [],
-            "topic": "",
-            "grounding_links": [],
-            "show_images": False,
-            "region": None,
-            "observed_at": None,
-            # F37: no provider was attempted — nothing was captured to send.
-            "vision_provider": None,
-            "vision_model": None,
-            "vision_attempts": [],
-        }
-
-    # F48: when the screen was actually looked at — the observation time every
-    # evidence item inherits.
-    observed_at = utc_now_iso()
-
-    prompt = _ANALYSIS_PROMPT.format(question=question)
-    if region_note:
-        prompt = region_note + "\n\n" + prompt
-
-    # F37: the cascade fills this with the ACTUAL attempted providers/models.
+    mode = "region" if region_question else "full"
     attempts = {}
-    result = _ask_screen_vision_cascade(
-        prompt,
-        capture["image_data_url"],
-        max_completion_tokens=800,
-        attempts_out=attempts,
-    )
+    obs, grade, meta = _identify(question, target_text="", mode=mode,
+                                 attempts_out=attempts)
 
-    if not result or not result.get("choices"):
+    if obs is None:
+        if grade.get("error") == "capture":
+            logging.warning("[SCREEN-QA] Capture failed: %s",
+                            grade.get("detail"))
+            return {
+                "tip": "I couldn't capture your screen, sir. Please try again.",
+                "evidence": [],
+                "topic": "",
+                "grounding_links": [],
+                "show_images": False,
+                "region": None,
+                "observed_at": None,
+                # F37: no provider was attempted — nothing was captured to send.
+                "vision_provider": None,
+                "vision_model": None,
+                "vision_attempts": [],
+            }
         # F37: total unavailability is reported with the ACTUAL attempted
         # providers instead of a bare "the model failed".
-        reason = vision_cascade.unavailable_reason(attempts) or (
-            "no vision provider returned a result")
+        reason = (vision_cascade.unavailable_reason(attempts)
+                  or grade.get("detail")
+                  or "no vision provider returned a result")
         logging.warning("[SCREEN-QA] %s", reason)
+        attempted = vision_cascade.attempted_providers(attempts)
         return {
             "tip": ("I couldn't get a response from the vision model, sir. "
-                    "(tried: %s)" % ", ".join(
-                        vision_cascade.attempted_providers(attempts))
-                    if vision_cascade.attempted_providers(attempts)
+                    "(tried: %s)" % ", ".join(attempted)
+                    if attempted
                     else "I couldn't get a response from the vision model, sir. "
                          "No vision provider is configured or eligible."),
             "evidence": [],
             "topic": "",
             "grounding_links": [],
             "show_images": False,
-            "region": (capture.get("region") or None) if region_question else None,
-            "observed_at": observed_at,
+            "region": ((meta.get("cap") or {}).get("region") or None)
+                      if region_question else None,
+            "observed_at": utc_now_iso(),
             "vision_provider": None,
             "vision_model": None,
             "vision_attempts": list(attempts.get("attempts") or []),
             "vision_unavailable_reason": reason,
         }
 
-    content = result["choices"][0].get("message", {}).get("content", "")
-    parsed = _extract_json(content)
+    # F48: when the screen was actually looked at — the observation time every
+    # evidence item inherits.
+    parsed = meta.get("parsed") or {}
+    content = str(meta.get("content") or "")
+    observed_at = utc_now_iso()
 
-    tip = (parsed.get("tip") or "").strip()
+    tip = obs.answer
     if not tip:
         # Fallback: use the raw text as the tip.
-        tip = content.strip() if content.strip() else "I couldn't interpret the screen, sir."
+        tip = content.strip() if content.strip() else \
+            "I couldn't interpret the screen, sir."
 
     evidence = parsed.get("evidence", [])
     if not isinstance(evidence, list):
@@ -702,14 +1013,24 @@ def analyze_screen(question: str) -> dict:
         if checked:
             clean_evidence.append(checked)
 
-    topic = (parsed.get("topic") or "").strip()
-    creator = (parsed.get("creator") or "").strip()[:120]
+    # RANK 1: prefer the exact label of the primary on-screen item; fall
+    # back to the model's topic when the inventory named none.
+    primary = next((item for item in obs.items if item.primary),
+                   obs.items[0] if obs.items else None)
+    topic = ""
+    creator = ""
+    if primary is not None:
+        if primary.label_is_text:
+            topic = primary.label
+        creator = primary.creator
+    topic = topic or (parsed.get("topic") or "").strip()
+    creator = (creator or str(parsed.get("creator") or "").strip())[:120]
     show_images = bool(parsed.get("show_images", False))
 
     # Source URLs, when the provider grounds its answer at all. Search
     # grounding is OFF for this call, so this is normally empty — it is never
     # presented to the user as "verified sources".
-    grounding_links = result.get("grounding_links", [])
+    grounding_links = meta.get("grounding_links") or []
 
     return {
         "tip": tip,
@@ -718,12 +1039,14 @@ def analyze_screen(question: str) -> dict:
         "creator": creator,
         "grounding_links": grounding_links,
         "show_images": show_images,
-        "region": (capture.get("region") or None) if region_question else None,
+        "region": (obs.region or None) if region_question else None,
         "observed_at": observed_at,
         # F37: the ACTUAL provider/model that served this answer travels with
         # it (and whether the output only survived as a degraded last resort).
-        "vision_provider": attempts.get("provider"),
-        "vision_model": attempts.get("model"),
-        "vision_attempts": list(attempts.get("attempts") or []),
-        "vision_degraded": bool(attempts.get("degraded")),
+        "vision_provider": obs.vision_provider,
+        "vision_model": obs.vision_model,
+        "vision_attempts": list(obs.vision_attempts or []),
+        "vision_degraded": bool(obs.vision_degraded),
+        # RANK 1: the stored observation later turns/corrections re-ask on.
+        "observation_id": obs.id,
     }
