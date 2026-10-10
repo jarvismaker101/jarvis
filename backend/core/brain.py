@@ -5692,6 +5692,77 @@ _mi_chain_active = False
 _chain_memory_lock = threading.Lock()
 _last_chain_run = None
 
+#: R20 — the last chain step findings (the screen step's vision answer, the
+#: research step's summary). The folder-name answer arrives on a LATER turn
+#: when the chain worker is long gone, so its file write needs the findings
+#: the chain already produced — stored here, TTL'd, never persisted.
+_CHAIN_FINDINGS_TTL = 300.0
+_chain_last_findings = {"text": "", "at": 0.0}
+
+
+def _set_chain_findings(text):
+    """Remember the latest chain step output for a later follow-up."""
+    try:
+        with _chain_memory_lock:
+            _chain_last_findings["text"] = str(text or "")[:4000]
+            _chain_last_findings["at"] = time.time()
+    except Exception:
+        pass
+
+
+def _get_chain_findings():
+    """The recent chain findings, or "" when the window has lapsed."""
+    try:
+        with _chain_memory_lock:
+            state = dict(_chain_last_findings)
+    except Exception:
+        return ""
+    if time.time() - float(state.get("at") or 0.0) > _CHAIN_FINDINGS_TTL:
+        return ""
+    return str(state.get("text") or "")
+
+
+def _remember_user_turn(text):
+    """R20: a consumed action turn is a real user turn in the history.
+
+    The chat path always committed its halves, but chain/task/tool turns
+    never did — history held danging assistant notes with no request above
+    them, so a follow-up ("did you put it in that folder?") was answered
+    from a conversation the model literally could not see.
+    """
+    try:
+        if str(text or "").strip():
+            add_message("user", str(text))
+    except Exception:
+        pass
+
+
+def _remember_chain_step(result):
+    """R20: a finished chain step leaves its specifics in history.
+
+    The final [background result] report is a summary; the per-step notes
+    carry the identified label, the searched query and the armed file so a
+    later turn can resolve its referent against what actually happened.
+    """
+    try:
+        kind = str(result.get("kind") or "")
+        status = str(result.get("status") or "")
+        frag = str(result.get("fragment") or "").strip()
+        if not kind or not frag:
+            return
+        if kind == "screen" and status == "ok":
+            label = str(result.get("output_query") or "").strip()
+            note = ("I looked at your screen: %s" % (label or frag)) \
+                if label else frag
+        elif kind == "research" and status == "ok":
+            q = str(result.get("output_query") or "").strip()
+            note = ('I searched "%s" — %s' % (q, frag)) if q else frag
+        else:
+            note = frag
+        _remember_tool_summary(kind, note)
+    except Exception:
+        pass
+
 
 def _mi_clip(text, limit=600):
     text = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -6107,17 +6178,40 @@ def _mi_safe_folder_name(name):
     return name[:60]
 
 
+#: A folder name that is a POINTER ("by the name of this website", "the
+#: player you found") — not a literal. The findings extraction should name
+#: it, not the folder.
+_FOLDER_NAME_POINTER_RE = re.compile(
+    r"\b(?:this|that|these|those|it|whatever|website|site|player|song|"
+    r"video|movie|model|channel|creator)\b"
+    r"|\byou\s+(?:find|found|see|get|learn)\b",
+    re.IGNORECASE)
+
+
 def _mi_folder_name(clause):
     """The explicit folder name in the clause, or "" when it is unnamed."""
+    # R20: the FILE half of the clause ("…txt file by the name info…")
+    # names the FILE, not the folder — only the folder half (before any
+    # file mention) may name the folder.
+    head = re.split(
+        r"\b(?:txt|text|file|document|note|report)\b",
+        str(clause or ""), maxsplit=1, flags=re.IGNORECASE)[0]
     match = re.search(
-        r"\b(?:named|called|name\s+it)\s+([A-Za-z0-9_.\- ]{1,60})",
-        clause or "", re.IGNORECASE)
+        r"\b(?:named|called|name\s+it|by\s+the\s+name(?:\s+of)?|"
+        r"with\s+the\s+name(?:\s+of)?|in\s+the\s+name(?:\s+of)?)\s+"
+        r"([A-Za-z0-9_.\- ]{1,60})",
+        head, re.IGNORECASE)
     if not match:
         return ""
     name = match.group(1).strip().strip("\"'")
     name = re.split(
-        r"\s+(?:with|and|in|on|for|to|about|containing|that|which)\b",
+        r"\s+(?:with|and|in|on|for|to|by|about|containing|that|which)\b",
         name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    # R20: a pointer name ("by the name of this website") is not a literal —
+    # leave it to the findings extraction instead of naming the folder
+    # "of this website".
+    if _FOLDER_NAME_POINTER_RE.search(name):
+        return ""
     return _mi_safe_folder_name(name)
 
 
@@ -6170,7 +6264,7 @@ def _set_pending_folder_name(clause):
     global _pending_folder_name
     try:
         with _screen_topic_lock:
-            _pending_folder_name = {"text": str(clause or "")[:200],
+            _pending_folder_name = {"text": str(clause or "")[:400],
                                     "at": time.time()}
     except Exception:
         pass
@@ -6185,12 +6279,29 @@ def _clear_pending_folder_name():
         pass
 
 
-def _mi_file_request(clause):
+#: File content that is a POINTER to the findings ("the information you
+#: found", "your report") — the real findings must be substituted, not the
+#: pointer words written into the file.
+_FILE_CONTENT_POINTER_RE = re.compile(
+    r"\b(?:whatever|what)\s+you\s+(?:find|found|see|get|learn)\b"
+    r"|\byou\s+(?:found|find)\b"
+    r"|\byour\s+(?:report|findings|research|results|summary)\b"
+    r"|\bthe\s+(?:information|info|findings|results|report|research|"
+    r"summary|answer)\b",
+    re.IGNORECASE)
+
+
+def _mi_file_request(clause, fallback_content=""):
     """(file_name, content) for a file the clause asks for INSIDE the folder.
 
     "…create a txt file by the name info and inside that txt file write
     hello from jarvis" -> ("info.txt", "hello from jarvis"). Empty when the
     clause asks for no file.
+
+    R20: when the clause asks for a file but its content is a POINTER to the
+    findings ("write the information you found inside that txt file"), the
+    *fallback_content* (the chain's real findings) is written instead of
+    the pointer words — never conjured when the clause asks for no file.
     """
     text = str(clause or "")
     match = re.search(
@@ -6204,6 +6315,14 @@ def _mi_file_request(clause):
                       or "").strip()
     except Exception:
         content = ""
+    if content and _FILE_CONTENT_POINTER_RE.search(content):
+        content = ""
+    if not content:
+        asks_file = bool(re.search(
+            r"\b(?:txt|text|file|document|note|report)\b",
+            text, re.IGNORECASE))
+        if asks_file and str(fallback_content or "").strip():
+            content = str(fallback_content).strip()
     content = re.sub(
         r"\s+(?:inside|in|into)\s+(?:the|that|this)\s+"
         r"(?:txt\s+|text\s+)?file\.?$", "", content,
@@ -6234,6 +6353,18 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
     the file inside it — so the follow-up file work is never dropped.
     """
     name = _mi_folder_name(clause)
+    findings = ""
+    for idx in (step or {}).get("consumes") or []:
+        if 0 <= idx < len(results or []):
+            prior = results[idx]
+            if prior.get("status") == "ok":
+                findings = str(prior.get("output_content") or "")
+                if findings:
+                    break
+    if not findings:
+        # R20: the folder-name answer arrives on a LATER turn, after the
+        # chain worker is gone — the findings it produced are stored.
+        findings = _get_chain_findings()
     if not name and results:
         content = ""
         for idx in (step or {}).get("consumes") or []:
@@ -6281,7 +6412,7 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
             "reason": "Creating the folder %s." % name,
         }],
     }
-    file_name, file_content = _mi_file_request(clause)
+    file_name, file_content = _mi_file_request(clause, findings)
     if file_name and file_content:
         file_path = os.path.join(path, file_name)
         plan["summary"] = ("Creating the folder %s and writing %s inside it."
@@ -6334,8 +6465,29 @@ def consume_pending_folder_name(msg):
     if not name:
         return None
     print("[CHAIN] Folder name answer:", name)
-    result = _mi_folder_task_step(
-        text, "create a folder named %s" % name)
+    # R20: answer against the ORIGINAL clause, not a bare "create a folder
+    # named X" — the original also carries the file request ("…and inside
+    # that folder create a txt file by the name random…"), which a bare
+    # clause dropped, so the file half of the request silently vanished.
+    clause = str(state.get("text") or "").strip() or "create a folder"
+    if not _mi_folder_name(clause):
+        # The name rides on the FIRST folder mention so the folder half
+        # keeps it — an appended tail lands past the file mention, where
+        # the folder-name search never looks.
+        clause = re.sub(r"\b(folder|directory)\b", "folder named %s" % name,
+                       clause, count=1, flags=re.IGNORECASE)
+    if not _mi_folder_name(clause):
+        clause = "create a folder named %s. %s" % (name, clause)
+    result = _mi_folder_task_step(text, clause)
+    # R20: the "name it X" answer is a real turn — commit both halves so
+    # the armed folder is recallable later.
+    _remember_user_turn(text)
+    try:
+        add_message(
+            "assistant",
+            str(result.get("prompt") or result.get("fragment") or ""))
+    except Exception:
+        pass
     if result.get("status") == "armed":
         return result.get("prompt")
     return result.get("fragment")
@@ -6433,6 +6585,13 @@ def _run_multi_intent_chain(msg, plan):
                 results.append({"kind": step.get("kind"),
                                 "status": "skipped",
                                 "fragment": "I skipped an unknown step."})
+            # R20: every finished step leaves its specifics in history, and
+            # the latest real output is stored for a later follow-up turn
+            # (the folder-name answer arrives after the worker is gone).
+            _remember_chain_step(results[-1])
+            if results[-1].get("status") == "ok" \
+                    and results[-1].get("output_content"):
+                _set_chain_findings(results[-1]["output_content"])
     finally:
         try:
             _finish_multi_intent(plan, results)
@@ -7297,6 +7456,8 @@ def _process_message_inner(
     confirmed = None if is_status_question(msg) else _consume_confirmation(msg)
     _mark_latency_duration(request_id, "preroute_confirmation", _t)
     if confirmed is not None:
+        # R20: the confirmation answer is a real turn of the conversation.
+        _remember_user_turn(msg)
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, confirmed)
         return confirmed
@@ -7309,6 +7470,8 @@ def _process_message_inner(
                       else consume_task_confirmation(msg))
     _mark_latency_duration(request_id, "preroute_task_confirmation", _t)
     if task_confirmed is not None:
+        # R20: the "confirm" answer is a real turn of the conversation.
+        _remember_user_turn(msg)
         _record_native_task_outcome(msg)
         _clear_browser_clarification()
         if from_voice and sync_voice:
@@ -7377,6 +7540,14 @@ def _process_message_inner(
             if chain_reply is not None:
                 print("[CHAIN] multi-intent chain:",
                       [s.get("kind") for s in _chain.get("steps") or []])
+                # R20: the chain request is a real turn — commit both halves
+                # so a follow-up ("put the findings in that folder") has its
+                # referent instead of dangling assistant notes.
+                _remember_user_turn(msg)
+                try:
+                    add_message("assistant", chain_reply)
+                except Exception:
+                    pass
                 if from_voice and sync_voice:
                     sync_voice_log(voice_log_message, chain_reply)
                 return chain_reply
@@ -7490,6 +7661,7 @@ def _process_message_inner(
         (not is_explicit_command) and is_explicit_task_request(msg))
     _mark_latency_duration(request_id, "preroute_task_request", _t)
     if _explicit_task_request:
+        _remember_user_turn(msg)
         response = handle_task_message(msg, voice_compact=voice_compact)
         _record_native_task_outcome(msg)
         _disarm_other_gates_if_task_gate_armed()
@@ -7504,6 +7676,7 @@ def _process_message_inner(
         (not is_explicit_command) and is_code_tool_request(msg))
     _mark_latency_duration(request_id, "preroute_code_tool", _t)
     if _code_tool_request:
+        _remember_user_turn(msg)
         response = handle_task_message(msg, voice_compact=voice_compact)
         _record_native_task_outcome(msg)
         _disarm_other_gates_if_task_gate_armed()
@@ -7840,6 +8013,7 @@ def _process_message_inner(
                     except Exception:
                         pass
                 print("[TASK] Code-shaped task intent -> native task path:", msg)
+                _remember_user_turn(msg)
                 response = handle_task_message(msg, voice_compact=voice_compact)
                 _record_native_task_outcome(msg)
                 _disarm_other_gates_if_task_gate_armed()
@@ -7890,6 +8064,7 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, response)
             return response
+        _remember_user_turn(msg)
         response = handle_task_message(msg, voice_compact=voice_compact)
         _record_native_task_outcome(msg)
         _disarm_other_gates_if_task_gate_armed()
@@ -7914,6 +8089,7 @@ def _process_message_inner(
                     except Exception:
                         pass
                 print("[TASK] Code-tool safety net -> task path:", msg)
+                _remember_user_turn(msg)
                 response = handle_task_message(msg, voice_compact=voice_compact)
                 _record_native_task_outcome(msg)
                 _disarm_other_gates_if_task_gate_armed()

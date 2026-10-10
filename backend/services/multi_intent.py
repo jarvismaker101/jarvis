@@ -180,25 +180,21 @@ def build_chain(text):
             merged[-1]["text"] = merged[-1]["text"] + " and " + clause
             continue
         merged.append({"kind": kind, "text": clause})
-    # Live fix: ONE clause that both points at the screen and asks to
-    # research it ("research about this verse on my screen from bhagwat
-    # gita and tell me what does it actually say") is really two jobs —
-    # look at the screen, then research what was seen. Without this the
-    # whole sentence was typed into the web.
-    if (len(merged) == 1 and merged[0]["kind"] == "screen"
-            and _RESEARCH_RE.search(merged[0]["text"])):
-        merged = [
-            {"kind": "screen", "text": merged[0]["text"]},
-            {"kind": "research", "text": merged[0]["text"]},
-        ]
-        steps = [
-            {"kind": "screen", "text": merged[0]["text"], "index": 0,
-             "consumes": []},
-            {"kind": "research", "text": merged[1]["text"], "index": 1,
-             "consumes": [0]},
-        ]
-        return {"ok": True, "steps": steps, "source": raw,
-                "command_text": raw}
+    # Live fix (general): ONE clause that both points at the screen and asks
+    # to research it ("find out who this player on my screen is by
+    # researching on the internet, and create a folder…") is TWO jobs even
+    # when more clauses follow — without this the research half of the
+    # request silently died and only the screen look ran. A screen clause
+    # that carries research markers gains a research sibling right after it
+    # (unless the next clause is already its own research step).
+    expanded = []
+    for i, m in enumerate(merged):
+        expanded.append(m)
+        if (m["kind"] == "screen" and _RESEARCH_RE.search(m["text"])
+                and not (i + 1 < len(merged)
+                         and merged[i + 1]["kind"] == "research")):
+            expanded.append({"kind": "research", "text": m["text"]})
+    merged = expanded
     if len(merged) < 2 or len(merged) > _MAX_STEPS:
         return None
     kinds = [m["kind"] for m in merged]

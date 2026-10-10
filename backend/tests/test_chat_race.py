@@ -290,15 +290,17 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         self.assertEqual(hist[1]["content"], resp)
 
     def test_build_chat_messages_voice_compact_trims_history(self):
-        # 20 history messages -> only last 6 in LLM messages
+        # MAX_HISTORY history messages -> only last 6 in LLM messages
         from backend.core.memory import clear_history, add_message, get_history
+        from backend.core import memory as memory_mod
         clear_history()
-        for i in range(20):
+        pairs = memory_mod.MAX_HISTORY // 2 + 10
+        for i in range(pairs):
             add_message("user", f"msg {i}")
             add_message("assistant", f"reply {i}")
-        # get_history returns last 20 (capped)
+        # get_history returns last MAX_HISTORY (capped)
         all_hist = get_history()
-        self.assertEqual(len(all_hist), 20)
+        self.assertEqual(len(all_hist), memory_mod.MAX_HISTORY)
         # voice_compact True -> only last 6
         with patch.object(brain, "search_internet", return_value=None):
             built = brain._build_chat_messages("final question", voice_compact=True)
@@ -311,11 +313,11 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         # should be last 6 of all_hist
         expected = all_hist[-6:]
         self.assertEqual(history_part, expected)
-        # non-voice keeps full 20
+        # non-voice keeps full MAX_HISTORY
         with patch.object(brain, "search_internet", return_value=None):
             built2 = brain._build_chat_messages("final question", voice_compact=False)
         msgs2 = built2["messages"]
-        self.assertEqual(len(msgs2[1:]), 20)
+        self.assertEqual(len(msgs2[1:]), memory_mod.MAX_HISTORY)
         self.assertEqual(msgs2[1:], all_hist)
         # also check search_info branch with voice_compact
         with patch.object(brain, "search_internet", return_value="some search info that is long enough to trigger browser? no"):

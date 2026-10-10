@@ -35,7 +35,10 @@ except Exception:  # pragma: no cover - config import fallback
 
     BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-MAX_HISTORY = 20
+#: R20 — 40 turns: every chain/task turn now commits its user half AND its
+#: per-step notes, so 20 slots held only ~7 real exchanges before the older
+#: half of a working session rolled off exactly when a follow-up needed it.
+MAX_HISTORY = 40
 _MEMORY_FILE = BASE_DIR / "data" / "conversation_history.json"
 
 #: P0-11 — how long the writer waits for the burst of appends that is a turn

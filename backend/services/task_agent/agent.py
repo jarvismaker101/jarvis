@@ -661,11 +661,24 @@ def _active_window_title(context):
 def gather_context():
     windows = windows_connector.snapshot()
     title = windows.get("active_window", {}).get("title", "")
-    return {
+    context = {
         "windows": windows,
         "editor": editor_bridge.snapshot(active_window_title=title),
         "browser": browser_cdp.snapshot(),
     }
+    # R20: the recent conversation is context too — "create a file in that
+    # folder" resolves against the folder the previous turn created. Bounded
+    # (12 turns, 240 chars each) so it can never flood the planner prompt.
+    try:
+        from backend.core.memory import get_history
+        context["history"] = [
+            {"role": str(m.get("role") or "")[:12],
+             "content": str(m.get("content") or "")[:240]}
+            for m in (get_history() or [])[-12:]
+        ]
+    except Exception:  # noqa: BLE001 - memory must never block a task
+        context["history"] = []
+    return context
 
 
 def _summarize_context(context):
@@ -2014,6 +2027,24 @@ def _build_planner_prompt(command, context, observations=None):
                                     default=str)[:6000])
         except Exception:  # noqa: BLE001 - never fail planning over this
             observations_block = ""
+    # R20: the recent conversation grounds references — "that folder",
+    # "the file you made", "it" — against the REAL paths and results of the
+    # turns before this one.
+    history_block = ""
+    turns = list((context or {}).get("history") or [])
+    if turns:
+        try:
+            lines = []
+            for t in turns:
+                role = "User" if str(t.get("role")) == "user" else "Jarvis"
+                lines.append("%s: %s" % (role, str(t.get("content") or "")))
+            history_block = (
+                "\nRECENT CONVERSATION (resolve references like 'that "
+                "folder', 'the file you made', 'it' against these REAL "
+                "paths and results):\n%s\n" % "\n".join(lines)[:2400]
+            )
+        except Exception:  # noqa: BLE001 - never fail planning over this
+            history_block = ""
     return (
         "You are Jarvis Task Brain, a connector-first computer control planner.\n"
         "You are not watching a video feed. You are inside the app through structured connectors.\n"
@@ -2059,6 +2090,7 @@ def _build_planner_prompt(command, context, observations=None):
         "Set requires_confirmation true for login/logout, destructive edits, purchases, sending, deleting, closing, settings changes, installs, or unknown-risk multi-step changes.\n"
         "If a required connector is unavailable, produce the best safe first step and explain the missing connector in response.\n\n"
         f"{fs_context}\n"
+        f"{history_block}"
         f"{observations_block}"
         f"USER TASK:\n{command}\n\n"
         f"CONNECTOR CONTEXT:\n{compact_context}\n"
@@ -4678,8 +4710,61 @@ def last_task_result():
         return _last_task_result
 
 
+#: R20 — "Folder ready: <path>" as the history records a created folder.
+_FOLDER_READY_RE = re.compile(
+    r"[Ff]older ready:\s*([A-Za-z]:[^\n]+?)(?:\.\s*$|\.$|$)")
+#: A folder pointer in a later request ("create a file in that folder").
+_FOLDER_REF_RE = re.compile(
+    r"\b(?:in|inside|into)\s+(?:that|the|this)\s+(?:folder|directory)\b"
+    r"|\b(?:that|the)\s+(?:folder|directory)\s+(?:you\s+)?(?:just\s+)?"
+    r"(?:made|created|maked)\b",
+    re.IGNORECASE)
+
+
+def _last_created_folder():
+    """The most recent folder the conversation says it created (and exists)."""
+    try:
+        from backend.core.memory import get_history
+        for m in reversed(get_history() or []):
+            match = _FOLDER_READY_RE.search(str(m.get("content") or ""))
+            if not match:
+                continue
+            path = match.group(1).strip().rstrip(". ")
+            if os.path.isdir(path):
+                return path
+    except Exception:  # noqa: BLE001 - history must never block a task
+        pass
+    return ""
+
+
+def _resolve_folder_references(command):
+    """Substitute folder POINTERS with the real path just created.
+
+    "create a txt file in that folder" becomes "create a txt file in
+    C:\\...\\information" when the previous turn's history recorded that
+    folder — so the plan writes inside the folder the user means, instead
+    of guessing a Desktop path. History-less or folder-less turns return
+    the command unchanged.
+    """
+    text = str(command or "")
+    folder = _last_created_folder()
+    if not folder or not _FOLDER_REF_RE.search(text):
+        return text
+
+    def _sub(match):
+        head = match.group(0).lower()
+        if head.startswith(("in ", "inside ", "into ")):
+            return "in " + folder
+        return folder
+
+    return _FOLDER_REF_RE.sub(_sub, text)
+
+
 def handle_task_message(text, voice_compact=False):
     command = _strip_task_prefix(text)
+    # R20: resolve "that folder" against the folder the conversation just
+    # created before any planning sees it.
+    command = _resolve_folder_references(command)
     # A fresh run must not look like the previous one's result.
     _remember_task_result(None)
     context = gather_context()
