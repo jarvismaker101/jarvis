@@ -77,6 +77,34 @@ OUTPUT_LATENCY = "low"
 #: newer one, no matter how the ring is drained.
 Chunk = namedtuple("Chunk", "key generation pcm")
 
+#: [LIVE FIX 11] A start landing shortly after an abort hits MME's "media data
+#: is still playing" state (PaErrorCode -9999, "...wait until the data is
+#: finished playing", MME error 33): ``Pa_AbortStream`` is asynchronous at the
+#: driver, so the device needs a beat before it accepts a new start. Retrying
+#: briefly is the driver's own documented cure; without it EVERY sentence
+#: after a barge-in failed its primary start and the reply dropped onto the
+#: fragile per-sentence fallback chain — which sometimes plays, sometimes
+#: double-plays, and sometimes goes silent entirely.
+START_RETRY_ATTEMPTS = 5
+START_RETRY_DELAY_SECONDS = 0.08
+
+
+def _start_with_retry(stream):
+    """Start *stream*, retrying briefly over a transient device-busy state.
+
+    Raises the last error when every attempt fails, so callers can reopen a
+    genuinely dead device instead of looping on it.
+    """
+    for attempt in range(START_RETRY_ATTEMPTS):
+        try:
+            stream.start()
+            return
+        except Exception:
+            if attempt + 1 >= START_RETRY_ATTEMPTS:
+                raise
+            time.sleep(START_RETRY_DELAY_SECONDS)
+
+
 _stream_lock = threading.Lock()
 _stream_factory_override = None
 
@@ -111,7 +139,10 @@ class SoundDeviceStream:
         # from its ``with`` statement, never from ``__init__``, so it has to
         # be done explicitly here. Without this every ``write()`` raises and
         # NO audio is ever heard, whatever engine produced the PCM.
-        self._stream.start()
+        #
+        # [LIVE FIX 11] The start is retried briefly: a fresh open right after
+        # a barge-in can hit MME's "media data is still playing" state.
+        _start_with_retry(self._stream)
         #: [P0-07] A long-lived device is *aborted* on every barge-in, and
         #: abort() leaves a PortAudio stream stopped - so the next utterance
         #: must start it again before it can write. Tracking it here means the
@@ -121,7 +152,8 @@ class SoundDeviceStream:
     def ensure_started(self):
         """Start the stream if an abort left it stopped. Idempotent."""
         if not self._started:
-            self._stream.start()
+            # [LIVE FIX 11] Retry over the driver's post-abort busy window.
+            _start_with_retry(self._stream)
             self._started = True
 
     def write(self, pcm_bytes):
@@ -254,7 +286,8 @@ def make_sounddevice_factory(device=None, samplerate=DEFAULT_SAMPLE_RATE,
                                  latency="high")
         # Same reason as SoundDeviceStream.__init__: a blocking PortAudio
         # stream must be started before Pa_WriteStream will accept data.
-        stream.start()
+        # [LIVE FIX 11] Retried over the driver's post-abort busy window.
+        _start_with_retry(stream)
         return RawPcmStream(stream, channels=channels)
 
     return _factory
@@ -499,7 +532,18 @@ class AudioActor:
             stream = self._factory()
             self._persistent = stream
             self._persistent_sd = binding
-        stream.ensure_started()
+        try:
+            stream.ensure_started()
+        except Exception:
+            # [LIVE FIX 11] Even after the bounded retry the cached device
+            # refuses to start (driver reset, device swapped mid-abort,
+            # wedged MME state): replace it once, exactly as a dead write
+            # does, instead of dropping the whole reply onto the
+            # per-sentence fallback ladder.
+            fresh = self._reopen_persistent_stream()
+            if fresh is None:
+                raise
+            return fresh
         return stream
 
     def _reopen_persistent_stream(self):

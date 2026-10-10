@@ -272,8 +272,18 @@ def _speak_local(clean, generation, play_earcon=True):
 
         if play_earcon:
             play_reply_start_earcon()
+        started = time.monotonic()
         engine.say(clean)
         engine.runAndWait()
+        elapsed = time.monotonic() - started
+        # [LIVE FIX 11] In hidden sessions pyttsx3/SAPI5 can return almost
+        # instantly while playing NOTHING. A long chunk that took a blink
+        # did not talk — report the failure so the ladder still tries the
+        # remote engines instead of treating silence as spoken.
+        if len(clean) > 10 and elapsed < 0.8:
+            print("[VOICE] local TTS returned in %.2fs for %d chars — "
+                  "no audio, treating as failure" % (elapsed, len(clean)))
+            return False
         return True
     except Exception:
         print("[VOICE] Local TTS error:")

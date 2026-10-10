@@ -1410,7 +1410,11 @@ def _play_via_sounddevice(audio):
                 print("[FISH] sounddevice playback interrupted")
             else:
                 print("[FISH] sounddevice 48k playback done")
-            return ok
+            # [LIVE FIX 11] A partial play (ring backpressure) must never
+            # re-speak the sentence's head through simpleaudio: once the
+            # actor has written PCM for THIS utterance, audio reached the
+            # device — report success exactly like the streaming path does.
+            return ok or _actor_heard_audio()
 
         return False
     except Exception as e:
