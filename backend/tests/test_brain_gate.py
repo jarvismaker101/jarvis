@@ -592,6 +592,68 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
         handoff.assert_not_called()
         task_msg.assert_not_called()
 
+    def test_relook_after_failed_replicate_arms_not_chat(self):
+        # Live log: the replicate failure says "keep the folders visible and
+        # ask me again" — "look again you will see" then fell into chat,
+        # which improvised "please ensure the folder structure is fully
+        # visible". The re-look gate must answer it instead.
+        brain._mi_remember_replicate_attempt("replicate it", False)
+        self.addCleanup(brain._mi_replicate_last.update,
+                        {"text": "", "at": 0.0, "read_ok": False})
+        with patch.object(brain, "classify_intent",
+                          return_value=self._chat_verdict()), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "_mi_replicate_relook_reply",
+                          return_value="Armed — one confirmation.") as relook, \
+             patch.object(brain, "handle_chat") as chat:
+            response = brain.process_message("look again you will see",
+                                             sync_voice=False)
+        relook.assert_called_once()
+        self.assertEqual(response, "Armed — one confirmation.")
+        chat.assert_not_called()
+
+    def test_confirm_task_with_nothing_pending_gets_the_honest_line(self):
+        # Live log: a hallucinated chat reply imitated the "[task] … Say
+        # confirm task to proceed" arm format; "confirm task" had nothing
+        # pending and the chat model invented "specify the source folder".
+        with patch.object(brain, "classify_intent",
+                          return_value=self._chat_verdict()), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "_last_offer", None), \
+             patch.object(brain, "_get_pending_screen_clarify",
+                          return_value=None), \
+             patch.object(brain, "handle_chat") as chat:
+            response = brain.process_message("confirm task",
+                                             sync_voice=False)
+        self.assertIn("no task waiting", response.lower())
+        chat.assert_not_called()
+
+    def test_decline_with_a_restate_falls_through(self):
+        # Live log: "no , that taskflowapp that you read from screen ,
+        # create a duplicate of it on desktop" — the decline swallowed the
+        # whole turn and the restated replicate request died.
+        brain._pending_opencode_task = {
+            "task_description": "Create a new folder on the desktop",
+            "original_message": "create this folder for me on desktop",
+            "expires": time.time() + 300, "contract": None}
+        self.addCleanup(setattr, brain, "_pending_opencode_task", None)
+        reply = brain._consume_opencode_confirmation(
+            "no , that taskflowapp that you read from screen , create a "
+            "duplicate of it on desktop")
+        self.assertIsNone(reply)
+        self.assertIsNone(brain._pending_opencode_task)
+
+    def test_plain_decline_still_skips(self):
+        brain._pending_opencode_task = {
+            "task_description": "Create a new folder on the desktop",
+            "original_message": "create this folder for me on desktop",
+            "expires": time.time() + 300, "contract": None}
+        self.addCleanup(setattr, brain, "_pending_opencode_task", None)
+        reply = brain._consume_opencode_confirmation("no skip it")
+        self.assertIn("skip", reply.lower())
+
 
 class ScreenQuestionNetTests(unittest.TestCase):
     """Round 16: deterministic screen-question net fires when the cloud

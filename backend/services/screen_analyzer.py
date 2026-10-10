@@ -199,6 +199,10 @@ _ANALYSIS_PROMPT = (
     "Study the screenshot carefully and answer the user's question. "
     "You have NO internet access: never claim to have searched, checked or "
     "verified anything. Work only from what is visible in the screenshot.\n\n"
+    "Never answer that you cannot create files or folders — you can, "
+    "through your task routes — and never offer command-line steps instead. "
+    "When the user asks to recreate, copy or duplicate something visible, "
+    "describe it and tell them to just ask you to recreate it.\n\n"
     "Return a JSON object with exactly these keys:\n"
     '  "tip"  — A concise, direct answer to the user\'s question (1-3 sentences max).\n'
     '  "evidence" — A JSON array of 0-3 supporting detail objects, each with:\n'
@@ -913,19 +917,29 @@ def get_observation(obs_id):
 #: computer. Names are copied exactly; nesting comes from the display.
 _PROJECT_TREE_PROMPT = (
     "Screen-reading task: the user wants the folder structure visible on "
-    "this screen recreated on their computer. Look at any file tree, folder "
-    "hierarchy or directory listing shown (file explorer sidebar, editor "
-    "explorer panel, terminal tree output, archive contents). Reply with "
-    'JSON only, exactly: {"folders": [{"name": "<exact displayed folder '
-    'name>", "depth": 0}], "files": [{"name": "<exact displayed file name '
-    "with extension>\", \"folder\": \"<the folder it sits in, as displayed; "
+    "this screen recreated on their computer. A file tree is often in a "
+    "SIDEBAR or PANEL, not the main area — check the left and right edges, "
+    "the editor's explorer panel, open terminal output, archive windows and "
+    "any listing before concluding there is none. If you see ANY folder or "
+    "file listing anywhere, report it; only reply with the empty object "
+    "when genuinely NO listing exists on the whole screen.\n\n"
+    'Reply with JSON only, exactly: {"folders": [{"name": "<exact displayed '
+    'folder name>", "depth": 0}], "files": [{"name": "<exact displayed file '
+    'name with extension>", "folder": "<the folder it sits in, as displayed; '
     'empty string at the top level>"}]} — one entry per FOLDER in the first '
     "array, top to bottom as displayed, depth 0 for a top-level folder and "
     "+1 for each nesting level of indentation shown; one entry per FILE in "
     'the second array (never folders). Copy every name character by '
     'character; never put a path inside "name", never list files in the '
     'folders array, never add commentary. Files at the top level use an '
-    'empty "folder". If no folder structure is visible, reply '
+    'empty "folder".\n\n'
+    "FORMAT example only — never copy these names: a structure showing a "
+    "top folder 'myapp' containing 'src' with 'index.js' and a top-level "
+    "'README.md' is "
+    '{"folders": [{"name": "myapp", "depth": 0}, {"name": "src", "depth": 1}], '
+    '"files": [{"name": "index.js", "folder": "src"}, '
+    '{"name": "README.md", "folder": ""}]}.\n\n'
+    'If no folder or file listing is visible ANYWHERE on the screen, reply '
     '{"folders": [], "files": []}.'
 )
 
@@ -982,6 +996,10 @@ def extract_project_tree(obs):
             "message", {}).get("content", "") or ""
         parsed = _extract_json(content)
         if isinstance(parsed, list):
+            if not parsed:
+                flat = re.sub(r"\s+", " ", content).strip()[:200]
+                print("[SCREEN] Project-tree read: %s returned an empty list "
+                      "(reply: %s)" % (attempts.get("provider") or "?", flat))
             return _flatten_tree_entries(parsed), []
         if not isinstance(parsed, dict) or not parsed:
             flat = re.sub(r"\s+", " ", content).strip()[:200]
@@ -991,6 +1009,14 @@ def extract_project_tree(obs):
         folders = _flatten_tree_entries(parsed.get("folders"))
         files = parsed.get("files")
         files = files if isinstance(files, list) else []
+        if not folders:
+            # Parsed-but-empty is the quiet killer: a valid JSON object with
+            # an empty folders array (the prompt's own give-up shape) used to
+            # read as "no structure" with NO trace anywhere. Always leave a
+            # line with the provider and what it actually said.
+            flat = re.sub(r"\s+", " ", content).strip()[:200]
+            print("[SCREEN] Project-tree read: %s returned 0 folders "
+                  "(reply: %s)" % (attempts.get("provider") or "?", flat))
         return folders, files
     except Exception as exc:
         logging.warning("[SCREEN] Project-tree read failed: %s", exc)

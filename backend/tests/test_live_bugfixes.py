@@ -475,6 +475,34 @@ class ScreenAnalyzerNoGroqPreconditionTests(LiveBugfixBase):
         self.assertEqual(result["tip"], "fallback answer")
 
 
+class ChatWorkLogLeakTests(unittest.TestCase):
+    """A chat reply that imitates the internal work-log format is replaced.
+
+    Live log: the chat model answered "yes" with a hallucinated task arm
+    ("[task] read folder structure from screen … Say confirm task to
+    proceed, or cancel.[background result] …") — copied from persisted
+    history entries. Such a reply is never a real arm; the honest no-task
+    line replaces it.
+    """
+
+    def test_an_imitated_task_arm_is_replaced(self):
+        leaked = ("[task] read folder structure from screen and create "
+                  "duplicate on desktop — windows.screen_action — I can "
+                  "capture your screen and create the exact duplicate on "
+                  "your desktop. Say confirm task to proceed, or cancel."
+                  "[background result] windows.screen_action — I can "
+                  "capture your screen and create the exact duplicate.")
+        out = brain._finalize_chat_reply("yes", leaked, [], None, False, None)
+        self.assertNotIn("[task]", out)
+        self.assertNotIn("[background result]", out)
+        self.assertIn("nothing was started", out.lower())
+
+    def test_a_normal_reply_is_untouched(self):
+        out = brain._finalize_chat_reply("hi jarvis", "Hello, sir.",
+                                         [], None, False, None)
+        self.assertEqual(out, "Hello, sir.")
+
+
 class DanglingChatHistoryTests(unittest.TestCase):
     """A persisted unanswered turn must never absorb the next reply.
 

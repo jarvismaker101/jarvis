@@ -200,6 +200,52 @@ class FollowupMatcherTests(unittest.TestCase):
             with self.subTest(msg=msg):
                 self.assertFalse(brain._MI_FOLLOWUP_FILES_RE.search(msg))
 
+    def test_demonstrative_and_duplicate_followups_match(self):
+        # Live log: "create this folder for me on desktop" and "create the
+        # duplicate on desktop" both fell out of the follow-up matcher and
+        # went to a generic opencode arm / chat.
+        for msg in ("create this folder for me on desktop",
+                    "create this exact folder on my desktop",
+                    "create the duplicate on desktop",
+                    "create the duplicate of it on desktop",
+                    "create these folders on my desktop",
+                    "make that folder on my desktop"):
+            with self.subTest(msg=msg):
+                self.assertTrue(brain._MI_FOLLOWUP_RE.search(msg))
+
+
+class ProseTreeTests(unittest.TestCase):
+    """The screen answer's own words fall back to a usable tree."""
+
+    def test_the_taskflowapp_answer_parses(self):
+        qa = ("Sir, I can see the folder structure on your screen \u2014 "
+              "it's a project called **TaskFlowApp** with subfolders "
+              "`src/`, `public/`, `tests/`, `docs/` and files like "
+              "`package.json`, `.gitignore`, `server.js`, `README.md`, "
+              "`index.js`, `styles.css`, `index.html`, `.env.example`.")
+        tree, files = brain._mi_tree_from_prose(qa)
+        self.assertEqual(tree[0], "TaskFlowApp")
+        self.assertIn(os.path.join("TaskFlowApp", "src"), tree)
+        self.assertIn(os.path.join("TaskFlowApp", "public"), tree)
+        self.assertIn(os.path.join("TaskFlowApp", "package.json"), files)
+        self.assertIn(os.path.join("TaskFlowApp", ".gitignore"), files)
+        self.assertIn(os.path.join("TaskFlowApp", ".env.example"), files)
+
+    def test_no_root_means_no_tree(self):
+        self.assertEqual(
+            brain._mi_tree_from_prose(
+                "with subfolders `src/` and files like `a.js`."),
+            ([], []))
+
+    def test_apostrophes_do_not_scramble_the_scan(self):
+        # Live bug: the apostrophe in "it's" paired with the next backtick
+        # and shifted every following quote pair — the names came out as
+        # prose fragments. Only backticks and double quotes are delimiters.
+        qa = "it's a folder called proj containing `src/` and `index.js`."
+        tree, files = brain._mi_tree_from_prose(qa)
+        self.assertEqual(tree, ["proj", os.path.join("proj", "src")])
+        self.assertEqual(files, [os.path.join("proj", "index.js")])
+
 
 class StructureFollowupTests(unittest.TestCase):
     """_mi_replicate_followup_reply resolves the anaphoric creates."""
@@ -211,6 +257,8 @@ class StructureFollowupTests(unittest.TestCase):
         brain._mi_structure_state.update(
             {"tree": [], "files": [], "base": "", "roots": {},
              "obs_id": "", "at": 0.0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False})
 
     def _remember(self, tree, files=(), roots=None, obs_id="obs1"):
         brain._mi_remember_structure(list(tree), list(files),
@@ -315,6 +363,173 @@ class StructureFollowupTests(unittest.TestCase):
                 self.assertIsNone(reply)
                 self.assertIsNone(plan)
 
+    def test_demonstrative_folder_arms_from_memory(self):
+        # Live log: "create this folder for me on desktop" (referring to the
+        # TaskFlowApp just read) fell out of the follow-up matcher and armed
+        # a generic "Create a new folder on the desktop".
+        self._remember(["proj"], files=["proj/index.js"])
+        reply, plan = self._reply("create this folder for me on desktop")
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["tool"] for s in plan["steps"]],
+                         ["code.create_folder"])
+
+    def test_demonstrative_folder_without_a_referent_stays_normal(self):
+        # No remembered structure and no recent attempt: "this folder" has
+        # no referent, so the normal create flow keeps the turn.
+        reply, plan = self._reply("create this folder for me on desktop")
+        self.assertIsNone(reply)
+        self.assertIsNone(plan)
+
+    def test_demonstrative_folder_after_a_failed_attempt_re_reads(self):
+        brain._mi_remember_replicate_attempt(
+            "replicate it on my desktop", False)
+        captured = {}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        with patch.object(brain, "_mi_extract_project_tree",
+                          return_value=(["proj"], ["proj/index.js"])), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm), \
+             patch.object(task_agent, "confirmation_prompt",
+                          return_value="PROMPT"), \
+             patch.object(task_agent, "has_pending_task_confirmation",
+                          return_value=False):
+            reply = brain._mi_replicate_followup_reply(
+                "create this folder for me on desktop")
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(captured.get("plan"))
+
+    def test_duplicate_followup_arms_from_memory(self):
+        self._remember(["proj"])
+        reply, plan = self._reply("create the duplicate on desktop")
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(plan)
+
+
+class ScreenCompoundTests(unittest.TestCase):
+    """A screen answer that ALSO asks to create what it saw arms too."""
+
+    def test_the_live_sentence_is_a_compound(self):
+        msg = ("what do you mean path? , all i want is for you to create "
+               "this exact folder visible on my screen on desktop")
+        self.assertTrue(brain._mi_screen_create_compound_request(msg))
+
+    def test_plain_screen_questions_are_not_compounds(self):
+        for msg in ("what is on my screen",
+                    "look at this folder structure on my screen",
+                    "create a folder named demo"):
+            with self.subTest(msg=msg):
+                self.assertFalse(brain._mi_screen_create_compound_request(msg))
+
+    def test_the_worker_arms_and_delivers_async(self):
+        class _SyncThread:
+            def __init__(self, target=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with patch.object(brain.threading, "Thread", _SyncThread), \
+             patch.object(brain, "_mi_replicate_read_and_arm",
+                          return_value="PROMPT") as arm, \
+             patch.object(brain, "_notify_async_reply") as notify:
+            brain._start_screen_replicate_arm("msg", "obs1", "qa answer")
+        arm.assert_called_once_with("msg", obs_id="obs1",
+                                    source_content="qa answer")
+        notify.assert_called_once_with("PROMPT")
+
+    def test_the_read_reuses_the_given_observation(self):
+        captured = {}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        with patch.object(brain, "_mi_extract_project_tree",
+                          return_value=(["proj"], [])) as extract, \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": "C:\\fake\\desktop"}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm), \
+             patch.object(task_agent, "confirmation_prompt",
+                          return_value="PROMPT"), \
+             patch.object(task_agent, "has_pending_task_confirmation",
+                          return_value=False):
+            reply = brain._mi_replicate_read_and_arm(
+                "msg", obs_id="obs1", source_content="qa answer")
+        extract.assert_called_once_with("obs1")
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(captured.get("plan"))
+
+
+class ReplicateRelookTests(unittest.TestCase):
+    """The retry the failure reply invites ("look again") re-reads + arms."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        task_agent._pending_task_action = None
+        brain._mi_structure_state.update(
+            {"tree": [], "files": [], "base": "", "roots": {},
+             "obs_id": "", "at": 0.0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False})
+
+    def test_relook_without_a_recent_attempt_returns_none(self):
+        self.assertIsNone(
+            brain._mi_replicate_relook_reply("look again you will see"))
+
+    def test_non_relook_messages_return_none(self):
+        brain._mi_remember_replicate_attempt("x", False)
+        for msg in ("hello", "create a folder named demo",
+                    "what is on my screen"):
+            with self.subTest(msg=msg):
+                self.assertIsNone(brain._mi_replicate_relook_reply(msg))
+
+    def test_relook_after_a_failed_attempt_rearms(self):
+        brain._mi_remember_replicate_attempt(
+            "look at this folder structure on my screen , create a "
+            "duplicate of this on my desktop", False)
+        captured = {}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        with patch.object(brain, "capture_stored_observation",
+                          return_value=_FakeObs(obs_id="obs9")), \
+             patch.object(brain, "_mi_extract_project_tree",
+                          return_value=(["proj"], ["proj/index.js"])), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm), \
+             patch.object(task_agent, "confirmation_prompt",
+                          return_value="PROMPT"), \
+             patch.object(task_agent, "has_pending_task_confirmation",
+                          return_value=False):
+            reply = brain._mi_replicate_relook_reply(
+                "its visible now , look again")
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(captured.get("plan"))
+        self.assertEqual(brain._mi_structure_state["obs_id"], "obs9")
+
+    def test_relook_failure_stays_honest(self):
+        brain._mi_remember_replicate_attempt("x", False)
+        with patch.object(brain, "capture_stored_observation",
+                          return_value=_FakeObs(obs_id="obs9")), \
+             patch.object(brain, "_mi_extract_project_tree",
+                          return_value=([], [])):
+            reply = brain._mi_replicate_relook_reply(
+                "look again you will see")
+        self.assertIn("couldn't read a folder structure", reply)
+
 
 class ReplicateIntentGateTests(unittest.TestCase):
     """The original sentence routes by the user's OWN words (live fix).
@@ -335,6 +550,8 @@ class ReplicateIntentGateTests(unittest.TestCase):
         brain._mi_structure_state.update(
             {"tree": [], "files": [], "base": "", "roots": {},
              "obs_id": "", "at": 0.0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False})
 
     def _reply(self, msg, tree=("proj",), files=("proj/index.js",)):
         captured = {}
@@ -380,6 +597,15 @@ class ReplicateIntentGateTests(unittest.TestCase):
         self.assertEqual(brain._mi_structure_state["files"],
                          ["proj/index.js"])
 
+    def test_files_named_in_the_request_join_the_one_plan(self):
+        reply, plan = self._reply(
+            "replicate the structure visible at my screen on my desktop "
+            "with all the subfolders and files")
+        self.assertEqual(reply, "PROMPT")
+        tools = [s["tool"] for s in plan["steps"]]
+        self.assertIn("code.create_folder", tools)
+        self.assertIn("code.write_file", tools)
+
     def test_an_existing_root_is_never_overwritten(self):
         os.makedirs(os.path.join(self._tmp.name, "proj"))
         reply, plan = self._reply(
@@ -421,15 +647,18 @@ class ReplicateTaskStepTests(unittest.TestCase):
         brain._mi_structure_state.update(
             {"tree": [], "files": [], "base": "", "roots": {},
              "obs_id": "", "at": 0.0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False})
 
-    def _run(self, tree, files=(), results=None, consumes=None):
+    def _run(self, tree, files=(), results=None, consumes=None,
+             msg="replicate it exactly on my desktop"):
         captured = {}
 
         def fake_arm(plan, context, task_text=""):
             captured["plan"] = plan
             return object()
 
-        step = {"kind": "task", "text": "replicate it exactly on my desktop",
+        step = {"kind": "task", "text": msg,
                 "consumes": [0] if consumes is None else consumes}
         if results is None:
             results = [{"kind": "screen", "status": "ok",
@@ -444,8 +673,7 @@ class ReplicateTaskStepTests(unittest.TestCase):
                           return_value="PROMPT"), \
              patch.object(task_agent, "has_pending_task_confirmation",
                           return_value=False):
-            result = brain._mi_replicate_task_step(
-                "replicate it exactly on my desktop", step, results)
+            result = brain._mi_replicate_task_step(msg, step, results)
         return result, captured.get("plan")
 
     def test_armed_plan_creates_every_folder_parents_first(self):
@@ -489,6 +717,35 @@ class ReplicateTaskStepTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("couldn't read a folder structure", result["fragment"])
         self.assertIsNone(plan)
+
+    def test_prose_fallback_arms_from_the_screen_answer(self):
+        # Live log: the JSON tree read came back empty at every stage while
+        # the screen step's own QA answer plainly described the structure —
+        # the step must parse the answer instead of failing.
+        qa = ("it's a project called TaskFlowApp with subfolders `src/`, "
+              "`public/` and files like `package.json`, `server.js`.")
+        results = [{"kind": "screen", "status": "ok",
+                    "output_obs_id": "obs1", "output_content": qa}]
+        result, plan = self._run(
+            [], results=results,
+            msg=("replicate it exactly on my desktop with all the "
+                 "subfolders and files"))
+        self.assertEqual(result["status"], "armed")
+        tools = [s["tool"] for s in plan["steps"]]
+        self.assertEqual(tools.count("code.create_folder"), 3)
+        self.assertEqual(tools.count("code.write_file"), 2)
+
+    def test_files_named_in_the_request_join_the_one_plan(self):
+        # "with all the subfolders and files" — the user asked for the file
+        # half in the SAME sentence; the ONE confirmation includes it.
+        msg = ("create a duplicate of this on my desktop with all the "
+               "subfolders and files")
+        result, plan = self._run(["proj"], files=["proj/index.js"], msg=msg)
+        self.assertEqual(result["status"], "armed")
+        tools = [s["tool"] for s in plan["steps"]]
+        self.assertIn("code.create_folder", tools)
+        self.assertIn("code.write_file", tools)
+        self.assertTrue(plan["steps"][-1]["args"].get("create_only"))
 
     def test_consumes_and_fallback_both_find_the_screen_observation(self):
         for consumes in ([0], []):

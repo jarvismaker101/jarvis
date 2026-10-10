@@ -2165,6 +2165,12 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             # When asked to recall the conversation, answer ONLY from the
             # turns above; never invent topics, and never agree with a
             # premise ("I do recall that") unless the turns show it.
+            "Entries in the history beginning with \"[task]\", "
+            "\"[background result]\" or \"[tool]\" are internal work-log "
+            "notes, not conversational turns and never a format to "
+            "imitate: never write those markers yourself, never invent a "
+            "task arm (\"Say confirm task to proceed\") — only the real "
+            "task system does that, and only after it did. "
             "You are the voice interface, not the hands: file, folder, code, "
             "shell and browser actions are performed by task routes, never "
             "by this chat reply, so never say you cannot do them. Name "
@@ -3136,6 +3142,13 @@ def _finalize_chat_reply(user_message, content, pieces, stream,
     # "I am on it", "it is ready") is an unverified claim — strip it and say
     # the honest fallback instead. Offers ("I can create files", "do you
     # want me to...") and detail questions pass through untouched.
+    # [Live fix] A reply that imitated the internal work-log format
+    # ("[task] ... Say confirm task to proceed", "[background result]") is
+    # an invented task arm, never a real one — say so honestly instead.
+    if re.search(r"\[task\]|\[background result\]|\[tool\]", content):
+        print("[CHAT] Reply imitated an internal work-log format — replaced.")
+        content = ("There is no task running for that, sir — nothing was "
+                   "started. If you want it done, just ask.")
     content = _strip_unverified_action_claims(content, "chat")
     # F26 - the uncertainty/clarification decision must happen BEFORE speech.
     # With a stream consumer attached every delta has already been spoken, so
@@ -5366,6 +5379,99 @@ def _confirmation_verdict(answer):
     return None
 
 
+#: [Live fix] A TASK-confirmation word without any "yes" ambiguity ("confirm
+#: task", "confirm", "confirm the task"). When NOTHING is actually pending,
+#: such a turn once fell into free chat, which invented a task arm
+#: ("[task] … Say confirm task to proceed") imitating history entries — it
+#: gets a deterministic honest answer instead.
+_CONFIRM_TASK_SHAPE_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?\s*[,.]?\s*|please\s+)?"
+    r"confirm(?:\s+the)?(?:\s+task)?"
+    r"(?:\s+please)?[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
+def _confirmation_has_no_pending(msg):
+    """True when *msg* is a bare task confirmation with nothing pending.
+
+    Every REAL consumer (task confirmation, opencode confirmation, offers,
+    clarification) is checked; any pending state means an earlier gate owns
+    the message and this guard does not fire. Never raises.
+    """
+    if not _CONFIRM_TASK_SHAPE_RE.match(str(msg or "")):
+        return False
+    try:
+        if task_agent_module.has_pending_task_confirmation():
+            return False
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            if _pending_opencode_task:
+                return False
+    except Exception:
+        pass
+    try:
+        with _offer_lock:
+            if _last_offer:
+                return False
+    except Exception:
+        pass
+    try:
+        if _get_pending_screen_clarify():
+            return False
+    except Exception:
+        pass
+    return True
+
+
+#: [Live fix] The decline lead of a refusal turn ("no", "cancel it", "skip
+#: it") — stripped to expose a restated request riding behind it ("no, that
+#: taskflowapp you read from screen, create a duplicate of it on desktop").
+_DECLINE_LEAD_RE = re.compile(
+    r"^\s*(?:no+|nope|nah|not\s+that|cancel(?:\s+(?:it|that))?|"
+    r"don'?t(?:\s+do\s+(?:it|that))?|skip(?:\s+(?:it|that))?|stop|"
+    r"never\s*mind|forget\s+it)\b[\s,.!;:—-]*",
+    re.IGNORECASE,
+)
+
+
+def _decline_remainder(answer):
+    """The rest of a decline turn after its decline lead (live fix)."""
+    text = _DECLINE_LEAD_RE.sub("", str(answer or ""), count=1).strip()
+    return text if len(text.split()) >= 2 else ""
+
+
+def _looks_like_new_request(text):
+    """True when a clause-shaped remainder carries a real new request."""
+    text = str(text or "").strip()
+    if not text:
+        return False
+    try:
+        if multi_intent.build_chain(text) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        if (_MI_REPLICATE_RE.search(text)
+                and _MI_SCREEN_MENTION_RE.search(text)):
+            return True
+    except Exception:
+        pass
+    try:
+        if is_explicit_task_request(text) or is_code_tool_request(text):
+            return True
+    except Exception:
+        pass
+    try:
+        if force_research(text):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _llm_resolve_confirmation(original_message, answer):
     """Let the brain itself judge the confirmation.
 
@@ -5693,13 +5799,20 @@ def _mi_extract_project_tree(obs_id):
 
     obs = get_observation(obs_id) if obs_id else None
     paths, files = _read(obs)
+    print("[CHAIN] Project-tree stage 1 (stored image): %d folders, %d files"
+          % (len(paths), len(files)))
     if not paths:
         # One retry on the SAME image: a vision reply that misses the tree
-        # once ("folders": []) usually reads it on the second look.
+        # once ("folders": []) usually reads it on the second look. A short
+        # pause keeps a burst rate limit from eating the retry too.
+        time.sleep(1.5)
         paths, files = _read(obs)
+        print("[CHAIN] Project-tree stage 2 (same image retry): "
+              "%d folders, %d files" % (len(paths), len(files)))
     if not paths:
         # The stored image may be pruned or expired — capture once, fresh,
         # and read that (this is the "its visible, look again" flow).
+        time.sleep(1.5)
         try:
             fresh = capture_stored_observation(
                 "replicate the folder structure on my screen")
@@ -5708,6 +5821,8 @@ def _mi_extract_project_tree(obs_id):
             fresh = None
         if fresh is not None and str(getattr(fresh, "image_data_url", "") or ""):
             paths, files = _read(fresh)
+            print("[CHAIN] Project-tree stage 3 (fresh capture): "
+                  "%d folders, %d files" % (len(paths), len(files)))
     if paths:
         print("[CHAIN] Folder tree from screen: %d folders, %d files"
               % (len(paths), len(files)))
@@ -6287,14 +6402,30 @@ def _mi_safe_folder_name(name):
 
 #: [LIVE FIX 13] An anaphoric follow-up create ("ok so create it", "create
 #: the folders now") that resolves against the structure the screen read.
+#: Live fix: also the demonstrative-folder and duplicate shapes ("create
+#: this folder for me on desktop", "create the duplicate of it on desktop")
+#: — with a destination tail allowed, since "on my desktop" is where the
+#: structure goes, not a different request.
 _MI_FOLLOWUP_RE = re.compile(
     r"^(?:please\s+|just\s+|can\s+you\s+|could\s+you\s+)*"
     r"(?:(?:ok(?:ay)?|so|now|then|also|alright|well|please|and)\b[\s,.!]*)*"
     r"(?:go\s+ahead\s+(?:and\s+)?)?"
     r"(?:create|make|build)\b[^.?!]{0,32}?"
     r"\b(?:it|that|this|them|those|everything|"
-    r"the\s+(?:folders?|structure|tree|project|directories))\b"
-    r"(?:\s+(?:please|sir|now|then|too|also|as\s+well))?[\s.!,]*$",
+    r"the\s+(?:folders?|structure|tree|project|directories|duplicate)|"
+    r"(?:this|that|these|those)\s+(?:exact\s+)?(?:folders?|structure|tree|"
+    r"project|directories))\b"
+    r"(?:\s+(?:please|sir|now|then|too|also|as\s+well|"
+    r"for\s+me|on\s+(?:my\s+)?desktop|to\s+(?:my\s+)?desktop))*[\s.!,]*$",
+    re.IGNORECASE,
+)
+
+#: A demonstrative structure reference needs a real referent (LIVE FIX 13's
+#: memory or a recent attempt) — a bare "create this folder" with neither
+#: keeps its normal create flow.
+_MI_FOLLOWUP_DEMONSTRATIVE_RE = re.compile(
+    r"\b(?:this|these|those|that)\s+(?:exact\s+)?(?:folders?|files?|"
+    r"structure|tree|project|directories|duplicate)\b",
     re.IGNORECASE,
 )
 
@@ -6349,6 +6480,66 @@ def _mi_structure_snapshot():
     except Exception:
         return {"tree": [], "files": [], "base": "", "roots": {},
                 "obs_id": "", "at": 0.0}
+
+
+#: [Live fix] The last replicate attempt (any path): its text, when it ran
+#: and how the read went. The honest failure fragment tells the user to
+#: "keep the folders visible and ask me again" — the re-look gate resolves
+#: that "again" against THIS instead of letting chat improvise.
+_MI_REPLICATE_LAST_TTL = 900.0
+_mi_replicate_last_lock = threading.Lock()
+_mi_replicate_last = {"text": "", "at": 0.0, "read_ok": False}
+
+
+def _mi_remember_replicate_attempt(text, read_ok):
+    """Record the last replicate attempt for the re-look gate (live fix)."""
+    try:
+        with _mi_replicate_last_lock:
+            _mi_replicate_last.update({"text": str(text or ""),
+                                       "at": time.time(),
+                                       "read_ok": bool(read_ok)})
+    except Exception:
+        pass
+
+
+def _mi_replicate_attempt_fresh():
+    """True when a replicate attempt happened recently (live fix)."""
+    try:
+        with _mi_replicate_last_lock:
+            state = dict(_mi_replicate_last)
+    except Exception:
+        return False
+    return (time.time() - float(state.get("at") or 0.0)
+            ) <= _MI_REPLICATE_LAST_TTL
+
+
+#: "look again you will see" / "its visible now, look again" / "try again" —
+#: the retry the replicate failure reply itself invites.
+_MI_RELOOK_RE = re.compile(
+    r"\b(?:look|check|see|read)\b[^.?!]{0,24}?\bagain\b"
+    r"|\btry\s+(?:it\s+)?again\b"
+    r"|\bhave\s+another\s+look\b"
+    r"|\blook\s+once\s+more\b"
+    r"|\bthe\s+(?:folders?|structure|tree|project)\s+(?:is|are)\s+visible\b",
+    re.IGNORECASE,
+)
+
+
+#: "with all the subfolders and files" / "including the files" — the request
+#: itself asks for the file half too, so the ONE confirmation includes it
+#: (LIVE FIX 14 follow-up: an explicit request never waits for "as well").
+_MI_WANT_ALL_RE = re.compile(
+    r"\b(?:sub)?folders?\s+and\s+files?\b"
+    r"|\b(?:with|including)\b[^.?!]{0,48}?\bfiles?\b"
+    r"|\bfiles?\s+(?:as\s+well|too|also)\b"
+    r"|\beverything\b",
+    re.IGNORECASE,
+)
+
+
+def _mi_want_from_text(text):
+    """The structure-plan want an explicit request asks for (live fix)."""
+    return "all" if _MI_WANT_ALL_RE.search(str(text or "")) else "folders"
 
 
 #: [LIVE FIX 12] Caps for a replicated on-screen tree: enough for a real
@@ -6464,6 +6655,88 @@ def _parse_file_entries(entries, folder_paths):
             seen.add(rel.lower())
             out.append(rel)
     return out
+
+
+#: A prose token that names a FILE (has an extension, dotfiles included).
+_MI_FILE_TOKEN_RE = re.compile(
+    r"^(?:[.\w\-]{1,70}\.[A-Za-z0-9]{1,12}|\.[A-Za-z0-9_\-]{1,40})$")
+
+
+def _mi_tree_from_prose(text):
+    """Last-resort tree parsed from a screen answer's own words (live fix).
+
+    When the JSON tree read comes back empty at every ladder stage but the
+    screen step's QA answer plainly described the structure ("a project
+    called TaskFlowApp with subfolders src/, public/ ... and files like
+    package.json, .gitignore ..."), that answer is parsed here instead of
+    failing the whole replicate. Names come from the answer's backticked /
+    quoted spans plus the listing chunks after "subfolders"/"files"; nesting
+    is NOT recoverable from prose, so files land at the root and the JSON
+    read stays the primary path. Returns (tree, files) in the same shape
+    `_parse_folder_tree`/`_parse_file_entries` produce, or ([], []).
+    """
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", str(text or ""))
+    text = " ".join(text.split())
+    if not text:
+        return [], []
+    root = ""
+    for pattern in (
+        r"\b(?:project|folder|directory|repo(?:sitory)?)\s+"
+        r"(?:called|named)\s+[\"'`]?([\w][\w .\-]{0,58}?)[\"'`]?"
+        r"(?=[\s,.!;:]|$)",
+        r"\b(?:called|named)\s+[\"'`]?([\w][\w .\-]{0,58}?)[\"'`]?"
+        r"(?=[\s,.!;:]|$)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            root = _mi_safe_folder_name(match.group(1))
+            if root:
+                break
+    if not root:
+        return [], []
+    # Quoting delimiters are backticks and double quotes ONLY — an
+    # apostrophe in prose ("it's a project called TaskFlowApp") must never
+    # pair with the next backtick and scramble the whole scan (live bug).
+    tokens = re.findall(r"`([^`]{1,80})`", text)
+    tokens.extend(re.findall(r'"([^"]{1,80})"', text))
+    for keyword in ("subfolders", "subdirectories", "folders", "directories",
+                    "files"):
+        for chunk in re.findall(
+                r"\b%s\b[:\s]+([^;]{0,300})" % keyword, text,
+                re.IGNORECASE):
+            chunk = re.sub(r"^\s*(?:like|such\s+as|including)\s+", "",
+                           chunk, flags=re.IGNORECASE)
+            for part in re.split(r"\s*(?:,|\band\b)\s*", chunk):
+                part = part.strip(" \"'`")
+                if part:
+                    tokens.append(part)
+    folders, out_files = [], []
+    seen_folders, seen_files = set(), set()
+    for raw in tokens:
+        token = raw.strip().strip("`\"'").strip().rstrip(".")
+        if not token or len(token.split()) > 2:
+            continue
+        is_folder = token.endswith("/") or token.endswith("\\")
+        token = token.rstrip("/\\").strip().replace("\\", "/").split("/")[-1]
+        if not token or len(token) > 60:
+            continue
+        if is_folder:
+            name = _mi_safe_folder_name(token)
+            key = name.lower()
+            if name and key not in seen_folders and key != root.lower():
+                seen_folders.add(key)
+                folders.append(os.path.join(root, name))
+        elif (_MI_FILE_TOKEN_RE.match(token)
+              or token.lower() in ("dockerfile", "makefile")):
+            name = _mi_safe_file_name(token)
+            key = name.lower()
+            if name and key not in seen_files:
+                seen_files.add(key)
+                out_files.append(os.path.join(root, name))
+    if not folders and not out_files:
+        return [], []
+    folders = ([root] + folders)[:_MI_TREE_MAX_FOLDERS]
+    return folders, out_files[:_MI_TREE_MAX_FILES]
 
 
 #: A folder name that is a POINTER ("by the name of this website", "the
@@ -6879,7 +7152,7 @@ def _mi_arm_structure_plan(msg, tree, files, base, want,
         pass
     roots = []
     for rel in tree or []:
-        root = str(rel).split(os.sep, 1)[0]
+        root = str(rel).replace("\\", "/").split("/", 1)[0]
         if root and root not in roots:
             roots.append(root)
     root_paths = {}
@@ -6894,7 +7167,7 @@ def _mi_arm_structure_plan(msg, tree, files, base, want,
             root_paths[root] = _mi_free_path(direct)
     folder_steps = []
     for rel in tree or []:
-        parts = str(rel).split(os.sep)
+        parts = str(rel).replace("\\", "/").split("/")
         root_path = root_paths.get(parts[0])
         if not root_path:
             continue
@@ -6910,7 +7183,7 @@ def _mi_arm_structure_plan(msg, tree, files, base, want,
         })
     file_steps = []
     for rel in files or []:
-        parts = str(rel).split(os.sep)
+        parts = str(rel).replace("\\", "/").split("/")
         root_path = root_paths.get(parts[0])
         if not root_path or len(parts) < 2:
             continue
@@ -6982,9 +7255,11 @@ def _mi_replicate_task_step(msg, step, results):
     the reply says so — it never asks the user to name a visible folder.
     """
     obs_id = ""
+    source_content = ""
     for idx in (step or {}).get("consumes") or []:
         if 0 <= idx < len(results or []):
             obs_id = str(results[idx].get("output_obs_id") or "")
+            source_content = str(results[idx].get("output_content") or "")
             if obs_id:
                 break
     if not obs_id:
@@ -6993,8 +7268,20 @@ def _mi_replicate_task_step(msg, step, results):
         for prior in reversed(results or []):
             obs_id = str(prior.get("output_obs_id") or "")
             if obs_id:
+                if not source_content:
+                    source_content = str(prior.get("output_content") or "")
                 break
     tree, files = _mi_extract_project_tree(obs_id)
+    if not tree and source_content:
+        # Live fix: the screen step's own QA answer usually DESCRIBED the
+        # structure even when the JSON tree read came back empty at every
+        # stage — parse the names from that answer instead of failing.
+        tree, files = _mi_tree_from_prose(source_content)
+        if tree:
+            print("[CHAIN] Folder tree from the screen answer (prose "
+                  "fallback): %d folders, %d files"
+                  % (len(tree), len(files)))
+    _mi_remember_replicate_attempt(msg, bool(tree))
     if not tree:
         return {"kind": "task", "status": "failed",
                 "fragment": "I looked at your screen, but I couldn't read a "
@@ -7008,7 +7295,8 @@ def _mi_replicate_task_step(msg, step, results):
     if not base:
         return {"kind": "task", "status": "failed",
                 "fragment": "I couldn't find your Desktop folder."}
-    result = _mi_arm_structure_plan(msg, tree, files, base, "folders")
+    result = _mi_arm_structure_plan(msg, tree, files, base,
+                                    _mi_want_from_text(msg))
     status = str(result.get("status") or "")
     if status == "armed":
         _mi_remember_structure(tree, files, base,
@@ -7048,6 +7336,11 @@ def _mi_replicate_followup_reply(msg):
     state = _mi_structure_snapshot()
     age = time.time() - float(state.get("at") or 0.0)
     fresh = bool(state.get("tree")) and age <= _MI_STRUCTURE_TTL
+    if (not fresh and not _mi_replicate_attempt_fresh()
+            and _MI_FOLLOWUP_DEMONSTRATIVE_RE.search(text)):
+        # "create this folder" with no structure read recently has no
+        # referent — the normal create flow keeps it (live fix).
+        return None
     tree = list(state.get("tree") or []) if fresh else []
     files = list(state.get("files") or []) if fresh else []
     obs_id = str(state.get("obs_id") or "") if fresh else ""
@@ -7058,6 +7351,7 @@ def _mi_replicate_followup_reply(msg):
         if tree:
             print("[TASK] Structure follow-up read the screen: %d folders, "
                   "%d files" % (len(tree), len(files)))
+    _mi_remember_replicate_attempt(text, bool(tree))
     if not tree:
         return ("Sir, I looked at your screen, but I couldn't read a folder "
                 "structure from it — keep the folders visible and ask me "
@@ -7133,14 +7427,53 @@ def _mi_replicate_intent_reply(msg):
         return None
     if not _MI_SCREEN_MENTION_RE.search(text):
         return None
-    obs_id = ""
-    try:
-        obs = capture_stored_observation(msg)
-        obs_id = str(getattr(obs, "id", "") or "")
-    except Exception as exc:
-        logging.warning("[TASK] Structure replicate capture failed: %s", exc)
+    return _mi_replicate_read_and_arm(text)
+
+
+def _mi_replicate_relook_reply(msg):
+    """The retry a failed replicate read itself invites (live fix).
+
+    The honest failure fragment says "keep the folders visible and ask me
+    again" — this is that "again": when a replicate was attempted recently
+    and the message asks for another look ("look again you will see"), the
+    screen is re-read and the structure plan armed, instead of letting the
+    chat model improvise a "please ensure the folders are visible" reply.
+    Returns the reply string, or None when the message is not a re-look.
+    """
+    text = str(msg or "").strip()
+    if not text or not _MI_RELOOK_RE.search(text):
+        return None
+    if not _mi_replicate_attempt_fresh():
+        return None
+    print("[TASK] Structure re-look requested:", text)
+    return _mi_replicate_read_and_arm(text)
+
+
+def _mi_replicate_read_and_arm(msg, obs_id=None, source_content=""):
+    """Capture (unless given), read the structure, arm the ONE plan.
+
+    Shared by the original-sentence gate, the re-look gate and the screen
+    answer's compound arm. Returns the reply to speak. Remembers the
+    attempt (for the re-look gate) and the structure (for follow-ups).
+    """
+    if obs_id is None:
+        obs_id = ""
+        try:
+            obs = capture_stored_observation(msg)
+            obs_id = str(getattr(obs, "id", "") or "")
+        except Exception as exc:
+            logging.warning("[TASK] Structure replicate capture failed: %s",
+                            exc)
     tree, files = _mi_extract_project_tree(obs_id)
+    if not tree and source_content:
+        # Last resort: the screen answer itself described the structure even
+        # when the JSON tree read came back empty at every stage.
+        tree, files = _mi_tree_from_prose(source_content)
+        if tree:
+            print("[TASK] Folder tree from the screen answer (prose "
+                  "fallback): %d folders, %d files" % (len(tree), len(files)))
     if not tree:
+        _mi_remember_replicate_attempt(msg, False)
         return ("Sir, I looked at your screen, but I couldn't read a folder "
                 "structure from it — keep the folders visible and ask me "
                 "again.")
@@ -7150,22 +7483,69 @@ def _mi_replicate_intent_reply(msg):
         folders = {}
     base = folders.get("desktop") or folders.get("home") or ""
     if not base:
+        _mi_remember_replicate_attempt(msg, False)
         return "Sir, I couldn't find your Desktop folder."
-    result = _mi_arm_structure_plan(text, tree, files, base, "folders")
+    result = _mi_arm_structure_plan(msg, tree, files, base,
+                                    _mi_want_from_text(msg))
     status = str(result.get("status") or "")
     if status == "armed":
         _mi_remember_structure(tree, files, base,
                                result.get("root_paths"), obs_id)
+        _mi_remember_replicate_attempt(msg, True)
         print("[TASK] Structure replicate from the user's own words: "
               "%d folders, %d files" % (len(tree), len(files)))
         return str(result.get("fragment") or "")
     if status == "exists":
         _mi_remember_structure(tree, files, base,
                                result.get("root_paths"), obs_id)
+        _mi_remember_replicate_attempt(msg, True)
         return ("The folder structure is already there, sir — say create "
                 "the files as well if you want the files too.")
+    _mi_remember_replicate_attempt(msg, False)
     return str(result.get("fragment") or
                "I couldn't prepare the folder replication.")
+
+
+#: A screen-answer turn that ALSO asks to create what it looked at
+#: ("all i want is for you to create this exact folder visible on my screen
+#: on desktop") — the QA answer alone dropped the create half (live fix).
+_MI_SCREEN_CREATE_RE = re.compile(
+    r"\b(?:create|make|build|recreate|replicate|duplicate|copy)\b"
+    r"[^.?!]{0,64}?\b(?:this|that|the|these|those)\s+(?:exact\s+)?"
+    r"(?:folder|structure|tree|project|directories|folder structure)\b"
+    r"[^.?!]{0,64}?\b(?:screen|desktop)\b",
+    re.IGNORECASE,
+)
+
+
+def _mi_screen_create_compound_request(msg):
+    """True when a screen-answer turn also asks to create the structure."""
+    return bool(_MI_SCREEN_CREATE_RE.search(str(msg or "")))
+
+
+def _start_screen_replicate_arm(msg, obs_id, source_content):
+    """Arm the replicate plan from the screen answer's OWN observation.
+
+    Runs on a worker so the spoken screen answer is never delayed; the
+    confirmation (or the honest failure) is delivered async, like the
+    chain's own completion. Reuses the observation just captured — no
+    second capture.
+    """
+    def _work():
+        try:
+            reply = _mi_replicate_read_and_arm(
+                msg, obs_id=str(obs_id or ""), source_content=source_content)
+        except Exception as exc:
+            logging.warning("[TASK] Screen compound arm failed: %s", exc)
+            return
+        if reply:
+            _notify_async_reply(reply)
+
+    try:
+        threading.Thread(target=_work, daemon=True,
+                         name="screen-replicate-arm").start()
+    except Exception as exc:
+        logging.warning("[TASK] Screen compound arm start failed: %s", exc)
 
 
 def consume_pending_folder_name(msg):
@@ -7688,6 +8068,16 @@ def _consume_opencode_confirmation(answer):
         else:
             verdict = "unclear"
     if verdict == "no":
+        # Live fix: a decline that ALSO restates a request ("no, that
+        # taskflowapp you read from screen, create a duplicate of it on
+        # desktop") must not swallow the restatement — the pending preview
+        # is already discarded above, so fall through and let the normal
+        # routing handle the whole turn again.
+        remainder = _decline_remainder(answer)
+        if remainder and _looks_like_new_request(remainder):
+            print("[TASK] Decline carried a new request — re-routing:",
+                  remainder)
+            return None
         print("[TASK] User declined the opencode handoff.")
         return "As you wish, sir. I will skip that."
     if verdict == "unclear":
@@ -8824,6 +9214,21 @@ def _process_message_inner(
                     _start_screen_enrichment(
                         answer_id, capture, tip, evidence, links, topic,
                         show_images, region)
+                # [Live fix] A screen-answer turn that ALSO asks to create
+                # what it looked at ("all i want is for you to create this
+                # exact folder visible on my screen on desktop") must arm
+                # the replicate too — the QA answer alone dropped the
+                # create half. Runs on a worker with the observation just
+                # captured (no second capture), the confirmation follows
+                # async.
+                try:
+                    if _mi_screen_create_compound_request(msg):
+                        _start_screen_replicate_arm(
+                            msg, str(result.get("observation_id") or ""),
+                            tip)
+                except Exception as exc:
+                    logging.warning("[TASK] Screen compound arm failed: %s",
+                                    exc)
                 return tip
             finally:
                 _screen_qa_busy.release()
@@ -8863,9 +9268,12 @@ def _process_message_inner(
             # confirmed handoff executed THAT description — which the
             # capability resolver sent to the browser agent. Route on the
             # user's own words: read the structure and arm its confirmation
-            # here, before any opencode task is armed.
+            # here, before any opencode task is armed. The re-look gate
+            # ("look again you will see") resolves the failure's own retry
+            # invitation the same way.
             try:
-                replicate_reply = _mi_replicate_intent_reply(msg)
+                replicate_reply = (_mi_replicate_intent_reply(msg)
+                                   or _mi_replicate_relook_reply(msg))
             except Exception as exc:
                 logging.warning("[TASK] Structure replicate gate failed: %s",
                                 exc)
@@ -8953,9 +9361,11 @@ def _process_message_inner(
             return follow_reply
         # Live fix: same structure replicate gate as the intent branch — the
         # original sentence names the screen, so it never goes to the
-        # browser handoff as a rewritten description.
+        # browser handoff as a rewritten description (the re-look gate
+        # answers the failure's own "ask me again" the same way).
         try:
-            replicate_reply = _mi_replicate_intent_reply(msg)
+            replicate_reply = (_mi_replicate_intent_reply(msg)
+                               or _mi_replicate_relook_reply(msg))
         except Exception as exc:
             logging.warning("[TASK] Structure replicate gate failed: %s", exc)
             replicate_reply = None
@@ -9010,6 +9420,44 @@ def _process_message_inner(
                 return response
         except Exception as exc:
             logging.warning("[TASK] Code-tool safety net failed: %s", exc)
+        # [Live fix] Two deterministic nets before any chat improvisation:
+        # a re-look after a failed replicate read ("look again you will see"
+        # — the failure itself says "ask me again") re-reads and arms; and a
+        # bare "confirm task" with NOTHING pending gets the honest no-task
+        # line instead of a chat model inventing an arm format from history.
+        try:
+            relook_reply = _mi_replicate_relook_reply(msg)
+        except Exception as exc:
+            logging.warning("[TASK] Structure re-look failed: %s", exc)
+            relook_reply = None
+        if relook_reply is not None:
+            if racer is not None:
+                try:
+                    racer.cancel()
+                except Exception:
+                    pass
+            _remember_user_turn(msg)
+            _disarm_other_gates_if_task_gate_armed()
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, relook_reply)
+            return relook_reply
+        try:
+            if _confirmation_has_no_pending(msg):
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                print("[TASK] Confirmation with nothing pending.")
+                response = ("There is no task waiting for your approval, "
+                            "sir. Nothing was started.")
+                _remember_user_turn(msg)
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, response)
+                return response
+        except Exception as exc:
+            logging.warning("[TASK] No-pending confirmation guard failed: %s",
+                            exc)
         # [S6] ONE call, two jobs: the intent router classified this turn AND
         # wrote the answer, so a plain conversational turn no longer pays for a
         # second chat completion. The reply is used ONLY here - after every
