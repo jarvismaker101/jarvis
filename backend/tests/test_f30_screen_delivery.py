@@ -235,7 +235,9 @@ class WiringTests(unittest.TestCase):
 
         code = inspect.getsource(brain._process_message_inner)
         begin = code.index("begin_screen_capture")
-        analyse = code.index("analyze_screen(msg)")
+        # The call itself may carry the LIVE FIX 17 retry question
+        # (analyze_screen(retry_q or msg)) — the ORDER is the contract.
+        analyse = code.index("analyze_screen(")
         self.assertLess(begin, analyse,
                         "the generation must be registered before analysis")
 

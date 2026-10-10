@@ -555,5 +555,108 @@ class DanglingChatHistoryTests(unittest.TestCase):
         self.assertNotIn("python decorators", blob)
 
 
+class ScreenQuestionRetryTests(unittest.TestCase):
+    """LIVE FIX 17: "look again there is a video on top right" is the
+    previous screen question RETRIED, pointing at where the answer is.
+
+    Live log: "what is this news about openAi on my screen" missed ("I
+    don't see any news about OpenAI on your screen") and the retry — with
+    a LOCATION HINT, not a new question — had nothing to resolve against.
+    The original question is re-asked with the pointed-at area as focus.
+    """
+
+    _ORIGINAL = "what is this news about openAi on my screen"
+
+    def setUp(self):
+        brain._screen_qa_last.update(
+            {"question": self._ORIGINAL, "at": time.time(), "miss": True,
+             "seq": 0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False, "seq": 0})
+
+    def tearDown(self):
+        brain._screen_qa_last.update(
+            {"question": "", "at": 0.0, "miss": False, "seq": 0})
+        brain._mi_replicate_last.update(
+            {"text": "", "at": 0.0, "read_ok": False, "seq": 0})
+
+    def test_the_live_retry_composes_the_original_with_the_hint(self):
+        composed = brain._screen_retry_question(
+            "look again there is a video on top right")
+        self.assertIsNotNone(composed)
+        self.assertTrue(composed.startswith(self._ORIGINAL))
+        self.assertIn("top right", composed)
+
+    def test_no_recent_question_returns_none(self):
+        brain._screen_qa_last.update(
+            {"question": "", "at": 0.0, "miss": False})
+        self.assertIsNone(brain._screen_retry_question(
+            "look again there is a video on top right"))
+
+    def test_stale_question_expires(self):
+        brain._screen_qa_last["at"] = time.time() - 1000.0
+        self.assertIsNone(brain._screen_retry_question(
+            "look again there is a video on top right"))
+
+    def test_structure_messages_belong_to_the_replicate_relook(self):
+        self.assertIsNone(brain._screen_retry_question(
+            "look again at the folders on my screen"))
+
+    def test_a_new_question_routes_normally(self):
+        self.assertIsNone(brain._screen_retry_question(
+            "look again what is this video on top right about?"))
+
+    def test_a_work_request_is_not_a_screen_retry(self):
+        self.assertIsNone(brain._screen_retry_question(
+            "look again at the page and fix the layout"))
+
+    def test_the_users_own_plan_is_not_a_retry(self):
+        self.assertIsNone(brain._screen_retry_question(
+            "i will look again later"))
+
+    def test_the_fresher_replicate_attempt_wins_a_bare_again(self):
+        brain._mi_remember_replicate_attempt("replicate it", False)
+        self.assertIsNone(brain._screen_retry_question(
+            "look again you will see"))
+
+    def test_the_miss_is_recorded_from_the_live_tip(self):
+        brain._screen_remember_question(
+            self._ORIGINAL,
+            "Sir, I don't see any news about OpenAI on your screen. Your "
+            "screen shows the YouTube homepage — no OpenAI-related content "
+            "is visible.")
+        self.assertTrue(brain._screen_qa_last["miss"])
+        brain._screen_remember_question(
+            "what is this video about",
+            "The video is about neural networks, sir.")
+        self.assertFalse(brain._screen_qa_last["miss"])
+
+    def test_the_net_routes_the_retry_into_the_screen_branch(self):
+        with patch.object(brain, "classify_intent",
+                          return_value={"intent": "chat", "steps": [],
+                                        "task_description": "",
+                                        "query": ""}), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "analyze_screen",
+                          return_value={"tip": "It is the OpenAI news, sir.",
+                                        "evidence": [], "topic": "",
+                                        "grounding_links": [],
+                                        "show_images": False,
+                                        "region": None}) as analyze, \
+             patch.object(brain, "add_message"), \
+             patch.object(brain, "push_screen_answer", return_value="a1"):
+            response = brain.process_message(
+                "look again there is a video on top right", sync_voice=False)
+        analyze.assert_called_once()
+        asked = analyze.call_args[0][0]
+        self.assertTrue(asked.startswith(self._ORIGINAL))
+        self.assertIn("top right", asked)
+        self.assertEqual(response, "It is the OpenAI news, sir.")
+        # The stored question stays the ORIGINAL, so a second retry re-asks
+        # it instead of stacking focus notes.
+        self.assertEqual(brain._screen_qa_last["question"], self._ORIGINAL)
+
+
 if __name__ == "__main__":
     unittest.main()

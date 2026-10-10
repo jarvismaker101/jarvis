@@ -6517,13 +6517,27 @@ def _mi_structure_snapshot():
                 "obs_id": "", "at": 0.0}
 
 
+#: Fix 17: a monotonic activity counter. Windows time.time() ticks at
+#: ~15.6 ms, so "which attempt is fresher" cannot be decided by comparing
+#: timestamps that often land in the same tick — each remembered activity
+#: takes the next sequence number instead.
+_mi_activity_seq = 0
+
+
+def _next_activity_seq():
+    """The next activity sequence number (fix 17)."""
+    global _mi_activity_seq
+    _mi_activity_seq += 1
+    return _mi_activity_seq
+
+
 #: [Live fix] The last replicate attempt (any path): its text, when it ran
 #: and how the read went. The honest failure fragment tells the user to
 #: "keep the folders visible and ask me again" — the re-look gate resolves
 #: that "again" against THIS instead of letting chat improvise.
 _MI_REPLICATE_LAST_TTL = 900.0
 _mi_replicate_last_lock = threading.Lock()
-_mi_replicate_last = {"text": "", "at": 0.0, "read_ok": False}
+_mi_replicate_last = {"text": "", "at": 0.0, "read_ok": False, "seq": 0}
 
 
 def _mi_remember_replicate_attempt(text, read_ok):
@@ -6532,7 +6546,8 @@ def _mi_remember_replicate_attempt(text, read_ok):
         with _mi_replicate_last_lock:
             _mi_replicate_last.update({"text": str(text or ""),
                                        "at": time.time(),
-                                       "read_ok": bool(read_ok)})
+                                       "read_ok": bool(read_ok),
+                                       "seq": _next_activity_seq()})
     except Exception:
         pass
 
@@ -6595,6 +6610,154 @@ def _mi_relook_targets_structure(text):
     remainder = _MI_RELOOK_RE.sub(" ", raw)
     tokens = re.findall(r"[a-z']+", remainder.lower())
     return all(token in _MI_RELOOK_FILLER for token in tokens)
+
+
+#: [LIVE FIX 17] The last screen question and how it went. Live retest:
+#: "what is this news about openAi on my screen" missed ("I don't see any
+#: news about OpenAI…") and "look again there is a video on top right" —
+#: the retry of that question, pointing at where the answer is — had
+#: nothing to resolve against and fell to chat. The retry gate re-asks
+#: THIS question with the pointed-at area as its focus.
+_SCREEN_QA_LAST_TTL = 900.0
+_screen_qa_last_lock = threading.Lock()
+_screen_qa_last = {"question": "", "at": 0.0, "miss": False, "seq": 0}
+
+#: The honest-miss shape of a screen answer ("I don't see any news about
+#: OpenAI on your screen", "couldn't find …", "not visible") — recorded so
+#: a retry is recognized against what it retries.
+_SCREEN_MISS_RE = re.compile(
+    r"\b(?:i\s+)?(?:don'?t|can'?t|couldn'?t|do\s+not|cannot|unable\s+to)\s+"
+    r"(?:see|find|read|locate|spot)\b"
+    r"|\bnot\s+visible\b"
+    r"|\bno\b[^.?!]{0,60}?\bvisible\b"
+    r"|\bnothing\b[^.?!]{0,40}?\b(?:visible|shows?|shown)\b"
+    r"|\bdoesn'?t\s+(?:appear|show)\b",
+    re.IGNORECASE,
+)
+
+#: The retry of a screen question: a re-look phrase or a pointing line
+#: ("look again", "it's there", "check more carefully") — fix 17.
+_SCREEN_RETRY_RE = re.compile(
+    r"\b(?:look|check|see|read|scan)\b[^.?!]{0,24}?\bagain\b"
+    r"|\btry\s+(?:it\s+)?again\b"
+    r"|\b(?:have|take)\s+another\s+look\b"
+    r"|\blook\s+(?:once\s+more|more\s+carefully)\b"
+    r"|\b(?:it'?s|its|it\s+is)\s+(?:right\s+|still\s+|definitely\s+)?"
+    r"(?:there|visible|shown)\b"
+    r"|\bno,?\s+(?:it'?s|its)\s+there\b",
+    re.IGNORECASE,
+)
+
+#: The location the user points at ("top right", "bottom-left corner").
+_SCREEN_HINT_RE = re.compile(
+    r"\b(?:top|upper|bottom|lower)\s*-?\s*(?:left|right)\b"
+    r"|\b(?:left|right)\s+corner\b"
+    r"|\bcorner\b"
+    r"|\b(?:center|centre|middle)\s+(?:of\s+the\s+screen|area|part)\b",
+    re.IGNORECASE,
+)
+
+#: A message asking for real work is not a screen re-look, whatever else
+#: it says ("look again at the deployment and fix it").
+_SCREEN_RETRY_TASKISH_RE = re.compile(
+    r"\b(?:create|make|build|install|uninstall|delete|remove|rename|move|"
+    r"copy|write|edit|fix|repair|run|execute|launch|close|download|"
+    r"upload|research|find|open|send|schedule|play|pause)\b",
+    re.IGNORECASE,
+)
+
+#: "I will look again later" is the USER's plan, not a retry request.
+_SCREEN_RETRY_NOT_NOW_RE = re.compile(
+    r"\b(?:later|tomorrow|next\s+time)\b"
+    r"|\bi(?:'ll|\s+will)\s+(?:look|check|see|read|scan)\b",
+    re.IGNORECASE,
+)
+
+#: A retry that carries its OWN wh-question ("look again what is this
+#: video about") is a new question — it routes normally instead.
+_SCREEN_RETRY_NEW_QUESTION_RE = re.compile(
+    r"\b(?:what|who|when|where|which|why|how|whose)\b",
+    re.IGNORECASE,
+)
+
+
+def _screen_remember_question(question, tip):
+    """Record the last screen question + whether its answer missed (17)."""
+    try:
+        with _screen_qa_last_lock:
+            _screen_qa_last.update({
+                "question": str(question or ""),
+                "at": time.time(),
+                "miss": bool(_SCREEN_MISS_RE.search(str(tip or ""))),
+                "seq": _next_activity_seq(),
+            })
+    except Exception:
+        pass
+
+
+def _screen_last_question():
+    """The stored original screen question, or "" (fix 17)."""
+    try:
+        with _screen_qa_last_lock:
+            return str(_screen_qa_last.get("question") or "")
+    except Exception:
+        return ""
+
+
+def _screen_retry_question(msg):
+    """Fix 17: the focused re-ask of a missed screen question, or None.
+
+    "look again there is a video on top right" is not a new question — it
+    is the previous screen question RETRIED, pointing at where the answer
+    is. Fires only when a recent screen question exists and the message is
+    a pointing/re-look line. Structure messages belong to the replicate
+    re-look; self-contained questions and work requests route normally;
+    and when a replicate attempt is MORE RECENT, a bare "again" belongs to
+    that attempt, not to the screen question.
+    """
+    text = str(msg or "").strip()
+    if not text or not _SCREEN_RETRY_RE.search(text):
+        return None
+    if _MI_STRUCTURE_SUBJECT_RE.search(text):
+        return None
+    if _SCREEN_RETRY_TASKISH_RE.search(text):
+        return None
+    if _SCREEN_RETRY_NOT_NOW_RE.search(text):
+        return None
+    if _QUESTION_SHAPED_RE.match(text):
+        return None
+    if _SCREEN_RETRY_NEW_QUESTION_RE.search(text):
+        return None
+    try:
+        with _screen_qa_last_lock:
+            state = dict(_screen_qa_last)
+    except Exception:
+        return None
+    original = str(state.get("question") or "").strip()
+    if not original:
+        return None
+    if (time.time() - float(state.get("at") or 0.0)) > _SCREEN_QA_LAST_TTL:
+        return None
+    try:
+        with _mi_replicate_last_lock:
+            replicate = dict(_mi_replicate_last or {})
+    except Exception:
+        replicate = {}
+    # Sequence numbers decide which "again" is the newer one; timestamps
+    # only break a tie when neither side has one (manually seeded state).
+    replicate_seq = int(replicate.get("seq") or 0)
+    screen_seq = int(state.get("seq") or 0)
+    if replicate_seq > screen_seq:
+        return None
+    if (not replicate_seq and not screen_seq
+            and float(replicate.get("at") or 0.0)
+            > float(state.get("at") or 0.0)):
+        return None
+    hint_match = _SCREEN_HINT_RE.search(text)
+    hint = hint_match.group(0).strip() if hint_match else ""
+    focus = (" The user says to look again"
+             + (" — focus on the %s of the screen." % hint if hint else "."))
+    return original + focus
 
 
 #: "with all the subfolders and files" / "including the files" — the request
@@ -9122,6 +9285,19 @@ def _process_message_inner(
         if intent.get("intent") in ("chat", "research") and is_screen_question(msg):
             intent["intent"] = "region" if is_region_question(msg) else "screen"
             print("[INTENT] Screen-question net ->", intent["intent"])
+        # [LIVE FIX 17] A retry of a recent screen question ("look again
+        # there is a video on top right") is that question re-asked with
+        # focus — deterministic, before any chat/task/tool route.
+        if intent.get("intent") not in ("screen", "region"):
+            try:
+                _screen_retry = _screen_retry_question(msg)
+            except Exception as exc:
+                _screen_retry = None
+                logging.warning("[INTENT] Screen retry net failed: %s", exc)
+            if _screen_retry is not None:
+                intent["intent"] = "screen"
+                intent["steps"] = []
+                print("[INTENT] Screen-question retry net -> screen")
         # Holdback: non-chat verdicts cancel the speculative chat stream
         if racer is not None and intent.get("intent") != "chat":
             try:
@@ -9240,8 +9416,21 @@ def _process_message_inner(
                         progress("analysing screen", stage="vision")
                     except Exception:
                         pass
-                result = analyze_screen(msg)
+                # [LIVE FIX 17] A retry of a missed screen question ("look
+                # again there is a video on top right") re-asks the ORIGINAL
+                # question with the pointed-at area as its focus. The user
+                # turn in history stays their own words.
+                retry_q = _screen_retry_question(msg)
+                if retry_q is not None:
+                    print("[SCREEN] Question retry — re-asking with the "
+                          "pointed area as focus.")
+                result = analyze_screen(retry_q or msg)
                 tip = result.get("tip") or "I couldn't analyse the screen, sir."
+                # Fix 17: remember this question + how it went, so the NEXT
+                # "look again" retries it instead of falling to chat.
+                _screen_remember_question(
+                    _screen_last_question() if retry_q is not None else msg,
+                    tip)
                 # The spoken tip is the assistant half of the exchange; it
                 # rides the normal commit rule (commit_response).
                 if commit_response:
