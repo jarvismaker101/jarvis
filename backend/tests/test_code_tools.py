@@ -972,6 +972,28 @@ class R20IntentCreateAndCheckTests(unittest.TestCase):
                 "have a quick look at that folder", {})
         self.assertIn("Which folder should I check", plan["response"])
 
+    def test_screen_sentence_is_never_a_local_folder_check(self):
+        # LIVE FIX 12, live log: "look at my screen there is a project
+        # folder structure visible i want you to see it and replicate it
+        # exactly on my desktop" asked "Which folder should I check, sir?"
+        # — the inspect verb belongs to the screen, not to a local folder.
+        text = ("look at my screen there is a project folder structure "
+                "visible i want you to see it and replicate it exactly on "
+                "my desktop")
+        self.assertIsNone(agent._local_inspect_folder(agent._normalize(text)))
+        self.assertFalse(agent.is_code_tool_request(text))
+
+    def test_screen_sentence_planner_never_asks_which_folder(self):
+        text = ("look at my screen there is a project folder structure "
+                "visible i want you to see it and replicate it exactly on "
+                "my desktop")
+        plan = agent._heuristic_plan(text, {}) or {}
+        self.assertNotIn("Which folder", plan.get("response") or "")
+
+    def test_screen_typo_still_counts_as_the_screen(self):
+        text = "look at my scrren and check the folder structure there"
+        self.assertIsNone(agent._local_inspect_folder(agent._normalize(text)))
+
 
 if __name__ == "__main__":
     unittest.main()

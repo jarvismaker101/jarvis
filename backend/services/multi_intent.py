@@ -77,6 +77,25 @@ _TASK_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 12] A clause that REPLICATES a structure shown elsewhere
+#: ("replicate it exactly on my desktop", "recreate the folder structure
+#: on my desktop"). The object of the verb is the thing the SCREEN showed,
+#: so this clause is a task half of a screen→task chain and must route as
+#: such, never as a standalone folder-name question. Note "copy" lives in
+#: both this and _TASK_ACTION_RE: there the object is a folder word, here
+#: it is the displayed structure.
+_TASK_REPLICATE_RE = re.compile(
+    r"\b(?:replicate|recreate|rebuild|duplicate|clone|mirror|copy)\b"
+    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b",
+    re.IGNORECASE,
+)
+
+#: [LIVE FIX 12] A displayed STRUCTURE (not a single folder): the marker
+#: that makes a screen clause a look-and-replicate job even when the
+#: replication fragment was merged into it (no conjunction to split on).
+_STRUCTURE_RE = re.compile(
+    r"\b(?:structure|tree|hierarchy|layout)\b", re.IGNORECASE)
+
 _TOOL_RE = re.compile(
     # "Open AI" / "OpenAI" is a company name, not the browser verb — but a
     # real tool clause ("open youtube", "open the browser") still counts.
@@ -103,7 +122,12 @@ _ANAPHORA_RE = re.compile(
     # the usual anaphora shape.
     r"|\b(?:whichever|which|the)\s+(?:name|model|one)\b[^.?!,;]{0,40}\byou\b"
     r"|\bby\s+that\s+name\b"
-    r"|\bthat\s+(?:model\s+)?name\b",
+    r"|\bthat\s+(?:model\s+)?name\b"
+    # Live fix 12: "replicate it exactly on my desktop" — the task clause
+    # reproduces what the screen step saw (RANK 1's stored observation).
+    r"|\b(?:replicate|recreate|rebuild|duplicate|clone|mirror|copy)\b\s+"
+    r"(?:it|this|that|them|the\s+(?:(?:folder|directory|project|file)\s+)?"
+    r"(?:structure|tree|layout|hierarchy))\b",
     re.IGNORECASE,
 )
 
@@ -149,7 +173,8 @@ def classify_clause(text):
         return "screen"
     if _RESEARCH_RE.search(t):
         return "research"
-    if _TASK_WRITE_RE.search(t) or _TASK_ACTION_RE.search(t):
+    if (_TASK_WRITE_RE.search(t) or _TASK_ACTION_RE.search(t)
+            or _TASK_REPLICATE_RE.search(t)):
         return "task"
     if _TOOL_RE.search(t):
         return "tool"
@@ -195,6 +220,19 @@ def build_chain(text):
                          and merged[i + 1]["kind"] == "research")):
             expanded.append({"kind": "research", "text": m["text"]})
     merged = expanded
+    # [LIVE FIX 12] The same rule for a screen clause that SHOWS a structure
+    # and asks to replicate it ("look at my screen there is a project folder
+    # structure replicate it on my desktop" — no conjunction to split on):
+    # look, then rebuild exactly that structure on the destination.
+    expanded = []
+    for i, m in enumerate(merged):
+        expanded.append(m)
+        if (m["kind"] == "screen" and _TASK_REPLICATE_RE.search(m["text"])
+                and _STRUCTURE_RE.search(m["text"])
+                and not (i + 1 < len(merged)
+                         and merged[i + 1]["kind"] == "task")):
+            expanded.append({"kind": "task", "text": m["text"]})
+    merged = expanded
     if len(merged) < 2 or len(merged) > _MAX_STEPS:
         return None
     kinds = [m["kind"] for m in merged]
@@ -212,6 +250,12 @@ def build_chain(text):
               and m["kind"] == "research"
               and (_DEICTIC_RES_RE.search(m["text"])
                    or _SCREEN_REF_RE.search(m["text"]))):
+            consumes = [i - 1]
+        elif (i > 0 and merged[i - 1]["kind"] == "screen"
+              and m["kind"] == "task"
+              and _TASK_REPLICATE_RE.search(m["text"])):
+            # [LIVE FIX 12] The task clause rebuilds what the screen step
+            # just saw — it consumes that step's stored observation.
             consumes = [i - 1]
         steps.append({"kind": m["kind"], "text": m["text"],
                       "index": i, "consumes": consumes})
@@ -231,6 +275,10 @@ def _step_label(step):
     """What this step will actually do — folder jobs never say "file"."""
     kind = step.get("kind")
     text = step.get("text") or ""
+    if kind == "task" and _TASK_REPLICATE_RE.search(text):
+        # [LIVE FIX 12] A replication rebuilds the on-screen structure —
+        # never "save it to a file".
+        return "recreate that structure on your desktop"
     if kind == "task" and _FOLDER_CLAUSE_RE.search(text):
         if re.search(r"\bfile\b", text, re.IGNORECASE):
             return "create a folder with a file inside"
@@ -246,8 +294,10 @@ def render_ack(plan, voice_compact=False):
     if n < 2:
         return "On it, sir."
     parts = ", ".join(_step_label(s) for s in steps)
+    last_text = steps[-1].get("text") or ""
     folder_last = (kinds[-1] == "task"
-                   and _FOLDER_CLAUSE_RE.search(steps[-1].get("text") or ""))
+                   and (_FOLDER_CLAUSE_RE.search(last_text)
+                        or _TASK_REPLICATE_RE.search(last_text)))
     if folder_last:
         tail = "I'll ask before creating it."
     elif kinds[-1] == "task":

@@ -881,6 +881,53 @@ def get_observation(obs_id):
 
 
 # ---------------------------------------------------------------------------
+# LIVE FIX 12 — read the folder structure the screen shows, so a
+# "replicate it exactly on my desktop" request can rebuild it.
+# ---------------------------------------------------------------------------
+
+#: The folder-tree reader job sheet. Structure only — folders, exact names,
+#: the nesting as displayed. Files, paths and commentary are out of scope.
+_FOLDER_TREE_PROMPT = (
+    "Screen-reading task: the user wants the folder structure visible on "
+    "this screen recreated on their computer. Look at any file tree, folder "
+    "hierarchy or directory listing shown (file explorer sidebar, editor "
+    "explorer panel, terminal tree output, archive contents). Reply with "
+    'JSON only, exactly: {"folders": [{"name": "<exact displayed name>", '
+    '"depth": 0}]} — one entry per FOLDER shown, top to bottom as displayed, '
+    "depth 0 for a top-level folder and +1 for each nesting level of "
+    "indentation shown. Copy each folder name character by character; never "
+    "include paths, files or commentary. If no folder structure is visible, "
+    'reply {"folders": []}.'
+)
+
+
+def extract_folder_tree(obs):
+    """The folder hierarchy a stored screen observation shows (LIVE FIX 12).
+
+    A vision read of the SAME stored image (never a re-capture). Returns
+    the raw entries list ({"name": str, "depth": int} dicts) or [] when
+    the screen shows no readable structure. Never raises.
+    """
+    try:
+        image = str(getattr(obs, "image_data_url", "") or "")
+        if not image:
+            return []
+        result = _ask_screen_vision_cascade(
+            _FOLDER_TREE_PROMPT, image, max_completion_tokens=1200)
+        if not result or not result.get("choices"):
+            return []
+        content = (result.get("choices") or [{}])[0].get(
+            "message", {}).get("content", "") or ""
+        parsed = _extract_json(content)
+        if not isinstance(parsed, dict):
+            return []
+        folders = parsed.get("folders")
+        return folders if isinstance(folders, list) else []
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # RANK 10 — the model composes the search query from the observation
 # ---------------------------------------------------------------------------
 

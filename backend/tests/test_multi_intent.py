@@ -90,6 +90,52 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIsNone(multi_intent.build_chain(
             "look at my screen to see what verse im talking about"))
 
+    def test_screen_structure_replication_chains_screen_then_task(self):
+        # LIVE FIX 12, live log: this exact sentence was answered "Which
+        # folder should I check, sir? Please say the folder name." — the
+        # replicate half was no task kind, the chain died, and the folder
+        # inspect net asked the user to name a folder visible on screen.
+        text = ("look at my screen there is a project folder structure "
+                "visible i want you to see it and replicate it exactly on "
+                "my desktop")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "task"])
+        self.assertEqual(plan["steps"][1]["consumes"], [0])
+
+    def test_screen_structure_replication_without_a_conjunction(self):
+        # Run-on variant: the replicate fragment has no conjunction to
+        # split on, so the screen+task expansion has to split them.
+        text = ("look at my screen there is a project folder structure "
+                "replicate it on my desktop")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "task"])
+        self.assertEqual(plan["steps"][1]["consumes"], [0])
+
+    def test_screen_and_replicate_the_structure_chains(self):
+        text = ("look at my screen and replicate the folder structure on "
+                "my desktop")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "task"])
+
+    def test_replication_alone_is_a_single_job_not_a_chain(self):
+        self.assertIsNone(multi_intent.build_chain(
+            "replicate the folder structure on my desktop"))
+
+    def test_ack_describes_structure_replication_not_a_file(self):
+        text = ("look at my screen there is a project folder structure "
+                "visible i want you to see it and replicate it exactly on "
+                "my desktop")
+        ack = multi_intent.render_ack(multi_intent.build_chain(text))
+        self.assertIn("structure", ack.lower())
+        self.assertNotIn("file", ack.lower())
+        self.assertIn("creating it", ack.lower())
+
     def test_screen_research_single_clause_without_a_tell_me_fragment(self):
         # Live transcript: "research about these image generation models on
         # my screen" — a ONE-clause message. The chain gate used to require

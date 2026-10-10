@@ -1200,6 +1200,17 @@ _INSPECT_FOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 12] "look at my screen …" is a SCREEN job, never a local folder
+#: inspect — the inspect verb anchors to the screen word, and any "folder
+#: structure" inside the sentence only DESCRIBES what is visible there. A
+#: local-folder read would ask the user to name a folder they can SEE.
+_INSPECT_SCREEN_RE = re.compile(
+    r"\b(?:look\s+at|see|check|view|examine|watch|read|analyse|analyze|"
+    r"scan|list|show|inspect)\b[^.?!,;]{0,40}\b(?:scr+[ae]*n|monitor|display)\b"
+    r"|\bon (?:my|the) (?:scr+[ae]*n|monitor|display)\b",
+    re.IGNORECASE,
+)
+
 #: R20 — an explicitly NAMED inspect target beats the bare word "folder".
 #: "folder by the name X", "folder named/called X", "is there a folder X".
 _INSPECT_NAMED_CUE_RE = re.compile(
@@ -1246,6 +1257,12 @@ def _local_inspect_folder(routed):
     R20: a named target resolves BEFORE the bare "folder" pronoun shortcut.
     """
     if not routed or not _INSPECT_VERB_RE.search(routed):
+        return None
+    # [LIVE FIX 12] The inspect verb belongs to the SCREEN ("look at my
+    # screen there is a project folder structure visible…") — the folder
+    # words only describe what is displayed, so this is a screen job, not
+    # a local folder read.
+    if _INSPECT_SCREEN_RE.search(routed):
         return None
     if re.match(r"^(?:create|make|write|save|update)\b", routed or ""):
         return None

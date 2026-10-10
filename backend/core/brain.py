@@ -72,6 +72,7 @@ from backend.services.research_service import run_research, request_stop as requ
 from backend.services.quick_search import run_quick_search, fetch_ai_overview_text
 from backend.services.screen_analyzer import analyze_screen, is_screen_question, is_region_question
 from backend.services.screen_analyzer import identify_on_screen, get_observation
+from backend.services.screen_analyzer import extract_folder_tree
 from backend.services.screen_analyzer import compose_search_query
 from backend.services.image_fetcher import build_explore_links, fetch_topic_images
 
@@ -5629,6 +5630,35 @@ def _mi_vision_screen_query(clause, correction="", obs_id=""):
                                     obs_id=obs_id)[0]
 
 
+def _mi_extract_folder_tree(obs_id):
+    """The folder hierarchy the stored screen observation shows (LIVE FIX 12).
+
+    A vision read of the SAME stored image the screen step captured (never
+    a re-capture), serialized under the shared screen-QA lock. Returns
+    relative folder paths, parents first, or [] when the screen shows no
+    readable structure.
+    """
+    obs = get_observation(obs_id) if obs_id else None
+    if obs is None or not str(getattr(obs, "image_data_url", "") or ""):
+        return []
+    if not _screen_qa_busy.acquire(timeout=30):
+        return []
+    try:
+        entries = extract_folder_tree(obs)
+    except Exception as exc:
+        logging.warning("[CHAIN] Folder-tree read failed: %s", exc)
+        entries = []
+    finally:
+        try:
+            _screen_qa_busy.release()
+        except Exception:
+            pass
+    paths = _parse_folder_tree(entries)
+    if paths:
+        print("[CHAIN] Folder tree from screen: %d folders" % len(paths))
+    return paths
+
+
 #: "no not that, the image to the left" — a redirect, not a refusal.
 _SCREEN_REDIRECT_RE = re.compile(
     r"\b(?:not\s+(?:that|this|those|these|it|the\s+\w+)|instead|"
@@ -6169,6 +6199,16 @@ def _mi_free_path(path):
 #: A chain task clause that creates a FOLDER, not a file.
 _MI_FOLDER_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
 
+#: [LIVE FIX 12] A chain task clause that REPLICATES the structure the
+#: screen step just saw ("replicate it exactly on my desktop", "recreate
+#: the folder structure on my desktop") — a folder-tree rebuild, not a
+#: file write and not a single folder create.
+_MI_REPLICATE_RE = re.compile(
+    r"\b(?:replicate|recreate|rebuild|duplicate|clone|mirror|copy)\b"
+    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b",
+    re.IGNORECASE,
+)
+
 
 def _mi_safe_folder_name(name):
     """One filesystem-safe folder name (single component, bounded)."""
@@ -6176,6 +6216,52 @@ def _mi_safe_folder_name(name):
     name = re.sub(r"\s+", " ", name)
     name = name.replace("\\", "/").split("/")[-1].strip(" .")
     return name[:60]
+
+
+#: [LIVE FIX 12] Caps for a replicated on-screen tree: enough for a real
+#: project (150 folders, 8 levels), impossible to explode into a runaway
+#: plan from a misread screen.
+_MI_TREE_MAX_FOLDERS = 150
+_MI_TREE_MAX_DEPTH = 8
+
+
+def _parse_folder_tree(entries):
+    """Normalize vision entries into relative folder paths (LIVE FIX 12).
+
+    Entries are {"name": str, "depth": int} top-to-bottom, depth from the
+    displayed indentation. The depth builds the nesting stack, so every
+    path's parents precede it and the plan can create them in order. Names
+    are sanitized (single component, filesystem-safe), junk entries are
+    skipped, duplicates collapse and the caps apply. Never raises.
+    """
+    if isinstance(entries, dict):
+        entries = entries.get("folders")
+    if not isinstance(entries, list):
+        return []
+    stack = []
+    paths = []
+    seen = set()
+    for entry in entries:
+        if len(paths) >= _MI_TREE_MAX_FOLDERS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        name = _mi_safe_folder_name(entry.get("name"))
+        name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name).strip(" .")
+        if not name:
+            continue
+        try:
+            depth = int(entry.get("depth") or 0)
+        except Exception:
+            depth = 0
+        depth = max(0, min(depth, len(stack), _MI_TREE_MAX_DEPTH - 1))
+        del stack[depth:]
+        stack.append(name)
+        rel = os.path.join(*stack)
+        if rel not in seen:
+            seen.add(rel)
+            paths.append(rel)
+    return paths
 
 
 #: A folder name that is a POINTER ("by the name of this website", "the
@@ -6570,6 +6656,97 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
             "prompt": prompt, "path": path}
 
 
+def _mi_replicate_task_step(msg, step, results):
+    """Rebuild the on-screen folder structure under the Desktop (LIVE FIX 12).
+
+    The screen step already captured the observation; this step re-reads
+    that SAME image, extracts the folder hierarchy, and arms ONE
+    confirmation for a plan of code.create_folder steps (parents first).
+    When the screen shows no readable structure the reply says so — it
+    never asks the user to name a folder that is visible on their screen.
+    """
+    obs_id = ""
+    for idx in (step or {}).get("consumes") or []:
+        if 0 <= idx < len(results or []):
+            obs_id = str(results[idx].get("output_obs_id") or "")
+            if obs_id:
+                break
+    if not obs_id:
+        # The anaphora may have been phrased past the strict rule ("rebuild
+        # the whole thing on my desktop"); the screen step still ran first.
+        for prior in reversed(results or []):
+            obs_id = str(prior.get("output_obs_id") or "")
+            if obs_id:
+                break
+    tree = _mi_extract_folder_tree(obs_id)
+    if not tree:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I looked at your screen, but I couldn't read a "
+                            "folder structure from it — keep the folders "
+                            "visible and ask me again."}
+    try:
+        folders = task_agent_module._known_folders() or {}
+    except Exception:
+        folders = {}
+    base = folders.get("desktop") or folders.get("home") or ""
+    if not base:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't find your Desktop folder."}
+    try:
+        if task_agent_module.has_pending_task_confirmation():
+            return {"kind": "task", "status": "failed",
+                    "fragment": "Another task is already waiting for your "
+                                "approval, so I left the folders uncreated — "
+                                "ask me again once that is settled."}
+    except Exception:
+        pass
+    # A same-named root already on disk is never overwritten — each root
+    # gets the free "name (2)" path, and every child follows its root.
+    roots = []
+    for rel in tree:
+        root = rel.split(os.sep, 1)[0]
+        if root and root not in roots:
+            roots.append(root)
+    root_paths = {root: _mi_free_path(os.path.join(base, root))
+                  for root in roots}
+    steps = []
+    for rel in tree:
+        parts = rel.split(os.sep)
+        root_path = root_paths.get(parts[0])
+        if not root_path:
+            continue
+        target = (os.path.join(root_path, *parts[1:])
+                  if len(parts) > 1 else root_path)
+        steps.append({
+            "tool": "code.create_folder",
+            "args": {"path": target},
+            "risk": "safe",
+            "reason": "Creating folder %s." % rel,
+        })
+    if not steps:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't prepare the folder structure."}
+    plan = {
+        "ok": True,
+        "confidence": 0.9,
+        "summary": ("Replicating the folder structure on your screen — "
+                    "%d folders under %s."
+                    % (len(steps), os.path.basename(base.rstrip("\\/")) or base)),
+        "requires_confirmation": True,
+        "command_text": msg,
+        "steps": steps,
+    }
+    try:
+        task_agent_module._arm_plan_confirmation(plan, {}, task_text=msg)
+        prompt = task_agent_module.confirmation_prompt(plan)
+    except Exception as exc:
+        return {"kind": "task", "status": "failed",
+                "fragment": "I couldn't prepare the folder replication (%s)."
+                            % _mi_clip(exc, 80)}
+    return {"kind": "task", "status": "armed", "fragment": prompt,
+            "prompt": prompt}
+
+
 def consume_pending_folder_name(msg):
     """The user answers the folder-name ask ("name it james dark").
 
@@ -6707,6 +6884,11 @@ def consume_pending_file_name(msg):
 def _mi_task_step(msg, step, results):
     """Compose the file write and arm the ONE approval; nothing runs now."""
     clause = step.get("text") or ""
+    if _MI_REPLICATE_RE.search(clause):
+        # [LIVE FIX 12] A structure replication is a folder-tree rebuild,
+        # never a file write — and it must be checked before the folder
+        # dispatch (the merged clause also carries the word "folder").
+        return _mi_replicate_task_step(msg, step, results)
     if _MI_FOLDER_RE.search(clause):
         return _mi_folder_task_step(msg, clause, step, results)
     content = ""
