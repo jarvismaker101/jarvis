@@ -151,6 +151,24 @@ class FolderNameTests(unittest.TestCase):
                 "create a folder by the name of this website"),
             "")
 
+    def test_positional_name_before_the_folder_word_resolves(self):
+        # Live transcript: "store all the information you find in a txt
+        # file inside information folder on my desktop" — the name rides
+        # before the folder word, PAST the file mention where the phrase
+        # search never looks.
+        self.assertEqual(
+            brain._mi_folder_name(
+                "store all the information you find in a txt file "
+                "inside information folder on my desktop"),
+            "information")
+
+    def test_positional_articles_and_pointers_name_nothing(self):
+        for clause in ("write it inside that folder",
+                       "store the info in the new folder on my desktop",
+                       "create a txt file and put it in a folder",
+                       "put the notes in a folder on my desktop"):
+            self.assertEqual(brain._mi_folder_name(clause), "")
+
 
 class FileRequestTests(unittest.TestCase):
     def test_pointer_content_uses_the_findings(self):
@@ -183,12 +201,15 @@ class FolderNameAnswerTests(unittest.TestCase):
     def setUp(self):
         clear_history()
         brain._set_chain_findings("")
+        brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
         self._tmp = tempfile.TemporaryDirectory()
 
     def tearDown(self):
         clear_history()
         brain._set_chain_findings("")
         brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
         self._tmp.cleanup()
 
     def test_answer_arms_folder_and_file_with_findings(self):
@@ -231,6 +252,192 @@ class FolderNameAnswerTests(unittest.TestCase):
         self.assertIn("assistant", roles)
         self.assertEqual(hist[-2]["content"], "name it james dark")
         self.assertTrue(hist[-1]["content"])
+
+
+class ExistingFolderFileAskTests(unittest.TestCase):
+    """The folder is a location, never a duplicate; the file ASKS its name.
+
+    Live transcript: "the folder is already there on the desktop by the
+    name information, create a txt file inside that folder" — then
+    "name it random.txt". The answer must name the FILE inside the
+    EXISTING folder, never birth a "random" folder with an "info.txt".
+    """
+
+    def setUp(self):
+        clear_history()
+        brain._set_chain_findings("")
+        brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
+        self._tmp = tempfile.TemporaryDirectory()
+        self._folder = os.path.join(self._tmp.name, "information")
+        os.makedirs(self._folder, exist_ok=True)
+
+    def tearDown(self):
+        clear_history()
+        brain._set_chain_findings("")
+        brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
+        self._tmp.cleanup()
+
+    def _arm_patches(self, captured):
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        return (patch.object(task_agent, "_known_folders",
+                             return_value={"desktop": self._tmp.name}),
+                patch.object(task_agent, "_arm_plan_confirmation",
+                             side_effect=fake_arm))
+
+    def test_existing_folder_is_reused_not_duplicated(self):
+        brain._set_chain_findings(
+            "Yao Ming is a retired center, 7 ft 6 in tall.")
+        captured = {}
+        clause = ("store the information you found in a txt file named "
+                  "random.txt inside information folder on my desktop")
+        arm1, arm2 = self._arm_patches(captured)
+        with arm1, arm2:
+            result = brain._mi_folder_task_step(clause, clause)
+        self.assertEqual(result.get("status"), "armed")
+        steps = captured["plan"]["steps"]
+        self.assertEqual([s["tool"] for s in steps], ["code.write_file"])
+        self.assertEqual(steps[0]["args"]["path"],
+                         os.path.join(self._folder, "random.txt"))
+        self.assertIn("retired center", steps[0]["args"]["content"])
+
+    def test_unnamed_findings_file_asks_for_the_file_name(self):
+        brain._set_chain_findings(
+            "Yao Ming is a retired center, 7 ft 6 in tall.")
+        clause = ("store all the information you find in a txt file "
+                  "inside information folder on my desktop")
+        with patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}):
+            result = brain._mi_folder_task_step(clause, clause)
+        self.assertEqual(result.get("status"), "failed")
+        self.assertIn("what name should I give",
+                      str(result.get("fragment")))
+        self.assertTrue(brain._pending_file_name.get("text"))
+        self.assertFalse(brain._pending_folder_name.get("text"))
+
+    def test_existing_folder_with_no_file_asks_what_to_create(self):
+        clause = ("the folder is already there on the desktop by the "
+                  "name information")
+        with patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}):
+            result = brain._mi_folder_task_step(clause, clause)
+        self.assertEqual(result.get("status"), "failed")
+        self.assertIn("already there", str(result.get("fragment")))
+
+    def test_file_name_answer_writes_inside_the_existing_folder(self):
+        brain._set_chain_findings(
+            "Yao Ming is a retired center, 7 ft 6 in tall.")
+        brain._set_pending_file_name(
+            "the folder is already there on the desktop by the name "
+            "information , create a txt file inside that folder and store "
+            "all the information you found inside it")
+        captured = {}
+        arm1, arm2 = self._arm_patches(captured)
+        with arm1, arm2:
+            reply = brain.consume_pending_file_name("name it random.txt")
+        self.assertIsNotNone(reply)
+        self.assertIn("confirm", str(reply).lower())
+        steps = captured["plan"]["steps"]
+        self.assertEqual([s["tool"] for s in steps], ["code.write_file"])
+        self.assertTrue(steps[0]["args"]["path"].endswith(
+            os.path.join("information", "random.txt")))
+        self.assertIn("retired center", steps[0]["args"]["content"])
+        self.assertFalse(brain._pending_file_name.get("text"))
+
+    def test_live_replay_folder_then_file_answers(self):
+        """The exact live sequence, replayed: it must converge on the
+        EXISTING folder with the user's file name inside it."""
+        brain._set_chain_findings(
+            "Yao Ming is a retired center, 7 ft 6 in tall.")
+        # Turn 1 left the folder ask armed (the folder was unnamed then).
+        brain._set_pending_folder_name(
+            "store all the information you find in a txt file inside a "
+            "folder on my desktop")
+        captured = {}
+        arm1, arm2 = self._arm_patches(captured)
+        with arm1, arm2:
+            # Turn 2: the inline clarification names the folder and says
+            # it already exists.
+            reply = brain.consume_pending_folder_name(
+                "the folder is already there on the desktop by the name "
+                "information , create a txt file inside that folder and "
+                "store all the information you found inside it")
+        self.assertIn("what name should I give", str(reply))
+        self.assertFalse(brain._pending_folder_name.get("text"))
+        self.assertTrue(brain._pending_file_name.get("text"))
+        arm1, arm2 = self._arm_patches(captured)
+        with arm1, arm2:
+            # Turn 3: the answer names the FILE, never a second folder.
+            reply2 = brain.consume_pending_file_name("name it random.txt")
+        self.assertIn("confirm", str(reply2).lower())
+        steps = captured["plan"]["steps"]
+        self.assertEqual([s["tool"] for s in steps], ["code.write_file"])
+        self.assertTrue(steps[0]["args"]["path"].endswith(
+            os.path.join("information", "random.txt")))
+        # The answer turns are real turns in the history.
+        roles = [m["role"] for m in get_history()]
+        self.assertIn("user", roles)
+        self.assertIn("assistant", roles)
+
+
+class ChainReportBrevityTests(unittest.TestCase):
+    """Findings destined for a file are saved, not spoken aloud."""
+
+    def setUp(self):
+        clear_history()
+        brain._set_chain_findings("")
+        brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        clear_history()
+        brain._set_chain_findings("")
+        brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
+        self._tmp.cleanup()
+
+    def test_research_summary_is_saved_not_spoken(self):
+        plan = {"ok": True, "source": "s", "command_text": "s", "steps": [
+            {"kind": "screen", "text": "look at my screen",
+             "index": 0, "consumes": []},
+            {"kind": "research", "text": "research Yao Ming career online",
+             "index": 1, "consumes": [0]},
+            {"kind": "task",
+             "text": "store all the information you find in a txt file "
+                     "inside a folder on my desktop",
+             "index": 2, "consumes": [1]},
+        ]}
+        captured = {}
+        with patch.object(brain, "analyze_screen", return_value={
+                "tip": "A Yao Ming interview video is playing.",
+                "topic": "Yao Ming interview",
+                "creator": ""}), \
+             patch.object(brain, "run_quick_search",
+                          return_value={"query": "Yao Ming career",
+                                        "spoken_summary":
+                                        "Yao Ming represented China in "
+                                        "three Olympics and two FIBA World "
+                                        "Cups."}), \
+             patch.object(brain, "_notify_async_reply",
+                          side_effect=lambda reply:
+                          captured.setdefault("reply", reply)), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}):
+            brain._run_multi_intent_chain("look at my screen", plan)
+        reply = str(captured.get("reply") or "")
+        self.assertIn("ready for your file", reply)
+        self.assertNotIn("three Olympics", reply)
+        # The history note stays one line too — a later "remind me what we
+        # did" never re-reads the findings the user never asked to hear.
+        texts = " || ".join(_history_texts())
+        self.assertNotIn("three Olympics", texts)
+        # The full findings still reach the later file write.
+        self.assertIn("three Olympics", brain._get_chain_findings())
 
 
 class SplitterExpansionTests(unittest.TestCase):

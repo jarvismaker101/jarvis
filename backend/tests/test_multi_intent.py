@@ -177,6 +177,7 @@ class ChainExecutorTests(unittest.TestCase):
         brain._held_redirect = None
         brain._proactive_research_fired = False
         brain._pending_folder_name = {"text": "", "at": 0.0}
+        brain._pending_file_name = {"text": "", "at": 0.0}
         task_agent._pending_task_action = None
         entity_ledger.reset()
         self.addCleanup(entity_ledger.reset)

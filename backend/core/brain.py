@@ -6188,8 +6188,8 @@ _FOLDER_NAME_POINTER_RE = re.compile(
     re.IGNORECASE)
 
 
-def _mi_folder_name(clause):
-    """The explicit folder name in the clause, or "" when it is unnamed."""
+def _mi_folder_name_phrase(clause):
+    """The "named X" folder name in the FOLDER half, or "" when absent."""
     # R20: the FILE half of the clause ("…txt file by the name info…")
     # names the FILE, not the folder — only the folder half (before any
     # file mention) may name the folder.
@@ -6213,6 +6213,52 @@ def _mi_folder_name(clause):
     if _FOLDER_NAME_POINTER_RE.search(name):
         return ""
     return _mi_safe_folder_name(name)
+
+
+#: A folder named by POSITION ("inside information folder on my desktop") —
+#: the name rides immediately before the folder word, even after the file
+#: mention. An article ("the folder"), a pointer ("that folder") or a
+#: grammar word names nothing.
+_FOLDER_POSITIONAL_RE = re.compile(
+    r"\b(?:in|inside|into|on|at|under)\s+(?:the\s+|my\s+|our\s+)?"
+    r"([A-Za-z0-9_.\-]+(?:\s+[A-Za-z0-9_.\-]+){0,2})\s+"
+    r"(?:folder|directory)\b", re.IGNORECASE)
+
+_FOLDER_POSITIONAL_STOPWORDS = {
+    "a", "an", "the", "my", "our", "his", "her", "their", "its",
+    "this", "that", "these", "those", "new", "same", "one", "some",
+    "any", "every", "following", "above", "below", "txt", "text",
+    "file", "document", "note", "report", "folder", "directory",
+    "name", "named", "called", "in", "on", "at", "by", "with",
+    "under", "inside", "into", "and", "or", "of", "for", "to",
+}
+
+
+def _mi_folder_name_positional(clause):
+    """The "<name> folder" positional folder name, or "" when absent."""
+    for match in _FOLDER_POSITIONAL_RE.finditer(str(clause or "")):
+        name = match.group(1).strip().strip("\"'").strip(" .")
+        words = [w for w in re.split(r"\s+", name.lower()) if w]
+        if not words or len(name) > 40:
+            continue
+        if any(w in _FOLDER_POSITIONAL_STOPWORDS for w in words):
+            continue
+        if _FOLDER_NAME_POINTER_RE.search(name):
+            continue
+        return _mi_safe_folder_name(name)
+    return ""
+
+
+def _mi_folder_name(clause):
+    """The explicit folder name in the clause, or "" when it is unnamed.
+
+    Live fix: a clause can name the folder by position ("store it in a
+    txt file inside information folder on my desktop") — the name rides
+    before the folder word, past the file mention where the phrase
+    search ("named X") never looks.
+    """
+    return _mi_folder_name_phrase(clause) \
+        or _mi_folder_name_positional(clause)
 
 
 def _extract_name_from_findings(content):
@@ -6279,6 +6325,33 @@ def _clear_pending_folder_name():
         pass
 
 
+#: Live fix: the FILE-name ask's remembered request. The folder task asked
+#: WHICH name to give the txt file inside the (existing) folder — the
+#: answer ("name it random.txt") arrives on a LATER turn, so the clause
+#: (and its folder half) must survive the chain worker's death.
+_pending_file_name = {"text": "", "at": 0.0}
+
+
+def _set_pending_file_name(clause):
+    """Remember the file-name ask so "name it X" can answer it."""
+    global _pending_file_name
+    try:
+        with _screen_topic_lock:
+            _pending_file_name = {"text": str(clause or "")[:400],
+                                   "at": time.time()}
+    except Exception:
+        pass
+
+
+def _clear_pending_file_name():
+    global _pending_file_name
+    try:
+        with _screen_topic_lock:
+            _pending_file_name = {"text": "", "at": 0.0}
+    except Exception:
+        pass
+
+
 #: File content that is a POINTER to the findings ("the information you
 #: found", "your report") — the real findings must be substituted, not the
 #: pointer words written into the file.
@@ -6289,6 +6362,28 @@ _FILE_CONTENT_POINTER_RE = re.compile(
     r"|\bthe\s+(?:information|info|findings|results|report|research|"
     r"summary|answer)\b",
     re.IGNORECASE)
+
+
+#: The explicit file name inside a folder request ("txt file by the
+#: name random") — the lookahead stops the name at the next clause
+#: boundary so it never swallows the rest of the request.
+_FILE_NAME_RE = re.compile(
+    r"\bfile\s+(?:named\s+|called\s+|by\s+the\s+name(?:\s+of)?\s+)"
+    r"([A-Za-z0-9_ .\-]{1,60}?)(?=\s*(?:,|;|\band\b|\bon\b|\bin\b|"
+    r"\binside\b|\binto\b|\bat\b|\bwith\b|\bwrite\b|$))", re.IGNORECASE)
+
+
+def _mi_file_name(clause):
+    """The explicit "<file> named X" file name, or "" when it is unnamed."""
+    match = _FILE_NAME_RE.search(str(clause or ""))
+    if not match:
+        return ""
+    name = match.group(1).strip().strip("\"'")
+    if not name:
+        return ""
+    if not re.search(r"\.\w{1,5}$", name):
+        name += ".txt"
+    return _mi_safe_folder_name(name)
 
 
 def _mi_file_request(clause, fallback_content=""):
@@ -6304,11 +6399,7 @@ def _mi_file_request(clause, fallback_content=""):
     the pointer words — never conjured when the clause asks for no file.
     """
     text = str(clause or "")
-    match = re.search(
-        r"\bfile\s+(?:named\s+|called\s+|by\s+the\s+name(?:\s+of)?\s+)"
-        r"([A-Za-z0-9_ .\-]{1,60}?)(?=\s*(?:,|;|\band\b|\bon\b|\bin\b|"
-        r"\bat\b|\bwith\b|\bwrite\b|$))",
-        text, re.IGNORECASE)
+    match = _FILE_NAME_RE.search(text)
     rest = text[match.end():] if match else text
     try:
         content = str(task_agent_module._located_write_content(rest, "")
@@ -6329,17 +6420,21 @@ def _mi_file_request(clause, fallback_content=""):
         flags=re.IGNORECASE).strip()
     if not content:
         return "", ""
-    if match:
-        name = match.group(1).strip().strip("\"'")
-        if not re.search(r"\.\w{1,5}$", name):
-            name += ".txt"
-    else:
-        name = ("info.txt" if re.search(r"\b(?:txt|text)\b", text,
-                                        re.IGNORECASE) else "notes.txt")
-    name = _mi_safe_folder_name(name)
+    name = _mi_file_name(text) \
+        or ("info.txt" if re.search(r"\b(?:txt|text)\b", text,
+                                    re.IGNORECASE) else "notes.txt")
     if not name:
         return "", ""
     return name, content
+
+
+#: The clause says the folder ALREADY EXISTS ("the folder is already there
+#: on the desktop by the name information") — it is a LOCATION for the
+#: file, never a new folder to create.
+_FOLDER_EXISTS_RE = re.compile(
+    r"\balready\s+(?:there|exists?|existing|created|present|made)\b"
+    r"|\b(?:pre[-\s]?existing|existing)\s+(?:folder|directory)\b",
+    re.IGNORECASE)
 
 
 def _mi_folder_task_step(msg, clause, step=None, results=None):
@@ -6351,6 +6446,11 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
     Live fix 2: "…and inside that folder create a txt file by the name
     info and write hello" arms BOTH steps in the one plan — the folder and
     the file inside it — so the follow-up file work is never dropped.
+    Live fix 3: "the folder is already there by the name information" —
+    the folder is a LOCATION for the file: it is reused as-is (never a
+    duplicate "information (2)"), and when the findings file is unnamed
+    it ASKS for the file name (remembered) so "name it random.txt" names
+    the FILE instead of birthing a "random" folder.
     """
     name = _mi_folder_name(clause)
     findings = ""
@@ -6390,7 +6490,6 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
     if not base:
         return {"kind": "task", "status": "failed",
                 "fragment": "I couldn't find your Desktop folder."}
-    path = _mi_free_path(os.path.join(base, name))
     try:
         if task_agent_module.has_pending_task_confirmation():
             return {"kind": "task", "status": "failed",
@@ -6399,24 +6498,57 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
                                 "ask me again once that is settled."}
     except Exception:
         pass
+    direct = os.path.join(base, name)
+    try:
+        folder_exists = os.path.isdir(direct)
+    except Exception:
+        folder_exists = False
+    file_name, file_content = _mi_file_request(clause, findings)
+    # Live fix 3: the folder the user says is already there, with nothing
+    # new to put inside it — never re-create it.
+    if folder_exists and _FOLDER_EXISTS_RE.search(clause) \
+            and not (file_name and file_content):
+        return {"kind": "task", "status": "failed",
+                "fragment": "The folder %s is already there — tell me what "
+                            "to create inside it and I'll do it." % name}
+    # Live fix 3: the findings will be written but the file is unnamed —
+    # ASK for the file name, never guess "info.txt"; the ask is remembered
+    # so "name it random.txt" names the FILE, not a second folder.
+    if (file_name and file_content and findings
+            and not _mi_file_name(clause)
+            and str(file_content).strip() == str(findings).strip()):
+        _set_pending_file_name(clause)
+        _clear_pending_folder_name()
+        return {"kind": "task", "status": "failed",
+                "fragment": "I have the findings for the folder %s — what "
+                            "name should I give the txt file? Say 'name it "
+                            "<name>' and I'll prepare the write." % name}
+    # Live fix 3: an existing folder hosting the file is reused, never
+    # duplicated — the file is the deliverable, the folder the location.
+    reuse = bool(folder_exists and file_name and file_content)
+    path = direct if reuse else _mi_free_path(direct)
     plan = {
         "ok": True,
         "confidence": 0.9,
-        "summary": "Creating the folder %s." % name,
+        "summary": ("Writing %s inside the existing folder %s."
+                    % (file_name, name)) if reuse else
+                   ("Creating the folder %s." % name),
         "requires_confirmation": True,
         "command_text": msg,
-        "steps": [{
+        "steps": [],
+    }
+    if not reuse:
+        plan["steps"].append({
             "tool": "code.create_folder",
             "args": {"path": path},
             "risk": "safe",
             "reason": "Creating the folder %s." % name,
-        }],
-    }
-    file_name, file_content = _mi_file_request(clause, findings)
+        })
     if file_name and file_content:
         file_path = os.path.join(path, file_name)
-        plan["summary"] = ("Creating the folder %s and writing %s inside it."
-                           % (name, file_name))
+        if not reuse:
+            plan["summary"] = ("Creating the folder %s and writing %s "
+                               "inside it." % (name, file_name))
         plan["steps"].append({
             "tool": "code.write_file",
             "args": {"path": file_path, "content": file_content,
@@ -6433,6 +6565,7 @@ def _mi_folder_task_step(msg, clause, step=None, results=None):
                 "fragment": "I couldn't prepare the folder creation (%s)."
                             % _mi_clip(exc, 80)}
     _clear_pending_folder_name()
+    _clear_pending_file_name()
     return {"kind": "task", "status": "armed", "fragment": prompt,
             "prompt": prompt, "path": path}
 
@@ -6459,25 +6592,39 @@ def consume_pending_folder_name(msg):
         r"^(?:ok(?:ay)?\s*[,.]?\s*)?(?:name\s+(?:it|the\s+folder)|"
         r"call\s+(?:it|the\s+folder)|folder\s+name\s+(?:is|:))\s+(.+)$",
         text, re.IGNORECASE)
-    if not match:
-        return None
-    name = _mi_safe_folder_name(match.group(1))
-    if not name:
-        return None
-    print("[CHAIN] Folder name answer:", name)
-    # R20: answer against the ORIGINAL clause, not a bare "create a folder
-    # named X" — the original also carries the file request ("…and inside
-    # that folder create a txt file by the name random…"), which a bare
-    # clause dropped, so the file half of the request silently vanished.
-    clause = str(state.get("text") or "").strip() or "create a folder"
-    if not _mi_folder_name(clause):
-        # The name rides on the FIRST folder mention so the folder half
-        # keeps it — an appended tail lands past the file mention, where
-        # the folder-name search never looks.
-        clause = re.sub(r"\b(folder|directory)\b", "folder named %s" % name,
-                       clause, count=1, flags=re.IGNORECASE)
-    if not _mi_folder_name(clause):
-        clause = "create a folder named %s. %s" % (name, clause)
+    clause = ""
+    if match:
+        name = _mi_safe_folder_name(match.group(1))
+        if not name:
+            return None
+        print("[CHAIN] Folder name answer:", name)
+        # R20: answer against the ORIGINAL clause, not a bare "create a
+        # folder named X" — the original also carries the file request
+        # ("…and inside that folder create a txt file by the name
+        # random…"), which a bare clause dropped, so the file half of the
+        # request silently vanished.
+        clause = str(state.get("text") or "").strip() or "create a folder"
+        if not _mi_folder_name(clause):
+            # The name rides on the FIRST folder mention so the folder half
+            # keeps it — an appended tail lands past the file mention,
+            # where the folder-name search never looks.
+            clause = re.sub(r"\b(folder|directory)\b",
+                            "folder named %s" % name,
+                            clause, count=1, flags=re.IGNORECASE)
+        if not _mi_folder_name(clause):
+            clause = "create a folder named %s. %s" % (name, clause)
+    else:
+        # Live fix: the answer arrives as a full clarification ("the
+        # folder is already there on the desktop by the name information,
+        # create a txt file inside that folder…") — it names the folder
+        # itself and re-carries the file request, so it completes the ask
+        # directly instead of falling into chat and leaving the ask stale.
+        inline = _mi_folder_name_phrase(text)
+        if not inline or not _MI_FOLDER_RE.search(text):
+            return None
+        name = inline
+        print("[CHAIN] Folder name answer (inline):", name)
+        clause = text
     result = _mi_folder_task_step(text, clause)
     # R20: the "name it X" answer is a real turn — commit both halves so
     # the armed folder is recallable later.
@@ -6489,6 +6636,70 @@ def consume_pending_folder_name(msg):
     except Exception:
         pass
     if result.get("status") == "armed":
+        return result.get("prompt")
+    return result.get("fragment")
+
+
+def consume_pending_file_name(msg):
+    """The user answers the FILE-name ask ("name it random.txt").
+
+    Returns the confirmation prompt when the message names the FILE for a
+    remembered, unfulfilled folder+file request; None otherwise. The
+    answer names the file INSIDE the resolved folder — never a second
+    folder.
+    """
+    text = str(msg or "").strip()
+    if not text:
+        return None
+    try:
+        with _screen_topic_lock:
+            state = dict(_pending_file_name)
+    except Exception:
+        return None
+    if not state.get("text"):
+        return None
+    if time.time() - float(state.get("at") or 0.0) > _PENDING_FOLDER_TTL:
+        return None
+    match = re.match(
+        r"^(?:ok(?:ay)?\s*[,.]?\s*)?(?:name\s+(?:it|the\s+(?:txt\s+|"
+        r"text\s+)?file)|call\s+(?:it|the\s+(?:txt\s+|text\s+)?file)|"
+        r"(?:txt\s+|text\s+)?file\s+name\s+(?:is|:))\s+(.+)$",
+        text, re.IGNORECASE)
+    clause = ""
+    if match:
+        name = _mi_file_name("file named %s" % match.group(1))
+        if not name:
+            return None
+        print("[CHAIN] File name answer:", name)
+        clause = str(state.get("text") or "").strip()
+    else:
+        # The answer arrives as a full request ("create a txt file named
+        # random.txt inside that folder…") — it names the file itself.
+        inline = _mi_file_name(text)
+        if not inline:
+            return None
+        name = inline
+        print("[CHAIN] File name answer (inline):", name)
+        clause = text
+    if not _mi_file_name(clause):
+        # The name rides on the FIRST file mention so the file half keeps
+        # it — never past a clause boundary.
+        clause = re.sub(r"\bfile\b", "file named %s," % name,
+                        clause, count=1, flags=re.IGNORECASE)
+    if not _mi_file_name(clause):
+        clause = "create a txt file named %s. %s" % (name, clause)
+    result = _mi_folder_task_step(text, clause)
+    # The answer is a real turn — commit both halves so the written file
+    # is recallable later.
+    _remember_user_turn(text)
+    try:
+        add_message(
+            "assistant",
+            str(result.get("prompt") or result.get("fragment") or ""))
+    except Exception:
+        pass
+    if result.get("status") == "armed":
+        _clear_pending_file_name()
         return result.get("prompt")
     return result.get("fragment")
 
@@ -6559,6 +6770,15 @@ def _run_multi_intent_chain(msg, plan):
     """Execute the chain in order, then deliver ONE honest summary."""
     global _mi_chain_active
     results = []
+    # Live fix: the chain ends by STORING the findings in a file — the
+    # research summary is then never spoken aloud (the user asked to save
+    # it, not to hear it); the full findings still reach the file write,
+    # the follow-up findings store and a one-line history note.
+    stores_findings = any(
+        str(s.get("kind") or "") == "task" and re.search(
+            r"\b(?:txt|text|file|document|note|report)\b",
+            str(s.get("text") or ""), re.IGNORECASE)
+        for s in plan.get("steps") or [])
     try:
         for step in plan.get("steps") or []:
             blocked = [j for j in (step.get("consumes") or [])
@@ -6585,6 +6805,12 @@ def _run_multi_intent_chain(msg, plan):
                 results.append({"kind": step.get("kind"),
                                 "status": "skipped",
                                 "fragment": "I skipped an unknown step."})
+            if (stores_findings and results[-1].get("kind") == "research"
+                    and results[-1].get("status") == "ok"):
+                # The findings are destined for the file — say THAT, not
+                # the summary the user never asked to hear.
+                results[-1]["fragment"] = \
+                    "The findings are ready for your file."
             # R20: every finished step leaves its specifics in history, and
             # the latest real output is stored for a later follow-up turn
             # (the folder-name answer arrives after the worker is gone).
@@ -7373,6 +7599,18 @@ def _process_message_inner(
             return folder_reply
     except Exception as exc:
         logging.warning("[CHAIN] Folder-name answer failed: %s", exc)
+
+    # ── Live fix: "name it X" answers a pending FILE-name ask ──
+    # The folder task asked WHICH name to give the txt file inside the
+    # (existing) folder; the answer names the FILE, never a second folder.
+    try:
+        file_reply = consume_pending_file_name(msg)
+        if file_reply is not None:
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, file_reply)
+            return file_reply
+    except Exception as exc:
+        logging.warning("[CHAIN] File-name answer failed: %s", exc)
 
     # ── R8: one turn, two jobs (status + work) ──
     # "Are you doing the queued task? Also create a folder named x" is NOT
