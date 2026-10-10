@@ -541,6 +541,57 @@ class FreshInfoAndWebRoutingTests(unittest.TestCase):
         task_msg.assert_not_called()
         self.assertEqual(response, "confirm?")
 
+    def test_replicate_sentence_takes_the_chain_not_the_browser(self):
+        # Live log: "there is a project structure visible at my screen ,
+        # create a exact replica of this on my desktop" — with the noun
+        # form in the replicate matcher and "at my screen" in the screen
+        # matcher, this compound forms a screen→task chain and never
+        # reaches the classifier or the browser handoff at all.
+        msg = ("there is a project structure visible at my screen , "
+               "create a exact replica of this on my desktop")
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain, "classify_intent") as classify, \
+             patch.object(brain, "handle_multi_intent",
+                          return_value="Sir, I'll do this in 2 steps.") as chain, \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "handle_opencode_task") as handoff:
+            response = brain.process_message(msg, sync_voice=False)
+        self.assertEqual(response, "Sir, I'll do this in 2 steps.")
+        chain.assert_called_once()
+        classify.assert_not_called()
+        handoff.assert_not_called()
+
+    def test_a_collapsed_replicate_task_arms_structure_not_browser(self):
+        # Safety net for phrasings the chain gate still misses: when the
+        # classifier collapses the sentence into ONE task with a rewritten
+        # description, the gate must key on the user's own words — the
+        # confirmed handoff executing that description once reached the
+        # browser agent.
+        msg = ("there is a project structure visible at my screen , "
+               "create a exact replica of this on my desktop")
+        verdict = {"intent": "task",
+                   "task_description": ("Analyze the project structure "
+                                        "visible on the screen and recreate "
+                                        "the exact folder and file hierarchy "
+                                        "on the desktop.")}
+        with patch.object(config, "TASK_ENGINE", "browser_agent"), \
+             patch.object(brain.multi_intent, "build_chain",
+                          return_value=None), \
+             patch.object(brain, "classify_intent", return_value=verdict), \
+             patch.object(brain, "maybe_handle_screen_control_message",
+                          return_value=None), \
+             patch.object(brain, "_mi_replicate_intent_reply",
+                          return_value="Armed — one confirmation.") as gate, \
+             patch.object(brain, "_remember_user_turn"), \
+             patch.object(brain, "handle_opencode_task") as handoff, \
+             patch.object(brain, "handle_task_message") as task_msg:
+            response = brain.process_message(msg, sync_voice=False)
+        gate.assert_called_once()
+        self.assertEqual(response, "Armed — one confirmation.")
+        handoff.assert_not_called()
+        task_msg.assert_not_called()
+
 
 class ScreenQuestionNetTests(unittest.TestCase):
     """Round 16: deterministic screen-question net fires when the cloud

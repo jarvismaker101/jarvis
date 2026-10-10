@@ -22,8 +22,9 @@ from backend.services.task_agent import agent as task_agent
 
 
 class _FakeObs:
-    def __init__(self, image="data:image/png;base64,AAAA"):
+    def __init__(self, image="data:image/png;base64,AAAA", obs_id="obs1"):
         self.image_data_url = image
+        self.id = obs_id
 
 
 class FolderTreeParseTests(unittest.TestCase):
@@ -313,6 +314,101 @@ class StructureFollowupTests(unittest.TestCase):
                 reply, plan = self._reply(msg)
                 self.assertIsNone(reply)
                 self.assertIsNone(plan)
+
+
+class ReplicateIntentGateTests(unittest.TestCase):
+    """The original sentence routes by the user's OWN words (live fix).
+
+    Live log: "there is a project structure visible at my screen , create a
+    exact replica of this on my desktop" was classified as ONE task with a
+    rewritten description, armed as a generic opencode confirmation, and
+    the confirmed handoff executed the description — which the capability
+    resolver sent to the browser agent. This gate reads the user's words,
+    reads the structure, and arms the same folder plan the chain step
+    would. It must also never hijack a plain create or a screen question.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        task_agent._pending_task_action = None
+        brain._mi_structure_state.update(
+            {"tree": [], "files": [], "base": "", "roots": {},
+             "obs_id": "", "at": 0.0})
+
+    def _reply(self, msg, tree=("proj",), files=("proj/index.js",)):
+        captured = {}
+
+        def fake_arm(plan, context, task_text=""):
+            captured["plan"] = plan
+            return object()
+
+        with patch.object(brain, "capture_stored_observation",
+                          return_value=_FakeObs(obs_id="obs9")), \
+             patch.object(brain, "_mi_extract_project_tree",
+                          return_value=(list(tree), list(files))), \
+             patch.object(task_agent, "_known_folders",
+                          return_value={"desktop": self._tmp.name}), \
+             patch.object(task_agent, "_arm_plan_confirmation",
+                          side_effect=fake_arm), \
+             patch.object(task_agent, "confirmation_prompt",
+                          return_value="PROMPT"), \
+             patch.object(task_agent, "has_pending_task_confirmation",
+                          return_value=False):
+            reply = brain._mi_replicate_intent_reply(msg)
+        return reply, captured.get("plan")
+
+    def test_the_original_sentence_arms_the_folder_plan(self):
+        msg = ("there is a project structure visible at my screen , "
+               "create a exact replica of this on my desktop")
+        reply, plan = self._reply(msg)
+        self.assertEqual(reply, "PROMPT")
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["requires_confirmation"])
+        self.assertEqual([s["tool"] for s in plan["steps"]],
+                         ["code.create_folder"])
+        self.assertEqual(plan["steps"][0]["args"]["path"],
+                         os.path.join(self._tmp.name, "proj"))
+        self.assertEqual(brain._mi_structure_state["obs_id"], "obs9")
+
+    def test_the_plan_stays_folders_only_and_files_are_remembered(self):
+        reply, plan = self._reply(
+            "create a exact replica of the structure visible at my screen")
+        self.assertEqual(reply, "PROMPT")
+        self.assertEqual([s["tool"] for s in plan["steps"]],
+                         ["code.create_folder"])
+        self.assertEqual(brain._mi_structure_state["files"],
+                         ["proj/index.js"])
+
+    def test_an_existing_root_is_never_overwritten(self):
+        os.makedirs(os.path.join(self._tmp.name, "proj"))
+        reply, plan = self._reply(
+            "create a exact replica of the structure visible at my screen")
+        self.assertEqual(reply, "PROMPT")
+        self.assertEqual(plan["steps"][0]["args"]["path"],
+                         os.path.join(self._tmp.name, "proj (2)"))
+
+    def test_a_replica_without_a_screen_reference_returns_none(self):
+        reply, plan = self._reply(
+            "create a exact replica of this on my desktop")
+        self.assertIsNone(reply)
+        self.assertIsNone(plan)
+
+    def test_non_replicate_messages_return_none(self):
+        for msg in ("create a folder named demo",
+                    "what's on my screen",
+                    "open chrome and scrape x"):
+            with self.subTest(msg=msg):
+                reply, plan = self._reply(msg)
+                self.assertIsNone(reply)
+                self.assertIsNone(plan)
+
+    def test_unreadable_screen_fails_honestly(self):
+        reply, plan = self._reply(
+            "create a exact replica of the structure visible at my screen",
+            tree=())
+        self.assertIsNone(plan)
+        self.assertIn("couldn't read a folder structure", reply)
 
 
 class ReplicateTaskStepTests(unittest.TestCase):

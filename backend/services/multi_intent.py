@@ -43,13 +43,16 @@ _FUTURE_TALK_RE = re.compile(
 #: The screen word tolerates the typos speech-to-text actually produces
 #: ("scrren", "scren", "screan") — a typo used to drop the screen clause
 #: entirely, so "research about it" never bound to it and the whole
-#: sentence was typed into the web.
+#: sentence was typed into the web. Live fix: "at my screen" counts too —
+#: the live log's replicate sentence ("there is a project structure
+#: visible at my screen, create a exact replica of this on my desktop")
+#: said "at", so the screen clause never formed and the chain died.
 _SCREEN_WORD = r"(?:scr+[ae]*n|monitor|display)"
 
 _SCREEN_RE = re.compile(
     r"\b(look at|check|see|read|watch|analyse|analyze|scan|view|examine)\b"
     r"[^.?!,;]{0,40}\b" + _SCREEN_WORD + r"\b"
-    r"|\bon (?:my|the) " + _SCREEN_WORD + r"\b"
+    r"|\b(?:on|at) (?:my|the) " + _SCREEN_WORD + r"\b"
     r"|\bwhat(?:'s| is) on (?:my|the) " + _SCREEN_WORD + r"\b"
     r"|\blook at (?:this|the) (?:video|image|picture|photo|window)\b",
     re.IGNORECASE,
@@ -86,7 +89,14 @@ _TASK_ACTION_RE = re.compile(
 #: it is the displayed structure.
 _TASK_REPLICATE_RE = re.compile(
     r"\b(?:replicate|recreate|rebuild|duplicate|clone|mirror|copy)\b"
-    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b",
+    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b"
+    # Live fix: the NOUN form — "create a exact replica of this on my
+    # desktop" (the verb is "create"; "replica" is the object of the job).
+    # The live log showed this phrasing sailing past every replicate gate
+    # and reaching the browser handoff as a rewritten task description.
+    r"|\b(?:create|make|build|generate)\b[^.?!]{0,48}?\breplica\b"
+    r"[^.?!]{0,32}\b(?:of\s+)?(?:it|this|that|them|structure|tree|layout|"
+    r"hierarchy)\b",
     re.IGNORECASE,
 )
 

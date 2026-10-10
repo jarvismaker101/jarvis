@@ -475,5 +475,57 @@ class ScreenAnalyzerNoGroqPreconditionTests(LiveBugfixBase):
         self.assertEqual(result["tip"], "fallback answer")
 
 
+class DanglingChatHistoryTests(unittest.TestCase):
+    """A persisted unanswered turn must never absorb the next reply.
+
+    Live log: "hi jarvis" was answered "I can search the web for Python
+    decorators, sir." — the disk-persisted history carried an old
+    "task search python decorators" user turn with NO assistant reply
+    right before the greeting, and the chat model answered the stale
+    request. The build must drop that dead context.
+    """
+
+    def _build(self, history, msg, speculative=False):
+        with patch.object(brain, "_memory_context_cached",
+                          return_value=("", "")):
+            return brain._build_chat_messages(
+                msg, speculative=speculative, history=list(history))
+
+    def test_a_dangling_user_turn_is_dropped(self):
+        history = [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "task search python decorators"},
+            {"role": "user", "content": "hi jarvis"},
+        ]
+        built = self._build(history, "hi jarvis")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertNotIn("python decorators", blob)
+        users = [m for m in built["messages"] if m["role"] == "user"]
+        self.assertEqual(len(users), 1)
+        self.assertTrue(users[0]["content"].startswith("hi jarvis"))
+
+    def test_a_normal_exchange_is_untouched(self):
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "Hi sir."},
+            {"role": "user", "content": "what is two plus two"},
+        ]
+        built = self._build(history, "what is two plus two")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertIn("hello", blob)
+        self.assertIn("Hi sir.", blob)
+
+    def test_a_speculative_snapshot_drops_its_dangling_tail(self):
+        # The racer's snapshot is taken BEFORE the new turn is committed —
+        # its last entry may BE the unanswered turn and must go.
+        history = [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "task search python decorators"},
+        ]
+        built = self._build(history, "hi jarvis", speculative=True)
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertNotIn("python decorators", blob)
+
+
 if __name__ == "__main__":
     unittest.main()

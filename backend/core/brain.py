@@ -2087,6 +2087,33 @@ def _append_time_note(text):
     return f"{text}\n\n{note}" if note else text
 
 
+def _drop_dangling_user_turns(history, current_message=""):
+    """Remove unanswered trailing user turns from a chat window (live fix).
+
+    History persists to disk across restarts; a user turn whose reply never
+    got committed (a crash, a restart, a misroute) then sits unanswered right
+    before the next request — and the chat model answers THAT instead of the
+    new message ("hi jarvis" once replied "I can search the web for Python
+    decorators" because an old unanswered "task search python decorators"
+    turn survived on disk). An unanswered turn is dead context: every
+    answered turn has an assistant entry after it, so a trailing run of
+    user-role entries is dropped. The CURRENT turn is kept — it is the last
+    committed entry (content matches *current_message*); in a speculative
+    snapshot it is not present yet.
+    """
+    out = [m for m in (history or []) if isinstance(m, dict)]
+    current = None
+    if (out and out[-1].get("role") == "user"
+            and current_message
+            and str(out[-1].get("content") or "") == str(current_message)):
+        current = out.pop()
+    while out and out[-1].get("role") == "user":
+        out.pop()
+    if current is not None:
+        out.append(current)
+    return out
+
+
 def _build_chat_messages(user_message, voice_compact=False, speculative=False, history=None):
     """Shared message-construction for chat (used by both streaming and plain paths).
 
@@ -2214,6 +2241,9 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
         history = get_history()
     if voice_compact:
         history = history[-6:]
+    # Live fix: an unanswered persisted turn must never absorb this reply —
+    # drop the dangling trailing user run (the current turn is kept).
+    history = _drop_dangling_user_turns(history, user_message)
     if search_info:
         # ``history[:-1]`` assumes the new user turn is already the last
         # entry. That holds in the committed (selected) route but NOT in a
@@ -6235,7 +6265,14 @@ _MI_FOLDER_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
 #: file write and not a single folder create.
 _MI_REPLICATE_RE = re.compile(
     r"\b(?:replicate|recreate|rebuild|duplicate|clone|mirror|copy)\b"
-    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b",
+    r"[^.?!]{0,48}\b(?:it|this|that|them|structure|tree|layout|hierarchy)\b"
+    # Live fix: the NOUN form — "create a exact replica of this on my
+    # desktop" (verb "create", object "replica"). Mirrors the multi_intent
+    # pattern so the chain step, the dispatch and the task-intent gate all
+    # agree on the same sentence.
+    r"|\b(?:create|make|build|generate)\b[^.?!]{0,48}?\breplica\b"
+    r"[^.?!]{0,32}\b(?:of\s+)?(?:it|this|that|them|structure|tree|layout|"
+    r"hierarchy)\b",
     re.IGNORECASE,
 )
 
@@ -7066,6 +7103,69 @@ def _mi_replicate_followup_reply(msg):
                 "the files as well if you want the files too.")
     return str(result.get("fragment") or
                "Sir, I couldn't prepare that.")
+
+
+#: A message that names the screen the structure sits on. The replicate
+#: gate below only fires when the user's OWN words point at the screen —
+#: a bare "replicate the structure" carries no visible target.
+_MI_SCREEN_MENTION_RE = re.compile(
+    r"\b(?:scr+[ae]*n|monitor|display|visible|shown|displayed)\b",
+    re.IGNORECASE,
+)
+
+
+def _mi_replicate_intent_reply(msg):
+    """A replicate-the-screen request that arrived as ONE task verdict.
+
+    (Live fix.) "there is a project structure visible at my screen, create
+    a exact replica of this on my desktop" was classified as a single task
+    with a REWRITTEN description ("Analyze the project structure…"), armed
+    as a generic opencode confirmation, and the confirmed handoff executed
+    the DESCRIPTION — which the capability resolver cannot see as local
+    structure work, so it went to the browser agent. Routing must key on
+    the user's own words: when the message itself asks to replicate a
+    structure that is on the screen, read that structure and arm the ONE
+    structure confirmation here, before any opencode task is armed.
+    Returns the reply string, or None when the message is not this shape.
+    """
+    text = str(msg or "").strip()
+    if not text or not _MI_REPLICATE_RE.search(text):
+        return None
+    if not _MI_SCREEN_MENTION_RE.search(text):
+        return None
+    obs_id = ""
+    try:
+        obs = capture_stored_observation(msg)
+        obs_id = str(getattr(obs, "id", "") or "")
+    except Exception as exc:
+        logging.warning("[TASK] Structure replicate capture failed: %s", exc)
+    tree, files = _mi_extract_project_tree(obs_id)
+    if not tree:
+        return ("Sir, I looked at your screen, but I couldn't read a folder "
+                "structure from it — keep the folders visible and ask me "
+                "again.")
+    try:
+        folders = task_agent_module._known_folders() or {}
+    except Exception:
+        folders = {}
+    base = folders.get("desktop") or folders.get("home") or ""
+    if not base:
+        return "Sir, I couldn't find your Desktop folder."
+    result = _mi_arm_structure_plan(text, tree, files, base, "folders")
+    status = str(result.get("status") or "")
+    if status == "armed":
+        _mi_remember_structure(tree, files, base,
+                               result.get("root_paths"), obs_id)
+        print("[TASK] Structure replicate from the user's own words: "
+              "%d folders, %d files" % (len(tree), len(files)))
+        return str(result.get("fragment") or "")
+    if status == "exists":
+        _mi_remember_structure(tree, files, base,
+                               result.get("root_paths"), obs_id)
+        return ("The folder structure is already there, sir — say create "
+                "the files as well if you want the files too.")
+    return str(result.get("fragment") or
+               "I couldn't prepare the folder replication.")
 
 
 def consume_pending_folder_name(msg):
@@ -8756,6 +8856,31 @@ def _process_message_inner(
                 if from_voice and sync_voice:
                     sync_voice_log(voice_log_message, follow_reply)
                 return follow_reply
+            # Live fix: the ORIGINAL sentence already asks to replicate the
+            # structure on the screen ("there is a project structure visible
+            # at my screen, create a exact replica of this on my desktop").
+            # The classifier rewrote it into a generic description and the
+            # confirmed handoff executed THAT description — which the
+            # capability resolver sent to the browser agent. Route on the
+            # user's own words: read the structure and arm its confirmation
+            # here, before any opencode task is armed.
+            try:
+                replicate_reply = _mi_replicate_intent_reply(msg)
+            except Exception as exc:
+                logging.warning("[TASK] Structure replicate gate failed: %s",
+                                exc)
+                replicate_reply = None
+            if replicate_reply is not None:
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                _remember_user_turn(msg)
+                _disarm_other_gates_if_task_gate_armed()
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, replicate_reply)
+                return replicate_reply
             description = intent.get("task_description") or msg
             # Live fix: a file/folder task ("create a text file inside that
             # folder and write …") is NATIVE work — it goes to the code-tool
@@ -8826,6 +8951,20 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, follow_reply)
             return follow_reply
+        # Live fix: same structure replicate gate as the intent branch — the
+        # original sentence names the screen, so it never goes to the
+        # browser handoff as a rewritten description.
+        try:
+            replicate_reply = _mi_replicate_intent_reply(msg)
+        except Exception as exc:
+            logging.warning("[TASK] Structure replicate gate failed: %s", exc)
+            replicate_reply = None
+        if replicate_reply is not None:
+            _remember_user_turn(msg)
+            _disarm_other_gates_if_task_gate_armed()
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, replicate_reply)
+            return replicate_reply
         if config.TASK_ENGINE == "browser_agent" and is_web_shaped_task(msg):
             print("[TASK] Web-shaped task -> browser-agent handoff:", msg)
             response = handle_opencode_task(

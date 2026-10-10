@@ -213,7 +213,13 @@ class SpeculationPurityTests(unittest.TestCase):
         self.assertFalse(racer.has_stream())
 
     def test_racer_builds_from_an_immutable_snapshot(self):
-        snapshot = [{"role": "user", "content": "earlier question"}]
+        # A settled exchange: the trailing unanswered-turn sanitize (live
+        # fix) drops dangling user tails from every chat window, so the
+        # snapshot here is shaped like a normal answered turn.
+        snapshot = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+        ]
         with patch.object(brain, "should_search", return_value=False), \
              patch.object(brain, "force_search", return_value=False), \
              patch.object(brain, "get_history", return_value=snapshot) as live:

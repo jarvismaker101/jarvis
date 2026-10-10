@@ -127,6 +127,27 @@ class ChainSplitTests(unittest.TestCase):
         self.assertIsNone(multi_intent.build_chain(
             "replicate the folder structure on my desktop"))
 
+    def test_replica_noun_form_chains_screen_then_task(self):
+        # Live log: "there is a project structure visible at my screen ,
+        # create a exact replica of this on my desktop" — the NOUN form
+        # ("create a exact replica") matched no replicate verb, and "at my
+        # screen" matched no screen clause, so the chain died, the
+        # classifier collapsed the sentence into one rewritten task and the
+        # confirmed handoff executed THAT description — in the browser.
+        text = ("there is a project structure visible at my screen , "
+                "create a exact replica of this on my desktop")
+        plan = multi_intent.build_chain(text)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s["kind"] for s in plan["steps"]],
+                         ["screen", "task"])
+        self.assertEqual(plan["steps"][1]["consumes"], [0])
+
+    def test_visible_at_my_screen_is_a_screen_clause(self):
+        self.assertEqual(
+            multi_intent.classify_clause(
+                "there is a project structure visible at my screen"),
+            "screen")
+
     def test_ack_describes_structure_replication_not_a_file(self):
         text = ("look at my screen there is a project folder structure "
                 "visible i want you to see it and replicate it exactly on "
