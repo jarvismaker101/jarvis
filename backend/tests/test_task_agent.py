@@ -1036,5 +1036,81 @@ class G4CodingInterfaceTests(unittest.TestCase):
                       agent.CONFIRM_SENSITIVE_PREVIEW)
 
 
+class StructurePlanSummaryTests(unittest.TestCase):
+    """Fix 16: a structure replicate reports counts + location, never one
+    "Folder ready: <full path>" per created item (live log: 5 folders +
+    13 files → 18 paths, cut mid-list at the 300-char cap)."""
+
+    def _ok(self, tool, fragment):
+        return {"tool": tool, "status": "ok", "result": fragment,
+                "reason": "", "goal": "", "attempts": 1, "proof": None,
+                "fragment": fragment}
+
+    def _structure_plan(self):
+        return {"summary": "Replicating the folder structure on your screen.",
+                "structure_meta": {
+                    "folder_count": 5,
+                    "file_count": 13,
+                    "location": "Desktop",
+                    "root": "TaskFlowApp",
+                    "want": "all"}}
+
+    def test_structure_plan_reports_counts_and_location(self):
+        outcomes = (
+            [self._ok(
+                "code.create_folder",
+                r"Folder ready: C:\Users\m\OneDrive\Desktop\TaskFlowApp")]
+            + [self._ok(
+                "code.create_folder",
+                r"Folder ready: C:\Users\m\OneDrive\Desktop\TaskFlowApp\src")
+               for _ in range(4)]
+            + [self._ok(
+                "code.write_file",
+                r"Folder ready: C:\Users\m\OneDrive\Desktop\TaskFlowApp"
+                r"\src\App.js") for _ in range(13)])
+        summary = agent._summarize_outcomes(outcomes, self._structure_plan())
+        self.assertTrue(summary.startswith("Done, sir."))
+        self.assertIn("5 folders and 13 files", summary)
+        self.assertIn("on your desktop", summary)
+        self.assertNotIn("Folder ready", summary)
+        self.assertLess(len(summary), 200)
+
+    def test_long_run_compacts_instead_of_cutting_mid_item(self):
+        outcomes = [self._ok(
+            "code.create_folder",
+            r"Folder ready: C:\Users\m\OneDrive\Desktop\folder number %d" % i)
+            for i in range(20)]
+        summary = agent._summarize_outcomes(outcomes, {})
+        self.assertTrue(summary.startswith("Done, sir."))
+        self.assertNotIn("Folder ready", summary)
+        self.assertNotIn("...", summary)
+        self.assertIn("20 of 20 steps completed", summary)
+
+    def test_small_plan_keeps_its_fragments(self):
+        outcomes = [self._ok("code.create_folder",
+                                  r"Folder ready: C:\x.")]
+        summary = agent._summarize_outcomes(outcomes, {})
+        self.assertEqual(summary, r"Done, sir. Folder ready: C:\x.")
+
+    def test_structure_failure_stays_honest(self):
+        outcomes = [
+            self._ok("code.create_folder",
+                          r"Folder ready: C:\Users\m\Desktop\TaskFlowApp")]
+        outcomes += [self._ok(
+            "code.write_file",
+            r"Folder ready: C:\Users\m\Desktop\TaskFlowApp\src\f%d.js" % i)
+            for i in range(12)]
+        outcomes.append({
+            "tool": "code.create_folder", "status": "failed",
+            "result": "", "reason": "denied", "goal": "", "attempts": 1,
+            "proof": None,
+            "fragment": r"Folder C:\Users\m\Desktop\TaskFlowApp\tests "
+                        r"failed: denied."})
+        summary = agent._summarize_outcomes(outcomes, self._structure_plan())
+        self.assertTrue(summary.startswith("Partly done, sir."))
+        self.assertIn("failed", summary.lower())
+        self.assertIn("13 of 14 steps completed", summary)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3421,6 +3421,41 @@ def _fail_fragment(step, reason):
     return f"{tool or 'The step'} failed: {reason}."
 
 
+def _structure_plan_summary(done, plan):
+    """Fix 16: a structure replicate reports COUNTS + the location.
+
+    Live log: the confirmed replica spoke one "Folder ready: <full path>"
+    per created item (18 paths for 5 folders + 13 files), cut mid-list at
+    the 300-char cap ("Folder ready:..."). The full per-step detail stays
+    in the result detail and the work log — the spoken completion is one
+    short line ("Done, sir. The replica of this project has been created
+    on your desktop — 5 folders and 13 files.").
+    """
+    meta = plan.get("structure_meta") if isinstance(plan, dict) else None
+    if not meta or not done:
+        return ""
+    if any(item.get("tool") not in ("code.create_folder", "code.write_file")
+           for item in done):
+        return ""
+    folders = sum(1 for item in done
+                  if item.get("tool") == "code.create_folder")
+    files = sum(1 for item in done
+                if item.get("tool") == "code.write_file")
+    location = str(meta.get("location") or "").strip()
+    if location and location.lower() != "desktop":
+        place = "in %s" % location
+    else:
+        place = "on your desktop"
+    counts = []
+    if folders:
+        counts.append("%d folder%s" % (folders, "" if folders == 1 else "s"))
+    if files:
+        counts.append("%d file%s" % (files, "" if files == 1 else "s"))
+    line = "The replica of this project has been created %s" % place
+    line += " — %s." % " and ".join(counts) if counts else "."
+    return "Done, sir. " + line
+
+
 def _summarize_outcomes(outcomes, plan):
     """Spoken-friendly 1-3 line summary reflecting ACTUAL step outcomes.
 
@@ -3440,6 +3475,9 @@ def _summarize_outcomes(outcomes, plan):
         return re.sub(r"\s+", " ", " ".join(bits)).strip() or (
             "Stopped per your request.")
     if not bad:
+        compact = _structure_plan_summary(done, plan)
+        if compact:
+            return compact
         summary = "Done, sir. " + " ".join(item["fragment"] for item in done)
     else:
         bits = [item["fragment"] for item in done]
@@ -3447,8 +3485,17 @@ def _summarize_outcomes(outcomes, plan):
         summary = "Partly done, sir. " + " ".join(bits)
     summary = re.sub(r"\s+", " ", summary).strip()
     if len(summary) > 300:
-        cut = summary.rfind(" ", 0, 297)
-        summary = (summary[:cut] if cut > 0 else summary[:297]).rstrip() + "..."
+        # Fix 16: never cut a long run mid-item ("…Folder ready:" endings).
+        # A run too long to narrate compacts to counts; failures stay named.
+        if not bad:
+            summary = "Done, sir. %d of %d steps completed." % (
+                len(done), len(outcomes))
+        else:
+            bad_bits = " ".join(item["fragment"] for item in bad)
+            if len(bad_bits) > 150:
+                bad_bits = bad_bits[:147].rstrip() + "..."
+            summary = ("Partly done, sir. %d of %d steps completed. "
+                       "Failed: %s" % (len(done), len(outcomes), bad_bits))
     return summary
 
 

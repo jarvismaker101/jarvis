@@ -841,6 +841,22 @@ class R13SpeechGatewayTests(unittest.TestCase):
             self.assertEqual(
                 brain._strip_unverified_action_claims(benign, "chat"), benign)
 
+    def test_first_person_ready_status_passes_through(self):
+        # Fix 16 live log: "I am ready and listening. How can I help you
+        # today?" was cut to a dangling "How can I help you today?"
+        # because the bare word "ready" read as an action claim.
+        benign = "I am ready and listening. How can I help you today?"
+        self.assertEqual(
+            brain._strip_unverified_action_claims(benign, "chat"), benign)
+
+    def test_ready_claim_with_a_subject_still_replaced(self):
+        # The tightened "ready" still catches third-person completion
+        # claims — only the speaker's own state passes.
+        for text in ("It's ready, sir.", "The file is ready, sir."):
+            with self.subTest(text=text):
+                out = brain._strip_unverified_action_claims(text, "chat")
+                self.assertIn("Nothing was started", out)
+
     def test_non_chat_roles_untouched(self):
         text = "Sir, the folder has been created."
         for role in ("preview", "scheduler", "runner", "result", "status"):
@@ -965,6 +981,36 @@ class R12StatusGroundingTests(unittest.TestCase):
         self.assertFalse(brain.is_status_question("create a folder named x"))
         self.assertTrue(
             brain.is_status_question("are you doing the cued task right now"))
+
+    def test_sourcing_question_is_not_status(self):
+        # Fix 16 live log: "did you do a online search for this skin or
+        # did you just know that ?" was answered with the last task's
+        # folder log ("Yes, sir. Done — Done, sir. Folder ready: …").
+        self.assertFalse(brain.is_status_question(
+            "did you do a online search for this skin or did you just "
+            "know that ?"))
+        self.assertTrue(brain.is_status_question("did you do it?"))
+        self.assertTrue(brain.is_status_question("did you do the task?"))
+
+    def test_completed_pastes_summary_only_when_work_is_referenced(self):
+        from backend.services.task_agent import agent as task_agent
+
+        class _R:
+            status = "completed"
+            summary = ("Done, sir. The replica of this project has been "
+                       "created on your desktop.")
+            detail = ""
+        task_agent._remember_task_result(_R(), "replicate it")
+        try:
+            plain = self._status("did you finish?")
+            cited = self._status("did you finish the task?")
+        finally:
+            task_agent._remember_task_result(None)
+        self.assertEqual(plain, "Yes, sir. The last task finished.")
+        self.assertTrue(cited.startswith("Yes, sir. Done —"))
+        self.assertIn("on your desktop", cited)
+        # The stored headline must not repeat after "Done —".
+        self.assertNotIn("Done, sir.", cited)
 
 
 class R6StopThenRedirectTests(unittest.TestCase):

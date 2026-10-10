@@ -530,6 +530,24 @@ class ReplicateRelookTests(unittest.TestCase):
                 "look again you will see")
         self.assertIn("couldn't read a folder structure", reply)
 
+    def test_a_new_subject_is_not_a_relook(self):
+        # Fix 16 live log: "look again there is a video on top right" (a
+        # screen question about a video) hijacked the structure re-look
+        # and answered "couldn't read a folder structure".
+        brain._mi_remember_replicate_attempt("x", False)
+        self.assertIsNone(brain._mi_replicate_relook_reply(
+            "look again there is a video on top right"))
+
+    def test_structure_words_keep_the_relook(self):
+        brain._mi_remember_replicate_attempt("x", False)
+        with patch.object(brain, "capture_stored_observation",
+                          return_value=_FakeObs(obs_id="obs9")), \
+             patch.object(brain, "_mi_extract_project_tree",
+                          return_value=([], [])):
+            reply = brain._mi_replicate_relook_reply(
+                "look again at the folders on my screen")
+        self.assertIn("couldn't read a folder structure", reply)
+
 
 class ReplicateIntentGateTests(unittest.TestCase):
     """The original sentence routes by the user's OWN words (live fix).

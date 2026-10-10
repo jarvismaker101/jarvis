@@ -297,7 +297,11 @@ _ACTION_CLAIM_RE = re.compile(
     r"\b("
     r"i\s+will\s+(get|have|create|make|check|do|run|start|open|send|fetch|look)|"
     r"i(?:'m| am)\s+(?:right\s+)?on\s+it|"
-    r"(?:it(?:'s| is)\s+)?(?:done|created|ready|finished|taken\s+care\s+of)|"
+    # Fix 16: bare "done/created/finished" stays a claim, but "ready" now
+    # needs a third-person subject ("it's ready") — "I am ready and
+    # listening" is the speaker's own state, not an action claim.
+    r"(?:it(?:'s| is)\s+)?(?:done|created|finished|taken\s+care\s+of)|"
+    r"(?:it(?:'s| is)|that(?:'s| is)|this(?:'s| is)|they(?:'re| are)|everything(?:'s| is)|(?:the|your|my|our)\s+\w+(?:\s+(?:is|are))?)\s+ready|"
     r"consider\s+it\s+done|"
     r"right\s+away|"
     r"has\s+been\s+(created|deleted|removed|completed|finished|started)|"
@@ -332,6 +336,8 @@ _ACTION_OFFER_RE = re.compile(
     r"which\s+(folder|file|folder)|"
     r"ask\s+for\s+the\s+missing|"
     r"nothing\s+was\s+started|"
+    # Fix 16: first-person readiness is a status/offer line, never a claim.
+    r"i(?:'m|\s+am)\s+(?:ready|listening)|"
     r"what\s+would\s+you\s+like)\b",
     re.IGNORECASE,
 )
@@ -3477,7 +3483,13 @@ _STATUS_QUESTION_RE = re.compile(
     r"\b("
     r"are\s+you\s+(doing|working\s+on|running|executing)|"
     r"is\s+(it|that|the\s+\w+\s+task)\s+(done|finished|complete|completed|running|started)|"
-    r"did\s+you\s+(finish|complete|do|start|stop|cancel)|"
+    # Fix 16: bare "did you do <a thing>" is a question about the thing,
+    # not about live work — "do" now needs a work referent ("did you do
+    # it/the task"), while the work verbs stay broad. Live log: "did you
+    # do a online search for this skin or did you just know that ?" was
+    # answered with the last task's completion log.
+    r"did\s+you\s+(finish|complete|start|stop|cancel)\b|"
+    r"did\s+you\s+do\s+(it|that|this|them|those|the\s+(?:task|job|file|folder|work|thing|browser|report|duplicate|replica|structure|plan|request))\b|"
     r"have\s+you\s+(finished|completed|started|done)|"
     r"what(?:'s|\s+is)\s+(?:the\s+)?(?:status|queued|running|happening)|"
     r"anything\s+(queued|running|pending)|"
@@ -3492,6 +3504,16 @@ _STATUS_QUESTION_RE = re.compile(
 # filenames or task descriptions.
 _CUED_TASK_RE = re.compile(r"\bcued\s+tasks?\b", re.IGNORECASE)
 _Q_TEST_RE = re.compile(r"\bq[\s-]?test\b", re.IGNORECASE)
+
+#: Fix 16: only a question that points at the work itself may hear the
+#: stored last-result summary. A topic question ("did you do a online
+#: search for this skin") must never be answered with the last task's log.
+_STATUS_SUMMARY_REF_RE = re.compile(
+    r"\b(?:it|that|this|them|those|these)\b"
+    r"|\b(?:task|job|work|file|folder|report|duplicate|replica"
+    r"|structure|plan|request)\b",
+    re.IGNORECASE,
+)
 
 
 def is_status_question(msg):
@@ -3682,6 +3704,17 @@ def _status_snapshot():
     }
 
 
+def _status_summary_tail(summary):
+    """Fix 16: the stored summary without its own headline.
+
+    The status line already leads with "Done —"/"Partly", so a stored
+    "Done, sir. …" must not repeat ("Done — Done, sir. …" — the live bug).
+    """
+    return re.sub(
+        r"^(?:partly\s+done|done|completed),\s*sir\.?\s*", "",
+        str(summary or ""), flags=re.IGNORECASE).strip()
+
+
 def answer_status_question(msg):
     """R12: the grounded status reply for *msg* (Astra §4 table).
 
@@ -3734,14 +3767,16 @@ def answer_status_question(msg):
         return "Sir, quick question is waiting on you before I continue."
     status = snap["last_status"]
     if status == "completed":
-        if snap["last_summary"]:
-            return "Yes, sir. Done — %s." % _voice_clip(
-                snap["last_summary"], 140)
+        tail = _status_summary_tail(snap["last_summary"])
+        # Fix 16: the stored summary is pasted only when the question
+        # actually references the work — never for a topic question.
+        if tail and _STATUS_SUMMARY_REF_RE.search(text):
+            return "Yes, sir. Done — %s." % _voice_clip(tail, 140)
         return "Yes, sir. The last task finished."
     if status == "partial":
+        tail = _status_summary_tail(snap["last_summary"])
         return ("Partly, sir. The last task is only partly done"
-                + (" — %s." % _voice_clip(snap["last_summary"], 120)
-                   if snap["last_summary"] else "."))
+                + (" — %s." % _voice_clip(tail, 120) if tail else "."))
     if status in ("failed", "known_failure"):
         return "No, sir. The last attempt failed."
     if status == "stopped":
@@ -6524,6 +6559,43 @@ _MI_RELOOK_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Fix 16: a re-look must point back at the structure — either it names
+#: the subject or it is a bare retry. Live log: "look again there is a
+#: video on top right" (a screen question) hijacked the replicate re-look
+#: and answered "couldn't read a folder structure".
+_MI_STRUCTURE_SUBJECT_RE = re.compile(
+    r"\b(?:sub)?folders?\b|\bstructure\b|\btree\b|\bproject\b"
+    r"|\bdirector(?:y|ies)\b|\breplicate\b|\bduplicate\b|\breplica\b"
+    r"|\bcopy\b|\bfiles\b",
+    re.IGNORECASE,
+)
+
+#: Filler words a BARE retry may carry ("look again you will see").
+_MI_RELOOK_FILLER = frozenset((
+    "look", "check", "see", "read", "again", "try", "it", "its", "it's",
+    "is", "was", "visible", "shown", "there", "here", "now", "please",
+    "sir", "jarvis", "ok", "okay", "just", "you", "you'll", "will",
+    "i", "said", "told", "they", "they're", "are", "on", "the", "screen",
+    "and", "still", "once", "more", "have", "another", "my", "a",
+))
+
+
+def _mi_relook_targets_structure(text):
+    """True when a re-look message points back at the structure (fix 16).
+
+    Either the message names the structure ("look again at the folders"),
+    or it is a BARE retry — nothing left once the re-look phrase is
+    removed but filler ("look again you will see"). Anything else brings
+    its own subject ("look again there is a video on top right") and is
+    NOT our re-look — it must reach the screen-question path instead.
+    """
+    raw = str(text or "")
+    if _MI_STRUCTURE_SUBJECT_RE.search(raw):
+        return True
+    remainder = _MI_RELOOK_RE.sub(" ", raw)
+    tokens = re.findall(r"[a-z']+", remainder.lower())
+    return all(token in _MI_RELOOK_FILLER for token in tokens)
+
 
 #: "with all the subfolders and files" / "including the files" — the request
 #: itself asks for the file half too, so the ONE confirmation includes it
@@ -7230,6 +7302,16 @@ def _mi_arm_structure_plan(msg, tree, files, base, want,
         "requires_confirmation": True,
         "command_text": msg,
         "steps": steps,
+        # Fix 16: the executor builds the spoken completion from these
+        # counts + the location — never one full path per created item.
+        "structure_meta": {
+            "root_paths": root_paths,
+            "folder_count": len(folder_steps),
+            "file_count": len(file_steps),
+            "location": base_name,
+            "root": root_name,
+            "want": want,
+        },
     }
     try:
         task_agent_module._arm_plan_confirmation(plan, {}, task_text=msg)
@@ -7442,6 +7524,11 @@ def _mi_replicate_relook_reply(msg):
     """
     text = str(msg or "").strip()
     if not text or not _MI_RELOOK_RE.search(text):
+        return None
+    if not _mi_relook_targets_structure(text):
+        # Fix 16: the message carries its own subject (a video, a news
+        # item, a character) — not a retry of the failed structure read.
+        # Fall through to normal routing (screen question / chat).
         return None
     if not _mi_replicate_attempt_fresh():
         return None
