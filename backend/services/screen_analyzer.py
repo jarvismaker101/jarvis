@@ -770,6 +770,28 @@ def capture_observation(mode="full"):
     }
 
 
+def capture_stored_observation(utterance="", mode="full"):
+    """Capture the screen ONCE and store it as an Observation (LIVE FIX 13).
+
+    The construction analyze_screen performs after its vision call — minus
+    the vision call — so a caller that needs a fresh stored image (the
+    folder-tree reader's fallback ladder) can re-read it later by id.
+    Returns the stored Observation.
+    """
+    cap = capture_observation(mode)
+    obs = context_state.Observation(
+        id=context_state.OBSERVATIONS.next_id(),
+        at=time.time(),
+        mode=str(cap.get("mode") or "full"),
+        utterance=str(utterance or ""),
+        image_data_url=str(cap.get("image_data_url") or ""),
+        img_hash=str(cap.get("img_hash") or ""),
+        region=cap.get("region") or None,
+    )
+    context_state.OBSERVATIONS.add(obs)
+    return obs
+
+
 def _identify_prompt(utterance, target_text="", spatial="", rejected=(),
                      mode="full"):
     base = _ANALYSIS_PROMPT.format(question=utterance)
@@ -881,50 +903,103 @@ def get_observation(obs_id):
 
 
 # ---------------------------------------------------------------------------
-# LIVE FIX 12 — read the folder structure the screen shows, so a
-# "replicate it exactly on my desktop" request can rebuild it.
+# LIVE FIX 12/13 — read the folder structure the screen shows, so a
+# "replicate it exactly on my desktop" request can rebuild it (and a later
+# "create the files as well" can fill it in).
 # ---------------------------------------------------------------------------
 
-#: The folder-tree reader job sheet. Structure only — folders, exact names,
-#: the nesting as displayed. Files, paths and commentary are out of scope.
-_FOLDER_TREE_PROMPT = (
+#: The project-tree reader job sheet. Folders AND files in one read — the
+#: user wants the structure visible on this screen recreated on their
+#: computer. Names are copied exactly; nesting comes from the display.
+_PROJECT_TREE_PROMPT = (
     "Screen-reading task: the user wants the folder structure visible on "
     "this screen recreated on their computer. Look at any file tree, folder "
     "hierarchy or directory listing shown (file explorer sidebar, editor "
     "explorer panel, terminal tree output, archive contents). Reply with "
-    'JSON only, exactly: {"folders": [{"name": "<exact displayed name>", '
-    '"depth": 0}]} — one entry per FOLDER shown, top to bottom as displayed, '
-    "depth 0 for a top-level folder and +1 for each nesting level of "
-    "indentation shown. Copy each folder name character by character; never "
-    "include paths, files or commentary. If no folder structure is visible, "
-    'reply {"folders": []}.'
+    'JSON only, exactly: {"folders": [{"name": "<exact displayed folder '
+    'name>", "depth": 0}], "files": [{"name": "<exact displayed file name '
+    "with extension>\", \"folder\": \"<the folder it sits in, as displayed; "
+    'empty string at the top level>"}]} — one entry per FOLDER in the first '
+    "array, top to bottom as displayed, depth 0 for a top-level folder and "
+    "+1 for each nesting level of indentation shown; one entry per FILE in "
+    'the second array (never folders). Copy every name character by '
+    'character; never put a path inside "name", never list files in the '
+    'folders array, never add commentary. Files at the top level use an '
+    'empty "folder". If no folder structure is visible, reply '
+    '{"folders": [], "files": []}.'
 )
 
 
-def extract_folder_tree(obs):
-    """The folder hierarchy a stored screen observation shows (LIVE FIX 12).
+def _flatten_tree_entries(entries):
+    """Vision folder entries → flat {"name", "depth"} list (LIVE FIX 13).
 
-    A vision read of the SAME stored image (never a re-capture). Returns
-    the raw entries list ({"name": str, "depth": int} dicts) or [] when
-    the screen shows no readable structure. Never raises.
+    Tolerant of the shapes models actually emit: a top-level list, a
+    {"folders": [...]} wrapper, nested "children" arrays and string depths.
+    """
+    flat = []
+
+    def walk(items, depth):
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                own = int(entry.get("depth", depth))
+            except Exception:
+                own = depth
+            own = max(0, own)
+            flat.append({"name": name, "depth": own})
+            children = entry.get("children")
+            if isinstance(children, list):
+                walk(children, own + 1)
+
+    if isinstance(entries, dict):
+        entries = entries.get("folders")
+    if isinstance(entries, list):
+        walk(entries, 0)
+    return flat
+
+
+def extract_project_tree(obs):
+    """The folders AND files a stored screen observation shows (LIVE FIX 13).
+
+    One vision read of the SAME stored image (never a re-capture). Returns
+    (folder_entries, file_entries) — flat {"name", "depth"} dicts and raw
+    {"name", "folder"} dicts — or ([], []) when the screen shows no
+    readable structure. Never raises.
     """
     try:
         image = str(getattr(obs, "image_data_url", "") or "")
         if not image:
-            return []
+            return [], []
+        attempts = {}
         result = _ask_screen_vision_cascade(
-            _FOLDER_TREE_PROMPT, image, max_completion_tokens=1200)
-        if not result or not result.get("choices"):
-            return []
+            _PROJECT_TREE_PROMPT, image, max_completion_tokens=2000,
+            attempts_out=attempts)
         content = (result.get("choices") or [{}])[0].get(
             "message", {}).get("content", "") or ""
         parsed = _extract_json(content)
-        if not isinstance(parsed, dict):
-            return []
-        folders = parsed.get("folders")
-        return folders if isinstance(folders, list) else []
-    except Exception:
-        return []
+        if isinstance(parsed, list):
+            return _flatten_tree_entries(parsed), []
+        if not isinstance(parsed, dict) or not parsed:
+            flat = re.sub(r"\s+", " ", content).strip()[:200]
+            print("[SCREEN] Project-tree read: unparseable reply from %s: %s"
+                  % (attempts.get("provider") or "?", flat))
+            return [], []
+        folders = _flatten_tree_entries(parsed.get("folders"))
+        files = parsed.get("files")
+        files = files if isinstance(files, list) else []
+        return folders, files
+    except Exception as exc:
+        logging.warning("[SCREEN] Project-tree read failed: %s", exc)
+        return [], []
+
+
+def extract_folder_tree(obs):
+    """Compat (LIVE FIX 12 callers): folders only, flat vision entries."""
+    return extract_project_tree(obs)[0]
 
 
 # ---------------------------------------------------------------------------
