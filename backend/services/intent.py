@@ -57,7 +57,7 @@ _INTENT_PROMPT = (
     ' (+ browser chrome|edge|brave)\n\n'
     'Rules: "how are you" -> chat not research; screen/region no steps; task/task_description; tool/steps; research/query.'
     ' Hinglish e.g. "deepseek kya hai, dhundho" -> research.\n'
-    '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "".\n'
+     '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "". Recall asks need history: reply "".\n'
     'Reply ONLY JSON: {"intent": "chat"|"tool"|"screen"|"region"|"research"|"task", "reply": "...", "steps": [], "query": "...", "task_description": "...", "original": "..."}\n'
     "User message: __MESSAGE__"
 )

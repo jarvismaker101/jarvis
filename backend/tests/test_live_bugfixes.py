@@ -658,5 +658,191 @@ class ScreenQuestionRetryTests(unittest.TestCase):
         self.assertEqual(brain._screen_qa_last["question"], self._ORIGINAL)
 
 
+class MemoryRecallRouterTests(unittest.TestCase):
+    """LIVE FIX 18: a turn that asks to recall the conversation itself must
+    be answered by the history-aware chat model — never by the [S6] router's
+    blind reply (the router prompt carries only the current message).
+
+    Live log: "i forgot what you told me about zed just moments ago, remind
+    me" was answered from parametric knowledge ("Zed is a high-performance
+    code editor…") and "no about zed new ai ide, tell me exactly what you
+    just told" was denied ("I haven't provided information about the Zed AI
+    IDE yet") — while the Zed chain's findings sat in history as a
+    [background result] the router never saw.
+    """
+
+    _RECALL_1 = ("i forgot what you told me about zed just moments ago , "
+                 "remind me")
+    _RECALL_2 = "no about zed new ai ide , tell me exactly what you just told"
+    _BLIND = ("I am an AI assistant designed to help with tasks. I haven't "
+              "provided information about the Zed AI IDE yet.")
+    _ZED_BG = ("[background result] I searched \"Zed's new AI IDE is "
+               "Spectacularly... ByteGrad review\" — the 39:48 review calls "
+               "Zed spectacularly fast with AI-assisted multi-buffer editing.")
+
+    def test_the_two_live_recall_turns_are_detected(self):
+        self.assertTrue(brain._memory_recall_request(self._RECALL_1))
+        self.assertTrue(brain._memory_recall_request(self._RECALL_2))
+
+    def test_recall_shapes_are_detected(self):
+        for msg in (
+                "remind me what we discussed",
+                "remind me of what you said",
+                "remind me about the zed video",
+                "repeat that",
+                "repeat what you said",
+                "say that again",
+                "come again",
+                "what were we talking about",
+                "what did you just say about zed",
+                "what did we discuss",
+                "what do you mean by that",
+                "summarize the conversation",
+                "summarise what you told me",
+                "recap what you said",
+                "what was that about",
+                "tell me again what you said"):
+            self.assertTrue(brain._memory_recall_request(msg), msg)
+
+    def test_non_recall_shapes_are_ignored(self):
+        for msg in (
+                # A screen question about the thing on screen (LF16/LF17).
+                "what is this about adobe on my screen",
+                # A status question about the work done (LF16).
+                "did you do an online search for this skin",
+                "what did you do",
+                # Plain general knowledge — the [S6] shortcut stays.
+                "why is the sky blue",
+                "how are you",
+                # A NEW information request, not a recall of an old one.
+                "tell me about zed",
+                "summarize this video for me",
+                "find out what this video is about",
+                # A reminder to schedule, not a recall (commitment route).
+                "remind me to call mom in 10 minutes",
+                "remind me in 10 minutes to stretch",
+                # A parrot game, not a recall.
+                "repeat after me: hello"):
+            self.assertFalse(brain._memory_recall_request(msg), msg)
+
+    def test_the_routers_blind_reply_is_refused_for_recall(self):
+        intent = {"intent": "chat", "steps": [], "task_description": "",
+                  "query": self._RECALL_1, "reply": self._BLIND}
+        self.assertEqual(brain._router_chat_reply(intent, self._RECALL_1), "")
+        intent["query"] = self._RECALL_2
+        self.assertEqual(brain._router_chat_reply(intent, self._RECALL_2), "")
+
+    def test_the_routers_reply_survives_for_normal_chat(self):
+        intent = {"intent": "chat", "steps": [], "task_description": "",
+                  "query": "why is the sky blue",
+                  "reply": "Light scatters off air molecules."}
+        self.assertEqual(
+            brain._router_chat_reply(intent, "why is the sky blue"),
+            "Light scatters off air molecules.")
+        self.assertEqual(
+            brain._router_chat_reply({"intent": "chat"}, "why is the sky blue"),
+            "")
+
+    def _zed_history(self):
+        # The committed shape of the live session: the Zed chain (user half,
+        # ack, per-step notes, background result) + TWO later research
+        # exchanges — 10 entries before the current turn, so the Zed finding
+        # sits 7th from the end: past the normal spoken window of 6, inside
+        # the widened recall window.
+        return [
+            {"role": "user", "content": "find out what this video on my screen is talking about zed new Ai IDE"},
+            {"role": "assistant", "content": "Sir, I'll do this in 2 steps: look at your screen, research it online. I'll report back when it's done."},
+            {"role": "assistant", "content": "I looked at your screen: Zed's new AI IDE is Spectacularly... ByteGrad review"},
+            {"role": "assistant", "content": self._ZED_BG},
+            {"role": "user", "content": "do a deep research about when will the next deepseek model be released"},
+            {"role": "assistant", "content": "Quick lookup for that, sir."},
+            {"role": "assistant", "content": "[background result] DeepSeek's next model has no confirmed release date yet."},
+            {"role": "user", "content": "find out what this video is about"},
+            {"role": "assistant", "content": "Quick lookup for that, sir."},
+            {"role": "assistant", "content": "[background result] The video is AI Just Killed the Adobe Subscription by Stackd Podcast, 39:48, 467 views."},
+        ]
+
+    def _build(self, history, msg, voice_compact=False):
+        with patch.object(brain, "_memory_context_cached",
+                           return_value=("", "")), \
+             patch.object(brain, "force_search", return_value=False), \
+             patch.object(brain, "should_search", return_value=False):
+            return brain._build_chat_messages(
+                msg, voice_compact=voice_compact, history=list(history))
+
+    def test_the_recall_window_keeps_the_older_finding(self):
+        history = self._zed_history() + [
+            {"role": "user", "content": self._RECALL_1}]
+        built = self._build(history, self._RECALL_1, voice_compact=True)
+        self.assertEqual(built["path"], "llm")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        # The Zed finding is the 7th entry from the end — past the normal
+        # spoken window of 6 — and must still be seen.
+        self.assertIn("ByteGrad", blob)
+        self.assertIn("DeepSeek", blob)
+
+    def test_the_normal_spoken_window_stays_tight(self):
+        history = self._zed_history() + [
+            {"role": "user", "content": "why is the sky blue"}]
+        built = self._build(history, "why is the sky blue",
+                            voice_compact=True)
+        self.assertEqual(built["path"], "llm")
+        self.assertEqual(len(built["messages"][1:]), 6)
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertNotIn("ByteGrad", blob)
+
+    def _process_rig(self, reply):
+        patchers = [
+            # Force the classifier path (no fast path) with the router's
+            # blind answer, then watch which reply the process uses.
+            patch.object(brain, "is_definitely_plain_chat",
+                         return_value=False),
+            patch.object(brain, "classify_intent",
+                         return_value={"intent": "chat", "steps": [],
+                                       "task_description": "",
+                                       "query": "x", "reply": reply,
+                                       "_source": "gemini"}),
+            patch.object(brain, "handle_chat", return_value="FROM-CHAT"),
+            patch.object(brain, "_ChatRacer"),
+            patch.object(brain, "memory_store", None),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_the_process_refuses_the_blind_reply_end_to_end(self):
+        self._process_rig(self._BLIND)
+        for msg in (self._RECALL_1, self._RECALL_2):
+            with self.subTest(msg=msg):
+                brain.handle_chat.reset_mock()
+                response = brain.process_message(msg, sync_voice=False)
+                self.assertEqual(response, "FROM-CHAT")
+                brain.handle_chat.assert_called_once()
+                # handle_chat ran WITHOUT answered= — the router's blind
+                # reply was refused and the history-aware model answers.
+                answered = brain.handle_chat.call_args.kwargs.get("answered")
+                self.assertFalse(answered)
+
+    def test_normal_chat_still_uses_the_router_reply(self):
+        self._process_rig("Light scatters off air molecules.")
+        response = brain.process_message("why is the sky blue",
+                                         sync_voice=False)
+        # handle_chat is stubbed, so the response is its stub — the [S6]
+        # shortcut is proven by answered= carrying the router's reply.
+        self.assertEqual(response, "FROM-CHAT")
+        brain.handle_chat.assert_called_once()
+        self.assertEqual(
+            brain.handle_chat.call_args.kwargs.get("answered"),
+            "Light scatters off air molecules.")
+
+    def test_the_router_prompt_declines_recall(self):
+        from backend.services import intent as intent_mod
+        # Belt-and-braces with the brain-side refusal: the router itself is
+        # told a recall ask needs history this call lacks. The length guard
+        # pins the prompt budget this rule was squeezed into.
+        self.assertIn("Recall asks need history", intent_mod._INTENT_PROMPT)
+        self.assertLess(len(intent_mod._INTENT_PROMPT), 2000)
+
+
 if __name__ == "__main__":
     unittest.main()

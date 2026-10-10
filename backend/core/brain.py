@@ -2120,6 +2120,66 @@ def _drop_dangling_user_turns(history, current_message=""):
     return out
 
 
+#: [LIVE FIX 18] A turn that asks to recall/repeat/summarize the conversation
+#: itself ("remind me", "what did you just tell me", "repeat that") can only
+#: be answered from the turns above — the [S6] intent router writes its reply
+#: blind (its prompt carries only the current message), so those turns must
+#: fall through to the history-aware chat model. The shapes below name the
+#: earlier exchange explicitly (said/told/talking/discussed/conversation); a
+#: bare "what is this about …" stays OUT (a screen question), "what did you
+#: do …" stays OUT (a status question), and "remind me to/in/at …" stays OUT
+#: (a reminder to schedule, owned by the commitment phrase route above).
+_MEMORY_RECALL_RE = re.compile(
+    r"(?i)\b(?:"
+    r"remind\s+me\b(?!\s+(?:to|in|at|after|on)\b)"
+    r"|tell\s+me\s+(?:exactly\s+|again\s+)?what\s+you\s+"
+    r"(?:just\s+|already\s+)?(?:said|told|mentioned|meant|reported|found|"
+    r"answered|showed)\b"
+    r"|what\s+did\s+you\s+(?:just\s+|already\s+)?(?:say|tell|speak|mention|"
+    r"mean|report|find(?:\s+out)?|answer|show)\b"
+    r"|what\s+do\s+you\s+mean\b"
+    r"|\bi\s+forg[eo]t\s+what\s+you\b"
+    r"|\bwhat\s+were\s+we\s+(?:talking|discussing)\b"
+    r"|\bwhat\s+did\s+we\s+(?:discuss|talk|say)\b"
+    r"|\brecap\s+(?:what\s+(?:you|we)|the\s+(?:conversation|chat))\b"
+    r"|repeat\s+(?:that|what\s+you\s+(?:said|told)|it|yourself)\b"
+    r"|\bsay\s+(?:that|it)\s+again\b"
+    r"|\bcome\s+again\b"
+    r"|\bsummari[sz]e\s+(?:what\s+you|the\s+(?:conversation|chat)|what\s+we)\b"
+    r"|\bwhat\s+was\s+that\s+(?:you\s+(?:said|told|meant)|about)\b"
+    r")"
+)
+
+
+def _memory_recall_request(text):
+    """True when the turn asks to recall the conversation itself (live fix).
+
+    A recall-shaped turn is refused the [S6] router's blind reply and gets a
+    wider spoken history window (see _build_chat_messages). Never raises.
+    """
+    try:
+        return bool(text and _MEMORY_RECALL_RE.search(str(text)))
+    except Exception:
+        return False
+
+
+def _router_chat_reply(intent, msg):
+    """The [S6] router's answer for a chat verdict — or "" when refused.
+
+    A recall-shaped turn ("remind me", "what did you just tell me") is
+    refused: the router wrote its reply with no conversation history, so
+    using it invents ("Zed is a code editor…") or denies ("I haven't told
+    you about that yet"). "" falls through to the history-aware chat model
+    below, which answers from the turns above.
+    """
+    reply = str((intent or {}).get("reply") or "").strip()
+    if reply and _memory_recall_request(msg):
+        print("[INTENT] Memory-recall turn — the router answered blind; "
+              "refusing it so the history-aware chat model answers.")
+        return ""
+    return reply
+
+
 def _build_chat_messages(user_message, voice_compact=False, speculative=False, history=None):
     """Shared message-construction for chat (used by both streaming and plain paths).
 
@@ -2252,7 +2312,13 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
     if history is None:
         history = get_history()
     if voice_compact:
-        history = history[-6:]
+        # [LIVE FIX 18] A recall-shaped turn needs the earlier exchange, not
+        # just the last three turns: every chain/task/research turn commits
+        # 3-5 entries (user half, ack, per-step notes, background result), so
+        # the finding a "remind me" points at already sits past position 6.
+        # Normal spoken chat keeps the tight window.
+        history = (history[-14:] if _memory_recall_request(user_message)
+                   else history[-6:])
     # Live fix: an unanswered persisted turn must never absorb this reply —
     # drop the dangling trailing user run (the current turn is kept).
     history = _drop_dangling_user_turns(history, user_message)
@@ -9741,8 +9807,10 @@ def _process_message_inner(
         # its chance to upgrade the route - so a misrouted chat verdict still
         # becomes research/task/screen exactly as before. An empty reply (the
         # fast path, or a router that returned no text) falls through to the
-        # normal chat model below.
-        router_reply = str((intent or {}).get("reply") or "").strip()
+        # normal chat model below. [LIVE FIX 18] A recall-shaped turn refuses
+        # the router's blind reply (no history in that call) and falls through
+        # to the history-aware chat model instead of inventing or denying.
+        router_reply = _router_chat_reply(intent, msg)
         if router_reply:
             if racer is not None:
                 # The answer already exists, so the speculative chat stream is
