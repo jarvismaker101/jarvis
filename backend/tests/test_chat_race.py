@@ -335,8 +335,8 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
     def test_intent_prompt_length_and_keys(self):
         p = intent_mod._INTENT_PROMPT
         # LIVE FIX 19 grew the prompt with the conversation-context rules;
-        # the ceiling moved with it (was 2000 for the history-blind prompt).
-        self.assertLess(len(p), 2600, f"prompt len {len(p)} must be <2600")
+        # the ceiling moved with it (was 2600 for the LF19 prompt).
+        self.assertLess(len(p), 4000, f"prompt len {len(p)} must be <4000")
         for name in ["chat", "tool", "screen", "region", "research", "task"]:
             self.assertIn(name, p)
         for action in ["open_website", "launch_app", "youtube_play", "search"]:

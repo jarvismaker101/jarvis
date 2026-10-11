@@ -31,6 +31,7 @@ import re
 import time
 
 from backend.config import GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
+from backend.core.memory import SESSION_MARKER
 from backend.services import model_registry
 from backend.services.gemini_client import ask_gemini_chat
 from backend.services.grok_client import _strip_think_blocks, ask_grok
@@ -49,7 +50,7 @@ _INTENT_PROMPT = (
     ' tool - simple direct actions: open app/site, play media, web search (ONLY 4 actions below)\n'
      ' screen - LOOK AT whole screen (e.g. "what is on my screen", "what\'s on my screen jarvis", "screen pe kya dikh raha hai")\n'
     ' region - SPECIFIC small area/cursor/highlight (e.g. "what does this highlighted area mean", "cursor pe kya aaya")\n'
-    ' research - LOOK UP on internet and report; ANY question needing CURRENT world facts: pricing/price/cost of any product, service or AI model (even obscure or possibly-new names - e.g. "whats the pricing for claude fable 5.1 model" -> research), latest/newest versions, releases, current events, news, scores, weather, dates, today/now/latest questions; when unsure between chat and research for a specific named product/model/version/price/date, choose research\n'
+     ' research - LOOK UP on internet and report; ANY question needing CURRENT world facts: pricing/price/cost of any product, service or AI model (even obscure or possibly-new names - e.g. "whats the pricing for claude fable 5.1 model" -> research), latest/newest versions, releases, current events, news, scores, weather, dates, today/now/latest questions; ongoing-series/live-event facts (today\'s scores, squads, captains, venues, who won the toss/match) are research even when the conversation already names the match - your own knowledge of current events is stale; when unsure between chat and research for a specific named product/model/version/price/date, choose research\n'
     ' task - ANY real computer manipulation not covered by 4 tool actions: files/folders, code, shell, install, settings, automation, multi-step web/browser interaction (e.g. "Go to 1hd.to website, search for One Piece Movie Red, and play it" -> task with task_description)\n\n'
     "Allowed tool actions (ONLY these -> else task):\n"
     ' {"action": "open_website", "input": "site.com"} {"action": "launch_app", "input": "app"}'
@@ -57,7 +58,8 @@ _INTENT_PROMPT = (
     ' (+ browser chrome|edge|brave)\n\n'
     'Rules: "how are you" -> chat not research; screen/region no steps; task/task_description; tool/steps; research/query.'
     ' Hinglish e.g. "deepseek kya hai, dhundho" -> research.\n'
-     '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "". Context: a "Recent conversation" block before the routing request is the conversation so far (most recent last); "[background result]" lines are Jarvis\'s own work notes. Resolve this/that/it references and recall questions from it. "What did we discuss" is chat — "reply" answers ONLY from the conversation. Fresh facts are research — "query" is STANDALONE with references replaced by what the conversation shows. A chat "reply" never offers to search or act — choose research or task instead.\n'
+     '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "". Context: a "Recent conversation" block before the routing request is the conversation so far (most recent last); "[background result]" lines are Jarvis\'s own work notes. The block is THIS session only - never treat it as yesterday or another app. Resolve this/that/it references and recall questions from it. "What did we discuss" is chat — "reply" answers ONLY from the conversation. Fresh facts are research — "query" is STANDALONE with references replaced by what the conversation shows. A chat "reply" never offers to search or act — choose research or task instead. Questions about the CURRENT screen/desktop state ("what is on/running/open on my screen") are screen, never chat or status. Bare "Again/do it again" after a completed action repeats that action, never the conversation topic.\n'
+     '[CAPABILITIES - routing knowledge, not trigger phrases] Jarvis CAN: control windows (minimize/maximize/restore/scroll the active window, hotkeys), drive on-screen UI (click/type/press), run real computer work (files/folders, code, shell, desktop windows, browser automation), look things up online, and analyze the screen. A request using any of these is task, screen, region or tool - NEVER chat, in ANY language or sentence position ("Meri screen pe jo window hai usko minimize karo", "these all windows ko minimize karo", "okay now minimize all the terminal windows" are all actions). Chat never answers an action request and never claims inability ("I cannot minimize/interact/control/click") - route the capable path instead. Bare active-window ops go screen; requests naming other windows/apps ("all terminal windows", "the topmost window") go task for the full plan.\n'
     'Reply ONLY JSON: {"intent": "chat"|"tool"|"screen"|"region"|"research"|"task", "reply": "...", "steps": [], "query": "...", "task_description": "...", "original": "..."}\n'
     "User message: __MESSAGE__"
 )
@@ -90,6 +92,15 @@ def _render_router_history(history, current_message=""):
     """
     try:
         items = [m for m in (history or []) if isinstance(m, dict)]
+        # [LIVE FIX 20 / bug 8] a session marker ends the previous boot's
+        # turns — the router's "recent conversation" never crosses a
+        # restart, so the first classification after boot cannot latch
+        # onto the last session's final exchange. Explicit recall still
+        # sees the whole history (the recall path keeps the full window).
+        for i in range(len(items) - 1, -1, -1):
+            if str(items[i].get("content") or "") == SESSION_MARKER:
+                items = items[i + 1:]
+                break
         while (items and items[-1].get("role") == "user"
                and current_message
                and str(items[-1].get("content") or "") == str(current_message)):

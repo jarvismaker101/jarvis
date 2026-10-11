@@ -361,8 +361,9 @@ class RouterConversationContextTests(unittest.TestCase):
         prompt = intent_mod._INTENT_PROMPT
         self.assertIn("Recent conversation", prompt)
         self.assertIn("STANDALONE", prompt)
-        # The LF19 context rules grew the prompt: the ceiling moved with it.
-        self.assertLess(len(prompt), 2600)
+        # The LF20 capability manifest grew the prompt: the ceiling moved
+        # with it (was 2600 for the LF19 prompt).
+        self.assertLess(len(prompt), 4000)
 
 
 if __name__ == "__main__":

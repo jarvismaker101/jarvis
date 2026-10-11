@@ -840,9 +840,10 @@ class MemoryRecallRouterTests(unittest.TestCase):
         # Belt-and-braces with the brain-side refusal: since LIVE FIX 19 the
         # router carries the conversation, so the rule tells it to resolve
         # recall from that block instead of declining. The length guard pins
-        # the prompt budget the context rules were squeezed into.
+        # the prompt budget the context rules were squeezed into (LF20 added
+        # the capability manifest, so the ceiling moved to 4000).
         self.assertIn("Recent conversation", intent_mod._INTENT_PROMPT)
-        self.assertLess(len(intent_mod._INTENT_PROMPT), 2600)
+        self.assertLess(len(intent_mod._INTENT_PROMPT), 4000)
 
 
 class RouterSeesConversationTests(unittest.TestCase):
@@ -935,6 +936,306 @@ class RouterSeesConversationTests(unittest.TestCase):
             response = brain.process_message(
                 "can you check online who won the toss", sync_voice=False)
         self.assertEqual(response, "RESEARCHED")
+
+
+class SessionBoundaryTests(unittest.TestCase):
+    """LIVE FIX 20 / bug 8: the first turn after boot must not see the
+    previous session's final exchanges as "recent conversation"."""
+
+    _HISTORY = [
+        {"role": "user", "content": "scrape the X website"},
+        {"role": "assistant",
+         "content": "Should I proceed with scraping the X website now?"},
+        {"role": "user", "content": "good evening"},
+    ]
+
+    def test_the_router_render_stops_at_the_session_marker(self):
+        from backend.services import intent as intent_mod
+        from backend.core.memory import SESSION_MARKER
+        history = self._HISTORY[:2] + [
+            {"role": "system", "content": SESSION_MARKER},
+            self._HISTORY[2],
+            {"role": "assistant", "content": "Loud and clear, sir."},
+        ]
+        out = intent_mod._render_router_history(history, "what next")
+        self.assertNotIn("scrape", out)
+        self.assertNotIn(SESSION_MARKER, out)
+        self.assertIn("good evening", out)
+
+    def test_no_marker_renders_everything(self):
+        from backend.services import intent as intent_mod
+        out = intent_mod._render_router_history(self._HISTORY, "good evening")
+        self.assertIn("scrape", out)
+
+    def test_session_history_slices_and_legacy_files_pass_through(self):
+        from backend.core import memory as mem
+        from backend.core.memory import SESSION_MARKER
+        history = self._HISTORY[:2] + [
+            {"role": "system", "content": SESSION_MARKER},
+            self._HISTORY[2],
+        ]
+        self.assertEqual(mem.session_history(history), [self._HISTORY[2]])
+        self.assertEqual(mem.session_history(self._HISTORY),
+                         self._HISTORY)
+
+    def test_mark_session_start_is_idempotent(self):
+        from backend.core import memory as mem
+        saved = mem.get_history()
+        try:
+            mem.conversation_history.clear()
+            with patch.object(mem, "_ensure_writer", return_value=None):
+                self.assertTrue(mem.mark_session_start())
+                self.assertFalse(mem.mark_session_start())
+                self.assertEqual(len(mem.get_history()), 1)
+        finally:
+            mem.conversation_history.clear()
+            mem.conversation_history.extend(saved)
+
+    def _build(self, history, msg):
+        with patch.object(brain, "_memory_context_cached",
+                          return_value=("", "")), \
+             patch.object(brain, "force_search", return_value=False), \
+             patch.object(brain, "should_search", return_value=False), \
+             patch.object(brain, "should_search_live_event",
+                          return_value=False):
+            return brain._build_chat_messages(
+                msg, voice_compact=True, history=list(history))
+
+    def test_normal_spoken_window_stops_at_the_marker(self):
+        from backend.core.memory import SESSION_MARKER
+        history = self._HISTORY[:2] + [
+            {"role": "system", "content": SESSION_MARKER},
+            {"role": "user", "content": "no, i'm asking, can you hear me?"},
+        ]
+        built = self._build(history, "no, i'm asking, can you hear me?")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertNotIn("scrape", blob)
+
+    def test_recall_crosses_the_marker(self):
+        from backend.core.memory import SESSION_MARKER
+        history = [
+            {"role": "user",
+             "content": "remind me what you told me about Zed"},
+            {"role": "assistant",
+             "content": "[background result] Zed is a fast editor."},
+            {"role": "system", "content": SESSION_MARKER},
+            {"role": "user", "content": "i forgot what you told me"},
+        ]
+        built = self._build(history, "i forgot what you told me")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertIn("Zed", blob)
+
+
+class StatusYieldsToScreenTests(unittest.TestCase):
+    """LIVE FIX 20 / bug 2: "what is running on my screen" is a screen
+    question, not a job-queue status question."""
+
+    def test_screen_state_question_is_not_status(self):
+        self.assertFalse(brain.is_status_question(
+            "can you tell me what is running on my screen right now"))
+        self.assertFalse(brain.is_status_question(
+            "what is running on my screen"))
+
+    def test_plain_status_questions_still_status(self):
+        self.assertTrue(brain.is_status_question("is it done"))
+        self.assertTrue(brain.is_status_question("anything queued"))
+        self.assertTrue(brain.is_status_question("what is running"))
+
+    def test_screen_net_sees_the_live_phrasing(self):
+        from backend.services.screen_analyzer import is_screen_question
+        self.assertTrue(is_screen_question(
+            "can you tell me what is running on my screen right now"))
+
+
+class LiveEventSearchTests(unittest.TestCase):
+    """LIVE FIX 20 / bug 4: stats about the ongoing event are looked up,
+    never answered parametrically — but only in that event's context."""
+
+    _CRICKET = [
+        {"role": "user", "content": "i want you to find out what cricket "
+         "match is today between india and west indies"},
+        {"role": "assistant", "content": "Quick lookup for that, sir."},
+        {"role": "assistant", "content": "[background result] India vs "
+         "West Indies 5th T20 today."},
+    ]
+
+    def test_captains_question_searches_in_match_context(self):
+        self.assertTrue(brain.should_search_live_event(
+            "tell me the name of both side captains", self._CRICKET))
+
+    def test_scores_question_searches_in_match_context(self):
+        self.assertTrue(brain.should_search_live_event(
+            "how much did both teams score in the last match",
+            self._CRICKET))
+
+    def test_same_questions_without_context_stay_chat(self):
+        plain = [{"role": "user", "content": "hello"}]
+        self.assertFalse(brain.should_search_live_event(
+            "tell me the name of both side captains", plain))
+        self.assertFalse(brain.should_search_live_event(
+            "what is two plus two", self._CRICKET))
+        self.assertFalse(brain.should_search_live_event(
+            "tell me the name of both side captains", []))
+
+    def test_explicit_internet_demand_still_routes(self):
+        self.assertTrue(brain.force_research(
+            "arre internet pe search karke batao apni memory se mat batao"))
+
+
+class RepeatLastActionTests(unittest.TestCase):
+    """LIVE FIX 20 / bug 6: bare "Again." repeats the last ACTION."""
+
+    def test_registry_roundtrip_and_ttl(self):
+        brain.note_executed_action(
+            "screen_control", "minimize the window on my screen",
+            "Minimizing the active window, sir.")
+        self.assertEqual(brain._repeatable_last_command(),
+                         "minimize the window on my screen")
+        with brain._last_action_lock:
+            brain._last_action["at"] = time.time() - 9999
+        self.assertEqual(brain._repeatable_last_command(), "")
+
+    def test_bare_repeat_shapes(self):
+        for text in ("Again.", "again", "do it again", "one more time",
+                     "phir se", "Jarvis, again!", "ek baar aur"):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    brain._REPEAT_LAST_RE.match(text.strip()), text)
+        for text in ("minimize it again", "yes", "again, what did you say",
+                     "try again", "repeat that song"):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    brain._REPEAT_LAST_RE.match(text.strip()), text)
+
+
+class OrdinalRecallTests(unittest.TestCase):
+    """LIVE FIX 20 / bug 7a: "second last reply" resolves by arithmetic."""
+
+    def _exchanges(self):
+        return [
+            {"role": "user",
+             "content": "minimize all the terminal windows"},
+            {"role": "assistant", "content": "Minimize all open terminal "
+             "windows. Do you want me to go ahead?"},
+            {"role": "user", "content": "yes, exactly"},
+            {"role": "assistant",
+             "content": "Taking over the browser task, sir."},
+            {"role": "user",
+             "content": "minimize the window on my screen"},
+            {"role": "assistant",
+             "content": "Minimizing the active window, sir."},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": "I will continue to respond "
+             "in English."},
+        ]
+
+    def test_numbering_pairs_user_turns_with_following_replies(self):
+        numbered, exchanges = brain._number_recall_exchanges(
+            self._exchanges())
+        self.assertEqual([e["n"] for e in exchanges], [1, 2, 3, 4])
+        self.assertTrue(numbered[0]["content"].startswith("[#1 you]"))
+        self.assertTrue(numbered[5]["content"].startswith("[#3 jarvis]"))
+
+    def test_second_last_resolves_to_the_minimize_exchange(self):
+        _, exchanges = brain._number_recall_exchanges(self._exchanges())
+        ref = brain._resolve_ordinal_reference(
+            "i asked you what in the second last reply from now, tell me",
+            exchanges)
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref["user"], "minimize the window on my screen")
+        self.assertIn("Minimizing the active window", ref["assistant"])
+
+    def test_last_reply_resolves_to_the_latest_exchange(self):
+        _, exchanges = brain._number_recall_exchanges(self._exchanges())
+        ref = brain._resolve_ordinal_reference(
+            "what was your last reply", exchanges)
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref["user"], "again")
+
+    def test_live_phrasing_is_recall_shaped(self):
+        self.assertTrue(brain._memory_recall_request(
+            "i asked you what in the second last reply from now, tell me"))
+
+    def test_recall_build_carries_numbers_and_the_located_exchange(self):
+        msg = "i asked you what in the second last reply from now, tell me"
+        history = self._exchanges() + [{"role": "user", "content": msg}]
+        with patch.object(brain, "_memory_context_cached",
+                          return_value=("", "")), \
+             patch.object(brain, "force_search", return_value=False), \
+             patch.object(brain, "should_search", return_value=False), \
+             patch.object(brain, "should_search_live_event",
+                          return_value=False):
+            built = brain._build_chat_messages(
+                msg, voice_compact=True, history=list(history))
+        self.assertEqual(built["path"], "llm")
+        blob = "\n".join(m["content"] for m in built["messages"])
+        self.assertIn("[#3 you]", blob)
+        self.assertIn("exchange #3", built["system_prompt"])
+        self.assertIn("Minimizing the active window",
+                      built["system_prompt"])
+
+
+class CapabilityRoutingTests(unittest.TestCase):
+    """LIVE FIX 20 / bugs 1+7b: window management reaches a capable path
+    in any language or sentence position — never a chat refusal."""
+
+    def test_hinglish_minimize_shapes_are_screen_commands_when_enabled(self):
+        from backend.services import screen_control, screen_state
+        screen_state.set_enabled(True)
+        try:
+            self.assertTrue(screen_control._looks_like_screen_command(
+                "these all windows ko minimize karo"))
+            self.assertTrue(screen_control._looks_like_screen_command(
+                "meri screen pe jo window hai is waqt sabse upar usko "
+                "minimize karo"))
+            self.assertTrue(screen_control._looks_like_screen_command(
+                "minimize the window on my screen"))
+        finally:
+            screen_state.set_enabled(False)
+
+    def test_screen_questions_are_not_commands(self):
+        from backend.services import screen_control, screen_state
+        screen_state.set_enabled(True)
+        try:
+            self.assertFalse(screen_control._looks_like_screen_command(
+                "can you tell me what is running on my screen right now"))
+            self.assertFalse(screen_control._looks_like_screen_command(
+                "my screen dekh ke batao ki screen pe kya hai is waqt"))
+        finally:
+            screen_state.set_enabled(False)
+
+    def test_window_command_scopes_bare_vs_qualified(self):
+        from backend.services import screen_control
+        plan = screen_control._parse_window_command(
+            "minimize the window on my screen")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["summary"], "Minimizing the active window, sir.")
+        for text in ("minimize all the terminal windows",
+                     "minimize the topmost window",
+                     "meri screen pe jo window hai sabse upar usko "
+                     "minimize karo"):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    screen_control._parse_window_command(text))
+
+    def test_false_inability_claims_are_stripped(self):
+        out = brain._strip_unverified_action_claims(
+            "I cannot minimize windows on your screen, sir.", "chat")
+        self.assertNotIn("cannot minimize", out)
+        out = brain._strip_unverified_action_claims(
+            "I cannot interact with your desktop directly, sir. "
+            "Let me know what specific system commands you need run.",
+            "chat")
+        self.assertNotIn("cannot interact", out)
+
+    def test_honest_inability_about_other_things_passes(self):
+        text = "I cannot predict the future, sir."
+        self.assertEqual(
+            brain._strip_unverified_action_claims(text, "chat"), text)
+
+    def test_prompt_carries_the_capability_manifest(self):
+        from backend.services import intent as intent_mod
+        self.assertIn("CAPABILITIES", intent_mod._INTENT_PROMPT)
 
 
 if __name__ == "__main__":

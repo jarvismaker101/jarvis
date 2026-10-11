@@ -80,6 +80,11 @@ _SCREEN_QUESTION_PATTERNS = [
     r"\bcan you see (?:my |the )?screen\b",
     r"\bscreen (?:me |pe )?(kya|what)\b",
     r"\bwhat(?:'s| is) (?:going on|happening)\b.*screen\b",
+    # [LIVE FIX 20 / bug 2] state-of-screen questions ("what is running on
+    # my screen right now") — previously only the status net saw "running"
+    # and answered from the job snapshot without ever looking.
+    r"\bwhat(?:'s| is) running (?:on |in )?(?:my |the )?screen\b",
+    r"\bwhat(?:'s| is) open (?:on |in )?(?:my |the )?screen\b",
     # Hindi / Hinglish
     r"\bscreen pe kya hai\b",
     r"\bscreen pe kya ho raha\b",

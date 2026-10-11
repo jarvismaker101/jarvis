@@ -42,6 +42,14 @@ app.include_router(router)
 @app.on_event("startup")
 def _startup_checks():
     validate_environment()
+    # [LIVE FIX 20 / bug 8] mark the session boundary: without it the first
+    # turn after a boot sees the previous session's final exchanges as
+    # "recent conversation" and offers to resume the old task. Best-effort.
+    try:
+        from backend.core import memory
+        memory.mark_session_start()
+    except Exception as exc:
+        logging.debug("Session marker skipped: %s", exc)
     # G11 / F52 — durable instance identity: the supervisor matches this
     # stamp against the listening port instead of assuming ownership from a
     # port alone. Best-effort; a stamping failure never blocks startup.

@@ -335,18 +335,23 @@ _SCREEN_CMD_HIGH_CONFIDENCE = re.compile(
 
 _SCREEN_CMD_UI_NOUN = re.compile(
     r"\b(button|link|search\s*bar|search\s*box|text\s*box|textbox|"
-    r"field|tab|icon|checkbox|dropdown|menu\s*item|toolbar)\b",
+    r"field|tab|icon|checkbox|dropdown|menu\s*item|toolbar|windows?)\b",
     re.IGNORECASE,
 )
 
 _SCREEN_CMD_ACTION_RE = re.compile(
-    r"\b(click|type|open|close|select|focus|tap|press|hit|enter)\b",
+    r"\b(click|type|open|close|select|focus|tap|press|hit|enter|"
+    r"minimize|minimise|maximize|maximise|restore)\b",
     re.IGNORECASE,
 )
 
 # PART A - screen phrase + action verb detection anywhere (regardless of toggle)
+# [LIVE FIX 20 / bug 7b] window verbs belong here too: with controls ON, a
+# mid-sentence/Hinglish "minimize ... window" must reach the capable path
+# instead of falling through to a chat refusal.
 _SCREEN_ACTION_VERBS_RE = re.compile(
-    r"\b(click|double\s*click|double-?click|press|tap|open|close|play|pause|scroll|type|drag)\b",
+    r"\b(click|double\s*click|double-?click|press|tap|open|close|play|pause|scroll|type|drag|"
+    r"minimize|minimise|maximize|maximise|restore)\b",
     re.IGNORECASE,
 )
 
@@ -354,6 +359,7 @@ _SCREEN_PHRASE_RE = re.compile(
     r"\b(?:visible\s+(?:on|at)\s+(?:my\s+|the\s+)?screen|"
     r"(?:on|at)\s+(?:my\s+|the\s+)?screen|"
     r"(?:on|at)\s+(?:my\s+|the\s+)?desktop|"
+    r"screen\s+(?:pe|par|mein|me)\b|"
     r"anything\s+visible)\b",
     re.IGNORECASE,
 )
@@ -499,10 +505,26 @@ def _parse_windows_shell_command(command_text):
     return None
 
 
+# A window command names a target BEYOND the bare active window ("all the
+# terminal windows", "the topmost window") — the instant direct plan only
+# minimizes/maximizes/restores the ACTIVE window, so a qualified request
+# must NOT be answered by it (it would do the narrower wrong thing, e.g.
+# minimizing one window when asked for all). Returning None defers to the
+# fuller path (vision plan with controls on, task route via the router).
+_WINDOW_QUALIFIER_RE = re.compile(
+    r"\b(all|every|each|these|those|other|another|topmost|top\s*most|"
+    r"sab|sabhi|saare|saari|sare|sabse\s+upar)\b",
+    re.IGNORECASE,
+)
+
+
 def _parse_window_command(command_text):
     normalized = _normalize_text(command_text)
 
     if any(word in normalized for word in ("minimize", "minimise")):
+        # [LIVE FIX 20 / bug 1] qualified targets defer — see above.
+        if _WINDOW_QUALIFIER_RE.search(normalized):
+            return None
         return {
             "ok": True,
             "confidence": 0.99,
@@ -3555,6 +3577,7 @@ def _execute_or_queue(plan, command_text):
     # Record in context memory
     screen_state.add_interaction(command_text, summary, verified=verified, plan=plan)
     _write_screen_command_log(command_text, plan, "EXECUTED", verified=verified)
+    _notify_action_executed(command_text, summary)
 
     if verified is False:
         return f"{summary} Though I'm not fully sure it worked - want me to try again?"
@@ -3591,6 +3614,29 @@ def set_response_callback(callback):
     """
     global _response_callback
     _response_callback = callback
+
+
+_action_notifier = None
+
+
+def set_action_notifier(callback):
+    """Register callback(kind, command, summary) for executed actions.
+
+    [LIVE FIX 20 / bug 6] the brain's bare-repeat resolution ("Again.")
+    needs a cross-executor record of what actually ran. Screen-control
+    reports its two execution sites (immediate plans, confirmed plans);
+    toggles, refusals and queued-for-confirmation plans never report.
+    """
+    global _action_notifier
+    _action_notifier = callback
+
+
+def _notify_action_executed(command_text, summary):
+    try:
+        if _action_notifier is not None:
+            _action_notifier("screen_control", command_text, summary)
+    except Exception:
+        pass
 
 
 def maybe_handle_screen_control_message(text):
@@ -3669,6 +3715,7 @@ def maybe_handle_screen_control_message(text):
             summary = plan.get("summary") or "Done, sir."
             screen_state.add_interaction("confirm", summary, plan=plan)
             _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTED")
+            _notify_action_executed(cmd_text, summary)
             return summary
         if answer == approvals._NO:
             plan = screen_state.pop_pending_plan()

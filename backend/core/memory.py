@@ -86,6 +86,47 @@ def _load_from_disk():
         conversation_history = []
 
 
+#: [LIVE FIX 20 / bug 8] — session boundary marker. The file persists
+#: across backend restarts, so without a boundary the first turn after a
+#: boot sees the PREVIOUS session's final exchanges as "recent conversation"
+#: and the chat model offers to resume the old task. ``mark_session_start``
+#: is called from the server startup path only (never on module import, so
+#: tests stay deterministic); renderers slice at the last marker for ambient
+#: context, while explicit recall still crosses it.
+SESSION_MARKER = "[session started]"
+
+
+def mark_session_start():
+    """Append one session marker. Idempotent; returns True when appended."""
+    global _write_generation
+    with _lock:
+        if (conversation_history
+                and conversation_history[-1].get("content") == SESSION_MARKER):
+            return False
+        conversation_history.append(
+            {"role": "system", "content": SESSION_MARKER})
+        if len(conversation_history) > MAX_HISTORY:
+            conversation_history.pop(0)
+        _write_generation += 1
+    _ensure_writer()
+    _wake.set()
+    return True
+
+
+def session_history(history=None):
+    """Entries after the LAST session marker — this boot's turns.
+
+    Takes an explicit list (pure slice, for renderers) or defaults to the
+    live history. A file with no marker (legacy) returns everything.
+    """
+    items = list(history) if history is not None else get_history()
+    for i in range(len(items) - 1, -1, -1):
+        m = items[i]
+        if isinstance(m, dict) and str(m.get("content") or "") == SESSION_MARKER:
+            return items[i + 1:]
+    return items
+
+
 def _pending():
     """True when the file does not yet reflect the in-memory history."""
     with _lock:

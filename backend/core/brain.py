@@ -15,7 +15,7 @@ import requests
 from backend.core import deadline as budget
 from backend.core import entity_ledger
 from backend.core.executor import execute_multiple
-from backend.core.memory import add_message, clear_history, get_history
+from backend.core.memory import add_message, clear_history, get_history, session_history
 # G9: guarded import — the memory store is optional and import-safe
 # (pure data module; every call is a no-op when disabled).
 try:
@@ -25,6 +25,7 @@ except Exception:
 
 from backend.services.screen_control import (
     maybe_handle_screen_control_message,
+    set_action_notifier,
     set_response_callback,
 )
 from backend.services.task_agent import (
@@ -324,6 +325,21 @@ _ACTION_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# [LIVE FIX 20 / bug 1] false inability about MANIFEST capabilities —
+# "I cannot minimize windows on your screen", "I cannot interact with your
+# desktop directly". The chat route has no tools, but these actions ARE
+# doable through the task/screen-control routes, so a chat reply denying
+# them is a hallucinated refusal. Kept tight to capability verbs: honest
+# inability about anything else ("I cannot predict the future") passes.
+_INCAPABILITY_CLAIM_RE = re.compile(
+    r"\bi\s+(cannot|can'?t|am\s+unable|('m| am)\s+unable)\b"
+    r"[^\n.?]{0,80}?\b(minimize|minimise|maximize|maximise|restore|"
+    r"scroll|click|typ(?:e|ing)|press|move\s+(?:the\s+)?mouse|"
+    r"interact\s+with\s+your\s+desktop|control\s+(?:your|the)\s+screen|"
+    r"control\s+windows?|browse|launch)\b",
+    re.IGNORECASE,
+)
+
 # Sentences that merely offer to act or describe capability are NOT claims:
 # "I can create files", "Do you want me to...", "Say the word and I will".
 _ACTION_OFFER_RE = re.compile(
@@ -349,6 +365,14 @@ _CHAT_NO_ACTION_FALLBACK = (
     "which exact folder and file name should I use?"
 )
 
+# [LIVE FIX 20 / bug 1] fallback when the stripped sentences were false
+# inability claims: nothing started, so ask for the exact request instead
+# of the file-oriented fallback (a minimize request has no folder).
+_CHAT_REROUTE_FALLBACK = (
+    "Understood, sir. Nothing was started — "
+    "could you say exactly what you would like me to do?"
+)
+
 
 def _strip_unverified_action_claims(text, role):
     """R13 gate: drop action-claim sentences `role` has no authority to speak.
@@ -367,11 +391,16 @@ def _strip_unverified_action_claims(text, role):
     sentences = re.split(r"(?<=[.!?])\s+", str(text).strip())
     kept = [
         s for s in sentences
-        if not _ACTION_CLAIM_RE.search(s) or _ACTION_OFFER_RE.search(s)
+        if ((not _ACTION_CLAIM_RE.search(s) or _ACTION_OFFER_RE.search(s))
+            and not _INCAPABILITY_CLAIM_RE.search(s))
     ]
     # If every sentence was a claim (the classic "I will get that created
     # right away, sir." turn), say the honest fallback instead of silence.
     if not kept or not any(s.strip() for s in kept):
+        if any(_INCAPABILITY_CLAIM_RE.search(s) for s in sentences):
+            logging.warning("[R13] chat inability claim blocked: %r",
+                            text[:160])
+            return _CHAT_REROUTE_FALLBACK
         logging.warning("[R13] chat action claim blocked: %r", text[:160])
         return _CHAT_NO_ACTION_FALLBACK
     if len(kept) != len(sentences):
@@ -800,6 +829,40 @@ def should_search(query):
     if _SEARCH_HOW_MUCH_RE.search(q):
         return True
     return bool(words & _SEARCH_WEAK_WORDS and words & _SEARCH_FACT_NOUNS)
+
+
+#: [LIVE FIX 20 / bug 4] — a factual question about an ONGOING event the
+#: conversation is already about ("tell me the name of both side captains",
+#: "how much did both teams score in the last match") must be looked up,
+#: not answered parametrically. History-gated on purpose: the stat words
+#: alone ("captains", "score") must not flip general chat — they only count
+#: when the recent turns are about a live event (match/series/toss/...), so
+#: "who is the captain" out of nowhere still stays chat.
+_LIVE_EVENT_CONTEXT_RE = re.compile(
+    r"\b(match|matches|series|t20|t-20|odi|toss|innings|squad|"
+    r"cricket|football|ipl|world cup|league|test match)\b",
+    re.IGNORECASE,
+)
+_LIVE_EVENT_STAT_RE = re.compile(
+    r"\b(captains?|squad|playing ?xi|line-?ups?|scores?|scored|"
+    r"runs|wickets?|venue|stadium|tosses?|man of the match)\b",
+    re.IGNORECASE,
+)
+
+
+def should_search_live_event(query, history):
+    """True when *query* asks a live-event stat the history is about."""
+    try:
+        if not query or not history:
+            return False
+        if not _LIVE_EVENT_STAT_RE.search(str(query)):
+            return False
+        blob = " ".join(
+            str(m.get("content") or "")
+            for m in list(history)[-10:] if isinstance(m, dict))
+        return bool(_LIVE_EVENT_CONTEXT_RE.search(blob))
+    except Exception:
+        return False
 
 
 # Greeting-like chat that must never auto-reroute to research.
@@ -2152,6 +2215,17 @@ _MEMORY_RECALL_RE = re.compile(
     r"|\bcome\s+again\b"
     r"|\bsummari[sz]e\s+(?:what\s+you|the\s+(?:conversation|chat)|what\s+we)\b"
     r"|\bwhat\s+was\s+that\s+(?:you\s+(?:said|told|meant)|about)\b"
+    # [LIVE FIX 20 / bug 7a] ordinal references to earlier exchanges ("tell
+    # me what I asked in the second last reply") are recall too — they name
+    # a position in the conversation, answerable only from the turns.
+    r"|\b(?:second|2nd|third|3rd|fourth|4th|fifth|5th)\s*(?:to\s+)?"
+    r"last\s+(?:reply|replies|exchange|exchanges|message|messages|"
+    r"answer|answers|response|responses)\b"
+    r"|\b(?:last|latest|most\s+recent|previous)\s+(?:reply|replies|"
+    r"exchange|exchanges|message|messages|answer|answers|response|"
+    r"responses)\b"
+    r"|\bwhat\s+did\s+i\s+(?:just\s+|already\s+)?(?:ask|say|tell)"
+    r"(?:\s+you)?\b"
     r")"
 )
 
@@ -2166,6 +2240,113 @@ def _memory_recall_request(text):
         return bool(text and _MEMORY_RECALL_RE.search(str(text)))
     except Exception:
         return False
+
+
+#: [LIVE FIX 20 / bug 7a] — the recall transcript is NUMBERED so ordinal
+#: references ("second last reply") resolve by arithmetic, not by the
+#: model's counting across interleaved task/plan/background entries (task
+#: turns commit 3-5 entries each, which is how "second-to-last" landed on
+#: the wrong minimize exchange). An exchange starts at each user entry;
+#: following assistant entries (replies, task notes, background results)
+#: share its number. The session marker is structural, not conversation —
+#: it is left out of the render.
+def _number_recall_exchanges(history, current_message=""):
+    """Number the recall window; return (numbered_items, exchanges).
+
+    *exchanges* is [{"n", "user", "assistant"}] for ordinal resolution.
+    The question being answered is NOT an exchange yet (it has no reply):
+    when the trailing entry is the current turn it rides along UNNUMBERED
+    so "second last reply" counts completed exchanges only. Never raises.
+    """
+    numbered = []
+    exchanges = []
+    try:
+        items = [m for m in list(history or []) if isinstance(m, dict)]
+        current = None
+        if (items and items[-1].get("role") == "user" and current_message
+                and str(items[-1].get("content") or "")
+                == str(current_message)):
+            current = items.pop()
+        n = 0
+        for m in items:
+            role = str(m.get("role") or "")
+            content = str(m.get("content") or "")
+            if not content:
+                continue
+            try:
+                from backend.core.memory import SESSION_MARKER
+            except Exception:
+                SESSION_MARKER = "[session started]"
+            if content == SESSION_MARKER:
+                continue
+            if role == "user":
+                n += 1
+                exchanges.append({"n": n, "user": content, "assistant": ""})
+            elif role == "assistant" and exchanges:
+                prev = exchanges[-1]["assistant"]
+                exchanges[-1]["assistant"] = (
+                    (prev + "\n" + content).strip() if prev else content)
+            label = "you" if role == "user" else "jarvis"
+            numbered.append({"role": role, "content": "[#%d %s] %s"
+                             % (max(n, 1), label, content)})
+        if current is not None:
+            numbered.append({"role": "user",
+                             "content": str(current.get("content") or "")})
+    except Exception:
+        pass
+    return numbered, exchanges
+
+
+#: Ordinal references to earlier exchanges. Bare ordinals count from the
+#: start ("the second reply" = #2); "... last" counts from the end
+#: ("second last reply" = next-to-last). "Previous reply" = the most recent
+#: one. Only explicit reply/exchange/message/answer nouns resolve — a bare
+#: "again" is repetition (the action registry), not recall.
+_ORDINAL_NTH_LAST_RE = re.compile(
+    r"\b(second|2nd|third|3rd|fourth|4th|fifth|5th)\s*(?:to\s+)?last\b"
+    r"[^\n.?]*?\b(reply|replies|exchange|exchanges|message|messages|"
+    r"answer|answers|response|responses)\b",
+    re.IGNORECASE,
+)
+_ORDINAL_LAST_RE = re.compile(
+    r"\b(last|latest|most\s+recent|previous)\b"
+    r"[^\n.?]*?\b(reply|replies|exchange|exchanges|message|messages|"
+    r"answer|answers|response|responses)\b",
+    re.IGNORECASE,
+)
+_ORDINAL_NTH_RE = re.compile(
+    r"\bthe\s+(second|2nd|third|3rd|fourth|4th|fifth|5th)\b"
+    r"[^\n.?]*?\b(reply|replies|exchange|exchanges|message|messages|"
+    r"answer|answers|response|responses)\b",
+    re.IGNORECASE,
+)
+_ORDINAL_WORD = {"second": 2, "2nd": 2, "third": 3, "3rd": 3,
+                 "fourth": 4, "4th": 4, "fifth": 5, "5th": 5}
+
+
+def _resolve_ordinal_reference(text, exchanges):
+    """Locate the exchange an ordinal reference points at, or None.
+
+    Deterministic where counting is trivial (the model then phrases the
+    answer instead of locating it). Never raises.
+    """
+    try:
+        if not text or not exchanges:
+            return None
+        t = str(text)
+        m = _ORDINAL_NTH_LAST_RE.search(t)
+        if m:
+            want = len(exchanges) - _ORDINAL_WORD[m.group(1).lower()] + 1
+            return next((e for e in exchanges if e["n"] == want), None)
+        if _ORDINAL_LAST_RE.search(t):
+            return exchanges[-1]
+        m = _ORDINAL_NTH_RE.search(t)
+        if m:
+            want = _ORDINAL_WORD[m.group(1).lower()]
+            return next((e for e in exchanges if e["n"] == want), None)
+    except Exception:
+        pass
+    return None
 
 
 def _router_chat_reply(intent, msg):
@@ -2289,7 +2470,9 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
 
     search_info = None
 
-    if force_search(user_message) or should_search(user_message):
+    _hist = history if history is not None else get_history()
+    if (force_search(user_message) or should_search(user_message)
+            or should_search_live_event(user_message, _hist)):
         if speculative:
             # F25 — speculation stays pure. No network call is made here; the
             # selected route performs the lookup if it still wants one.
@@ -2316,14 +2499,42 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
 
     if history is None:
         history = get_history()
+    _recall_number = False
     if voice_compact:
         # [LIVE FIX 18] A recall-shaped turn needs the earlier exchange, not
         # just the last three turns: every chain/task/research turn commits
         # 3-5 entries (user half, ack, per-step notes, background result), so
         # the finding a "remind me" points at already sits past position 6.
         # Normal spoken chat keeps the tight window.
-        history = (history[-14:] if _memory_recall_request(user_message)
-                   else history[-6:])
+        # [LIVE FIX 20 / bug 8] ambient chat sees this session only — the
+        # previous boot's tail must not read as "just now". Explicit recall
+        # intentionally crosses the session marker (an old topic is exactly
+        # what a recall turn asks for).
+        if _memory_recall_request(user_message):
+            history = history[-14:]
+            _recall_number = True
+        else:
+            history = session_history(history)[-6:]
+    # Live fix: an unanswered persisted turn must never absorb this reply —
+    # drop the dangling trailing user run (the current turn is kept).
+    history = _drop_dangling_user_turns(history, user_message)
+    if _recall_number:
+        # [LIVE FIX 20 / bug 7a] numbering runs AFTER the dangling drop
+        # (which matches raw content): the recall window is NUMBERED so
+        # "second last reply" resolves by arithmetic; when the turn names
+        # an ordinal, the located exchange rides along so the model
+        # phrases instead of locating.
+        numbered, exchanges = _number_recall_exchanges(
+            history, current_message=user_message)
+        history = numbered
+        _recall_ref = _resolve_ordinal_reference(user_message, exchanges)
+        if _recall_ref is not None:
+            system_prompt += (
+                "\n\nThe exchange you are being asked about is "
+                "exchange #%d of the numbered transcript above: you "
+                "asked %r and I replied %r. Answer from that exchange."
+                % (_recall_ref["n"], _recall_ref["user"][:300],
+                   _recall_ref["assistant"][:300]))
     # Live fix: an unanswered persisted turn must never absorb this reply —
     # drop the dangling trailing user run (the current turn is kept).
     history = _drop_dangling_user_turns(history, user_message)
@@ -3592,6 +3803,13 @@ def is_status_question(msg):
     if not msg:
         return False
     text = str(msg)
+    # [LIVE FIX 20 / bug 2] a question ABOUT THE SCREEN ("what is running
+    # on my screen right now") is not a question about Jarvis's job queue —
+    # "what is running" matched the status net and answered "nothing is
+    # running" from the activity snapshot without ever looking. Screen
+    # questions skip the status branch and reach the screen branch.
+    if is_screen_question(text):
+        return False
     if _CUED_TASK_RE.search(text):
         return True
     return bool(_STATUS_QUESTION_RE.search(text))
@@ -6602,6 +6820,77 @@ def _next_activity_seq():
     return _mi_activity_seq
 
 
+#: [LIVE FIX 20 / bug 6] — the last EXECUTED action, across executors. A
+#: bare "Again." after "Minimize the window on my screen" must repeat the
+#: action, not the conversation topic — but no registry of executed actions
+#: existed (screen-control has its own retry phrases, the task agent has
+#: nothing, research has nothing), so "again" fell to the chat model, which
+#: resolved it to the English-preference exchange. Every executor reports
+#: here on success; bare-repeat resolution re-routes the stored COMMAND
+#: text through the normal pipeline (fresh planning, fresh capture — never
+#: replaying stale coordinates). Browser-agent tasks are deliberately NOT
+#: recorded: re-arming a handed-off task blindly could double-run it.
+_LAST_ACTION_TTL = 1800.0
+_last_action_lock = threading.Lock()
+_last_action = {"kind": "", "command": "", "summary": "", "seq": 0,
+                "at": 0.0}
+
+
+def note_executed_action(kind, command, summary=""):
+    """Record a successfully executed action for bare-repeat resolution."""
+    try:
+        with _last_action_lock:
+            _last_action.update({
+                "kind": str(kind or ""),
+                "command": str(command or ""),
+                "summary": str(summary or ""),
+                "seq": _next_activity_seq(),
+                "at": time.time(),
+            })
+    except Exception:
+        pass
+
+
+def get_last_action():
+    """A safe copy of the last executed action ({} fields when none)."""
+    try:
+        with _last_action_lock:
+            return dict(_last_action)
+    except Exception:
+        return {"kind": "", "command": "", "summary": "", "seq": 0,
+                "at": 0.0}
+
+
+#: Bare repetition with no other content — "minimize it again" (referent +
+#: repeat) stays with the router's history-aware rules; only the bare form
+#: resolves here, against the action registry.
+_REPEAT_LAST_RE = re.compile(
+    r"^(?:please\s+|kindly\s+|jarvis\s*,?\s+)?"
+    r"(again|do\s+it\s+again|one\s+more\s+time|ek\s+baar\s+aur|"
+    r"phir\s+se|repeat)"
+    r"[\s.,!]*$",
+    re.IGNORECASE,
+)
+
+
+def _repeatable_last_command():
+    """The stored command text when a bare repeat is answerable, else "".
+
+    Freshness is TTL-bound: a same-boot action younger than the TTL
+    re-runs; anything older (or nothing recorded) gets the honest reply.
+    Never raises.
+    """
+    try:
+        last = get_last_action()
+        cmd = (last or {}).get("command") or ""
+        if cmd and (time.time() - float(
+                (last or {}).get("at", 0))) < _LAST_ACTION_TTL:
+            return cmd
+    except Exception:
+        pass
+    return ""
+
+
 #: [Live fix] The last replicate attempt (any path): its text, when it ran
 #: and how the read went. The honest failure fragment tells the user to
 #: "keep the folders visible and ask me again" — the re-look gate resolves
@@ -9100,6 +9389,12 @@ def _process_message_inner(
                     add_message("assistant", chain_reply)
                 except Exception:
                     pass
+                # [LIVE FIX 20 / bug 6] a completed chain is repeatable —
+                # a bare "Again." re-routes this same request.
+                try:
+                    note_executed_action("chain", msg, chain_reply)
+                except Exception:
+                    pass
                 if from_voice and sync_voice:
                     sync_voice_log(voice_log_message, chain_reply)
                 return chain_reply
@@ -9245,6 +9540,29 @@ def _process_message_inner(
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, screen_control_response)
             return screen_control_response
+
+    # ── [LIVE FIX 20 / bug 6] bare repetition repeats the last ACTION ──
+    # "Again." after "Minimize the window on my screen" must re-run the
+    # minimize — not the conversation topic. The registry is cross-executor
+    # (screen-control plans, completed chains); the stored COMMAND text is
+    # re-routed through the normal pipeline, so repetition re-plans fresh
+    # (new capture, new plan) instead of replaying stale steps. Runs after
+    # the confirmation/stop/cancel gates above (their verdicts are consumed
+    # there, never mistaken for repetition) and before the classifier, so a
+    # bare "again" can never reach the chat model. Non-bare shapes
+    # ("minimize it again") keep their referent and stay with the router.
+    if not is_explicit_command and _REPEAT_LAST_RE.match(msg.strip()):
+        cmd = _repeatable_last_command()
+        if not cmd:
+            response = "There's nothing recent to repeat, sir."
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, response)
+            return response
+        print("[REPEAT] Re-running last action: %s" % cmd)
+        return _process_message_inner(
+            cmd, from_voice=from_voice, sync_voice=sync_voice,
+            voice_compact=voice_compact, commit_response=commit_response,
+            stream_reply=None, progress=progress, request_id=request_id)
 
     # ── Deep research — explicit phrases ("look this up", "find out about X") ──
     _t = time.perf_counter_ns()
@@ -9968,3 +10286,13 @@ def _process_message_inner(
     if from_voice and sync_voice:
         sync_voice_log(voice_log_message, response)
     return response
+
+
+# [LIVE FIX 20 / bug 6] wire the cross-executor repeat registry: executed
+# screen-control plans report here (toggles/refusals/queued plans never do).
+# Registration is best-effort and import-safe — a repeat feature must never
+# break module load.
+try:
+    set_action_notifier(note_executed_action)
+except Exception:
+    pass
