@@ -24,7 +24,9 @@ except Exception:
     memory_store = None
 
 from backend.services.screen_control import (
+    _execute_plan_tagged,
     maybe_handle_screen_control_message,
+    plan_command,
     set_action_notifier,
     set_response_callback,
 )
@@ -6467,6 +6469,50 @@ def _mi_aspect_suffix(clause, subject, query, obs_id):
     return [token for token in tokens if token[:4] not in query_low]
 
 
+def _mi_screen_control_step(step):
+    """Run one screen-CONTROL step; returns its result record.
+
+    [LIVE FIX 21] the step is PLANNED fresh here (against the screen as it
+    is when its turn comes — never replayed) and executed through the same
+    tagged path as single commands, so gates, confirmations, generation
+    checks and verification all apply per step. A step that needs consent
+    returns "armed": the chain stops and the user confirms that exact
+    action (the existing pending-plan verdict path runs it).
+    """
+    text = str(step.get("text") or "").strip()
+    if not text:
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": "I had nothing to do on the screen for that step."}
+    try:
+        plan = plan_command(text)
+    except Exception as exc:
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": "I couldn't plan that screen action (%s)."
+                            % _mi_clip(exc, 80)}
+    if plan is None:
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": "I couldn't turn %r into a screen action."
+                            % _mi_clip(text, 80)}
+    if not plan.get("ok"):
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": str(plan.get("reason")
+                                or "I couldn't plan that screen action.")}
+    try:
+        status, out = _execute_plan_tagged(plan, text)
+    except Exception as exc:
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": "That screen action failed (%s)."
+                            % _mi_clip(exc, 80)}
+    if status == "queued":
+        return {"kind": "screen_control", "status": "armed",
+                "fragment": str(out), "prompt": str(out)}
+    if status == "executed":
+        return {"kind": "screen_control", "status": "ok",
+                "fragment": str(out), "output_content": str(out)}
+    return {"kind": "screen_control", "status": "failed",
+            "fragment": str(out or "That screen action didn't go through.")}
+
+
 def _mi_screen_step(step):
     """Run one screen-analysis step; returns its result record."""
     if not _screen_qa_busy.acquire(timeout=30):
@@ -8359,10 +8405,16 @@ def _mi_task_step(msg, step, results):
             "prompt": prompt, "path": path}
 
 
-def _run_multi_intent_chain(msg, plan):
-    """Execute the chain in order, then deliver ONE honest summary."""
+def _run_multi_intent_chain(msg, plan, prior_results=None, tail_from=0):
+    """Execute the chain in order, then deliver ONE honest summary.
+
+    [LIVE FIX 21] *prior_results* pre-seeds already-finished steps for
+    chain continuation ("then click the search bar"): only steps from
+    ``len(prior_results)`` run, and the closing summary covers
+    ``results[tail_from:]`` so finished history is not re-narrated.
+    """
     global _mi_chain_active
-    results = []
+    results = list(prior_results or [])
     # Live fix: the chain ends by STORING the findings in a file — the
     # research summary is then never spoken aloud (the user asked to save
     # it, not to hear it); the full findings still reach the file write,
@@ -8372,8 +8424,10 @@ def _run_multi_intent_chain(msg, plan):
             r"\b(?:txt|text|file|document|note|report)\b",
             str(s.get("text") or ""), re.IGNORECASE)
         for s in plan.get("steps") or [])
+    steps = plan.get("steps") or []
     try:
-        for step in plan.get("steps") or []:
+        for pos in range(len(results), len(steps)):
+            step = steps[pos]
             blocked = [j for j in (step.get("consumes") or [])
                        if j >= len(results)
                        or results[j].get("status") != "ok"]
@@ -8390,6 +8444,8 @@ def _run_multi_intent_chain(msg, plan):
                 continue
             if step.get("kind") == "screen":
                 results.append(_mi_screen_step(step))
+            elif step.get("kind") == "screen_control":
+                results.append(_mi_screen_control_step(step))
             elif step.get("kind") == "research":
                 results.append(_mi_research_step(step, results))
             elif step.get("kind") == "task":
@@ -8411,9 +8467,19 @@ def _run_multi_intent_chain(msg, plan):
             if results[-1].get("status") == "ok" \
                     and results[-1].get("output_content"):
                 _set_chain_findings(results[-1]["output_content"])
+            if results[-1].get("status") == "armed":
+                # [LIVE FIX 21] a step awaiting consent stops the chain:
+                # later steps must not run ahead of an unconfirmed action.
+                for rest in steps[pos + 1:]:
+                    results.append({
+                        "kind": rest.get("kind"), "status": "skipped",
+                        "fragment": "I stopped before the %s step — "
+                                    "confirm the pending action first."
+                                    % (rest.get("kind") or "next")})
+                break
     finally:
         try:
-            _finish_multi_intent(plan, results)
+            _finish_multi_intent(plan, results, tail_from=tail_from)
         finally:
             with _MI_CHAIN_LOCK:
                 _mi_chain_active = False
@@ -8442,12 +8508,13 @@ def _record_chain_run(plan, reply):
         pass
 
 
-def _finish_multi_intent(plan, results):
+def _finish_multi_intent(plan, results, tail_from=0):
     armed = None
     ok_bits = []
     bad_bits = []
     asked_bits = []
-    for r in results:
+    # [LIVE FIX 21] a continuation only re-narrates its own new steps.
+    for r in list(results or [])[max(0, tail_from):]:
         status = r.get("status")
         if status == "armed":
             armed = r
@@ -8479,7 +8546,132 @@ def _finish_multi_intent(plan, results):
         reply = "Sir, done. " + " ".join(ok_bits)
     reply = _mi_clip(reply, 1400)
     _record_chain_run(plan, reply)
+    _remember_chain_plan(plan, results)
     _notify_async_reply(reply)
+
+
+#: [LIVE FIX 21] — chain continuation ("then click the search bar").
+#: The last finished chain is kept so a follow-up extends it instead of
+#: starting over: the stored prefix results satisfy the new step's
+#: ``consumes`` links and only the new step runs.
+_CHAIN_FOLLOWUP_TTL = 600.0
+_chain_followup_lock = threading.Lock()
+_last_chain = {"plan": None, "results": None, "at": 0.0}
+
+_CHAIN_FOLLOWUP_RE = re.compile(
+    r"^(?:then|and\s+then|after\s+that|afterwards|uske\s+baad|phir|"
+    r"next)\b[\s,]+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _remember_chain_plan(plan, results):
+    """Keep the last finished chain for follow-up extension."""
+    try:
+        with _chain_followup_lock:
+            _last_chain.update({
+                "plan": plan,
+                "results": [dict(r) for r in (results or [])],
+                "at": time.time(),
+            })
+    except Exception:
+        pass
+
+
+def _take_chain_plan():
+    """A safe copy of the continuable chain, or None when stale/empty."""
+    try:
+        with _chain_followup_lock:
+            last = {"plan": _last_chain.get("plan"),
+                    "results": [dict(r) for r in
+                                (_last_chain.get("results") or [])],
+                    "at": _last_chain.get("at", 0.0)}
+        if (not last["plan"] or not (last["plan"].get("steps") or [])
+                or time.time() - float(last["at"] or 0.0)
+                > _CHAIN_FOLLOWUP_TTL):
+            return None
+        return last
+    except Exception:
+        return None
+
+
+def _continue_chain(msg, clause, from_voice=False, voice_compact=False):
+    """Extend the last finished chain with one follow-up step.
+
+    Returns the ack line (the worker runs the new step only) or None
+    when there is nothing continuable — the turn then keeps its normal
+    single-intent routing. Never raises.
+    """
+    global _mi_chain_active
+    try:
+        last = _take_chain_plan()
+        if last is None:
+            return None
+        with _MI_CHAIN_LOCK:
+            if _mi_chain_active:
+                return ("Sir, another chained task is already running — "
+                        "one moment.")
+        kind = multi_intent.classify_clause(clause)
+        if kind is None or kind == "tool":
+            return None
+        old_steps = list(last["plan"].get("steps") or [])
+        consumes = ([len(old_steps)] if multi_intent.consumes_for(
+            old_steps[-1].get("kind"), clause) else [])
+        new_step = {"kind": kind, "text": clause.strip(),
+                    "index": len(old_steps), "consumes": consumes}
+        # Resume from the first unfinished step: a still-pending
+        # confirmation is re-planned fresh; a step whose consent resolved
+        # (no pending plan left) is taken as done, never re-run.
+        try:
+            from backend.services import screen_state as _screen_state
+            pending = bool(_screen_state.has_pending_plan())
+        except Exception:
+            pending = False
+        try:
+            pending = pending or bool(
+                task_agent_module.has_pending_task_confirmation())
+        except Exception:
+            pass
+        prefix = list(last["results"])
+        start = len(prefix)
+        for i, r in enumerate(prefix):
+            if r.get("status") != "ok":
+                if r.get("status") == "armed" and not pending:
+                    r = dict(r)
+                    r["status"] = "ok"
+                    r["fragment"] = "Confirmed earlier. " + str(
+                        r.get("fragment") or "")
+                    prefix[i] = r
+                    continue
+                start = i
+                break
+        new_plan = dict(last["plan"])
+        new_plan["steps"] = old_steps + [new_step]
+        new_plan["source"] = str(
+            last["plan"].get("source") or "") + " then " + clause.strip()
+        new_plan["command_text"] = new_plan["source"]
+        with _MI_CHAIN_LOCK:
+            if _mi_chain_active:
+                return ("Sir, another chained task is already running — "
+                        "one moment.")
+            _mi_chain_active = True
+        try:
+            threading.Thread(
+                target=_run_multi_intent_chain,
+                args=(msg, new_plan, prefix[:start], start),
+                daemon=True).start()
+        except Exception as exc:
+            with _MI_CHAIN_LOCK:
+                _mi_chain_active = False
+            logging.warning("[CHAIN] continuation start failed: %s", exc)
+            return None
+        label = multi_intent._step_label(new_step)
+        if voice_compact:
+            return "Sir, on it — continuing: %s." % label
+        return "Sir, continuing: %s." % label
+    except Exception as exc:
+        logging.warning("[CHAIN] continuation failed: %s", exc)
+        return None
 
 
 def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
@@ -9360,6 +9552,38 @@ def _process_message_inner(
                 return status_reply
         except Exception as exc:
             logging.warning("[STATUS] Grounded answer failed: %s", exc)
+
+    # ── [LIVE FIX 21] chain continuation ("then click the search bar")
+    # A follow-up clause extends the last finished chain instead of
+    # starting over: the stored prefix satisfies its consumes links and
+    # only the new step runs. Runs before the Rank-2 gate (a lone "then
+    # ..." clause is a single job to build_chain) and after the
+    # confirmation/stop gates above, so it can never swallow a verdict.
+    if not msg.lower().startswith("command"):
+        try:
+            _follow = _CHAIN_FOLLOWUP_RE.match(msg.strip())
+            _cont_reply = (_continue_chain(
+                msg, _follow.group(1), from_voice=from_voice,
+                voice_compact=voice_compact)
+                if _follow else None)
+        except Exception as exc:
+            logging.warning("[CHAIN] continuation split failed: %s", exc)
+            _cont_reply = None
+        if _cont_reply is not None:
+            print("[CHAIN] continued with:",
+                  _follow.group(1)[:80])
+            _remember_user_turn(msg)
+            try:
+                add_message("assistant", _cont_reply)
+            except Exception:
+                pass
+            try:
+                note_executed_action("chain", msg, _cont_reply)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _cont_reply)
+            return _cont_reply
 
     # ── Rank 2: one utterance, many jobs (screen → research → file) ──
     # A compound request whose pieces classify to distinct action kinds

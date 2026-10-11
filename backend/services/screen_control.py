@@ -3470,7 +3470,14 @@ def _plan_gate(plan):
     return _gate
 
 
-def _execute_or_queue(plan, command_text):
+def _execute_plan_tagged(plan, command_text):
+    """Execute (or queue) a plan, returning (status, spoken_text).
+
+    [LIVE FIX 21] chain steps need the outcome MACHINE-readable: "queued"
+    (a confirmation prompt is armed — the chain must stop), "executed"
+    (the summary), or "blocked" (any failure/refusal reason). The strings
+    are byte-identical to what _execute_or_queue always returned.
+    """
     # F19-enforcement: the control boundary is checked HERE, at the point of
     # effect, not only where the request arrived. A plan produced before the
     # user turned screen control off must never reach execute_steps.
@@ -3482,12 +3489,12 @@ def _execute_or_queue(plan, command_text):
                        "restarted, sir. Please ask again.")
         _write_screen_command_log(command_text, plan, "BLOCKED_SCREEN_DISABLED",
                                   error=gate_reason)
-        return reason
+        return "blocked", reason
 
     if not plan.get("ok"):
         reason = plan.get("reason") or "I couldn't complete that screen command, sir."
         _write_screen_command_log(command_text, plan, "FAILED_PLANNING", error=reason)
-        return reason
+        return "blocked", reason
 
     confidence = _coerce_float(plan.get("confidence"), 0.0)
     confirmation_reason = None
@@ -3495,7 +3502,7 @@ def _execute_or_queue(plan, command_text):
     if confidence < MIN_ACTIONABLE_CONFIDENCE:
         reason = plan.get("reason") or "I found a possible target, but not confidently enough to click it."
         _write_screen_command_log(command_text, plan, "LOW_CONFIDENCE_BLOCKED", error=reason)
-        return reason
+        return "blocked", reason
 
     if _is_risky_command(command_text):
         plan["needs_confirmation"] = True
@@ -3522,13 +3529,13 @@ def _execute_or_queue(plan, command_text):
             # F18: the spoken summary names the command and the action counts
             # — the full ordered preview travels with the approval record for
             # the UI to render.
-            return spoken
+            return "queued", spoken
         if confirmation_reason == "low_confidence":
-            return (
+            return "queued", (
                 "I found a likely target, but confidence is limited. "
                 "Say confirm screen action to proceed, or say cancel."
             )
-        return "That action looks risky. Say confirm screen action to proceed, or say cancel."
+        return "queued", "That action looks risky. Say confirm screen action to proceed, or say cancel."
 
     # Immediate execution path: re-check the gate right before the effect —
     # the confirmation delay is exactly the window this protects.
@@ -3536,7 +3543,7 @@ def _execute_or_queue(plan, command_text):
     if not allowed:
         _write_screen_command_log(command_text, plan, "BLOCKED_SCREEN_DISABLED",
                                   error=gate_reason)
-        return ("Screen controls are off — I've dropped that action, sir."
+        return "blocked", ("Screen controls are off — I've dropped that action, sir."
                 if gate_reason == "screen controls are off" else
                 "That action was planned before screen controls were "
                 "restarted, sir. Please ask again.")
@@ -3545,7 +3552,7 @@ def _execute_or_queue(plan, command_text):
     race_error = _maybe_adjust_for_window_move(plan)
     if race_error:
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=race_error)
-        return race_error
+        return "blocked", race_error
     error = None
     try:
         execute_steps(plan["steps"], target_hwnd=target_hwnd,
@@ -3557,7 +3564,7 @@ def _execute_or_queue(plan, command_text):
         # sequence after earlier steps had already fired.
         error = str(exc)
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=error)
-        return error
+        return "blocked", error
     screen_state.clear_pending_plan()
 
     summary = plan.get("summary") or "Done, sir."
@@ -3580,8 +3587,91 @@ def _execute_or_queue(plan, command_text):
     _notify_action_executed(command_text, summary)
 
     if verified is False:
-        return f"{summary} Though I'm not fully sure it worked - want me to try again?"
-    return summary
+        return "executed", f"{summary} Though I'm not fully sure it worked - want me to try again?"
+    return "executed", summary
+
+
+def _execute_or_queue(plan, command_text):
+    """Execute (or queue) a plan, returning the spoken text.
+
+    Thin wrapper over _execute_plan_tagged — every existing caller keeps
+    its exact strings.
+    """
+    return _execute_plan_tagged(plan, command_text)[1]
+
+
+def plan_command(command_text):
+    """Plan a screen command WITHOUT executing it (chain steps).
+
+    Returns the stamped plan dict, a failed plan dict when planning is
+    impossible (controls off, still busy, no confident target), or None
+    when the text is not a screen command at all. Never executes —
+    execution (with its gates) happens per step in the chain worker, so
+    each step plans against the screen as it is when its turn comes.
+    """
+    try:
+        if not _looks_like_screen_command(command_text):
+            return None
+        cleaned = _strip_leading_fillers(command_text)
+        request_generation = screen_state.generation()
+        # Instant hotkey/window plans need no capture and no toggle.
+        direct = _build_direct_plan(cleaned)
+        if isinstance(direct, dict):
+            direct["screen_generation"] = request_generation
+            direct["command_text"] = command_text
+            return direct
+        if not screen_state.is_enabled():
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": ("Screen controls are off. Say turn on screen "
+                           "controls first."),
+                "steps": [],
+                "command_text": command_text,
+                "screen_generation": request_generation,
+            }
+        if not _vision_busy.acquire(blocking=False):
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": "Still working on the last screen command, sir.",
+                "steps": [],
+                "command_text": command_text,
+                "screen_generation": request_generation,
+            }
+        try:
+            plan = _plan_with_tree(cleaned)
+        finally:
+            _vision_busy.release()
+        if isinstance(plan, dict):
+            plan["screen_generation"] = request_generation
+            plan["command_text"] = command_text
+            return plan
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "I couldn't plan that screen action, sir.",
+            "steps": [],
+            "command_text": command_text,
+            "screen_generation": request_generation,
+        }
+    except Exception as exc:
+        logging.warning("plan_command failed: %s", exc)
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "I couldn't plan that screen action, sir.",
+            "steps": [],
+            "command_text": command_text,
+        }
 
 
 _MENU_OPEN_HINTS = re.compile(

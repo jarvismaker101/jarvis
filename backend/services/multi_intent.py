@@ -4,7 +4,7 @@ Pure, deterministic, stdlib-only (no codebase imports), so the brain and
 the workers can use it freely.
 
 The chain is an ordered list of steps whose kinds are ``screen``,
-``research`` and ``task``. A ``task`` step is always a FILE WRITE and is
+``screen_control``, ``research`` and ``task``. A ``task`` step is always a FILE WRITE and is
 only allowed as the LAST step — so every chain has at most one approval
 pause and it lands at the end, with the earlier steps' output already in
 hand. Steps that refer back to earlier output ("about it", "whatever you
@@ -65,6 +65,37 @@ _RESEARCH_RE = re.compile(
     r"(?:on|from)\s+the\s+internet|online|internet)\b",
     re.IGNORECASE,
 )
+
+#: [LIVE FIX 21] screen-CONTROL clauses — DOING something to the screen or
+#: its windows, as opposed to LOOKING at it (kind "screen"). Open/launch/
+#: play/navigate stay OUT on purpose: those are the tool verbs (Rank 2
+#: rejects tool clauses), and file/report/folder verbs stay OUT (kind
+#: "task"). A bare "scroll down" / "press enter" / "minimize" names no
+#: target but is a complete command on its own, so those shapes match
+#: without a target noun.
+_SCREEN_CONTROL_RE = re.compile(
+    r"\b(click|double-?click|right-?click|tap|press|hit|type|enter|write|"
+    r"scroll|drag|drop|move|hover|select|focus|minimize|minimise|maximize|"
+    r"maximise|restore|switch|close)\b[^.?!]{0,48}\b(screen|windows?|"
+    r"desktop|button|link|tabs?|icon|checkbox|menu|toolbar|search\s*bar|"
+    r"search\s*box|text\s*box|textbox|field|mouse|cursor|apps?|"
+    r"applications?|dialog|popup)\b"
+    r"|\b(screen|windows?|desktop|button|link|tabs?|icon|mouse|cursor)\b"
+    r"[^.?!]{0,24}\b(click|press|type|scroll|minimize|minimise)\b"
+    r"|\b(scroll\s+(?:up|down|left|right)|press\s+enter|hit\s+enter|"
+    r"minimize|minimise|maximize|maximise|restore)\b"
+    # A control verb aimed at the previous step's target ("and click it",
+    # "then close that") is a follow-on control step, not a fragment.
+    r"|\b(click|double-?click|right-?click|tap|press|type|scroll|"
+    r"minimize|minimise|close)\s+(it|this|that|them|these|those)\b",
+    re.IGNORECASE,
+)
+
+#: A screen_control step that points at the previous step's target
+#: ("minimize the terminal, then close it") runs after it — the executor
+#: re-plans against the fresh screen, so the dependency is ordering-only.
+_SC_PRONOUN_RE = re.compile(
+    r"\b(it|this|that|them|these|those)\b", re.IGNORECASE)
 
 _TASK_WRITE_RE = re.compile(
     r"\b(create|make|write|save|put|store)\b[^.?!]{0,60}"
@@ -181,8 +212,18 @@ def classify_clause(text):
         return None
     if _SCREEN_RE.search(t):
         return "screen"
+    # [LIVE FIX 21] control-before-research: "click the search bar" IS a
+    # screen action even though it contains the word "search" — research
+    # clauses ("search the web for X", "look up Y") carry no control verb
+    # aimed at a UI target, so they still fall through below.
+    if _SCREEN_CONTROL_RE.search(t):
+        return "screen_control"
     if _RESEARCH_RE.search(t):
         return "research"
+    # [LIVE FIX 21] control verbs act on the screen/windows; file verbs
+    # act on files — checked before "task" so "close the window" is a
+    # screen action while "type the report in the file" stays a task
+    # (no UI/screen target noun there).
     if (_TASK_WRITE_RE.search(t) or _TASK_ACTION_RE.search(t)
             or _TASK_REPLICATE_RE.search(t)):
         return "task"
@@ -211,7 +252,10 @@ def build_chain(text):
             if merged:
                 merged[-1]["text"] = merged[-1]["text"] + " and " + clause
             continue
-        if merged and merged[-1]["kind"] == kind:
+        # [LIVE FIX 21] screen_control clauses never merge: each is its own
+        # planned+executed step ("minimize all terminals then click the
+        # search bar" is two actions, not one command).
+        if merged and merged[-1]["kind"] == kind and kind != "screen_control":
             merged[-1]["text"] = merged[-1]["text"] + " and " + clause
             continue
         merged.append({"kind": kind, "text": clause})
@@ -225,7 +269,20 @@ def build_chain(text):
     expanded = []
     for i, m in enumerate(merged):
         expanded.append(m)
-        if (m["kind"] == "screen" and _RESEARCH_RE.search(m["text"])
+        # A "search bar/box" is a UI target, not a lookup request — strip
+        # those before testing for research markers, or "click the search
+        # bar" would grow a bogus web-search sibling.
+        lookup_text = re.sub(r"search\s*(?:bar|box|field)", " ",
+                             m["text"], flags=re.IGNORECASE)
+        if (m["kind"] == "screen" and _RESEARCH_RE.search(lookup_text)
+                and not (i + 1 < len(merged)
+                         and merged[i + 1]["kind"] == "research")):
+            expanded.append({"kind": "research", "text": m["text"]})
+        # [LIVE FIX 21] same for a CONTROL clause carrying a lookup
+        # ("click the search bar to search for flights") — the lookup
+        # half must not die with the click.
+        if (m["kind"] == "screen_control"
+                and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):
             expanded.append({"kind": "research", "text": m["text"]})
@@ -256,6 +313,13 @@ def build_chain(text):
         consumes = []
         if i > 0 and _ANAPHORA_RE.search(m["text"]):
             consumes = [i - 1]
+        elif (i > 0 and merged[i - 1]["kind"] == "screen_control"
+              and m["kind"] == "screen_control"
+              and _SC_PRONOUN_RE.search(m["text"])):
+            # [LIVE FIX 21] "then close it" runs after the step it points
+            # at (ordering-only: the executor re-plans on the fresh
+            # screen, never replays coordinates).
+            consumes = [i - 1]
         elif (i > 0 and merged[i - 1]["kind"] == "screen"
               and m["kind"] == "research"
               and (_DEICTIC_RES_RE.search(m["text"])
@@ -274,6 +338,7 @@ def build_chain(text):
 
 _LABELS = {
     "screen": "look at your screen",
+    "screen_control": "run that screen action",
     "research": "research it online",
     "task": "save it to a file",
 }
@@ -285,6 +350,13 @@ def _step_label(step):
     """What this step will actually do — folder jobs never say "file"."""
     kind = step.get("kind")
     text = step.get("text") or ""
+    if kind == "screen_control":
+        # [LIVE FIX 21] window management reads as windows, the rest as
+        # on-screen control — the ack narrates the chain truthfully.
+        if re.search(r"\b(minimize|minimise|maximize|maximise|restore)\b",
+                     text, re.IGNORECASE):
+            return "manage your windows"
+        return "control your screen"
     if kind == "task" and _TASK_REPLICATE_RE.search(text):
         # [LIVE FIX 12] A replication rebuilds the on-screen structure —
         # never "save it to a file".
@@ -294,6 +366,25 @@ def _step_label(step):
             return "create a folder with a file inside"
         return "create a folder"
     return _LABELS.get(kind, kind)
+
+
+def consumes_for(prev_kind, text):
+    """True when a follow-up clause depends on the previous step.
+
+    [LIVE FIX 21] chain continuation ("then click the search bar"): the
+    same reference rules as build_chain, minus the index arithmetic —
+    anaphora, a screen_control pronoun ("then close it"), or a research
+    clause pointing at what the screen step just showed.
+    """
+    t = text or ""
+    if _ANAPHORA_RE.search(t):
+        return True
+    if (prev_kind == "screen_control" and _SC_PRONOUN_RE.search(t)):
+        return True
+    if (prev_kind == "screen"
+            and (_DEICTIC_RES_RE.search(t) or _SCREEN_REF_RE.search(t))):
+        return True
+    return False
 
 
 def render_ack(plan, voice_compact=False):
