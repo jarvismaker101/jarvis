@@ -1288,7 +1288,12 @@ def derive_research_query(raw_query):
     query = None
     meta_candidate = False
     try:
-        intent = classify_intent(raw_query, timeout_ms=3500)
+        # [LIVE FIX 19] The derivation sees the conversation too, so a
+        # deictic ask ("who won the toss", "what is it about") composes its
+        # query with the referent named instead of leaning on the regex
+        # back-reference ladders below (kept as fallback).
+        intent = classify_intent(raw_query, timeout_ms=3500,
+                                 history=get_history())
         if intent.get("intent") in ("research", "tools"):
             candidate = str(intent.get("query") or "").strip()
             if candidate and candidate != raw_query.strip():
@@ -9335,8 +9340,16 @@ def _process_message_inner(
                            "classifier": False})
             print("[INTENT] Deterministic chat fast path (classifier skipped)")
         else:
+            # [LIVE FIX 19] The router sees the conversation, not just the
+            # message: references ("this match", "what you just told me")
+            # resolve against the committed history, so recall routes chat
+            # and facts questions compose referent-named research queries.
+            # The current turn is not committed yet, so this is exactly the
+            # prior conversation (a trailing self-copy is dropped when the
+            # block is rendered).
             intent = classify_intent(msg, timeout_ms=INTENT_BUDGET_VOICE_MS
-                                     if from_voice else INTENT_BUDGET_MS)
+                                     if from_voice else INTENT_BUDGET_MS,
+                                     history=get_history())
             # [PERF] P1-19 — WHICH hop answered (openrouter | gemini | groq |
             # none) is recorded with the boundary: a throttled primary hides
             # completely inside a single "classify" duration.

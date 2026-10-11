@@ -20,7 +20,7 @@ Everything is stubbed: no network, no model, no microphone.
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from backend import voice_mode as vm
 from backend.services import request_registry as req_registry
@@ -540,6 +540,49 @@ class RegistrationTests(unittest.TestCase):
         state.attach_job(job)
         self.assertTrue(state.cancel_worker("barge-in"))
         self.assertTrue(job.cancelled)
+
+
+class CancelledTurnNeverShowsNoneTests(unittest.TestCase):
+    """[LIVE FIX 19] A barge-in-cancelled turn has no reply to echo.
+
+    Live log: the SSE stream was closed under the reader ("'NoneType'
+    object has no attribute 'peek'"), the retry saw the turn superseded and
+    returned the empty reply, and ``_run_turn_inner`` printed the None
+    sentinel raw — "🤖: None". The sentinel must never surface as text.
+    """
+
+    def _run(self, ask_result, current):
+        speaker = MagicMock()
+        speaker.spoken_any = False
+        turn = MagicMock()
+        with patch.object(vm, "_ask_backend",
+                          return_value=ask_result), \
+             patch.object(vm.TURNS, "is_current",
+                          return_value=current), \
+             patch.object(vm, "_safe_print") as safe_print, \
+             patch.object(vm, "speak") as speak, \
+             patch.object(vm, "_watch_turn_for_shipping"), \
+             patch.object(vm, "listener_state"):
+            vm._run_turn_inner("hello", "req-x", speaker, turn, [])
+        return safe_print, speak, speaker
+
+    def test_a_superseded_turn_prints_nothing(self):
+        safe_print, speak, speaker = self._run(None, current=False)
+        safe_print.assert_not_called()
+        speak.assert_not_called()
+        speaker.close.assert_called_once()
+
+    def test_an_unreachable_backend_speaks_the_fallback_without_none(self):
+        safe_print, speak, _speaker = self._run(None, current=True)
+        for call in safe_print.call_args_list:
+            for arg in call.args:
+                self.assertNotIn("None", str(arg))
+        speak.assert_called_once_with("I couldn't reach the backend, sir.")
+
+    def test_a_normal_reply_still_echoes(self):
+        safe_print, speak, _speaker = self._run("real reply", current=True)
+        safe_print.assert_called_once_with("🤖:", "real reply")
+        speak.assert_called_once_with("real reply")
 
 
 if __name__ == "__main__":

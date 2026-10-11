@@ -57,10 +57,92 @@ _INTENT_PROMPT = (
     ' (+ browser chrome|edge|brave)\n\n'
     'Rules: "how are you" -> chat not research; screen/region no steps; task/task_description; tool/steps; research/query.'
     ' Hinglish e.g. "deepseek kya hai, dhundho" -> research.\n'
-     '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "". Recall asks need history: reply "".\n'
+     '[S6] If intent is chat, ALSO answer in "reply" (1-3 spoken sentences, no markdown); else "reply" is "". Context: a "Recent conversation" block before the routing request is the conversation so far (most recent last); "[background result]" lines are Jarvis\'s own work notes. Resolve this/that/it references and recall questions from it. "What did we discuss" is chat — "reply" answers ONLY from the conversation. Fresh facts are research — "query" is STANDALONE with references replaced by what the conversation shows. A chat "reply" never offers to search or act — choose research or task instead.\n'
     'Reply ONLY JSON: {"intent": "chat"|"tool"|"screen"|"region"|"research"|"task", "reply": "...", "steps": [], "query": "...", "task_description": "...", "original": "..."}\n'
     "User message: __MESSAGE__"
 )
+
+
+#: [LIVE FIX 19] — the router sees the conversation, not just the message.
+#: Every classification call used to carry only the current message, so a
+#: recall ("tell me from your memory which match we just talked about") was
+#: judged blind and misrouted to research, and a facts question with a
+#: conversational referent ("who won the toss" after the cricket exchange)
+#: was answered with a chat offer instead of a research query naming the
+#: match. The caller (brain) passes its committed history; the hops render
+#: the last few turns as one compact block ahead of the routing prompt. The
+#: block is bounded (entries x chars) so the fast classifier stays fast —
+#: flash-lite latency is dominated by generating one JSON object, not by
+#: ~1k extra prompt chars.
+_ROUTER_HISTORY_MAX_ENTRIES = 10
+_ROUTER_HISTORY_ENTRY_CHARS = 180
+_ROUTER_HISTORY_MAX_CHARS = 1200
+
+
+def _render_router_history(history, current_message=""):
+    """Compact the recent conversation for the router's context block.
+
+    Renders the last turns as ``user: ...`` / ``jarvis: ...`` lines, newest
+    last; ``[background result]`` entries are Jarvis's own work notes. A
+    trailing entry identical to the message being routed (a gate that
+    already committed this turn) is dropped — the message itself follows
+    the block. Returns "" when there is nothing to show. Never raises.
+    """
+    try:
+        items = [m for m in (history or []) if isinstance(m, dict)]
+        while (items and items[-1].get("role") == "user"
+               and current_message
+               and str(items[-1].get("content") or "") == str(current_message)):
+            items.pop()
+        items = items[-_ROUTER_HISTORY_MAX_ENTRIES:]
+        lines = []
+        total = 0
+        for m in items:
+            role = ("jarvis" if str(m.get("role") or "") == "assistant"
+                    else "user")
+            text = re.sub(r"\s+", " ", str(m.get("content") or "")).strip()
+            if not text:
+                continue
+            if len(text) > _ROUTER_HISTORY_ENTRY_CHARS:
+                text = text[:_ROUTER_HISTORY_ENTRY_CHARS] + "\u2026"
+            line = "%s: %s" % (role, text)
+            if total + len(line) > _ROUTER_HISTORY_MAX_CHARS:
+                break
+            lines.append(line)
+            total += len(line)
+        if not lines:
+            return ""
+        return ("Recent conversation with the user (most recent last; "
+                "[background result] lines are Jarvis's own work notes):\n"
+                + "\n".join(lines))
+    except Exception:
+        return ""
+
+
+def _router_messages(message, history=None):
+    """The message list every classifier hop sends.
+
+    Without history this is exactly the two messages that shipped before
+    (system instruction + routing prompt), so history-less callers behave
+    identically. With history a compact conversation turn rides ahead of the
+    routing prompt — the router then resolves this/that/it and recalls from
+    the conversation instead of judging the message blind.
+    """
+    system = {"role": "system",
+              "content": "Return strict JSON only. No markdown, no extra text."}
+    user = {"role": "user",
+            "content": _INTENT_PROMPT.replace("__MESSAGE__", message)}
+    block = _render_router_history(history, message)
+    if not block:
+        return [system, user]
+    return [
+        system,
+        {"role": "user", "content": block},
+        {"role": "assistant",
+         "content": "Understood — I will use the conversation above to "
+                    "understand the next message."},
+        user,
+    ]
 
 
 def _extract_json(content):
@@ -149,21 +231,12 @@ def _parse_intent_json(content, message):
     return result
 
 
-def _classify_with_groq(message, timeout=(3, 3), model=None):
+def _classify_with_groq(message, history=None, timeout=(3, 3), model=None):
     """Ask Qwen via the Groq API. Returns raw JSON text or "" on any failure."""
     if not GROQ_API_KEY:
         return ""
     response = ask_grok(
-        [
-            {
-                "role": "system",
-                "content": "Return strict JSON only. No markdown, no extra text.",
-            },
-            {
-                "role": "user",
-                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
-            },
-        ],
+        _router_messages(message, history),
         temperature=0.0,
         max_tokens=320,
         model=model or os.getenv(
@@ -180,7 +253,7 @@ def _classify_with_groq(message, timeout=(3, 3), model=None):
     return _strip_think_blocks(content)
 
 
-def _classify_with_fireworks(message, timeout=(3, 3), model=None):
+def _classify_with_fireworks(message, history=None, timeout=(3, 3), model=None):
     """Ask Fireworks. Returns raw JSON text or "" on any failure.
 
     [F56] Only reachable when Fireworks is selected for the intent role (the
@@ -190,16 +263,7 @@ def _classify_with_fireworks(message, timeout=(3, 3), model=None):
     from backend.services.fireworks_client import ask_fireworks
 
     response = ask_fireworks(
-        [
-            {
-                "role": "system",
-                "content": "Return strict JSON only. No markdown, no extra text.",
-            },
-            {
-                "role": "user",
-                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
-            },
-        ],
+        _router_messages(message, history),
         temperature=0.0,
         max_tokens=500,
         model=model or None,
@@ -210,7 +274,8 @@ def _classify_with_fireworks(message, timeout=(3, 3), model=None):
     return response["choices"][0].get("message", {}).get("content", "")
 
 
-def _classify_with_openai_compat(provider, model, message, timeout):
+def _classify_with_openai_compat(provider, model, message, timeout,
+                                 history=None):
     """One classifier hop over the OpenAI-compatible adapter.
 
     [F56] Carries every provider whose calls ride that adapter: OpenRouter,
@@ -230,16 +295,7 @@ def _classify_with_openai_compat(provider, model, message, timeout):
         # several of them reject the field outright.
         kwargs["response_format"] = {"type": "json_object"}
     response = ask_openai_compat(
-        [
-            {
-                "role": "system",
-                "content": "Return strict JSON only. No markdown, no extra text.",
-            },
-            {
-                "role": "user",
-                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
-            },
-        ],
+        _router_messages(message, history),
         model=model,
         base_url=base_url,
         api_key=api_key,
@@ -260,7 +316,7 @@ def _classify_with_openai_compat(provider, model, message, timeout):
     return response["choices"][0].get("message", {}).get("content", "")
 
 
-def _classify_with_gemini(message, timeout=(3, 3), model=None):
+def _classify_with_gemini(message, history=None, timeout=(3, 3), model=None):
     """Ask Gemini Flash Lite. Returns raw JSON text or "" on any failure.
 
     Uses a short timeout + no_retry so a slow/hanging Gemini falls back to
@@ -269,16 +325,7 @@ def _classify_with_gemini(message, timeout=(3, 3), model=None):
     if not GEMINI_API_KEY:
         return ""
     response = ask_gemini_chat(
-        [
-            {
-                "role": "system",
-                "content": "Return strict JSON only. No markdown, no extra text.",
-            },
-            {
-                "role": "user",
-                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
-            },
-        ],
+        _router_messages(message, history),
         temperature=0.0,
         max_tokens=300,
         model=model or os.getenv(
@@ -304,7 +351,8 @@ def _budget_timeout(remaining):
     return (connect, read)
 
 
-def _classify_with_openrouter(message, timeout=(2, 2.5), model=None):
+def _classify_with_openrouter(message, history=None, timeout=(2, 2.5),
+                                model=None):
     """Ask the Lite brain model over OpenRouter. Returns raw JSON text or "".
 
     First hop since the 2026-09-23 incident: the Cloudflare-fronted openrouter
@@ -316,16 +364,7 @@ def _classify_with_openrouter(message, timeout=(2, 2.5), model=None):
         return ""
     from backend.services.openai_compat_client import ask_openai_compat
     response = ask_openai_compat(
-        [
-            {
-                "role": "system",
-                "content": "Return strict JSON only. No markdown, no extra text.",
-            },
-            {
-                "role": "user",
-                "content": _INTENT_PROMPT.replace("__MESSAGE__", message),
-            },
-        ],
+        _router_messages(message, history),
         model=model or DEFAULT_OPENROUTER_MODEL,
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
@@ -373,7 +412,7 @@ def _selected_intent_model():
     return (provider, model)
 
 
-def _classify_with_provider(provider, model, message, timeout):
+def _classify_with_provider(provider, model, message, timeout, history=None):
     """One classifier hop against an explicit (provider, model).
 
     Dispatch is explicit per provider because three of them have a dedicated
@@ -381,17 +420,23 @@ def _classify_with_provider(provider, model, message, timeout):
     other provider rides the generic OpenAI-compatible path.
     """
     if provider == "gemini":
-        return _classify_with_gemini(message, timeout=timeout, model=model)
+        return _classify_with_gemini(message, history=history, timeout=timeout,
+                                     model=model)
     if provider == "groq":
-        return _classify_with_groq(message, timeout=timeout, model=model)
+        return _classify_with_groq(message, history=history, timeout=timeout,
+                                   model=model)
     if provider == "fireworks":
-        return _classify_with_fireworks(message, timeout=timeout, model=model)
+        return _classify_with_fireworks(message, history=history,
+                                        timeout=timeout, model=model)
     if provider == "openrouter":
-        return _classify_with_openrouter(message, timeout=timeout, model=model)
-    return _classify_with_openai_compat(provider, model, message, timeout)
+        return _classify_with_openrouter(message, history=history,
+                                         timeout=timeout, model=model)
+    return _classify_with_openai_compat(provider, model, message, timeout,
+                                        history=history)
 
 
-def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
+def classify_intent(message: str, timeout_ms: int = 3500,
+                    history=None) -> dict:
     """Route *message* to chat/tool/screen/region/task.
 
     Every message is classified — no keyword pre-check. [F56] The (provider,
@@ -404,6 +449,12 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
     A single monotonic deadline (timeout_ms) spans the whole classification:
     primary and fallbacks share the remaining budget, so fast-fail never
     exceeds the advertised window.
+
+    [LIVE FIX 19] *history* is the caller's committed conversation (list of
+    {"role", "content"}). It rides ahead of the routing prompt as one compact
+    block, so references ("this match", "what you just told me") resolve
+    against the conversation instead of being judged blind. Omitted (legacy
+    callers) behaves exactly as before.
 
     [PERF] P1-19: the verdict carries ``_source`` — the hop that answered
     (the provider id: openrouter | gemini | groq | ollama | …, or "none" when
@@ -444,7 +495,8 @@ def classify_intent(message: str, timeout_ms: int = 3500) -> dict:
         if not timeout:
             break
         try:
-            content = _classify_with_provider(provider, model, message, timeout)
+            content = _classify_with_provider(provider, model, message,
+                                              timeout, history=history)
             result = _parse_intent_json(content, message)
             if result["intent"] != "chat" or content:
                 # Even a chat verdict from the model is a deliberate answer.

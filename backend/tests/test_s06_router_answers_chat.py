@@ -226,18 +226,23 @@ class HandleChatAnsweredTests(unittest.TestCase):
 
     def setUp(self):
         self.history = []
-        self.built = patch.object(brain, "_build_chat_messages").start()
-        self.nonstream = patch.object(
-            brain, "_ask_chat_nonstream").start()
-        self.deltas = patch.object(brain, "_stream_chat_deltas").start()
-        add = patch.object(
-            brain, "add_message",
-            side_effect=lambda role, text: self.history.append((role, text)))
-        add.start()
-        self.addCleanup(self.built.stop)
-        self.addCleanup(self.nonstream.stop)
-        self.addCleanup(self.deltas.stop)
-        self.addCleanup(add.stop)
+        started = []
+        specs = (
+            ("_build_chat_messages", {}),
+            ("_ask_chat_nonstream", {}),
+            ("_stream_chat_deltas", {}),
+            ("add_message", dict(side_effect=lambda role, text:
+                                 self.history.append((role, text)))),
+        )
+        for target, kwargs in specs:
+            patcher = patch.object(brain, target, **kwargs)
+            started.append((target, patcher.start()))
+            # The patcher — not the mock it returns — owns .stop().
+            self.addCleanup(patcher.stop)
+        mocks = dict(started)
+        self.built = mocks["_build_chat_messages"]
+        self.nonstream = mocks["_ask_chat_nonstream"]
+        self.deltas = mocks["_stream_chat_deltas"]
         brain.memory_store = None
 
     def test_the_chat_pipeline_is_never_entered(self):
@@ -256,6 +261,108 @@ class HandleChatAnsweredTests(unittest.TestCase):
     def test_multi_line_router_text_is_flattened_for_speech(self):
         out = brain.handle_chat("x", answered="one\n\ntwo   three")
         self.assertEqual(out, "one two three")
+
+
+class RouterConversationContextTests(unittest.TestCase):
+    """[LIVE FIX 19] The router sees the conversation, not just the message."""
+
+    _HISTORY = [
+        {"role": "user",
+         "content": "can you find out about today's cricket match between india and west indies?"},
+        {"role": "assistant", "content": "Quick lookup for that, sir."},
+        {"role": "assistant",
+         "content": "[background result] India vs West Indies, 2nd ODI at Indore — India won the toss and chose to bat."},
+    ]
+
+    def test_no_history_sends_exactly_the_old_two_messages(self):
+        msgs = intent_mod._router_messages("why is the sky blue", None)
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("why is the sky blue", msgs[1]["content"])
+        self.assertIn("Reply ONLY JSON", msgs[1]["content"])
+
+    def test_history_rides_ahead_of_the_routing_prompt(self):
+        msgs = intent_mod._router_messages("who won the toss", self._HISTORY)
+        self.assertEqual(len(msgs), 4)
+        block = msgs[1]["content"]
+        self.assertIn("Recent conversation", block)
+        self.assertIn("user: can you find out about today's cricket match",
+                      block)
+        self.assertIn("jarvis: [background result] India vs West Indies",
+                      block)
+        self.assertIn("who won the toss", msgs[3]["content"])
+
+    def test_the_render_is_bounded(self):
+        # Entry-count bound: 30 short turns keep only the last 10.
+        short = [{"role": "user", "content": "m%d hello" % i}
+                 for i in range(30)]
+        out = intent_mod._render_router_history(short, "who won the toss")
+        self.assertNotIn("m0 hello", out)
+        self.assertIn("m29 hello", out)
+        self.assertLessEqual(
+            len(out),
+            intent_mod._ROUTER_HISTORY_MAX_CHARS + 200)
+        # Char bound: one huge entry is clipped, never verbatim.
+        huge = "z" * 500
+        out2 = intent_mod._render_router_history(
+            [{"role": "user", "content": huge}], "who won the toss")
+        self.assertNotIn(huge, out2)
+        self.assertIn("…", out2)
+
+    def test_a_trailing_self_copy_is_dropped(self):
+        out = intent_mod._render_router_history(
+            self._HISTORY + [{"role": "user", "content": "who won the toss"}],
+            "who won the toss")
+        self.assertNotIn("user: who won the toss", out)
+
+    def test_render_never_raises_and_empty_is_empty(self):
+        self.assertEqual(intent_mod._render_router_history(None, "x"), "")
+        self.assertEqual(intent_mod._render_router_history([], "x"), "")
+        self.assertEqual(
+            intent_mod._render_router_history([None, "x", {}], "x"), "")
+
+    def test_classify_forwards_history_to_the_winning_hop(self):
+        seen = {}
+
+        def fake_gemini(message, history=None, timeout=None, model=None):
+            seen["history"] = history
+            seen["messages"] = intent_mod._router_messages(message, history)
+            return '{"intent": "chat", "reply": "grounded"}'
+
+        with patch.object(intent_mod, "_selected_intent_model",
+                          return_value=None), \
+             patch.object(intent_mod, "OPENROUTER_API_KEY", ""), \
+             patch.object(intent_mod, "_classify_with_gemini",
+                          side_effect=fake_gemini):
+            result = intent_mod.classify_intent("who won the toss",
+                                                history=self._HISTORY)
+        self.assertEqual(result["intent"], "chat")
+        self.assertEqual(seen["history"], self._HISTORY)
+        self.assertEqual(len(seen["messages"]), 4)
+
+    def test_each_hop_sends_the_history_block(self):
+        captured = {}
+
+        def fake_chat(messages, **kwargs):
+            captured["messages"] = messages
+            return {"choices": [{"message": {"content":
+                    '{"intent": "chat", "reply": "hi"}'}}]}
+
+        with patch.object(intent_mod, "GEMINI_API_KEY", "test-key"), \
+             patch.object(intent_mod, "ask_gemini_chat",
+                          side_effect=fake_chat):
+            intent_mod._classify_with_gemini("who won the toss",
+                                             history=self._HISTORY)
+        self.assertEqual(len(captured["messages"]), 4)
+        self.assertIn("Indore", captured["messages"][1]["content"])
+        self.assertIn("who won the toss", captured["messages"][3]["content"])
+
+    def test_the_prompt_carries_the_context_rules(self):
+        prompt = intent_mod._INTENT_PROMPT
+        self.assertIn("Recent conversation", prompt)
+        self.assertIn("STANDALONE", prompt)
+        # The LF19 context rules grew the prompt: the ceiling moved with it.
+        self.assertLess(len(prompt), 2600)
 
 
 if __name__ == "__main__":

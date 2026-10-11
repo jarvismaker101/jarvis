@@ -1979,7 +1979,12 @@ def _run_turn_inner(text, request_id, speaker, turn, early_marks):
             turn.ack(len(early_marks))
         except Exception:
             pass
-    _safe_print("🤖:", response)
+    # [LIVE FIX 19] A cancelled / unreachable turn has no reply to echo:
+    # the None sentinel must never surface as the literal text "None".
+    # (Superseded turns return just above; unreachable ones speak the
+    # fallback below.)
+    if response:
+        _safe_print("🤖:", response)
 
     # [P0-08] A superseded turn must never speak: its audio would land on top
     # of the answer that replaced it. The reply itself is already committed to

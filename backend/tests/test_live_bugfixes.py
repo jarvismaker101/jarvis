@@ -837,11 +837,104 @@ class MemoryRecallRouterTests(unittest.TestCase):
 
     def test_the_router_prompt_declines_recall(self):
         from backend.services import intent as intent_mod
-        # Belt-and-braces with the brain-side refusal: the router itself is
-        # told a recall ask needs history this call lacks. The length guard
-        # pins the prompt budget this rule was squeezed into.
-        self.assertIn("Recall asks need history", intent_mod._INTENT_PROMPT)
-        self.assertLess(len(intent_mod._INTENT_PROMPT), 2000)
+        # Belt-and-braces with the brain-side refusal: since LIVE FIX 19 the
+        # router carries the conversation, so the rule tells it to resolve
+        # recall from that block instead of declining. The length guard pins
+        # the prompt budget the context rules were squeezed into.
+        self.assertIn("Recent conversation", intent_mod._INTENT_PROMPT)
+        self.assertLess(len(intent_mod._INTENT_PROMPT), 2600)
+
+
+class RouterSeesConversationTests(unittest.TestCase):
+    """LIVE FIX 19: the intelligence fix — the router classifies with the
+    conversation in view, so recall routes chat and referents compose.
+
+    Live log: "tell me from your memory which match we just talked about"
+    was judged blind and sent to research; "can you check online who won
+    the toss" was answered with a chat offer instead of a research query
+    naming the match. Both turns now reach the router WITH the cricket
+    exchange above them.
+    """
+
+    _CRICKET_HISTORY = [
+        {"role": "user",
+         "content": "can you find out about today's cricket match between india and west indies?"},
+        {"role": "assistant", "content": "Quick lookup for that, sir."},
+        {"role": "assistant",
+         "content": "[background result] India vs West Indies, 2nd ODI at Indore — India won the toss and chose to bat."},
+    ]
+
+    def _history_blob(self, history):
+        return "\n".join(
+            "%s: %s" % (m.get("role"), m.get("content"))
+            for m in (history or []) if isinstance(m, dict))
+
+    def test_the_routing_call_carries_the_conversation(self):
+        seen = {}
+
+        def fake_classify(msg, timeout_ms=None, history=None, **kwargs):
+            seen["history"] = history
+            return {"intent": "chat", "steps": [], "task_description": "",
+                    "query": msg,
+                    "reply": "We just talked about the cricket match, sir.",
+                    "_source": "gemini"}
+
+        with patch.object(brain, "is_definitely_plain_chat",
+                          return_value=False), \
+             patch.object(brain, "classify_intent",
+                          side_effect=fake_classify), \
+             patch.object(brain, "get_history",
+                          return_value=list(self._CRICKET_HISTORY)), \
+             patch.object(brain, "handle_chat",
+                          return_value="FROM-CHAT") as chat, \
+             patch.object(brain, "_ChatRacer"), \
+             patch.object(brain, "memory_store", None):
+            response = brain.process_message(
+                "tell me something about our previous conversations",
+                sync_voice=False)
+        # The router saw the cricket exchange (not a blind message)...
+        self.assertIn("Indore", self._history_blob(seen.get("history")))
+        # ...and its history-grounded reply is trusted through the [S6]
+        # one-call path (this shape is not an LF18 blind-refusal shape).
+        self.assertEqual(response, "FROM-CHAT")
+        self.assertEqual(
+            chat.call_args.kwargs.get("answered"),
+            "We just talked about the cricket match, sir.")
+
+    def test_research_query_derivation_sees_the_conversation(self):
+        seen = {}
+
+        def fake_classify(raw, timeout_ms=None, history=None, **kwargs):
+            seen["history"] = history
+            return {"intent": "research",
+                    "query": "India vs West Indies toss result",
+                    "task_description": "", "steps": []}
+
+        with patch.object(brain, "classify_intent",
+                          side_effect=fake_classify), \
+             patch.object(brain, "get_history",
+                          return_value=list(self._CRICKET_HISTORY)):
+            out = brain.derive_research_query("who won the toss")
+        self.assertIn("Indore", self._history_blob(seen.get("history")))
+        self.assertEqual(out, "India vs West Indies toss result")
+
+    def test_a_toss_question_reaches_research_not_a_chat_offer(self):
+        verdict = {"intent": "research", "steps": [],
+                   "task_description": "India vs West Indies toss result",
+                   "query": "India vs West Indies toss result",
+                   "_source": "gemini"}
+        with patch.object(brain, "is_definitely_plain_chat",
+                          return_value=False), \
+             patch.object(brain, "classify_intent", return_value=verdict), \
+             patch.object(brain, "get_history",
+                          return_value=list(self._CRICKET_HISTORY)), \
+             patch.object(brain, "handle_research_intent",
+                          return_value="RESEARCHED"), \
+             patch.object(brain, "_ChatRacer"), \
+             patch.object(brain, "memory_store", None):
+            response = brain.process_message(
+                "can you check online who won the toss", sync_voice=False)
+        self.assertEqual(response, "RESEARCHED")
 
 
 if __name__ == "__main__":
