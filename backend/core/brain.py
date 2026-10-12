@@ -368,6 +368,32 @@ _ACTION_OFFER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 25 / B31] physical-action verbs chat must never offer, ask
+#: about, or request confirmation for. Deliberately narrow: "look",
+#: "check", "examine" and "go" are NOT here — lookup offers ("shall I
+#: look it up?") and go-ahead asks ("do you want me to go ahead?")
+#: must keep passing through untouched.
+_PHYS_VERB = (r"(?:click(?:ing)?|tap|press|typ(?:e|ing)|minimi[sz]e|"
+              r"maximi[sz]e|restore|scroll|select|drag|open|launch|play|"
+              r"close|hit)")
+
+#: [LIVE FIX 25 / B31] chat has no approval authority for physical
+#: actions: offering one ("Shall I click…", "do you want me to open…")
+#: or asking for a confirmation ("I need you to confirm the screen
+#: action") is cut like a claim. Lookup offers ("shall I look it up?")
+#: contain no physical verb and survive.
+_CHAT_SCREEN_AUTHORITY_RE = re.compile(
+    r"\b(?:shall|should|may|can|could)\s+i\b[^.!?]{0,60}?\b"
+    + _PHYS_VERB + r"\b"
+    r"|\b(?:do\s+you\s+want|would\s+you\s+like|want)\s+me\s+to\b"
+    r"[^.!?]{0,60}?\b" + _PHYS_VERB + r"\b"
+    r"|\bsay\s+confirm\b"
+    r"|\bconfirm\b[^.!?]{0,40}?\b(?:screen|action|click|step)\b"
+    r"|\b(?:need|waiting\s+for|require)\b[^.!?]{0,40}?\b"
+    r"(?:confirm(?:ation)?|approval|go-?ahead)\b",
+    re.IGNORECASE,
+)
+
 # R13 chat-safe fallback: states what happened (nothing) + what is needed.
 # Never an action sentence — verified by _ACTION_CLAIM_RE below at def time.
 _CHAT_NO_ACTION_FALLBACK = (
@@ -382,6 +408,45 @@ _CHAT_REROUTE_FALLBACK = (
     "Understood, sir. Nothing was started — "
     "could you say exactly what you would like me to do?"
 )
+
+#: [LIVE FIX 25 / B31] fallback when the stripped sentences were about
+#: the SCREEN (a cut claim or a cut screen-action offer): never the
+#: folder/file question — a minimize request has no folder.
+_CHAT_SCREEN_FALLBACK = (
+    "Nothing was started on the screen, sir — say exactly what you want "
+    "done there and I'll do it."
+)
+
+#: Every fallback chat may speak. All three pass the gate unchanged
+#: (each carries "nothing was started", which the offer exemption
+#: covers, and none matches the claim or authority patterns).
+_CHAT_FALLBACKS = frozenset({_CHAT_NO_ACTION_FALLBACK,
+                             _CHAT_REROUTE_FALLBACK,
+                             _CHAT_SCREEN_FALLBACK})
+
+#: [LIVE FIX 25 / B27] shape words used to pick the honest fallback that
+#: fits what was cut.
+_SCREENISH_RE = re.compile(
+    r"\b(?:click|tap|press|typ(?:e|ing)|minimi[sz]|maximi[sz]|restor|"
+    r"scroll|windows?|screen|tab|button|icon|search\s*bar|cursor|mouse)\b",
+    re.IGNORECASE)
+_FILEISH_RE = re.compile(
+    r"\b(?:files?|folders?|director(?:y|ies)|txt|documents?|created?|"
+    r"creating|save[ds]?)\b",
+    re.IGNORECASE)
+
+
+def _chat_claim_fallback(cut_sentences):
+    """The honest fallback that fits what was cut. Never raises."""
+    try:
+        blob = " ".join(cut_sentences or [])
+        if _SCREENISH_RE.search(blob):
+            return _CHAT_SCREEN_FALLBACK
+        if _FILEISH_RE.search(blob):
+            return _CHAT_NO_ACTION_FALLBACK
+    except Exception:
+        pass
+    return _CHAT_REROUTE_FALLBACK
 
 
 def _strip_unverified_action_claims(text, role):
@@ -399,11 +464,18 @@ def _strip_unverified_action_claims(text, role):
     if role != "chat":
         return text
     sentences = re.split(r"(?<=[.!?])\s+", str(text).strip())
-    kept = [
-        s for s in sentences
-        if ((not _ACTION_CLAIM_RE.search(s) or _ACTION_OFFER_RE.search(s))
-            and not _INCAPABILITY_CLAIM_RE.search(s))
-    ]
+    kept, cut = [], []
+    for s in sentences:
+        claim = (bool(_ACTION_CLAIM_RE.search(s))
+                 and not _ACTION_OFFER_RE.search(s))
+        # [LIVE FIX 25 / B31] a physical-action offer or approval ask is
+        # cut even though it is offer-shaped; lookup offers contain no
+        # physical verb and still pass.
+        if (claim or _INCAPABILITY_CLAIM_RE.search(s)
+                or _CHAT_SCREEN_AUTHORITY_RE.search(s)):
+            cut.append(s)
+        else:
+            kept.append(s)
     # If every sentence was a claim (the classic "I will get that created
     # right away, sir." turn), say the honest fallback instead of silence.
     if not kept or not any(s.strip() for s in kept):
@@ -412,10 +484,206 @@ def _strip_unverified_action_claims(text, role):
                             text[:160])
             return _CHAT_REROUTE_FALLBACK
         logging.warning("[R13] chat action claim blocked: %r", text[:160])
-        return _CHAT_NO_ACTION_FALLBACK
-    if len(kept) != len(sentences):
+        return _chat_claim_fallback(cut)
+    if cut:
         logging.warning("[R13] chat action claim stripped: %r", text[:160])
     return " ".join(kept).strip()
+
+
+def _chat_gate_unchanged(gated, original):
+    """True when the R13 gate changed nothing (normalized-equal).
+
+    [LIVE FIX 25 / B29] the old word-count comparison let a claim
+    through whenever its fallback happened to have the same number of
+    words. Never raises.
+    """
+    try:
+        return (" ".join(str(gated or "").split())
+                == " ".join(str(original or "").split()))
+    except Exception:
+        return False
+
+
+#: [LIVE FIX 25 / B29] the start of an action-claim sentence: a physical
+#: gerund (optionally led by "I am"/"I will"). An unfinished live
+#: partial shaped like this is HELD until its sentence completes and
+#: gates as a whole — nothing un-gated is ever spoken.
+_CLAIM_START_RE = re.compile(
+    r"\s*(?:i(?:'m|\s+am|\s+will)\s+)?"
+    r"(?:click(?:ing|ed)?|typ(?:ing|e|ed)?|open(?:ing|ed)?|"
+    r"press(?:ing|ed)?|launch(?:ing|ed)?|play(?:ing|ed)?|"
+    r"minimi[sz](?:ing|ed)?|maximi[sz](?:ing|ed)?|scroll(?:ing|ed)?|"
+    r"tapp?(?:ing|ed)?|select(?:ing|ed)?|drag(?:ging|ed)?|"
+    r"clos(?:ing|ed|e)?|hitt?(?:ing)?|restor(?:ing|ed)?|mov(?:ing|ed)?|"
+    r"creat(?:ing|ed|e)?|delet(?:ing|ed|e)?|run(?:ning)?|"
+    r"execut(?:ing|ed|e)?|start(?:ing|ed)?|check(?:ing|ed)?|"
+    r"search(?:ing|ed)?|look(?:ing)?|navigat(?:ing|ed|e)?)\b",
+    re.IGNORECASE)
+
+
+def _looks_like_claim_start(buf):
+    """True when the unfinished tail looks like a claim's start."""
+    try:
+        text = str(buf or "")
+        if not text.strip():
+            return False
+        # Only the unfinished tail matters: completed sentences already
+        # passed (or will pass) the whole-sentence gate.
+        tail = re.split(r"(?<=[.!?])\s+", text)[-1]
+        return bool(_CLAIM_START_RE.match(tail))
+    except Exception:
+        return False
+
+
+def _gate_live_deltas(deltas):
+    """Sentence gate for live speech on a plain delta iterable.
+
+    [LIVE FIX 25 / B29] wraps the non-racer streaming loop in
+    handle_chat with the same protection the racer's adopted stream
+    has: completed sentences gate as a whole, claim-shaped partials
+    are held (never spoken un-gated), provider sentence restarts
+    dedup instead of doubling, and the stream end gates its remainder.
+    Byte-identical passthrough whenever the gate changes nothing.
+    """
+    buf = ""
+    emitted = 0
+    for item in deltas or ():
+        piece = str(item or "")
+        if not piece:
+            continue
+        if buf and piece.startswith(buf):
+            # The provider restarted the sentence ("Loud" then "Loud and
+            # clear, sir."): replace instead of doubling. Safe — the new
+            # text contains the old as a prefix, so the spoken prefix
+            # (emitted chars) is a prefix of both.
+            buf = piece
+        else:
+            buf += piece
+        parts = re.split(r"(?<=[.!?])(\s+)", buf)
+        if len(parts) > 1:
+            head, buf = "".join(parts[:-1]), parts[-1]
+            try:
+                gated = _strip_unverified_action_claims(head, "chat")
+            except Exception:
+                gated = head
+            if gated and str(gated).strip():
+                if _chat_gate_unchanged(gated, head):
+                    tail = head[emitted:]
+                    if tail.strip():
+                        yield tail
+                else:
+                    buf = (str(gated)
+                           + (" " if buf[:1].isspace() else "") + buf)
+            emitted = 0
+        elif not _looks_like_claim_start(buf):
+            tail = buf[emitted:]
+            if tail:
+                yield tail
+                emitted = len(buf)
+    if buf.strip():
+        try:
+            gated = _strip_unverified_action_claims(buf, "chat")
+        except Exception:
+            gated = buf
+        if _chat_gate_unchanged(gated, buf):
+            tail = buf[emitted:]
+            if tail.strip():
+                yield tail
+        elif str(gated or "").strip():
+            yield str(gated)
+
+
+def _gate_chat_text(content):
+    """The chat-authority gate shared by streaming and finalize."""
+    if re.search(r"\[task\]|\[background result\]|\[tool\]", content or ""):
+        print("[CHAT] Reply imitated an internal work-log format — replaced.")
+        content = ("There is no task running for that, sir — nothing was "
+                   "started. If you want it done, just ask.")
+    return _strip_unverified_action_claims(content, "chat")
+
+
+#: [LIVE FIX 25] a bare affirmation with nothing else in it ("yes",
+#: "confirm", "confirm screen action", "do it", "haan, kar do").
+_BARE_AFFIRM_RE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|alright|jarvis|sir|please)\s*[,.!]?\s*)*"
+    r"(?:yes|yeah|yep|yup|sure|ok(?:ay)?|confirm(?:ed)?|"
+    r"confirm\s+(?:the\s+)?(?:screen\s+)?action|do\s+it|go\s+ahead|"
+    r"proceed|haan|han|theek\s+hai|kar\s*do)"
+    r"(?:\s*[,.!]?\s*(?:please|sir|jarvis)\s*[,.!]?)?\s*$",
+    re.IGNORECASE)
+
+#: [LIVE FIX 25] approval vocabulary only ("confirm", "confirm screen
+#: action", "proceed") — never a conversational "yes".
+_APPROVAL_WORD_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:confirm(?:ed)?(?:\s+(?:the\s+)?(?:screen\s+)?"
+    r"action)?|proceed|approve(?:d)?)\s*[,.!]?\s*(?:sir|please)?\s*[.!]?\s*$",
+    re.IGNORECASE)
+
+
+def _other_approval_pending():
+    """True while a screen plan/task approval is armed or being prepared."""
+    try:
+        from backend.services import screen_state as _ss
+        if _ss.has_pending_plan():
+            return True
+    except Exception:
+        pass
+    try:
+        if task_agent_module.has_pending_task_confirmation():
+            return True
+    except Exception:
+        pass
+    try:
+        from backend.services import screen_control as _sc
+        if _sc.screen_planning_in_progress():
+            return True
+    except Exception:
+        pass
+    try:
+        with _MI_CHAIN_LOCK:
+            return bool(_mi_chain_active)
+    except Exception:
+        return False
+
+
+def _bare_confirm_without_plan_reply(msg):
+    """Honest answer for a bare confirm with no live plan. Else None.
+
+    [LIVE FIX 25 / B29] runs after the screen-control preroute returned
+    None. A plan armed in the meantime goes back to the screen gate; a
+    plan still being prepared (vision planning / running chain) gets the
+    honest wait line; an approval word with nothing pending says so. A
+    conversational "yes" with nothing pending returns None (chat keeps
+    it). Never raises.
+    """
+    try:
+        t = str(msg or "").strip()
+        if not _BARE_AFFIRM_RE.match(t):
+            return None
+        from backend.services import approvals as _approvals
+        from backend.services import screen_state as _ss
+        from backend.services import screen_control as _sc
+        if _approvals.verdict(t) != _approvals._YES:
+            return None
+        if _ss.has_pending_plan():
+            # Armed between the gate and here — the gate consumes it.
+            return _sc.maybe_handle_screen_control_message(t)
+        with _MI_CHAIN_LOCK:
+            chain_running = bool(_mi_chain_active)
+        try:
+            planning = bool(_sc.screen_planning_in_progress())
+        except Exception:
+            planning = False
+        if chain_running or planning:
+            return ("That step is still being prepared, sir — I'll ask for "
+                    "your confirmation the moment it's ready.")
+        if _APPROVAL_WORD_RE.match(t):
+            return ("There's no screen action waiting for your confirmation, "
+                    "sir — nothing was started.")
+        return None
+    except Exception as exc:
+        logging.warning("[SCREEN] bare-confirm guard failed: %s", exc)
+        return None
 
 
 # ── Generic async-reply callback (opencode fallback results, etc.) ──
@@ -1029,6 +1297,50 @@ _OFFER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 25 / B31] UI targets that are not lookup requests: a
+#: "search button/icon/bar" is a screen target, never a web search.
+_OFFER_UI_TARGET_RE = re.compile(
+    r"search\s*(?:bar|box|field|button|icon|tab|results?)"
+    r"|\b(?:click|double-?click|right-?click|tap|press|hit)(?:ing)?\s+"
+    r"(?:on\s+)?(?:the\s+|that\s+)?(?:search|submit)\b",
+    re.IGNORECASE)
+#: The offer-lead half of _OFFER_RE, for phrasings ("look it up") the
+#: full offer regex misses.
+_OFFER_LEAD_RE = re.compile(
+    r"\b(?:shall|should|would\s+you\s+like|do\s+you\s+want|want\s+me\s+to|"
+    r"i\s+can|i\s+could|let\s+me\s+know\s+if)\b",
+    re.IGNORECASE)
+#: Genuine lookup phrasing, including the split "look it up".
+_LOOKUP_PHRASE_RE = re.compile(
+    r"\blook\s+(?:(?:it|that|this|them)\s+)?up\b"
+    r"|\b(?:search|searched|research|google|find)\b",
+    re.IGNORECASE)
+_OFFER_PHYSICAL_RE = re.compile(r"\b" + _PHYS_VERB + r"\b", re.IGNORECASE)
+
+
+def _is_lookup_offer(reply):
+    """True only for LOOKUP offers. Never raises.
+
+    [LIVE FIX 25 / B31] a "search button/icon/bar" is a UI target, and
+    any offer naming a physical action is not a search offer — those
+    must never register, or a later bare "yes" would fire a web search
+    for a screen job.
+    """
+    try:
+        for s in re.split(r"(?<=[.!?])\s+", str(reply or "")):
+            t = _OFFER_UI_TARGET_RE.sub(
+                " ", _SEARCH_UI_PHRASE_RE.sub(" ", s))
+            if (_OFFER_RE.search(t)
+                    and not _OFFER_PHYSICAL_RE.search(t)):
+                return True
+            if (_OFFER_LEAD_RE.search(t)
+                    and _LOOKUP_PHRASE_RE.search(t)
+                    and not _OFFER_PHYSICAL_RE.search(t)):
+                return True
+        return False
+    except Exception:
+        return False
+
 _offer_lock = threading.Lock()
 _last_offer = None
 _OFFER_TTL = 180.0
@@ -1061,7 +1373,12 @@ def _remember_chat_offer(user_msg, reply):
     global _last_offer
     try:
         text = str(reply or "")
-        if not text or not _OFFER_RE.search(text):
+        if not text or not _is_lookup_offer(text):
+            # A newer non-offer reply supersedes the old offer for a bare
+            # yes (an explicit "execute it" keeps today's behaviour).
+            with _offer_lock:
+                if _last_offer:
+                    _last_offer["superseded"] = True
             return
         query = _resolve_reference_query(user_msg)
         with _offer_lock:
@@ -1085,11 +1402,20 @@ def _consume_offered_action(msg):
         wants_execute = bool(_EXECUTE_IT_RE.search(t))
         no_ask_search = bool(_NO_ASK_RE.search(t)
                              and _SEARCH_SHAPED_VERB_RE.search(t))
-        if not (wants_execute or no_ask_search):
+        # [LIVE FIX 25 / B31] a bare yes/sure/confirm answers a pending
+        # lookup offer.
+        bare_yes = (not wants_execute) and bool(_BARE_AFFIRM_RE.match(t))
+        if not (wants_execute or no_ask_search or bare_yes):
+            return None
+        if bare_yes and _other_approval_pending():
+            # The screen/task gate owns this yes — a stale offer must
+            # never steal a "confirm" meant for an armed plan.
             return None
         with _offer_lock:
             offer = dict(_last_offer) if _last_offer else None
         if not offer:
+            return None
+        if bare_yes and offer.get("superseded"):
             return None
         if time.time() > float(offer.get("expires") or 0.0):
             with _offer_lock:
@@ -2414,6 +2740,16 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "Do not answer in Hindi, Hinglish, or Devanagari unless the user is asking for translation examples. "
             "Be concise, helpful, and address the user as 'sir' occasionally. "
             "Keep responses short unless asked for detail. "
+            # [LIVE FIX 25 / B31] screen actions belong to the
+            # screen-control system, never to chat prose.
+            "Screen actions (clicking, typing, pressing keys, opening, "
+            "playing, minimizing or moving windows) are run only by the "
+            "screen-control system, which asks for its own confirmations. "
+            "Never offer to do a screen action, never ask the user to "
+            "confirm one, and never say a confirmation is needed — if "
+            "they want something done on the screen, tell them to say "
+            "the exact action (for example 'click the search icon'). "
+            "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
     else:
@@ -2458,6 +2794,16 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "When asked what was discussed, report only what the turns "
             "above show; if a claimed topic is absent, say so plainly "
             "instead of agreeing. "
+            # [LIVE FIX 25 / B31] screen actions belong to the
+            # screen-control system, never to chat prose.
+            "Screen actions (clicking, typing, pressing keys, opening, "
+            "playing, minimizing or moving windows) are run only by the "
+            "screen-control system, which asks for its own confirmations. "
+            "Never offer to do a screen action, never ask the user to "
+            "confirm one, and never say a confirmation is needed — if "
+            "they want something done on the screen, tell them to say "
+            "the exact action (for example 'click the search icon'). "
+            "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
 
@@ -3319,7 +3665,7 @@ class _ChatRacer:
                         except Exception:
                             gated = buf
                         if (gated and str(gated).strip()
-                                and len(str(gated).split()) != len(buf.split())):
+                                and not _chat_gate_unchanged(gated, buf)):
                             # A cut claim ("I will get that created" ->
                             # fallback) is redelivered in gated form: live
                             # speech pauses rather than lies, and the prefix
@@ -3331,7 +3677,15 @@ class _ChatRacer:
                                 yield tail
                     break
                 piece = str(item or "")
-                buf += piece
+                # [LIVE FIX 25 / B29] provider restart dedup: a delta that
+                # restates the held buffer ("Loud" then "Loud and clear,
+                # sir.") replaces it instead of doubling it. Safe — the
+                # new text contains the old as a prefix, so the already
+                # spoken prefix (emitted chars) is a prefix of both.
+                if buf and piece.startswith(buf):
+                    buf = piece
+                else:
+                    buf += piece
                 # Emit complete sentences; hold the tail (maybe a claim cut
                 # mid-sentence) for the next delta or the sentinel flush.
                 parts = re.split(r"(?<=[.!?])(\s+)", buf)
@@ -3348,7 +3702,7 @@ class _ChatRacer:
                     # sentence replaces the head and is HELD in buf for the
                     # next flush, which redelivers it in gated form.
                     if gated and str(gated).strip():
-                        if len(str(gated).split()) == len(head.split()):
+                        if _chat_gate_unchanged(gated, head):
                             tail = head[emitted:]
                             if tail.strip():
                                 yield tail
@@ -3356,9 +3710,15 @@ class _ChatRacer:
                             buf = str(gated) + (" " if buf[:1].isspace() else "") + buf
                     emitted = 0
                 else:
-                    # Byte-identical passthrough of everything not yet
-                    # emitted (normally just this piece; after a cut claim,
-                    # the held gated replacement goes out here, in order).
+                    # [LIVE FIX 25 / B29] unfinished sentence: speak it
+                    # live ONLY when it does not look like the start of
+                    # an action claim ("Clicking 'Tab" is held until its
+                    # sentence completes and gates as a whole — nothing
+                    # un-gated is ever spoken). Held gated replacements
+                    # still flow here in order: a fallback never looks
+                    # claim-shaped.
+                    if _looks_like_claim_start(buf):
+                        continue
                     tail = buf[emitted:]
                     if tail:
                         yield tail
@@ -3457,11 +3817,8 @@ def _finalize_chat_reply(user_message, content, pieces, stream,
     # [Live fix] A reply that imitated the internal work-log format
     # ("[task] ... Say confirm task to proceed", "[background result]") is
     # an invented task arm, never a real one — say so honestly instead.
-    if re.search(r"\[task\]|\[background result\]|\[tool\]", content):
-        print("[CHAT] Reply imitated an internal work-log format — replaced.")
-        content = ("There is no task running for that, sir — nothing was "
-                   "started. If you want it done, just ask.")
-    content = _strip_unverified_action_claims(content, "chat")
+    # [LIVE FIX 25 / B29] one shared gate for streaming and finalize.
+    content = _gate_chat_text(content)
     # F26 - the uncertainty/clarification decision must happen BEFORE speech.
     # With a stream consumer attached every delta has already been spoken, so
     # swapping the reply here would speak one answer and store a different
@@ -3528,6 +3885,9 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
         # so a streaming consumer (voice/UI) sees exactly one reply, and skip
         # message building and the chat model entirely.
         content = re.sub(r"\s+", " ", str(answered)).strip()
+        # [LIVE FIX 25 / B29] gate BEFORE speech — the old order streamed
+        # the raw text and only gated the stored copy.
+        content = _gate_chat_text(content)
         pieces = []
         if stream:
             stream(content)
@@ -3569,9 +3929,11 @@ def handle_chat(user_message, voice_compact=False, commit_response=True, stream=
                     pieces.append(delta)
                     stream(delta)
         else:
-            for delta in _stream_chat_deltas(
-                messages, 0.45 if voice_compact else 0.7, 300 if voice_compact else 1400
-            ):
+            # [LIVE FIX 25 / B29] this loop speaks deltas live with no
+            # racer — gate them exactly like the adopted stream.
+            for delta in _gate_live_deltas(_stream_chat_deltas(
+                    messages, 0.45 if voice_compact else 0.7,
+                    300 if voice_compact else 1400)):
                 if delta:
                     pieces.append(delta)
                     stream(delta)
@@ -7140,6 +7502,71 @@ _REPEAT_LAST_RE = re.compile(
 )
 
 
+#: [LIVE FIX 25 / B27] a bare re-look ("look again", "look at it again",
+#: "check again", "have another look"). Pointing lines ("look again there
+#: is a video on top right") are not bare and stay with the screen-question
+#: retry family.
+_LOOK_AGAIN_RE = re.compile(
+    r"^\s*(?:(?:please|kindly|jarvis|sir|ok(?:ay)?|no)\s*,?\s*)*"
+    r"(?:(?:look|check|try\s+looking)\s+(?:at\s+(?:it|that|them|"
+    r"the\s+screen|my\s+screen)\s+)?(?:again|once\s+more|one\s+more\s+time)"
+    r"|(?:take|have)\s+another\s+look)"
+    r"(?:\s*,?\s*(?:please|sir|jarvis))?[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
+def _screen_command_relook(msg):
+    """The last WINDOW command to re-plan for a bare re-look, else "".
+
+    [LIVE FIX 25 / B27] fires only when the newest activity is a
+    screen-control window command (newer than the last screen question
+    and replicate attempt, by sequence), so the screen-question retry
+    family keeps its own "look again". Never raises.
+    """
+    try:
+        if not _LOOK_AGAIN_RE.match(str(msg or "").strip()):
+            return ""
+        last = get_last_action() or {}
+        cmd = str(last.get("command") or "")
+        if (str(last.get("kind") or "") != "screen_control" or not cmd
+                or not _WIN_CORR_VERB_RE.search(cmd)
+                or time.time() - float(last.get("at") or 0.0)
+                >= _LAST_ACTION_TTL):
+            return ""
+        seq = int(last.get("seq") or 0)
+        with _screen_qa_last_lock:
+            q_seq = int(_screen_qa_last.get("seq") or 0)
+        with _mi_replicate_last_lock:
+            r_seq = int((_mi_replicate_last or {}).get("seq") or 0)
+        return cmd if seq > max(q_seq, r_seq) else ""
+    except Exception:
+        return ""
+
+
+#: [LIVE FIX 25 / B32] whole-task repeat ("do the whole task again",
+#: "start it all over again") re-runs the stored chain from step 1.
+#: "do the whole task" WITHOUT "again" is deliberately NOT matched — that
+#: phrasing usually means "finish it", which belongs to resume.
+_REPEAT_WHOLE_TASK_RE = re.compile(
+    r"^\s*(?:(?:please|kindly|jarvis|ok(?:ay)?|now|sir)\s*,?\s*)*"
+    r"(?:(?:redo|repeat)\s+(?:(?:the|that|this)\s+)?"
+    r"(?:whole|entire|full|complete)\s+"
+    r"(?:task|thing|chain|sequence|process|request|job)"
+    r"(?:\s+(?:again|once\s+more|from\s+the\s+(?:start|top|beginning)))?"
+    r"|(?:do|run|perform|try)\s+(?:(?:the|that|this)\s+)?"
+    r"(?:whole|entire|full|complete)\s+"
+    r"(?:task|thing|chain|sequence|process|request|job)\s+"
+    r"(?:again|once\s+more|one\s+more\s+time|"
+    r"from\s+the\s+(?:start|top|beginning))"
+    r"|(?:do|run|start)\s+(?:it|that|everything)\s+(?:all\s+)?"
+    r"over(?:\s+again)?"
+    r"|start\s+(?:it\s+)?(?:all\s+)?over(?:\s+again)?)"
+    r"(?:\s*,?\s*(?:please|sir|jarvis))?[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
 def _repeatable_last_command():
     """The stored command text when a bare repeat is answerable, else "".
 
@@ -7234,6 +7661,94 @@ def _screen_target_correction_command(msg):
         if _WIN_CORR_NOUN_RE.search(corrected):
             return "%s %s" % (verb, corrected)
         return "%s the %s windows" % (verb, corrected)
+    except Exception:
+        return None
+
+
+#: [LIVE FIX 25 / B30] second-person corrections of a CLICK/PRESS/TYPE
+#: target: "you are not clicking the search icon after typing, instead
+#: you are clicking something else" -> "click the search icon after
+#: typing". The rejected half must name a real UI target; vague,
+#: targetless and recall turns never reroute.
+_SCREEN_ACTION_CORRECTION_RE = re.compile(
+    r"^\s*(?:(?:no|nope|jarvis|sir|wait|hey)\s*[,.!]?\s*)?"
+    r"you(?:\s+are|'re|\s+were)?\s*"
+    r"(?:not|aren'?t|weren'?t|didn'?t|did\s+not|never)\s+"
+    r"(?P<verb>click(?:ing|ed)?|press(?:ing|ed)?|tap(?:ping|ped)?|"
+    r"typ(?:e|ing|ed)|select(?:ing|ed)?|hit(?:ting)?)\s+"
+    r"(?:on\s+)?(?P<target>[^,;.!?]{2,80}?)\s*"
+    r"(?:[,;]\s*|\s+)?(?:(?:but|and)\s+)?"
+    r"(?:instead\b[^.!?]*|you(?:'re|\s+are|\s+were)?\s+"
+    r"(?:click|press|tap)\w*\b[^.!?]*)?"
+    r"[\s.!?]*$",
+    re.IGNORECASE)
+#: "you clicked the tab search instead of the search icon".
+_SCREEN_ACTION_INSTEAD_OF_RE = re.compile(
+    r"^\s*(?:(?:no|nope|jarvis|sir|wait)\s*[,.!]?\s*)?"
+    r"you(?:\s+are|'re|\s+were)?\s+(?P<verb>click(?:ing|ed)|press(?:ing|ed)|"
+    r"tap(?:ping|ped)|select(?:ing|ed))\s+(?:on\s+)?[^,;.!?]{2,60}?\s+"
+    r"instead\s+of\s+"
+    r"(?:clicking\s+|pressing\s+|tapping\s+)?(?:on\s+)?"
+    r"(?P<target>[^,;.!?]{2,80}?)[\s.!?]*$",
+    re.IGNORECASE)
+_CORR_UI_TARGET_RE = re.compile(
+    r"\b(?:button|link|bar|box|field|tab|icon|checkbox|dropdown|menu|"
+    r"toolbar|window|video|thumbnail|result|search|submit|enter|play)\b",
+    re.IGNORECASE)
+_CORR_VAGUE_RE = re.compile(
+    r"^(?:it|that|this|something|anything)(?:\s+else)?$", re.IGNORECASE)
+
+
+def _corr_verb_base(verb):
+    """Canonical imperative base for a correction verb, else ''."""
+    v = str(verb or "").lower()
+    for base in ("click", "press", "tap", "select", "hit"):
+        if v.startswith(base):
+            return base
+    return "type" if v.startswith("typ") else ""
+
+
+def _recent_screen_activity():
+    """True after a fresh screen-control/chain action or a stored chain."""
+    try:
+        last = get_last_action() or {}
+        if (str(last.get("kind") or "") in ("screen_control", "chain")
+                and time.time() - float(last.get("at") or 0.0)
+                < _LAST_ACTION_TTL):
+            return True
+    except Exception:
+        pass
+    try:
+        return _take_chain_plan() is not None
+    except Exception:
+        return False
+
+
+def _screen_action_correction_command(msg):
+    """Rewrite a click/press/type target correction to a command, else None."""
+    try:
+        text = re.sub(r"\s+", " ", str(msg or "")).strip()
+        m = (_SCREEN_ACTION_CORRECTION_RE.match(text)
+             or _SCREEN_ACTION_INSTEAD_OF_RE.match(text))
+        if not m:
+            return None
+        try:
+            if _memory_recall_request(text):
+                return None
+        except Exception:
+            pass
+        verb = _corr_verb_base(m.group("verb"))
+        target = re.sub(r"\s+([,.])", r"\1",
+                        m.group("target")).strip(" ,.")
+        if not verb or len(target) < 2 or len(target.split()) > 12:
+            return None
+        if _CORR_VAGUE_RE.match(target):
+            return None
+        if verb != "type" and not _CORR_UI_TARGET_RE.search(target):
+            return None
+        if not _recent_screen_activity():
+            return None
+        return "%s %s" % (verb, target)
     except Exception:
         return None
 
@@ -9244,7 +9759,8 @@ def _chain_control_blocked(steps):
             "first, then ask me again.")
 
 
-def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
+def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False,
+                        force_rerun=False):
     """Ack the chain now, run it on a worker; returns the single ack line."""
     global _mi_chain_active
     sig = _chain_signature(plan)
@@ -9276,7 +9792,10 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
                     "one moment.")
         with _chain_memory_lock:
             last = dict(_last_chain_run) if _last_chain_run else None
-        if (last and sig and last.get("sig") == sig
+        # [LIVE FIX 25 / B32] an explicit whole-task repeat bypasses the
+        # "did that a moment ago" dedup; the "already running" branch
+        # above still stands, so a repeat during a live run stays honest.
+        if (not force_rerun and last and sig and last.get("sig") == sig
                 and time.time() - float(last.get("at") or 0.0) < 150.0):
             return _mi_clip("Sir, I did that a moment ago — "
                             + str(last.get("reply") or ""), 600)
@@ -9295,6 +9814,55 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
         logging.warning("[CHAIN] worker start failed: %s", exc)
         return None
     return multi_intent.render_ack(plan, voice_compact=voice_compact)
+
+
+def _rerun_whole_chain(msg, from_voice=False, voice_compact=False):
+    """Re-run the stored chain from step 1, freshly. Else None.
+
+    [LIVE FIX 25 / B32] the chain is REBUILT from its source text
+    (current splitting rules; every step re-plans against the live
+    screen in _mi_screen_control_step) — never a replay of stored
+    results or coordinates. Falls back to the stored step TEXTS when
+    the source no longer chains. Never raises.
+    """
+    try:
+        last = _take_chain_plan()
+        if last is None:
+            return None
+        stored = dict(last.get("plan") or {})
+        source = str(stored.get("source")
+                     or stored.get("command_text") or "").strip()
+        try:
+            fresh = multi_intent.build_chain(source) if source else None
+        except Exception:
+            fresh = None
+        if fresh is None:
+            steps = [{"kind": s.get("kind"), "text": s.get("text"),
+                      "index": i,
+                      "consumes": [int(j)
+                                   for j in (s.get("consumes") or [])]}
+                     for i, s in enumerate(stored.get("steps") or [])
+                     if s.get("text")]
+            if len(steps) < 2:
+                return None
+            fresh = {"ok": True, "steps": steps, "source": source,
+                     "command_text": source}
+        print("[CHAIN] whole-task repeat — re-running from step 1:",
+              source[:80])
+        reply = handle_multi_intent(
+            source or msg, fresh, from_voice=from_voice,
+            voice_compact=voice_compact, force_rerun=True)
+        if reply is None:
+            return ("Sir, I couldn't restart that task — say it once more "
+                    "and I'll run it.")
+        try:
+            note_executed_action("chain", source or msg, reply)
+        except Exception:
+            pass
+        return reply
+    except Exception as exc:
+        logging.warning("[CHAIN] whole-task repeat failed: %s", exc)
+        return None
 
 
 def _consume_confirmation(answer):
@@ -9989,6 +10557,32 @@ def _process_message_inner(
             voice_compact=voice_compact, commit_response=commit_response,
             stream_reply=None, progress=progress, request_id=request_id)
 
+    # ── [LIVE FIX 25 / B30] a click/press/type TARGET correction
+    # ("you are not clicking the search icon after typing, instead you
+    # are clicking something else") rebuilds the action from the user's
+    # words and re-routes it. The rejected action's armed plan must not
+    # survive the correction.
+    try:
+        _act_corr_cmd = _screen_action_correction_command(msg)
+    except Exception as exc:
+        logging.warning("[CORRECTION] Action-target rewrite failed: %s",
+                        exc)
+        _act_corr_cmd = None
+    if _act_corr_cmd:
+        print("[CORRECTION] Screen action target revised:", _act_corr_cmd)
+        try:
+            from backend.services import screen_state as _screen_state
+            if _screen_state.has_pending_plan():
+                _screen_state.clear_pending_plan()
+                print("[CORRECTION] superseded pending screen approval "
+                      "cleared")
+        except Exception:
+            pass
+        return _process_message_inner(
+            _act_corr_cmd, from_voice=from_voice, sync_voice=sync_voice,
+            voice_compact=voice_compact, commit_response=commit_response,
+            stream_reply=None, progress=progress, request_id=request_id)
+
     # ── Live fix: "name it X" answers a pending folder-name ask ──
     # The chain folder step asked WHICH name to use; the next turn names it
     # instead of falling into chat ("I can certainly go by James Dark").
@@ -10251,6 +10845,39 @@ def _process_message_inner(
                     sync_voice_log(voice_log_message, chain_reply)
                 return chain_reply
 
+    # ── [LIVE FIX 25 / B32] whole-task repeat ("do the whole task
+    # again") re-runs the stored chain from step 1, freshly planned —
+    # never a replay of stored results or coordinates. Runs after the
+    # Rank-2 gate (a fresh chain keeps priority) and before resume (a
+    # whole-task repeat is not a tail resume).
+    if (not msg.lower().startswith("command")
+            and _REPEAT_WHOLE_TASK_RE.match(msg.strip())):
+        try:
+            _rerun_reply = _rerun_whole_chain(
+                msg, from_voice=from_voice, voice_compact=voice_compact)
+        except Exception as exc:
+            logging.warning("[CHAIN] whole-task repeat failed: %s", exc)
+            _rerun_reply = None
+        if _rerun_reply is None:
+            _cmd = _repeatable_last_command()
+            if _cmd:
+                print("[REPEAT] Whole-task repeat -> last action: %s" % _cmd)
+                return _process_message_inner(
+                    _cmd, from_voice=from_voice, sync_voice=sync_voice,
+                    voice_compact=voice_compact,
+                    commit_response=commit_response,
+                    stream_reply=None, progress=progress,
+                    request_id=request_id)
+            _rerun_reply = "There's nothing recent to repeat, sir."
+        _remember_user_turn(msg)
+        try:
+            add_message("assistant", _rerun_reply)
+        except Exception:
+            pass
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, _rerun_reply)
+        return _rerun_reply
+
     # ── [LIVE FIX 22 / B10] unfinished-chain feedback ("you didn't do
     # the next steps", "do the rest", "continue") resumes the stored
     # chain's tail instead of falling through to research/chat. Runs
@@ -10428,6 +11055,27 @@ def _process_message_inner(
                 sync_voice_log(voice_log_message, screen_control_response)
             return screen_control_response
 
+    # ── [LIVE FIX 25 / B29] a bare confirm while a step is still being
+    # planned (or with nothing armed) never reaches chat: the wait line
+    # while a chain/planning run is live, the honest no-pending line for
+    # an approval word, and chat keeps a conversational yes.
+    if not is_explicit_command:
+        try:
+            _confirm_wait = _bare_confirm_without_plan_reply(msg)
+        except Exception as exc:
+            logging.warning("[SCREEN] bare-confirm gate failed: %s", exc)
+            _confirm_wait = None
+        if _confirm_wait is not None:
+            print("[SCREEN] Bare confirmation with no armed plan:", msg)
+            _remember_user_turn(msg)
+            try:
+                add_message("assistant", _confirm_wait)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _confirm_wait)
+            return _confirm_wait
+
     # ── [LIVE FIX 20 / bug 6] bare repetition repeats the last ACTION ──
     # "Again." after "Minimize the window on my screen" must re-run the
     # minimize — not the conversation topic. The registry is cross-executor
@@ -10450,6 +11098,25 @@ def _process_message_inner(
             cmd, from_voice=from_voice, sync_voice=sync_voice,
             voice_compact=voice_compact, commit_response=commit_response,
             stream_reply=None, progress=progress, request_id=request_id)
+
+    # ── [LIVE FIX 25 / B27] a bare re-look ("look again") after a failed
+    # window command re-plans THAT command deterministically (fresh
+    # enumeration) instead of reaching chat. Screen-question and replicate
+    # retries keep their own "look again" via the sequence check inside.
+    if not is_explicit_command:
+        _relook_cmd = ""
+        try:
+            _relook_cmd = _screen_command_relook(msg)
+        except Exception as exc:
+            logging.warning("[REPEAT] Re-look gate failed: %s", exc)
+            _relook_cmd = ""
+        if _relook_cmd:
+            print("[REPEAT] Re-look re-plans last window command: %s"
+                  % _relook_cmd)
+            return _process_message_inner(
+                _relook_cmd, from_voice=from_voice, sync_voice=sync_voice,
+                voice_compact=voice_compact, commit_response=commit_response,
+                stream_reply=None, progress=progress, request_id=request_id)
 
     # ── Deep research — explicit phrases ("look this up", "find out about X") ──
     _t = time.perf_counter_ns()

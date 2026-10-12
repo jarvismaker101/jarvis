@@ -275,6 +275,42 @@ def split_clauses(text):
     return out
 
 
+#: [LIVE FIX 25 / B28] a bare typing verb JUXTAPOSED after a completed
+#: control clause ("click in the search bar on my screen type mr.beast")
+#: is its own step. "Completed" = the left part starts with a control
+#: verb and ends on a target noun or a screen phrase, so "click the font
+#: type dropdown" / "click the type button" never split.
+_JUXTAPOSED_TYPE_RE = re.compile(
+    r"^(?P<left>(?:(?:please|kindly|jarvis)\b[\s,]*)?"
+    r"(?:click|double-?click|right-?click|tap|select|focus|hover|press|hit)\b.*?"
+    r"(?:\b(?:bar|box|field|button|icon|link|tab|textbox|input|window|it|this|"
+    r"that|there)"
+    r"|\b(?:on|at|in)\s+(?:my|the)\s+(?:screen|desktop|browser|window)))"
+    r"\s+(?P<right>(?:type|enter|write)\s+\S.*)$",
+    re.IGNORECASE)
+_JUXT_RIGHT_BLOCK_RE = re.compile(
+    r"^(?:type|enter|write)\s+(?:of|key|button|field|box|bar|icon|tab|"
+    r"dropdown|menu)\b", re.IGNORECASE)
+#: The same file-noun guard _SCREEN_CONTROL_RE applies to "type <content>".
+_JUXT_FILE_NOUN_RE = re.compile(
+    r"\b(?:file|folder|directory|report|document|note|txt|script|code)\b",
+    re.IGNORECASE)
+
+
+def _split_control_juxtaposition(clauses):
+    """Cut "click X type Y" (no connector) into two control clauses."""
+    out = []
+    for clause in clauses or []:
+        m = _JUXTAPOSED_TYPE_RE.match(clause or "")
+        if (m and not _JUXT_RIGHT_BLOCK_RE.match(m.group("right"))
+                and not _JUXT_FILE_NOUN_RE.search(m.group("right")[:60])):
+            out.append(m.group("left").strip(" \t,;."))
+            out.append(m.group("right").strip(" \t,;"))
+        else:
+            out.append(clause)
+    return out
+
+
 def classify_clause(text):
     """The single action kind of one clause, or None for a fragment.
 
@@ -322,6 +358,8 @@ def build_chain(text):
     if not raw or _FUTURE_TALK_RE.match(raw):
         return None
     clauses = split_clauses(raw)
+    # [LIVE FIX 25 / B28] "click X type Y" with no connector is two steps.
+    clauses = _split_control_juxtaposition(clauses)
     if not clauses:
         return None
     merged = []

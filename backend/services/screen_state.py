@@ -26,6 +26,11 @@ _pending_approval = None
 _interaction_history = []
 _MAX_HISTORY = 5
 
+#: [LIVE FIX 25 / B27] the newest dispatched screen request (any
+#: outcome), so "try again" retries a FAILED attempt instead of an
+#: older success from the interaction ledger.
+_last_request = {"command": "", "ts": 0.0}
+
 #: Bumped every time screen control is enabled or disabled. A plan stamped
 #: with an older generation can never execute.
 _generation = 0
@@ -263,9 +268,35 @@ def get_recent_interactions():
 
 
 def clear_interactions():
-    global _interaction_history
+    global _interaction_history, _last_request
     with _state_lock:
         _interaction_history = []
+        _last_request = {"command": "", "ts": 0.0}
+
+
+def note_request(command):
+    """Record the newest dispatched screen request (any outcome).
+
+    [LIVE FIX 25 / B27] a failed direct plan leaves no ledger entry, so
+    without this the retry path could only see older successes. Never
+    raises.
+    """
+    global _last_request
+    try:
+        with _state_lock:
+            _last_request = {"command": tool_policy.redact_for_egress(
+                command), "ts": time.time()}
+    except Exception:
+        pass
+
+
+def get_last_request():
+    """A safe copy of the newest dispatched screen request."""
+    try:
+        with _state_lock:
+            return dict(_last_request)
+    except Exception:
+        return {"command": "", "ts": 0.0}
 
 
 def format_history_for_prompt():

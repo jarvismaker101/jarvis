@@ -648,21 +648,25 @@ _QUALIFIED_WINDOW_RE = re.compile(
 
 #: Optional app filter between the quantifier and "windows" ("minimize all
 #: the TERMINAL windows", "minimize the two terminal windows").
+#: [LIVE FIX 25 / B25] also accepts "all OF the windows".
 _QUALIFIED_APP_FILTER_RE = re.compile(
     r"\b(?:all|every|each|these|those|other|another|both|"
     r"one|two|three|four|five|six|seven|eight|nine|ten|\d+|"
     r"sab|sabhi|saare|saari|sare)\b"
-    r"\s+(?:the\s+|my\s+)?(.*?)\s*\b(?:windows?|apps?|applications?|"
-    r"programs?)\b",
+    r"\s+(?:of\s+)?(?:the\s+|my\s+)?(.*?)\s*\b(?:windows?|apps?|"
+    r"applications?|programs?)\b",
     re.IGNORECASE,
 )
 
 #: [LIVE FIX 24 / B18] an app-named target without a quantifier ("minimize
 #: the brave window", "minimize terminal windows") is a deterministic
 #: filtered plan, never the active window.
+#: [LIVE FIX 25 / B25] the object may not cross a second window verb, so
+#: compound feedback ("i said minimize the window, minimize terminal
+#: windows") resolves against the real command, not the quoted half.
 _APPNAMED_WINDOW_RE = re.compile(
     r"\b(minimize|minimise|maximize|maximise|restore)\b"
-    r"(?P<object>[^.?!]{1,64})"
+    r"(?P<object>(?:(?!\b(?:minimi[sz]e|maximi[sz]e|restore)\b)[^.?!]){1,64})"
     r"\b(?P<noun>windows?|apps?|applications?|programs?)\b",
     re.IGNORECASE,
 )
@@ -779,12 +783,81 @@ _QUALIFIED_VERB_ACTION = {
 }
 
 
+#: [LIVE FIX 25 / B26] owning-process resolution for enumerated windows,
+#: so "terminal" can match a window titled "Windows PowerShell" (its
+#: process is windowsterminal/cmd and its class is Cascadia/Console).
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_k32_lock = threading.Lock()
+_k32 = None
+
+
+def _kernel32():
+    """Private kernel32 handle with explicit prototypes. None off-Windows.
+
+    Uses its own WinDLL instance (never mutates ctypes.windll's shared
+    function objects). Never raises.
+    """
+    global _k32
+    with _k32_lock:
+        if _k32 is None:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                k = ctypes.WinDLL("kernel32", use_last_error=True)
+                k.OpenProcess.argtypes = [
+                    wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                k.OpenProcess.restype = wintypes.HANDLE
+                k.QueryFullProcessImageNameW.argtypes = [
+                    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                    ctypes.POINTER(wintypes.DWORD)]
+                k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+                k.CloseHandle.argtypes = [wintypes.HANDLE]
+                _k32 = k
+            except Exception:
+                _k32 = False
+        return _k32 or None
+
+
+def _process_image_name(pid, cache=None):
+    """Exe stem ('windowsterminal', 'cmd') owning *pid*, else ''. Never raises."""
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    if cache is not None and pid in cache:
+        return cache[pid]
+    name = ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = _kernel32()
+        handle = (k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                  if k else None)
+        if handle:
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(len(buf))
+                if k.QueryFullProcessImageNameW(
+                        handle, 0, buf, ctypes.byref(size)):
+                    base = os.path.basename(buf.value or "").lower()
+                    name = base[:-4] if base.endswith(".exe") else base
+            finally:
+                k.CloseHandle(handle)
+    except Exception:
+        name = ""
+    if cache is not None:
+        cache[pid] = name
+    return name
+
+
 def _list_managable_windows():
     """Visible titled top-level windows, oldest API, no model involved.
 
     Skips Jarvis's own windows, untitled helpers and the Program Manager.
-    Returns [{"hwnd", "title", "iconic", "rect"}]; [] when enumeration is
-    unavailable. Never raises.
+    Returns [{"hwnd", "title", "iconic", "rect", "process", "window_class"}];
+    [] when enumeration is unavailable. Never raises.
     """
     try:
         import ctypes
@@ -801,6 +874,8 @@ def _list_managable_windows():
     try:
         proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND,
                                   wintypes.LPARAM)
+        # [LIVE FIX 25 / B26] one process-name lookup per pid per pass.
+        pid_cache = {}
 
         def _cb(hwnd, _lp):
             try:
@@ -839,8 +914,24 @@ def _list_managable_windows():
                     }
                 else:
                     rect_info = None
+                # [LIVE FIX 25 / B26] owning process + window class, so
+                # app words ("terminal") match windows whose TITLE never
+                # names them ("Windows PowerShell").
+                try:
+                    _pid = wintypes.DWORD(0)
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid))
+                    process = _process_image_name(_pid.value, pid_cache)
+                except Exception:
+                    process = ""
+                try:
+                    _cls = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, _cls, len(_cls))
+                    window_class = (_cls.value or "").strip()
+                except Exception:
+                    window_class = ""
                 out.append({"hwnd": int(hwnd), "title": title,
-                            "iconic": iconic, "rect": rect_info})
+                            "iconic": iconic, "rect": rect_info,
+                            "process": process, "window_class": window_class})
             except Exception:
                 pass
             return True
@@ -935,6 +1026,58 @@ def _match_window_token(title_lower, token):
     return bool(words) and all(w in title_lower for w in words)
 
 
+#: [LIVE FIX 25 / B26] app words that never appear in a window title.
+#: A Windows Terminal tab is titled "Windows PowerShell"/"Command
+#: Prompt"; its owning process (windowsterminal/cmd/conhost) and its
+#: window class are the only reliable signal.
+_TERMINAL_PROCS = frozenset({"windowsterminal", "wt", "openconsole", "cmd",
+                             "powershell", "pwsh", "conhost"})
+_WINDOW_APP_ALIASES = {
+    "terminal": _TERMINAL_PROCS,
+    "windows terminal": frozenset({"windowsterminal", "openconsole"}),
+    "console": _TERMINAL_PROCS,
+    "command prompt": frozenset({"cmd", "conhost"}),
+    "cmd": frozenset({"cmd", "conhost"}),
+    "powershell": frozenset({"powershell", "pwsh"}),
+    "power shell": frozenset({"powershell", "pwsh"}),
+}
+_WINDOW_CLASS_ALIASES = {
+    "terminal": frozenset(
+        {"cascadia_hosting_window_class", "consolewindowclass"}),
+    "console": frozenset(
+        {"cascadia_hosting_window_class", "consolewindowclass"}),
+    "windows terminal": frozenset({"cascadia_hosting_window_class"}),
+}
+
+
+def _window_matches_filter(window, token):
+    """True when *token* names this window by title, process or class.
+
+    Title matching is first and unchanged (fakes without the new keys
+    behave exactly as before); the owning process / window class is
+    consulted through the alias map only when the title does not match.
+    Never raises.
+    """
+    try:
+        title_lower = str((window or {}).get("title") or "").lower()
+    except Exception:
+        return False
+    if _match_window_token(title_lower, token):
+        return True
+    t = re.sub(r"\s+", " ", str(token or "").strip().lower())
+    if not t:
+        return False
+    try:
+        process = str((window or {}).get("process") or "").lower()
+        wclass = str((window or {}).get("window_class") or "").lower()
+    except Exception:
+        return False
+    if process and (process == t.replace(" ", "")
+                    or process in _WINDOW_APP_ALIASES.get(t, ())):
+        return True
+    return bool(wclass and wclass in _WINDOW_CLASS_ALIASES.get(t, ()))
+
+
 def _finalize_window_targets(verb, action, candidates, exclusions=(),
                              except_clause_named=False, app_filter="",
                              requested_count=None, count_note=None,
@@ -957,7 +1100,7 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         except Exception:
             continue
         hit = next((e for e in (exclusions or [])
-                    if _match_window_token(title_lower, e)), None)
+                    if _window_matches_filter(w, e)), None)
         if hit is not None:
             kept_out.append(w.get("title"))
             kept_tokens.append(hit)
@@ -972,9 +1115,30 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         skipped = [w for w in targets if int(w.get("hwnd") or 0) in skips]
         kept_out.extend(w.get("title") for w in skipped)
         targets = [w for w in targets if int(w.get("hwnd") or 0) not in skips]
+    dropped_iconic = []
     if verb in ("minimize", "minimise"):
         # Minimizing an already-minimized window is a no-op — drop those.
+        dropped_iconic = [w for w in targets if w.get("iconic")]
         targets = [w for w in targets if not w.get("iconic")]
+    # [LIVE FIX 25 / B26] the named windows exist but are ALL already
+    # minimized: say so honestly, never "no windows" or "found only 0".
+    # (dropped_iconic holds exactly the exclusion/skip survivors that the
+    # no-op drop removed, so exclusions and "other"-skips never leak in.)
+    if (verb in ("minimize", "minimise") and not targets and not kept_out
+            and dropped_iconic and str(app_filter or "").strip()):
+        label = str(app_filter).strip()[:60]
+        return {
+            "ok": True,
+            "confidence": 0.99,
+            "summary": (
+                "That %s window is already minimized, sir." % label
+                if len(dropped_iconic) == 1 else
+                "All %d %s windows are already minimized, sir."
+                % (len(dropped_iconic), label)),
+            "needs_confirmation": False,
+            "reason": "",
+            "steps": [],
+        }
     if except_clause_named and not exclusions:
         return {
             "ok": False,
@@ -1166,8 +1330,7 @@ def _parse_referenced_window_command(command_text):
     app_filter = target.get("app_filter") or ""
     if app_filter:
         candidates = [w for w in candidates
-                      if _match_window_token(
-                          str(w.get("title") or "").lower(), app_filter)]
+                      if _window_matches_filter(w, app_filter)]
         if not candidates:
             return _failed_window_plan(
                 "I couldn't find any %s windows in that list, sir."
@@ -1231,14 +1394,21 @@ def _parse_qualified_window_command(command_text):
         quantifier = (m.group(2) or "").lower()
 
         app_filter = ""
-        fm = _QUALIFIED_APP_FILTER_RE.search(normalized)
+        # [LIVE FIX 25 / B25] parse ONLY the matched command span — the
+        # user's feedback ("you only minimized 1 ,") must never feed the
+        # filter (its digit used to win the quantifier and swallow the
+        # real command into the app name).
+        span = normalized[m.start(2):m.end()]
+        fm = _QUALIFIED_APP_FILTER_RE.match(span)
         if fm:
-            app_filter = re.sub(r"\s+", " ",
-                                (fm.group(1) or "")).strip().lower()
+            app_filter = re.sub(r"[^a-z0-9.+#\- ]", " ",
+                                (fm.group(1) or "").lower())
+            app_filter = re.sub(r"\s+", " ", app_filter).strip()
             if app_filter in ("", "the", "my"):
                 app_filter = ""
 
-        exclusions, except_clause_named = _parse_window_exclusions(normalized)
+        exclusions, except_clause_named = _parse_window_exclusions(
+            normalized[m.start():])
         windows = _list_managable_windows()
         if not windows:
             return _failed_window_plan(
@@ -1246,8 +1416,7 @@ def _parse_qualified_window_command(command_text):
         remember_window_enumeration(windows)
         if app_filter:
             windows = [w for w in windows
-                       if _match_window_token(
-                           str(w.get("title") or "").lower(), app_filter)]
+                       if _window_matches_filter(w, app_filter)]
             if not windows:
                 return _failed_window_plan(
                     "I couldn't find any %s windows, sir."
@@ -1270,26 +1439,31 @@ def _parse_qualified_window_command(command_text):
             skip_hwnds=skip_hwnds)
 
     # [LIVE FIX 24 / B18] an app-named target without a quantifier.
-    am = _APPNAMED_WINDOW_RE.search(normalized)
-    if not am:
+    # [LIVE FIX 25 / B25] first NAMED target wins: a bare object ("the
+    # window") defers to the active-window parser even when a later
+    # clause names an app.
+    am, app_filter = None, None
+    for cand in _APPNAMED_WINDOW_RE.finditer(normalized):
+        f = _extract_appnamed_filter(cand.group("object"))
+        if f is not None:
+            am, app_filter = cand, f
+            break
+    if am is None:
         return None
     verb = str(am.group(1) or "").lower()
     action = _QUALIFIED_VERB_ACTION.get(verb)
     if not action:
         return None
     noun = str(am.group("noun") or "").lower()
-    app_filter = _extract_appnamed_filter(am.group("object"))
-    if app_filter is None:
-        return None
-    exclusions, except_clause_named = _parse_window_exclusions(normalized)
+    exclusions, except_clause_named = _parse_window_exclusions(
+        normalized[am.start():])
     windows = _list_managable_windows()
     if not windows:
         return _failed_window_plan(
             "I couldn't list the open windows, sir — please try again.")
     remember_window_enumeration(windows)
     filtered = [w for w in windows
-                if _match_window_token(
-                    str(w.get("title") or "").lower(), app_filter)]
+                if _window_matches_filter(w, app_filter)]
     if not filtered:
         return _failed_window_plan(
             "I couldn't find any %s windows, sir." % app_filter[:60])
@@ -4537,6 +4711,19 @@ _vision_busy = threading.Lock()
 _response_callback = None
 
 
+def screen_planning_in_progress():
+    """True while a vision plan is being built. Never raises.
+
+    [LIVE FIX 25 / B29] single commands and chain steps hold the same
+    lock while planning, so the brain can tell "a step is still being
+    prepared" from "nothing is armed".
+    """
+    try:
+        return bool(_vision_busy.locked())
+    except Exception:
+        return False
+
+
 def set_response_callback(callback):
     """Register a callback(text) that delivers async screen-control results.
 
@@ -4697,21 +4884,43 @@ def maybe_handle_screen_control_message(text):
                 "and I'll redo it.")
 
     # Bug #10: "Try again" / "repeat that" support.
+    # [LIVE FIX 25 / B27] the NEWEST request wins: a failed attempt (no
+    # ledger entry) is retried instead of an older success. Deterministic
+    # commands always RE-PLAN (fresh enumeration) — never replayed, never
+    # sent to vision. Vision commands keep the Bug #10 rules unchanged.
     if screen_state.is_enabled() and _RETRY_RE.search(_normalize_text(text)):
         recent = screen_state.get_recent_interactions()
-        if recent and recent[-1].get("plan"):
-            age = time.time() - recent[-1].get("ts", 0)
-            if age > 30:
-                # Plan is stale — re-plan from scratch. F19: capture the
-                # generation *before* planning so a revocation during this
-                # re-plan cannot be adopted by the finished plan.
-                retry_generation = screen_state.generation()
-                retry_plan = _plan_with_tree(recent[-1]["command"])
-                if isinstance(retry_plan, dict):
-                    retry_plan["screen_generation"] = retry_generation
-                return _execute_or_queue(retry_plan, recent[-1]["command"])
-            return _execute_or_queue(recent[-1]["plan"], recent[-1]["command"])
-        return "I don't have a recent screen action to repeat, sir."
+        entry = recent[-1] if recent else None
+        req = screen_state.get_last_request()
+        if req.get("command") and (entry is None or float(
+                req.get("ts") or 0) > float((entry or {}).get("ts") or 0)):
+            cmd, entry = req["command"], None
+        elif entry is not None:
+            cmd = str(entry.get("command") or "")
+            if cmd.strip().lower() == "confirm":
+                cmd = str((entry.get("plan") or {}).get("command_text")
+                          or cmd)
+        else:
+            return "I don't have a recent screen action to repeat, sir."
+        retry_generation = screen_state.generation()
+        direct = _build_direct_plan(_strip_leading_fillers(cmd))
+        if direct:
+            direct["screen_generation"] = retry_generation
+            _notify_action_executed(cmd, "")
+            screen_state.note_request(cmd)
+            return _execute_or_queue(direct, cmd)
+        if entry is None or not entry.get("plan"):
+            retry_plan = _plan_with_tree(cmd)
+            if isinstance(retry_plan, dict):
+                retry_plan["screen_generation"] = retry_generation
+            return _execute_or_queue(retry_plan, cmd)
+        age = time.time() - entry.get("ts", 0)
+        if age > 30:
+            retry_plan = _plan_with_tree(cmd)
+            if isinstance(retry_plan, dict):
+                retry_plan["screen_generation"] = retry_generation
+            return _execute_or_queue(retry_plan, cmd)
+        return _execute_or_queue(entry["plan"], cmd)
 
     if not _looks_like_screen_command(text):
         return None
@@ -4735,6 +4944,8 @@ def maybe_handle_screen_control_message(text):
         # [LIVE FIX 22 / B11] register the request BEFORE the outcome: a
         # failed attempt still leaves the command repeatable/recallable.
         _notify_action_executed(command_text, "")
+        # [LIVE FIX 25 / B27] the newest request, whatever its outcome.
+        screen_state.note_request(command_text)
         return _execute_or_queue(direct_plan, command_text)
 
     # Vision plans are slow -- guard against duplicates and run in background.
@@ -4764,4 +4975,6 @@ def maybe_handle_screen_control_message(text):
     # lands later on the background thread, but a failure there must not
     # leave "Again." pointing at an older action.
     _notify_action_executed(command_text, "")
+    # [LIVE FIX 25 / B27] the newest request, whatever its outcome.
+    screen_state.note_request(command_text)
     return "Working on it, sir."
