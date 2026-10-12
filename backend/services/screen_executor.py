@@ -44,6 +44,10 @@ def _ensure_dpi_awareness():
 SW_RESTORE = 9
 SW_MAXIMIZE = 3
 SW_MINIMIZE = 6
+#: [LIVE FIX 23 / B16] the only reliable flag for minimizing a window
+#: owned by ANOTHER thread (the backend minimizing the user's apps) —
+#: plain SW_MINIMIZE from a foreign thread is silently ignored.
+SW_FORCEMINIMIZE = 11
 
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -181,12 +185,28 @@ _HWND_STATE_ACTIONS = {
 }
 
 
-def set_window_state_by_hwnd(hwnd, show_cmd):
+def _window_state_matches(hwnd, show_cmd):
+    """True when the window already sits in the requested state."""
+    try:
+        if show_cmd == SW_MINIMIZE:
+            return bool(user32.IsIconic(hwnd))
+        if show_cmd == SW_MAXIMIZE:
+            return bool(user32.IsZoomed(hwnd))
+        if show_cmd == SW_RESTORE:
+            return not bool(user32.IsIconic(hwnd))
+    except Exception:
+        return False
+    return False
+
+
+def set_window_state_by_hwnd(hwnd, show_cmd, failed=None):
     """Minimize/maximize/restore one window by identity, not focus.
 
-    Returns True when the state was set; False when the window closed
-    between plan and execution (skip it, never stop the rest of the
-    plan for it). Raises honestly on an unusable handle.
+    Returns True when the state was set AND verified; False when the
+    window closed between plan and execution (skip it, never stop the
+    rest of the plan for it) or when the state would not take (the hwnd
+    lands in *failed* when given, so the caller can report honestly
+    instead of claiming success). Raises honestly on an unusable handle.
     """
     try:
         hwnd = int(hwnd or 0)
@@ -204,8 +224,30 @@ def set_window_state_by_hwnd(hwnd, show_cmd):
         alive = 0
     if not alive:
         return False
-    user32.ShowWindow(hwnd, show_cmd)
-    return True
+    try:
+        want = int(show_cmd)
+    except (TypeError, ValueError):
+        want = SW_MINIMIZE
+    # [LIVE FIX 23 / B16] a cross-thread minimize must force: plain
+    # SW_MINIMIZE on a window the backend thread does not own is
+    # silently ignored, which used to report success while moving
+    # nothing.
+    cmd = SW_FORCEMINIMIZE if want == SW_MINIMIZE else want
+    try:
+        user32.ShowWindow(hwnd, cmd)
+    except Exception:
+        pass
+    if _window_state_matches(hwnd, want):
+        return True
+    time.sleep(0.35)
+    if _window_state_matches(hwnd, want):
+        return True
+    try:
+        if failed is not None:
+            failed.append(int(hwnd))
+    except Exception:
+        pass
+    return False
 
 
 def click(x, y, button="left", clicks=1):
@@ -476,6 +518,9 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
         with _effect_boundary(gate):
             pass
 
+    # [LIVE FIX 23 / B16] hwnds that refused their window state — the
+    # plan ends with an honest partial report, never a blanket "done".
+    _hwnd_failed = []
     for step in steps:
         action = (step.get("action") or "").lower()
 
@@ -559,8 +604,11 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
             elif action in _HWND_STATE_ACTIONS:
                 # [LIVE FIX 22] per-window identity action — a window that
                 # closed mid-plan is skipped, the rest still run.
+                # [LIVE FIX 23 / B16] a window that REFUSES its state is
+                # recorded for the honest partial report below.
                 set_window_state_by_hwnd(
-                    step.get("hwnd"), _HWND_STATE_ACTIONS[action])
+                    step.get("hwnd"), _HWND_STATE_ACTIONS[action],
+                    failed=_hwnd_failed)
             elif action == "scroll":
                 scroll(step.get("direction", "down"), step.get("amount", 600))
             elif action == "type":
@@ -577,3 +625,32 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
                 )
 
         time.sleep(0.12)
+
+    if _hwnd_failed:
+        # [LIVE FIX 23 / B16] partial window-state failure: the windows
+        # that moved stay moved — report exactly which ones refused, so
+        # the caller never claims a blanket success.
+        refused = set(_hwnd_failed)
+        failed_titles = []
+        total = 0
+        verb = "minimize"
+        for done_step in steps:
+            act = str(done_step.get("action") or "").lower()
+            if act not in _HWND_STATE_ACTIONS:
+                continue
+            total += 1
+            try:
+                handle = int(done_step.get("hwnd") or 0)
+            except (TypeError, ValueError):
+                handle = 0
+            if handle in refused:
+                failed_titles.append(
+                    str(done_step.get("title") or "a window")[:60])
+                verb = {"minimize_hwnd": "minimize",
+                        "maximize_hwnd": "maximize",
+                        "restore_hwnd": "restore"}.get(act, "minimize")
+        done = max(0, total - len(failed_titles))
+        names = ", ".join(failed_titles[:3])
+        raise RuntimeError(
+            "I managed to %s %d of %d windows, sir — %s wouldn't %s. "
+            "The rest are done." % (verb, done, total, names, verb))

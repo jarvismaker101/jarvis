@@ -206,6 +206,8 @@ class ComplaintRoutingTests(unittest.TestCase):
                 "steps": [{"kind": "screen_control",
                            "text": "click the search bar"},
                           {"kind": "screen_control", "text": "type hi"}]}
+        was_enabled = screen_state.is_enabled()
+        screen_state.set_enabled(True)
         brain._remember_chain_plan(plan, [
             {"kind": "screen_control", "status": "ok",
              "fragment": "Clicked it, sir."},
@@ -227,6 +229,8 @@ class ComplaintRoutingTests(unittest.TestCase):
                 brain.get_last_action()["command"],
                 "click the search bar then type hi")
         finally:
+            screen_state.set_enabled(was_enabled)
+            screen_state.clear_pending_plan()
             brain._remember_chain_plan(None, None)
             with brain._MI_CHAIN_LOCK:
                 brain._mi_chain_active = False

@@ -278,22 +278,29 @@ class ChainContinuationTests(unittest.TestCase):
     def test_followup_runs_only_the_new_step(self):
         self._seed()
         ran = []
+        # A control follow-up needs controls on (LIVE FIX 23 / B17 refuses
+        # honestly when they are off, instead of acking doomed steps).
+        was_enabled = screen_state.is_enabled()
+        screen_state.set_enabled(True)
+        try:
+            def fake_run(msg, plan, prior=None, tail=0):
+                ran.append(([s["text"] for s in plan["steps"]], prior, tail))
 
-        def fake_run(msg, plan, prior=None, tail=0):
-            ran.append(([s["text"] for s in plan["steps"]], prior, tail))
+            class SyncThread:
+                def __init__(self, target=None, args=(), **kwargs):
+                    self._target = target
+                    self._args = args
+                def start(self):
+                    self._target(*self._args)
 
-        class SyncThread:
-            def __init__(self, target=None, args=(), **kwargs):
-                self._target = target
-                self._args = args
-            def start(self):
-                self._target(*self._args)
-
-        with patch.object(brain, "_run_multi_intent_chain",
-                          side_effect=fake_run), \
-             patch.object(brain.threading, "Thread", SyncThread):
-            ack = brain._continue_chain(
-                "then click the search bar", "click the search bar")
+            with patch.object(brain, "_run_multi_intent_chain",
+                              side_effect=fake_run), \
+                 patch.object(brain.threading, "Thread", SyncThread):
+                ack = brain._continue_chain(
+                    "then click the search bar", "click the search bar")
+        finally:
+            screen_state.set_enabled(was_enabled)
+            screen_state.clear_pending_plan()
         self.assertIsNotNone(ack)
         self.assertIn("continuing", ack.lower())
         # The worker got old steps + 1 new step, with the old result

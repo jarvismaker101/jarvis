@@ -112,7 +112,13 @@ _SCREEN_CONTROL_RE = re.compile(
     # [LIVE FIX 22 / B9] ordinal play is a screen click ("play the first
     # video"); plain "play X" stays a tool request.
     r"|\bplay\b[^.?!]{0,32}\bthe\s+(?:first|second|third|fourth|fifth|"
-    r"top|next|last)\b",
+    r"top|next|last)\b"
+    # [LIVE FIX 23 / B14] a control verb aimed at the submit target
+    # ("click search", "press search", "tap the submit button") is a
+    # screen click — never a web-search step. Bare "search" alone keeps
+    # its own meaning (chain-level submit vs lookup).
+    r"|\b(click|double-?click|right-?click|tap|press|hit)\s+(?:the\s+)?"
+    r"(?:search|submit)\b",
     re.IGNORECASE,
 )
 
@@ -313,6 +319,14 @@ def build_chain(text):
         # bar" would grow a bogus web-search sibling.
         lookup_text = re.sub(r"search\s*(?:bar|box|field)", " ",
                              m["text"], flags=re.IGNORECASE)
+        # [LIVE FIX 23 / B14] same for a control verb aimed at the submit
+        # target ("click search") — the bare search word there is a
+        # button, never a lookup request. A REAL lookup keeps its own
+        # words ("…to search for flights" survives this strip).
+        lookup_text = re.sub(
+            r"\b(?:click|double-?click|right-?click|tap|press|hit)\s+"
+            r"(?:the\s+)?(?:search|submit)\b", " ",
+            lookup_text, flags=re.IGNORECASE)
         if (m["kind"] == "screen" and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):

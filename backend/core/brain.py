@@ -5367,7 +5367,34 @@ def is_bare_stop(text):
     return bool(_BARE_STOP_RE.match(t))
 
 
-def _stop_targets_still(cancelled_ids, had_browser, research_was):
+#: [LIVE FIX 23 / B15] "stop the task" is a real stop control, not chat:
+#: neither _BARE_STOP_RE ("stop it") nor _STOP_EVERYTHING_RE ("stop ALL
+#: tasks") matched it, so the intent router sent it to chat and the chat
+#: model fabricated "The task has been stopped." while the chain kept
+#: running. The target must sit DIRECTLY after the verb — "stop the
+#: BROWSER task" and "stop the RESEARCH" keep their dedicated earlier
+#: gates — and negation ("don't stop the task") never matches.
+_STOP_TASK_TARGET_RE = re.compile(
+    r"^\s*(?:jarvis[,\s]*)?(?:please\s+|just\s+|now\s+|kindly\s+)*"
+    r"(?:stop|cancel|halt|abort)\s+"
+    r"(?:the\s+|this\s+|that\s+|my\s+|current\s+)?"
+    r"(?:task|chain|chained\s+task|job|steps?|work(?:ing)?|"
+    r"this|that|it)\b"
+    r"(?:[\s,]+(?:now|please|sir|jarvis|at\s+once|right\s+now))*"
+    r"[.!]*$",
+    re.IGNORECASE)
+
+
+def is_stop_task_target(text):
+    """True when the WHOLE utterance stops the current task/chain."""
+    t = (text or "").strip()
+    if not t or _STOP_NEGATION_RE.search(t):
+        return False
+    return bool(_STOP_TASK_TARGET_RE.match(t))
+
+
+def _stop_targets_still(cancelled_ids, had_browser, research_was,
+                        chain_was=False):
     """Rank 5: are the things we stopped observably still?
 
     Background jobs we did NOT touch never block the "Stopped" report — a
@@ -5382,6 +5409,15 @@ def _stop_targets_still(cancelled_ids, had_browser, research_was):
         try:
             if opencode_task_in_progress() or not _browser_quiescent():
                 return False
+        except Exception:
+            pass
+    if chain_was:
+        # [LIVE FIX 23 / B15] a stopped chain is still only while its
+        # worker loop is exiting (it checks the stop event per step).
+        try:
+            with _MI_CHAIN_LOCK:
+                if _mi_chain_active:
+                    return False
         except Exception:
             pass
     try:
@@ -5413,14 +5449,22 @@ def _stop_report_text():
     return "Stopped, sir."
 
 
-def _finish_stop_reply(cancelled_ids, had_browser, research_was):
+def _finish_stop_reply(cancelled_ids, had_browser, research_was,
+                       chain_was=False):
     """Wait (bounded) for the stopped work to go quiet, then report once."""
     deadline = time.time() + _STOP_QUIESCE_TIMEOUT_S
     while time.time() < deadline:
-        if _stop_targets_still(cancelled_ids, had_browser, research_was):
+        if _stop_targets_still(cancelled_ids, had_browser, research_was,
+                               chain_was):
             break
         time.sleep(0.2)
-    if _stop_targets_still(cancelled_ids, had_browser, research_was):
+    if _stop_targets_still(cancelled_ids, had_browser, research_was,
+                           chain_was):
+        if chain_was:
+            # [LIVE FIX 23 / B15] the chain's own closing summary ("Stopped
+            # by your request, sir…") is the honest report — a second
+            # generic "Stopped, sir." on top of it would double-speak.
+            return
         _notify_async_reply(_stop_report_text())
     else:
         _notify_async_reply(
@@ -5452,6 +5496,16 @@ def handle_stop_message(msg, from_voice=False):
                 exclude_kinds=("request",))
     except Exception as exc:
         logging.warning("[STOP] job cancellation failed: %s", exc)
+    chain_was = False
+    try:
+        # [LIVE FIX 23 / B15] a running multi-intent chain is a stoppable
+        # target too — signal its worker; the loop exits between steps.
+        with _MI_CHAIN_LOCK:
+            chain_was = bool(_mi_chain_active)
+        if chain_was:
+            _mi_chain_stop.set()
+    except Exception as exc:
+        logging.warning("[STOP] chain cancellation failed: %s", exc)
     had_browser = False
     try:
         had_browser = bool(opencode_task_in_progress())
@@ -5497,13 +5551,13 @@ def handle_stop_message(msg, from_voice=False):
                 threading.Thread(target=_post, args=(path,), daemon=True).start()
             except Exception:
                 pass
-    if _stop_targets_still(cancelled, had_browser, research_was):
+    if _stop_targets_still(cancelled, had_browser, research_was, chain_was):
         # Everything is already still: "Stopped" is true right now.
         return _stop_report_text()
     try:
         threading.Thread(
             target=_finish_stop_reply,
-            args=(list(cancelled), had_browser, research_was),
+            args=(list(cancelled), had_browser, research_was, chain_was),
             daemon=True).start()
     except Exception:
         pass
@@ -6289,6 +6343,22 @@ def consume_screen_research_clarify(msg):
 _MI_CHAIN_LOCK = threading.Lock()
 _mi_chain_active = False
 
+#: [LIVE FIX 23 / B15] abort signal for a running multi-intent chain.
+#: handle_stop_message sets it when a chain is active; the chain loop
+#: checks it before every step (and inside the long steps) so "stop the
+#: task" actually stops the chain instead of letting later steps run.
+#: Cleared at every chain start site, never inside the worker (a stop
+#: arriving between spawn and first check must not be lost).
+_mi_chain_stop = threading.Event()
+
+
+def _chain_stop_requested():
+    """True when the user stopped the running chain."""
+    try:
+        return bool(_mi_chain_stop.is_set())
+    except Exception:
+        return False
+
 #: Live fix: remember the last finished chain so the SAME request arriving
 #: seconds later answers from that run instead of silently re-running it.
 _chain_memory_lock = threading.Lock()
@@ -6554,6 +6624,11 @@ def _mi_screen_control_step(step):
     if not text:
         return {"kind": "screen_control", "status": "failed",
                 "fragment": "I had nothing to do on the screen for that step."}
+    if _chain_stop_requested():
+        # [LIVE FIX 23 / B15] stop lands even mid-chain: no new planning
+        # or effects start after the user stopped the task.
+        return {"kind": "screen_control", "status": "stopped",
+                "fragment": "Stopped by your request."}
     # [LIVE FIX 22 / B9] ordinal play is a screen click ("play the first
     # video" starts playback by clicking it) — rephrase for the planner,
     # which plans clicks, not media verbs.
@@ -6579,6 +6654,11 @@ def _mi_screen_control_step(step):
         return {"kind": "screen_control", "status": "failed",
                 "fragment": str(plan.get("reason")
                                 or "I couldn't plan that screen action.")}
+    if _chain_stop_requested():
+        # [LIVE FIX 23 / B15] planned after the stop landed: drop the
+        # execution, never fire a step the user already cancelled.
+        return {"kind": "screen_control", "status": "stopped",
+                "fragment": "Stopped by your request."}
     try:
         status, out = _execute_plan_tagged(plan, text)
     except Exception as exc:
@@ -6597,6 +6677,10 @@ def _mi_screen_control_step(step):
 
 def _mi_screen_step(step):
     """Run one screen-analysis step; returns its result record."""
+    if _chain_stop_requested():
+        # [LIVE FIX 23 / B15] no new look starts after the stop.
+        return {"kind": "screen", "status": "stopped",
+                "fragment": "Stopped by your request."}
     if not _screen_qa_busy.acquire(timeout=30):
         return {"kind": "screen", "status": "failed",
                 "fragment": "I couldn't look at the screen — another "
@@ -6637,6 +6721,10 @@ def _mi_screen_step(step):
 
 def _mi_research_step(step, results):
     """Run one research step synchronously on the chain worker thread."""
+    if _chain_stop_requested():
+        # [LIVE FIX 23 / B15] no new lookup starts after the stop.
+        return {"kind": "research", "status": "stopped",
+                "fragment": "Stopped by your request."}
     prior = results[step["consumes"][0]] if step.get("consumes") else None
     obs_id = str(prior.get("output_obs_id") or "") if prior else ""
     creator_override = False
@@ -6744,6 +6832,11 @@ def _mi_research_step(step, results):
             return {"kind": "research", "status": "failed",
                     "fragment": "I could not tell which streamer or item you "
                                 "meant — name it and I will search at once."}
+        if _chain_stop_requested():
+            # [LIVE FIX 23 / B15] resolved after the stop landed: drop the
+            # lookup, never search for a cancelled chain.
+            return {"kind": "research", "status": "stopped",
+                    "fragment": "Stopped by your request."}
         deep = bool(re.search(r"\bdeep\s*(?:research|search)|deepsearch\b",
                               clause, re.IGNORECASE))
         _set_last_research_topic(query)
@@ -8431,6 +8524,10 @@ def consume_pending_file_name(msg):
 
 def _mi_task_step(msg, step, results):
     """Compose the file write and arm the ONE approval; nothing runs now."""
+    if _chain_stop_requested():
+        # [LIVE FIX 23 / B15] no new file job arms after the stop.
+        return {"kind": "task", "status": "stopped",
+                "fragment": "Stopped by your request."}
     clause = step.get("text") or ""
     if _MI_REPLICATE_RE.search(clause):
         # [LIVE FIX 12] A structure replication is a folder-tree rebuild,
@@ -8518,6 +8615,14 @@ def _run_multi_intent_chain(msg, plan, prior_results=None, tail_from=0):
     steps = plan.get("steps") or []
     try:
         for pos in range(len(results), len(steps)):
+            if _chain_stop_requested():
+                # [LIVE FIX 23 / B15] the user stopped the chain: every
+                # remaining step is skipped, never executed.
+                for rest in steps[pos:]:
+                    results.append({
+                        "kind": rest.get("kind"), "status": "stopped",
+                        "fragment": "Stopped by your request."})
+                break
             step = steps[pos]
             blocked = [j for j in (step.get("consumes") or [])
                        if j >= len(results)
@@ -8604,10 +8709,14 @@ def _finish_multi_intent(plan, results, tail_from=0):
     ok_bits = []
     bad_bits = []
     asked_bits = []
+    stopped = False
     # [LIVE FIX 21] a continuation only re-narrates its own new steps.
     for r in list(results or [])[max(0, tail_from):]:
         status = r.get("status")
-        if status == "armed":
+        if status == "stopped":
+            # [LIVE FIX 23 / B15] the user stopped the chain mid-run.
+            stopped = True
+        elif status == "armed":
             armed = r
         elif status == "asked":
             asked_bits.append(str(r.get("fragment") or ""))
@@ -8627,6 +8736,13 @@ def _finish_multi_intent(plan, results, tail_from=0):
         lead = " ".join(ok_bits).strip()
         reply = ("Sir, " + (lead + " " if lead else "")
                  + str(armed.get("prompt") or ""))
+    elif stopped:
+        # [LIVE FIX 23 / B15] a stopped chain reports the stop honestly —
+        # never a completion, never silence. The stored results keep the
+        # unfinished tail, so "do the rest" resumes from where it stopped.
+        lead = " ".join(ok_bits).strip()
+        reply = "Stopped by your request, sir." + (
+            " I had already " + lead if lead else "")
     elif asked_bits:
         lead = " ".join(ok_bits).strip()
         reply = ((lead + " ") if lead else "") + " ".join(asked_bits)
@@ -8753,10 +8869,19 @@ def _resume_chain_unfinished(msg, from_voice=False, voice_compact=False):
                 break
         if start >= len(steps):
             return _honest_idle
+        refusal = _chain_control_blocked(steps[start:])
+        if refusal:
+            # [LIVE FIX 23 / B17] resuming control work with controls off
+            # would refuse every step — say so up front instead.
+            return refusal
         with _MI_CHAIN_LOCK:
             if _mi_chain_active:
                 return ("Sir, another chained task is already running — "
                         "one moment.")
+            try:
+                _mi_chain_stop.clear()
+            except Exception:
+                pass
             _mi_chain_active = True
         try:
             threading.Thread(
@@ -8870,10 +8995,19 @@ def _continue_chain(msg, clause, from_voice=False, voice_compact=False):
         new_plan["source"] = str(
             last["plan"].get("source") or "") + " then " + clause.strip()
         new_plan["command_text"] = new_plan["source"]
+        refusal = _chain_control_blocked(new_plan["steps"][max(0, start):])
+        if refusal:
+            # [LIVE FIX 23 / B17] a control follow-up with controls off
+            # would be refused at execution — refuse honestly at ack time.
+            return refusal
         with _MI_CHAIN_LOCK:
             if _mi_chain_active:
                 return ("Sir, another chained task is already running — "
                         "one moment.")
+            try:
+                _mi_chain_stop.clear()
+            except Exception:
+                pass
             _mi_chain_active = True
         try:
             threading.Thread(
@@ -8894,10 +9028,36 @@ def _continue_chain(msg, clause, from_voice=False, voice_compact=False):
         return None
 
 
+def _chain_control_blocked(steps):
+    """Refusal line when the chain still has screen_control work to run
+    but screen controls are OFF; else None.
+
+    [LIVE FIX 23 / B17] the chain ack used to promise steps that every
+    execution gate then refused — the off state must surface at ack
+    time, like single commands do.
+    """
+    try:
+        if not any(str((s or {}).get("kind") or "") == "screen_control"
+                   for s in (steps or [])):
+            return None
+        from backend.services import screen_state as _screen_state
+        if _screen_state.is_enabled():
+            return None
+    except Exception:
+        return None
+    return ("Sir, screen controls are off — say 'turn on screen controls' "
+            "first, then ask me again.")
+
+
 def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
     """Ack the chain now, run it on a worker; returns the single ack line."""
     global _mi_chain_active
     sig = _chain_signature(plan)
+    refusal = _chain_control_blocked(plan.get("steps") or [])
+    if refusal:
+        # [LIVE FIX 23 / B17] controls off: refuse honestly up front,
+        # never start a worker whose every step is about to be refused.
+        return refusal
     with _MI_CHAIN_LOCK:
         if _mi_chain_active:
             with _chain_memory_lock:
@@ -8913,6 +9073,10 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
                 and time.time() - float(last.get("at") or 0.0) < 150.0):
             return _mi_clip("Sir, I did that a moment ago — "
                             + str(last.get("reply") or ""), 600)
+        try:
+            _mi_chain_stop.clear()
+        except Exception:
+            pass
         _mi_chain_active = True
     try:
         threading.Thread(
@@ -9692,7 +9856,8 @@ def _process_message_inner(
     # exact path) and BEFORE the confirmation gates, so a stop is never
     # eaten as an unclear answer to an armed preview.
     try:
-        if is_bare_stop(msg) or is_stop_everything(msg):
+        if (is_bare_stop(msg) or is_stop_everything(msg)
+                or is_stop_task_target(msg)):
             print("[STOP] General stop:", msg)
             response = handle_stop_message(msg, from_voice=from_voice)
             if from_voice and sync_voice:

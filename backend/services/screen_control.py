@@ -354,7 +354,12 @@ _SCREEN_CMD_BARE_RE = re.compile(
     r"|^\s*(?:please\s+|kindly\s+)?(?:press|hit|tap)\s+\S"
     r"|\bbackspace\b"
     r"|\bplay\b[^.?!]{0,32}\bthe\s+(?:first|second|third|fourth|fifth|"
-    r"top|next|last)\b",
+    r"top|next|last)\b"
+    # [LIVE FIX 23 / B14] a control verb on the submit target ("click
+    # search") is a complete click command — the vision planner targets
+    # the search button.
+    r"|\b(?:click|double-?click|right-?click|tap|press|hit)\s+"
+    r"(?:the\s+)?(?:search|submit)\b",
     re.IGNORECASE,
 )
 
@@ -756,11 +761,15 @@ def _parse_qualified_window_command(command_text):
             }
 
     kept_out = []
+    kept_tokens = []
     targets = []
     for w in windows:
         title_lower = w["title"].lower()
-        if any(_match_window_token(title_lower, e) for e in exclusions):
+        hit = next((e for e in exclusions
+                    if _match_window_token(title_lower, e)), None)
+        if hit is not None:
             kept_out.append(w["title"])
+            kept_tokens.append(hit)
             continue
         targets.append(w)
     if quantifier == "other":
@@ -813,8 +822,17 @@ def _parse_qualified_window_command(command_text):
         else "Maximizing" if verb.startswith("maxim") else "Restoring",
         len(targets), noun)
     if kept_out:
-        kept = sorted({t for t in kept_out}, key=len)[:2]
-        summary += " Leaving %s." % ", ".join(kept)[:80]
+        # [LIVE FIX 23 / B16] name the exclusion the user actually said
+        # ("Leaving Brave.") — never the raw window title with its tab
+        # notification count ("Leaving (22) YouTube - Brave.").
+        names = sorted(
+            {str(t[:1].upper() + t[1:]) for t in kept_tokens if t},
+            key=len)[:2]
+        if not names:
+            names = sorted(
+                {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
+                key=len)[:2]
+        summary += " Leaving %s." % ", ".join(names)[:80]
     return {
         "ok": True,
         "confidence": 0.99,
@@ -3533,8 +3551,62 @@ def _verify_action_locally(steps, capture=None, hwnd=None):
     return True
 
 
+def _verify_hwnd_state_steps(steps):
+    """Postcondition for per-window state steps (minimize_hwnd & co).
+
+    Returns True/False when the plan holds window-state steps, None when
+    it holds none (a window that vanished reads as a skip — the executor
+    already skipped those — and absence is not failure). The executor
+    verifies at effect time; this is the independent second check before
+    the plan reports success.
+    """
+    targets = [s for s in (steps or [])
+               if isinstance(s, dict)
+               and str(s.get("action") or "").lower() in (
+                   "minimize_hwnd", "maximize_hwnd", "restore_hwnd")]
+    if not targets:
+        return None
+    try:
+        import ctypes as _verify_ctypes
+        _verify_u32 = _verify_ctypes.windll.user32
+    except Exception:
+        return None
+    try:
+        for step in targets:
+            try:
+                hwnd = int(step.get("hwnd") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not hwnd:
+                continue
+            try:
+                alive = _verify_u32.IsWindow(hwnd)
+            except Exception:
+                return None
+            if not alive:
+                continue
+            action = str(step.get("action") or "").lower()
+            try:
+                if action == "minimize_hwnd":
+                    if not _verify_u32.IsIconic(hwnd):
+                        return False
+                elif action == "maximize_hwnd":
+                    if not _verify_u32.IsZoomed(hwnd):
+                        return False
+                elif _verify_u32.IsIconic(hwnd):
+                    return False
+            except Exception:
+                return None
+        return True
+    except Exception:
+        return None
+
+
 def _verify_action_with_steps(steps_description, steps=None, hwnd=None):
     """Verify action state locally first; cloud vision is opt-in."""
+    hwnd_verdict = _verify_hwnd_state_steps(steps)
+    if hwnd_verdict is not None:
+        return hwnd_verdict
     need_capture = bool(_typed_texts_from_steps(steps)) or _cloud_verification_enabled()
 
     if need_capture:
