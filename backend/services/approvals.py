@@ -204,6 +204,12 @@ _lock = threading.RLock()
 _pending: Optional[ApprovalRecord] = None
 _last_cancelled: Optional[ApprovalRecord] = None
 
+#: [LIVE FIX 24 / B21] the most recently EXPIRED approval, kept briefly so
+#: a late "confirm" gets an honest expiry reply instead of falling through
+#: to chat improvisation.
+_EXPIRED_GRACE_SECONDS = 90.0
+_last_expired = {"command": "", "at": 0.0}
+
 
 def arm(plan, command_text="", scope="screen", ttl=None, generation=0):
     """Register a plan as awaiting consent; returns the record."""
@@ -212,6 +218,7 @@ def arm(plan, command_text="", scope="screen", ttl=None, generation=0):
                           generation=generation)
     with _lock:
         _pending = record
+        _last_expired = {"command": "", "at": 0.0}
     return record
 
 
@@ -222,8 +229,33 @@ def pending(now=None):
         record = _pending
         if record is not None and record.is_expired(now):
             _pending = None
+            try:
+                _last_expired.update({
+                    "command": str(record.command or ""),
+                    "at": float(now if now is not None else time.time()),
+                })
+            except Exception:
+                pass
             return None
         return record
+
+
+def recently_expired(grace_seconds=None):
+    """The expired approval's command when it lapsed within the grace window.
+
+    Returns "" when nothing recently expired. Never raises.
+    """
+    try:
+        grace = (_EXPIRED_GRACE_SECONDS if grace_seconds is None
+                 else float(grace_seconds))
+        with _lock:
+            command = str(_last_expired.get("command") or "")
+            at = float(_last_expired.get("at") or 0.0)
+        if command and time.time() - at <= grace:
+            return command
+    except Exception:
+        pass
+    return ""
 
 
 def take(now=None):

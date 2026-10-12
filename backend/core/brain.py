@@ -27,7 +27,9 @@ from backend.services.screen_control import (
     _execute_plan_tagged,
     maybe_handle_screen_control_message,
     plan_command,
+    remember_window_enumeration,
     set_action_notifier,
+    set_plan_confirmed_callback,
     set_response_callback,
 )
 from backend.services.task_agent import (
@@ -319,8 +321,14 @@ _ACTION_CLAIM_RE = re.compile(
     # "On it", "Playing now", "Opening/Checking/Searching/Looking ... now",
     # "Navigating to ...", "I've opened ... for you".
     r"on\s+it|"
-    r"(?:playing|opening|checking|searching|looking|running|navigating)\s+.*\bnow\b|"
-    r"(?:playing|opening|checking|searching|looking|running|navigating)\b|"
+    # [LIVE FIX 24 / B21] screen-action narration ("Clicking 'Tab search',
+    # sir.") is a claim too — chat never performs clicks/types/minimizes.
+    r"(?:playing|opening|checking|searching|looking|running|navigating|"
+    r"clicking|typing|pressing|minimizing|minimising|maximizing|maximising|"
+    r"restoring|scrolling)\s+.*\bnow\b|"
+    r"(?:playing|opening|checking|searching|looking|running|navigating|"
+    r"clicking|typing|pressing|minimizing|minimising|maximizing|maximising|"
+    r"restoring|scrolling)\b|"
     r"back\s+in\s+a\s+moment|"
     r"(?:i(?:'ve| have)\s+)?(?:opened|started)\s+.*\bfor\s+you\b"
     r")\b",
@@ -2442,7 +2450,8 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "shell and browser actions are performed by task routes, never "
             "by this chat reply, so never say you cannot do them. Name "
             "capability as capability ('I can create files...') or ask for "
-            "the missing detail — never narrate an action as happening. "
+            "the missing detail — never narrate an action as happening "
+            "(never say 'Clicking ...', 'Minimizing ...', 'Typing ...'). "
             "This reply itself performs nothing: never claim an action is "
             "done, in progress, queued, or promised — if the request needs "
             "an action, ask for the missing detail instead. "
@@ -5522,7 +5531,8 @@ def handle_stop_message(msg, from_voice=False):
             invalidate_browser_runs("stop requested")
         except Exception:
             pass
-    if research_was:
+    if research_was or chain_was:
+        # [LIVE FIX 24 / B23] a running chain step is a research target too.
         try:
             request_research_stop()
         except Exception:
@@ -6610,7 +6620,7 @@ def _mi_aspect_suffix(clause, subject, query, obs_id):
     return [token for token in tokens if token[:4] not in query_low]
 
 
-def _mi_screen_control_step(step):
+def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
     """Run one screen-CONTROL step; returns its result record.
 
     [LIVE FIX 21] the step is PLANNED fresh here (against the screen as it
@@ -6619,6 +6629,9 @@ def _mi_screen_control_step(step):
     checks and verification all apply per step. A step that needs consent
     returns "armed": the chain stops and the user confirms that exact
     action (the existing pending-plan verdict path runs it).
+    [LIVE FIX 24 / B21] a chain-armed plan carries a longer approval TTL
+    and is tagged with its chain identity, so a later "confirm" executes
+    it AND resumes the chain tail instead of stranding it.
     """
     text = str(step.get("text") or "").strip()
     if not text:
@@ -6660,12 +6673,21 @@ def _mi_screen_control_step(step):
         return {"kind": "screen_control", "status": "stopped",
                 "fragment": "Stopped by your request."}
     try:
-        status, out = _execute_plan_tagged(plan, text)
+        status, out = _execute_plan_tagged(
+            plan, text, ttl=_MI_CHAIN_APPROVAL_TTL)
     except Exception as exc:
         return {"kind": "screen_control", "status": "failed",
                 "fragment": "That screen action failed (%s)."
                             % _mi_clip(exc, 80)}
     if status == "queued":
+        try:
+            if chain_plan is not None and chain_index is not None:
+                plan["chain_context"] = {
+                    "signature": _chain_signature(chain_plan),
+                    "step_index": int(chain_index),
+                }
+        except Exception:
+            pass
         return {"kind": "screen_control", "status": "armed",
                 "fragment": str(out), "prompt": str(out)}
     if status == "executed":
@@ -6840,11 +6862,24 @@ def _mi_research_step(step, results):
         deep = bool(re.search(r"\bdeep\s*(?:research|search)|deepsearch\b",
                               clause, re.IGNORECASE))
         _set_last_research_topic(query)
-        if deep:
-            overview = fetch_ai_overview_text(query)
-            result = run_research(query, pinned_overview=overview)
-        else:
-            result = run_quick_search(query)
+        # [LIVE FIX 24 / B23] register the running lookup exactly like
+        # handle_research_intent does, so a stop lands on it mid-flight
+        # (handle_stop_message only signals research it can see running).
+        global _research_running
+        _research_running = True
+        try:
+            clear_stop_request()
+            if deep:
+                overview = fetch_ai_overview_text(query)
+                result = run_research(query, pinned_overview=overview)
+            else:
+                result = run_quick_search(query)
+        finally:
+            _research_running = False
+            try:
+                clear_stop_request()
+            except Exception:
+                pass
     except Exception as exc:
         return {"kind": "research", "status": "failed",
                 "fragment": "I couldn't finish the research (%s)."
@@ -6852,9 +6887,11 @@ def _mi_research_step(step, results):
     if not isinstance(result, dict):
         return {"kind": "research", "status": "failed",
                 "fragment": "The research came back empty."}
-    if result.get("stopped"):
-        return {"kind": "research", "status": "failed",
-                "fragment": "The research was stopped."}
+    if result.get("stopped") or _chain_stop_requested():
+        # [LIVE FIX 24 / B23] a stopped lookup is "stopped", never a failure
+        # and never a spoken result the user cancelled.
+        return {"kind": "research", "status": "stopped",
+                "fragment": "Stopped by your request."}
     summary = str(result.get("spoken_summary")
                   or result.get("overview_text") or "").strip()
     content = str(result.get("detailed_markdown") or summary or "").strip()
@@ -7119,6 +7156,86 @@ def _repeatable_last_command():
     except Exception:
         pass
     return ""
+
+
+_WIN_CORR_VERB_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b", re.IGNORECASE)
+_WIN_CORR_NOUN_RE = re.compile(
+    r"\b(windows?|apps?|applications?|programs?)\b", re.IGNORECASE)
+
+#: [LIVE FIX 24 / B20] a window-target correction ("not the active window,
+#: the terminal window") revises the previous window action's target.
+_SCREEN_TARGET_CORRECTION_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s+)?"
+    r"(?:no|not|nope)\b([^,;.!?]{1,60}),\s*(.+?)\s*$",
+    re.IGNORECASE)
+
+
+def _last_window_action_verb():
+    """The verb of the recent window-management action, else "".
+
+    Prefers the cross-executor last-action registry, then the newest
+    screen-control interaction. Never raises.
+    """
+    try:
+        last = get_last_action() or {}
+        cmd = str(last.get("command") or "")
+        if cmd and (time.time() - float(last.get("at", 0.0))) < _LAST_ACTION_TTL:
+            verb = _WIN_CORR_VERB_RE.search(cmd)
+            if verb:
+                return verb.group(1).lower()
+    except Exception:
+        pass
+    try:
+        from backend.services import screen_state as _screen_state
+        recent = _screen_state.get_recent_interactions() or []
+        for entry in reversed(recent[-5:]):
+            cmd = str((entry or {}).get("command") or "")
+            verb = _WIN_CORR_VERB_RE.search(cmd)
+            if verb:
+                return verb.group(1).lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _screen_target_correction_command(msg):
+    """Rewrite a window-target correction to a fresh command, else None.
+
+    "not the active window, the terminal window" after a minimize becomes
+    "minimize the terminal window". A corrected half that already carries
+    its own action verb keeps the normal route. Never raises.
+    """
+    try:
+        m = _SCREEN_TARGET_CORRECTION_RE.match(msg or "")
+        if not m:
+            return None
+        # [LIVE FIX 24] the rejected half must name a window target ("the
+        # active window") — a leading "no" on any other turn ("no about
+        # zed ..., tell me ...") is not a screen correction. Recall turns
+        # never are either.
+        rejected = str(m.group(1) or "")
+        if not re.search(r"\b(window|active|foreground|front|screen)\b",
+                         rejected, re.IGNORECASE):
+            return None
+        try:
+            if _memory_recall_request(msg):
+                return None
+        except Exception:
+            pass
+        corrected = str(m.group(2) or "").strip().strip(" ,.")
+        if len(corrected) < 3 or len(corrected) > 80:
+            return None
+        if _WIN_CORR_VERB_RE.search(corrected):
+            return None
+        verb = _last_window_action_verb()
+        if not verb:
+            return None
+        if _WIN_CORR_NOUN_RE.search(corrected):
+            return "%s %s" % (verb, corrected)
+        return "%s the %s windows" % (verb, corrected)
+    except Exception:
+        return None
 
 
 #: [Live fix] The last replicate attempt (any path): its text, when it ran
@@ -8641,7 +8758,8 @@ def _run_multi_intent_chain(msg, plan, prior_results=None, tail_from=0):
             if step.get("kind") == "screen":
                 results.append(_mi_screen_step(step))
             elif step.get("kind") == "screen_control":
-                results.append(_mi_screen_control_step(step))
+                results.append(_mi_screen_control_step(
+                    step, chain_plan=plan, chain_index=pos))
             elif step.get("kind") == "research":
                 results.append(_mi_research_step(step, results))
             elif step.get("kind") == "task":
@@ -8762,6 +8880,9 @@ def _finish_multi_intent(plan, results, tail_from=0):
 #: starting over: the stored prefix results satisfy the new step's
 #: ``consumes`` links and only the new step runs.
 _CHAIN_FOLLOWUP_TTL = 600.0
+#: [LIVE FIX 24 / B21] a chain-armed approval outlives a single-turn one —
+#: the user reads, listens and thinks while the rest of the chain waits.
+_MI_CHAIN_APPROVAL_TTL = 300.0
 _chain_followup_lock = threading.Lock()
 _last_chain = {"plan": None, "results": None, "at": 0.0}
 
@@ -8940,6 +9061,80 @@ def _take_chain_plan():
         return None
 
 
+def _on_chain_plan_confirmed(chain_context, summary):
+    """Resume a chain tail after its armed step was confirmed and ran.
+
+    [LIVE FIX 24 / B21] confirming one step must not strand the rest: the
+    armed result is marked done and the remaining tail runs on a worker.
+    A stop in between, a stale store, or a signature mismatch resumes
+    nothing. Never raises; the confirmed action already spoke.
+    """
+    global _mi_chain_active
+    try:
+        if not isinstance(chain_context, dict):
+            return
+        if _chain_stop_requested():
+            return
+        last = _take_chain_plan()
+        if last is None:
+            return
+        plan = dict(last.get("plan") or {})
+        steps = list(plan.get("steps") or [])
+        if not steps:
+            return
+        if _chain_signature(plan) != str(
+                chain_context.get("signature") or ""):
+            return
+        try:
+            idx = int(chain_context.get("step_index"))
+        except (TypeError, ValueError):
+            return
+        if idx < 0 or idx >= len(steps):
+            return
+        results = [dict(r) for r in (last.get("results") or [])]
+        if len(results) <= idx:
+            return
+        confirmed = {
+            "kind": steps[idx].get("kind") or "screen_control",
+            "status": "ok",
+            "fragment": "Confirmed: %s" % str(summary or "done"),
+            "output_content": str(summary or ""),
+        }
+        prefix = results[:idx] + [confirmed]
+        start = idx + 1
+        if start >= len(steps):
+            _remember_chain_plan(
+                plan, prefix + [dict(r) for r in results[idx + 1:]])
+            return
+        if _chain_control_blocked(steps[start:]):
+            try:
+                _notify_async_reply(_chain_control_blocked(steps[start:]))
+            except Exception:
+                pass
+            return
+        with _MI_CHAIN_LOCK:
+            if _mi_chain_active:
+                return
+            try:
+                _mi_chain_stop.clear()
+            except Exception:
+                pass
+            _mi_chain_active = True
+        try:
+            threading.Thread(
+                target=_run_multi_intent_chain,
+                args=(str(plan.get("source") or plan.get("command_text")
+                         or ""),
+                      plan, prefix, start),
+                daemon=True).start()
+        except Exception as exc:
+            with _MI_CHAIN_LOCK:
+                _mi_chain_active = False
+            logging.warning("[CHAIN] confirmed-tail start failed: %s", exc)
+    except Exception as exc:
+        logging.warning("[CHAIN] confirmed-tail resume failed: %s", exc)
+
+
 def _continue_chain(msg, clause, from_voice=False, voice_compact=False):
     """Extend the last finished chain with one follow-up step.
 
@@ -9058,6 +9253,18 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False):
         # [LIVE FIX 23 / B17] controls off: refuse honestly up front,
         # never start a worker whose every step is about to be refused.
         return refusal
+    try:
+        # [LIVE FIX 24 / B22] a new chain supersedes a previous chain's
+        # still-pending approval (the "not tab search" rejection dies with
+        # its plan). Single-command approvals are left untouched.
+        from backend.services import screen_state as _screen_state
+        _stale = _screen_state.get_pending_plan()
+        if (isinstance(_stale, dict)
+                and isinstance(_stale.get("chain_context"), dict)):
+            _screen_state.clear_pending_plan()
+            print("[CHAIN] superseded chain approval cleared")
+    except Exception:
+        pass
     with _MI_CHAIN_LOCK:
         if _mi_chain_active:
             with _chain_memory_lock:
@@ -9766,6 +9973,21 @@ def _process_message_inner(
                 return correction_reply
     except Exception as exc:
         logging.warning("[CORRECTION] Revision handling failed: %s", exc)
+
+    # ── [LIVE FIX 24 / B20] a window-target correction re-targets the
+    # previous window action ("not the active window, the terminal
+    # window") instead of falling through to chat.
+    try:
+        _win_corr_cmd = _screen_target_correction_command(msg)
+    except Exception as exc:
+        logging.warning("[CORRECTION] Window-target rewrite failed: %s", exc)
+        _win_corr_cmd = None
+    if _win_corr_cmd:
+        print("[CORRECTION] Window target revised:", _win_corr_cmd)
+        return _process_message_inner(
+            _win_corr_cmd, from_voice=from_voice, sync_voice=sync_voice,
+            voice_compact=voice_compact, commit_response=commit_response,
+            stream_reply=None, progress=progress, request_id=request_id)
 
     # ── Live fix: "name it X" answers a pending folder-name ask ──
     # The chain folder step asked WHICH name to use; the next turn names it
@@ -10518,6 +10740,14 @@ def _process_message_inner(
                     except Exception:
                         pass
                 _set_last_screen_report(topic, tip, creator)
+                try:
+                    # [LIVE FIX 24 / B19] a window-naming answer also stores
+                    # the live enumeration, so "the first two that you
+                    # mentioned" resolves to this list.
+                    if re.search(r"\bwindows?\b", msg or "", re.IGNORECASE):
+                        remember_window_enumeration()
+                except Exception:
+                    pass
                 grounding_links = result.get("grounding_links", [])
                 show_images = result.get("show_images", False)
                 region = result.get("region")
@@ -10959,5 +11189,11 @@ def _process_message_inner(
 # break module load.
 try:
     set_action_notifier(note_executed_action)
+except Exception:
+    pass
+
+# [LIVE FIX 24 / B21] a confirmed chain-step plan resumes the chain tail.
+try:
+    set_plan_confirmed_callback(_on_chain_plan_confirmed)
 except Exception:
     pass

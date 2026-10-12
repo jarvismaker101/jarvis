@@ -390,6 +390,16 @@ _WHOLE_SCREEN_EXTRA_RE = re.compile(
 
 _INTERROGATIVE_PREFIX_RE = re.compile(r'^(what|which|how|where|who|why|when|whose)\b', re.IGNORECASE)
 
+#: [LIVE FIX 24 / B24] a question ABOUT an action ("can you identify the
+#: windows ... that you are trying to minimize") is screen Q&A, never a
+#: screen command — even though it names a UI noun and an action verb.
+_QUESTION_ABOUT_ACTION_RE = re.compile(
+    r"^\s*(?:can|could|would|will|do)\s+you\s+"
+    r"(?:identify|tell|show|list|name|describe|explain|say)\b"
+    r"|\b(?:identify|tell\s+me|show\s+me)\b[^.?!]{0,80}"
+    r"\b(?:that|which)\s+you\s+(?:are\s+)?(?:trying\s+to\s+|want\s+to\s+)?",
+    re.IGNORECASE)
+
 _MISSING_ELEMENT_PATTERNS = [
     "element id",
     "element_id",
@@ -426,6 +436,13 @@ def _looks_like_screen_command(text):
         has_ui_noun = bool(_SCREEN_CMD_UI_NOUN.search(normalized))
         has_action = bool(_SCREEN_CMD_ACTION_RE.search(normalized))
         if has_ui_noun and has_action:
+            # [LIVE FIX 24 / B24] a question ABOUT an action ("can you
+            # identify the windows ... that you are trying to minimize")
+            # falls through to screen Q&A instead of the vision planner.
+            if _INTERROGATIVE_PREFIX_RE.search(normalized):
+                return False
+            if _QUESTION_ABOUT_ACTION_RE.search(text):
+                return False
             return True
         # [LIVE FIX 22 / B9] bare element shapes ("type mr.beast") carry
         # no UI noun — matched directly so chain steps and single
@@ -529,17 +546,47 @@ def _parse_windows_shell_command(command_text):
     return None
 
 
-# A window command names a target BEYOND the bare active window ("all the
-# terminal windows", "the topmost window") — the instant direct plan only
-# minimizes/maximizes/restores the ACTIVE window, so a qualified request
-# must NOT be answered by it (it would do the narrower wrong thing, e.g.
-# minimizing one window when asked for all). Returning None defers to the
-# fuller path (vision plan with controls on, task route via the router).
+# A minimize command answers with the ACTIVE window only when its object is
+# bare ("minimize", "minimize it", "minimize the window on my screen"). Any
+# other target — a count ("the two terminal windows"), an app name ("the
+# brave window"), an exclusion, or a reference ("the first two that you
+# mentioned") — must NOT be answered by it. Returning None defers to the
+# fuller deterministic path below. [LIVE FIX 24 / B18]
 _WINDOW_QUALIFIER_RE = re.compile(
     r"\b(all|every|each|these|those|other|another|topmost|top\s*most|"
     r"sab|sabhi|saare|saari|sare|sabse\s+upar)\b",
     re.IGNORECASE,
 )
+
+_ACTIVE_WINDOW_FILLERS = frozenset({
+    "the", "a", "an", "my", "this", "that", "it", "them",
+    "active", "current", "front", "foreground", "open",
+    "window", "windows", "app", "apps", "application", "applications",
+    "program", "programs", "on", "at", "my", "screen", "desktop",
+    "please", "sir", "jarvis", "again", "now", "once",
+})
+
+_WINDOW_COUNT_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+_WINDOW_ORDINAL_START = {
+    "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
+}
+
+
+def _is_bare_active_window(normalized):
+    """True only for a bare active-window minimize ("minimize the window").
+
+    Anything else in the verb's object (a count, an app name, "except",
+    a reference) means the active-window plan must not answer.
+    """
+    m = re.search(r"\b(minimize|minimise)\b", normalized or "")
+    if not m:
+        return False
+    tail = re.findall(r"[a-z0-9]+", str(normalized[m.end():]).lower())
+    return not [w for w in tail if w not in _ACTIVE_WINDOW_FILLERS]
 
 
 def _parse_window_command(command_text):
@@ -547,7 +594,11 @@ def _parse_window_command(command_text):
 
     if any(word in normalized for word in ("minimize", "minimise")):
         # [LIVE FIX 20 / bug 1] qualified targets defer — see above.
+        # [LIVE FIX 24 / B18] defer-by-default: only the bare object
+        # stays on the active-window plan.
         if _WINDOW_QUALIFIER_RE.search(normalized):
+            return None
+        if not _is_bare_active_window(normalized):
             return None
         return {
             "ok": True,
@@ -588,19 +639,49 @@ def _parse_window_command(command_text):
 #: exclusions: its only window primitive minimizes the foreground).
 _QUALIFIED_WINDOW_RE = re.compile(
     r"\b(minimize|minimise|maximize|maximise|restore)\b"
-    r"[^.?!]{0,64}\b(all|every|each|other|another|sab|sabhi|saare|saari|"
-    r"sare)\b[^.?!]{0,64}\b(windows?|apps?|applications?|programs?)\b",
+    r"[^.?!]{0,64}\b(all|every|each|these|those|other|another|both|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|\d+|"
+    r"sab|sabhi|saare|saari|sare)\b"
+    r"[^.?!]{0,64}\b(windows?|apps?|applications?|programs?)\b",
     re.IGNORECASE,
 )
 
 #: Optional app filter between the quantifier and "windows" ("minimize all
-#: the TERMINAL windows").
+#: the TERMINAL windows", "minimize the two terminal windows").
 _QUALIFIED_APP_FILTER_RE = re.compile(
-    r"\b(?:all|every|each|other|another|sab|sabhi|saare|saari|sare)\b"
+    r"\b(?:all|every|each|these|those|other|another|both|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|\d+|"
+    r"sab|sabhi|saare|saari|sare)\b"
     r"\s+(?:the\s+|my\s+)?(.*?)\s*\b(?:windows?|apps?|applications?|"
     r"programs?)\b",
     re.IGNORECASE,
 )
+
+#: [LIVE FIX 24 / B18] an app-named target without a quantifier ("minimize
+#: the brave window", "minimize terminal windows") is a deterministic
+#: filtered plan, never the active window.
+_APPNAMED_WINDOW_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b"
+    r"(?P<object>[^.?!]{1,64})"
+    r"\b(?P<noun>windows?|apps?|applications?|programs?)\b",
+    re.IGNORECASE,
+)
+_APPNAMED_SINGULAR_NOUNS = frozenset(
+    {"window", "app", "application", "program"})
+
+#: [LIVE FIX 24 / B19] a reference to a previously named window list
+#: ("minimize the first two that you mentioned").
+_WINDOW_REFERENCE_MARK_RE = re.compile(
+    r"\bthat\s+you\s+(?:mentioned|said|listed|named|found|showed)\b"
+    r"|\byou\s+(?:mentioned|said|listed|named|found|showed)\b",
+    re.IGNORECASE,
+)
+_REFERENCE_FILLERS = frozenset({
+    "the", "a", "an", "my", "these", "those", "this", "that", "which",
+    "window", "windows", "app", "apps", "application", "applications",
+    "program", "programs", "one", "ones", "them", "those", "these",
+    "on", "my", "screen", "desktop", "visible", "please", "sir",
+})
 
 _EXCEPT_CLAUSE_RE = re.compile(
     r"\b(?:except|excluding|exclude|but\s+not|leaving|leave|keep(?:ing)?"
@@ -617,6 +698,78 @@ _EXCEPT_FILLERS = frozenset({
 _BROWSER_TOKENS = ("brave", "chrome", "msedge", "edge", "firefox",
                    "opera", "vivaldi", "arc")
 
+def _window_count_for_quantifier(quantifier):
+    """Explicit window count for a quantifier word, else None."""
+    q = str(quantifier or "").strip().lower()
+    if not q:
+        return None
+    if q == "both":
+        return 2
+    if q in _WINDOW_COUNT_WORDS:
+        return _WINDOW_COUNT_WORDS[q]
+    if re.fullmatch(r"\d+", q):
+        try:
+            return int(q)
+        except ValueError:
+            return None
+    return None
+
+
+_APPNAMED_BARE_FILLERS = frozenset({
+    "the", "a", "an", "my", "this", "that", "it", "them",
+    "active", "current", "front", "foreground", "open",
+    "window", "windows", "app", "apps", "application", "applications",
+    "program", "programs", "on", "at", "my", "screen", "desktop",
+    "please", "sir", "jarvis", "again", "now", "once",
+})
+
+
+def _parse_window_exclusions(normalized):
+    """Parse an "except X" clause; returns (exclusions, named)."""
+    exclusions = []
+    except_clause_named = False
+    em = _EXCEPT_CLAUSE_RE.search(normalized or "")
+    if em:
+        except_clause_named = True
+        raw = (em.group(1) or "").strip()
+        parts = [p.strip() for p in _EXCEPT_SPLIT_RE.split(raw) if p.strip()]
+        for part in parts:
+            words = [w for w in re.split(r"\s+", part.lower())
+                     if w and w not in _EXCEPT_FILLERS]
+            token = " ".join(words).strip()
+            if token:
+                exclusions.append(token)
+        if not exclusions and "browser" in raw.lower():
+            # "except for the browser" names no app — keep every browser.
+            exclusions.extend(list(_BROWSER_TOKENS))
+    return exclusions, except_clause_named
+
+
+def _failed_window_plan(reason):
+    """A failed direct plan with the honest spoken reason."""
+    return {
+        "ok": False,
+        "confidence": 0.0,
+        "summary": "",
+        "needs_confirmation": False,
+        "reason": reason,
+        "steps": [],
+    }
+
+
+def _extract_appnamed_filter(object_text):
+    """App words before the window noun ("the BRAVE window").
+
+    Returns None for a bare object ("the window on my screen"), so the
+    active-window parser still answers it.
+    """
+    words = re.findall(r"[a-z0-9]+", str(object_text or "").lower())
+    content = [w for w in words if w not in _APPNAMED_BARE_FILLERS]
+    if not content:
+        return None
+    return re.sub(r"\s+", " ", " ".join(content)).strip()[:60]
+
+
 _QUALIFIED_VERB_ACTION = {
     "minimize": "minimize_hwnd",
     "minimise": "minimize_hwnd",
@@ -630,7 +783,7 @@ def _list_managable_windows():
     """Visible titled top-level windows, oldest API, no model involved.
 
     Skips Jarvis's own windows, untitled helpers and the Program Manager.
-    Returns [{"hwnd", "title", "iconic"}]; [] when enumeration is
+    Returns [{"hwnd", "title", "iconic", "rect"}]; [] when enumeration is
     unavailable. Never raises.
     """
     try:
@@ -668,8 +821,26 @@ def _list_managable_windows():
                     iconic = bool(user32.IsIconic(hwnd))
                 except Exception:
                     iconic = False
+                # [LIVE FIX 24 / B19] capture bounds so references like
+                # "the first two" resolve spatially (top-left first), the
+                # same order a screen answer describes.
+                try:
+                    _rect = wintypes.RECT()
+                    _has_rect = bool(user32.GetWindowRect(
+                        hwnd, ctypes.byref(_rect)))
+                except Exception:
+                    _has_rect = False
+                    _rect = None
+                if _has_rect and _rect is not None:
+                    rect_info = {
+                        "left": int(_rect.left), "top": int(_rect.top),
+                        "width": int(_rect.right - _rect.left),
+                        "height": int(_rect.bottom - _rect.top),
+                    }
+                else:
+                    rect_info = None
                 out.append({"hwnd": int(hwnd), "title": title,
-                            "iconic": iconic})
+                            "iconic": iconic, "rect": rect_info})
             except Exception:
                 pass
             return True
@@ -679,6 +850,78 @@ def _list_managable_windows():
     except Exception:
         return []
     return out
+
+
+#: [LIVE FIX 24 / B19] the last seen window list, so a follow-up naming a
+#: position in it ("the first two that you mentioned") resolves instead of
+#: falling back to the active window. Entries are spatially sorted.
+_WINDOW_ENUM_TTL = 300.0
+_window_enum_lock = threading.Lock()
+_last_window_enumeration = {"windows": [], "at": 0.0}
+
+
+def _sort_windows_spatially(windows):
+    """Top-left first; entries without bounds keep enumeration order."""
+    def _key(item):
+        try:
+            rect = (item or {}).get("rect") or {}
+            top = rect.get("top")
+            left = rect.get("left")
+            if top is None or left is None:
+                return (10 ** 9, 10 ** 9, int((item or {}).get("hwnd") or 0))
+            return (int(top), int(left), int((item or {}).get("hwnd") or 0))
+        except Exception:
+            return (10 ** 9, 10 ** 9, 0)
+
+    try:
+        return sorted(list(windows or []), key=_key)
+    except Exception:
+        return list(windows or [])
+
+
+def remember_window_enumeration(windows=None):
+    """Store the current (or supplied) window list for reference follow-ups.
+
+    [LIVE FIX 24 / B19] called after qualified listings and screen answers
+    that name windows. Returns the stored list. Never raises.
+    """
+    try:
+        listed = _sort_windows_spatially(
+            list(windows) if windows is not None
+            else _list_managable_windows())
+    except Exception:
+        listed = []
+    try:
+        with _window_enum_lock:
+            _last_window_enumeration.update(
+                {"windows": [dict(w) for w in listed],
+                 "at": time.time()})
+    except Exception:
+        pass
+    return listed
+
+
+def _recent_window_enumeration():
+    """The stored enumeration when fresh, else []. Never raises."""
+    try:
+        with _window_enum_lock:
+            stored = list(_last_window_enumeration.get("windows") or [])
+            at = float(_last_window_enumeration.get("at") or 0.0)
+        if not stored or time.time() - at > _WINDOW_ENUM_TTL:
+            return []
+        return stored
+    except Exception:
+        return []
+
+
+def _clear_window_enumeration():
+    """Forget the stored enumeration (tests call this for isolation)."""
+    try:
+        with _window_enum_lock:
+            _last_window_enumeration.update({"windows": [], "at": 0.0})
+    except Exception:
+        pass
+    return []
 
 
 def _match_window_token(title_lower, token):
@@ -692,97 +935,43 @@ def _match_window_token(title_lower, token):
     return bool(words) and all(w in title_lower for w in words)
 
 
-def _parse_qualified_window_command(command_text):
-    """Deterministic all-windows plan with exclusions (no vision).
+def _finalize_window_targets(verb, action, candidates, exclusions=(),
+                             except_clause_named=False, app_filter="",
+                             requested_count=None, count_note=None,
+                             skip_hwnds=()):
+    """Turn enumerated windows into an honest per-window plan (no vision).
 
-    "minimize all the windows on my screen except for the brave browser"
-    becomes one minimize_hwnd step per enumerated window minus the
-    exclusions. Returns None when the text is not a qualified window
-    command; a FAILED plan dict (honest reason) when it is but has no
-    usable targets, so the caller reports instead of vision-planning.
+    Applies exclusions, drops no-op minimizes, honors an explicit count,
+    and reports honestly when nothing usable remains. Never raises.
     """
-    normalized = _normalize_text(command_text)
-    m = _QUALIFIED_WINDOW_RE.search(normalized)
-    if not m:
-        return None
-    verb = m.group(1).lower()
-    action = _QUALIFIED_VERB_ACTION.get(verb)
-    if not action:
-        return None
-    quantifier = (m.group(2) or "").lower()
-
-    app_filter = ""
-    fm = _QUALIFIED_APP_FILTER_RE.search(normalized)
-    if fm:
-        app_filter = re.sub(r"\s+", " ", (fm.group(1) or "")).strip().lower()
-        if app_filter in ("", "the", "my"):
-            app_filter = ""
-
-    exclusions = []
-    except_clause_named = False
-    em = _EXCEPT_CLAUSE_RE.search(normalized)
-    if em:
-        except_clause_named = True
-        raw = (em.group(1) or "").strip()
-        parts = [p.strip() for p in _EXCEPT_SPLIT_RE.split(raw) if p.strip()]
-        for part in parts:
-            words = [w for w in re.split(r"\s+", part.lower())
-                     if w and w not in _EXCEPT_FILLERS]
-            token = " ".join(words).strip()
-            if token:
-                exclusions.append(token)
-        if not exclusions and "browser" in raw.lower():
-            # "except for the browser" names no app — keep every browser.
-            exclusions.extend(list(_BROWSER_TOKENS))
-
-    windows = _list_managable_windows()
-    if not windows:
-        return {
-            "ok": False,
-            "confidence": 0.0,
-            "summary": "",
-            "needs_confirmation": False,
-            "reason": "I couldn't list the open windows, sir — "
-                      "please try again.",
-            "steps": [],
-        }
-    if app_filter:
-        windows = [w for w in windows
-                   if _match_window_token(w["title"].lower(), app_filter)]
-        if not windows:
-            return {
-                "ok": False,
-                "confidence": 0.0,
-                "summary": "",
-                "needs_confirmation": False,
-                "reason": "I couldn't find any %s windows, sir."
-                          % app_filter[:60],
-                "steps": [],
-            }
-
     kept_out = []
     kept_tokens = []
     targets = []
-    for w in windows:
-        title_lower = w["title"].lower()
-        hit = next((e for e in exclusions
+    try:
+        ordered = _sort_windows_spatially(candidates)
+    except Exception:
+        ordered = list(candidates or [])
+    for w in ordered:
+        try:
+            title_lower = str(w.get("title") or "").lower()
+        except Exception:
+            continue
+        hit = next((e for e in (exclusions or [])
                     if _match_window_token(title_lower, e)), None)
         if hit is not None:
-            kept_out.append(w["title"])
+            kept_out.append(w.get("title"))
             kept_tokens.append(hit)
             continue
         targets.append(w)
-    if quantifier == "other":
+    try:
+        skips = {int(h) for h in (skip_hwnds or ()) if int(h or 0)}
+    except (TypeError, ValueError):
+        skips = set()
+    if skips:
         # "all OTHER windows" — everything but the foreground one.
-        try:
-            import ctypes
-            fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
-        except Exception:
-            fg = 0
-        if fg:
-            skipped = [w for w in targets if w["hwnd"] == fg]
-            kept_out.extend(w["title"] for w in skipped)
-            targets = [w for w in targets if w["hwnd"] != fg]
+        skipped = [w for w in targets if int(w.get("hwnd") or 0) in skips]
+        kept_out.extend(w.get("title") for w in skipped)
+        targets = [w for w in targets if int(w.get("hwnd") or 0) not in skips]
     if verb in ("minimize", "minimise"):
         # Minimizing an already-minimized window is a no-op — drop those.
         targets = [w for w in targets if not w.get("iconic")]
@@ -796,6 +985,41 @@ def _parse_qualified_window_command(command_text):
                       "name it once and I'll leave it.",
             "steps": [],
         }
+    total_matches = len(targets)
+    if requested_count is not None:
+        try:
+            wanted = int(requested_count)
+        except (TypeError, ValueError):
+            wanted = 0
+        if wanted <= 0:
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": "I need a window count of one or more, sir.",
+                "steps": [],
+            }
+        if total_matches < wanted:
+            label = str(app_filter or "matching").strip() or "matching"
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": ("I found only %d %s window%s, sir — not the "
+                           "%d you named.")
+                          % (total_matches, label[:60],
+                             "" if total_matches == 1 else "s", wanted),
+                "steps": [],
+            }
+        if total_matches > wanted:
+            targets = targets[:wanted]
+            if not count_note:
+                scope = (" %s" % str(app_filter)[:40]
+                         if str(app_filter or "").strip() else "")
+                count_note = (" (first %d of %d%s windows)"
+                              % (wanted, total_matches, scope))
     if not targets:
         if kept_out:
             return {
@@ -821,6 +1045,8 @@ def _parse_qualified_window_command(command_text):
         "Minimizing" if verb.startswith("minim")
         else "Maximizing" if verb.startswith("maxim") else "Restoring",
         len(targets), noun)
+    if count_note:
+        summary += str(count_note)[:90]
     if kept_out:
         # [LIVE FIX 23 / B16] name the exclusion the user actually said
         # ("Leaving Brave.") — never the raw window title with its tab
@@ -833,6 +1059,8 @@ def _parse_qualified_window_command(command_text):
                 {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
                 key=len)[:2]
         summary += " Leaving %s." % ", ".join(names)[:80]
+    effect = ("Minimize" if verb.startswith("minim")
+              else "Maximize" if verb.startswith("maxim") else "Restore")
     return {
         "ok": True,
         "confidence": 0.99,
@@ -841,9 +1069,234 @@ def _parse_qualified_window_command(command_text):
         "reason": "",
         "steps": [{"action": action, "hwnd": w["hwnd"],
                    "title": w["title"],
-                   "description": "Minimize '%s'" % w["title"][:80]}
+                   "description": "%s '%s'" % (effect, w["title"][:80])}
                   for w in targets],
     }
+
+
+def _parse_reference_target(phrase):
+    """Resolve "the first two terminal" to (start, count, app_filter).
+
+    Returns None when the phrase names no usable position/count/all. Never
+    raises.
+    """
+    text = str(phrase or "").lower()
+    ordinal = None
+    ordinal_m = re.search(
+        r"\b(first|second|third|fourth|fifth|last)\b", text)
+    if ordinal_m:
+        ordinal = ordinal_m.group(1)
+    count = None
+    count_m = re.search(
+        r"\b(both|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b",
+        text)
+    if count_m:
+        token = count_m.group(1)
+        if token == "both":
+            count = 2
+        elif token in _WINDOW_COUNT_WORDS:
+            count = _WINDOW_COUNT_WORDS[token]
+        else:
+            try:
+                count = int(token)
+            except ValueError:
+                count = None
+    from_end = ordinal == "last"
+    if ordinal is not None and not from_end:
+        start = _WINDOW_ORDINAL_START.get(ordinal, 0)
+        wanted = count if count is not None else 1
+    elif from_end:
+        start = 0
+        wanted = count if count is not None else 1
+    elif count is not None:
+        start = 0
+        wanted = count
+    elif re.search(r"\b(ones|them|those|these)\b", text):
+        start = 0
+        wanted = None
+    else:
+        return None
+
+    words = re.findall(r"[a-z0-9]+", text)
+    kept = []
+    for w in words:
+        if w in _REFERENCE_FILLERS:
+            continue
+        if w in _WINDOW_ORDINAL_START or w == "last":
+            continue
+        if w in _WINDOW_COUNT_WORDS or w == "both" or re.fullmatch(r"\d+", w):
+            continue
+        kept.append(w)
+    app_filter = re.sub(r"\s+", " ", " ".join(kept)).strip()[:60]
+    return {"start": start, "count": wanted, "from_end": from_end,
+            "app_filter": app_filter}
+
+
+def _parse_referenced_window_command(command_text):
+    """A window verb aimed at a previously named list (no vision).
+
+    "minimize the first two that you mentioned" resolves against the stored
+    enumeration. Returns None when the text carries no such reference; a
+    FAILED plan dict when it does but the list/targets are unusable.
+    """
+    normalized = _normalize_text(command_text)
+    verb_m = re.search(r"\b(minimize|minimise|maximize|maximise|restore)\b",
+                       normalized)
+    if not verb_m:
+        return None
+    verb = verb_m.group(1).lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    after = normalized[verb_m.end():verb_m.end() + 96]
+    mark = _WINDOW_REFERENCE_MARK_RE.search(after)
+    if not mark:
+        return None
+    target = _parse_reference_target(after[:mark.start()])
+    if target is None:
+        return _failed_window_plan(
+            "I couldn't tell which windows from that list you meant, sir — "
+            "say the first two and I'll do it.")
+    stored = _recent_window_enumeration()
+    if not stored:
+        return _failed_window_plan(
+            "I don't have that window list anymore, sir — name them once "
+            "and I'll do it.")
+    candidates = list(stored)
+    app_filter = target.get("app_filter") or ""
+    if app_filter:
+        candidates = [w for w in candidates
+                      if _match_window_token(
+                          str(w.get("title") or "").lower(), app_filter)]
+        if not candidates:
+            return _failed_window_plan(
+                "I couldn't find any %s windows in that list, sir."
+                % app_filter[:60])
+    wanted = target.get("count")
+    if wanted is None:
+        selected = candidates
+        count_note = None
+    else:
+        try:
+            need = int(wanted)
+        except (TypeError, ValueError):
+            need = 0
+        if need <= 0 or len(candidates) < need:
+            label = (str(app_filter).strip() or "matching")[:60]
+            return _failed_window_plan(
+                "I have only %d %s window%s in that list, sir."
+                % (len(candidates), label,
+                   "" if len(candidates) == 1 else "s"))
+        if target.get("from_end"):
+            selected = candidates[-need:]
+            edge = "last"
+        else:
+            start = int(target.get("start") or 0)
+            if start < 0 or start + need > len(candidates):
+                return _failed_window_plan(
+                    "That position is past the end of that window list, "
+                    "sir.")
+            selected = candidates[start:start + need]
+            edge = "first"
+        if len(candidates) > need:
+            scope = (" %s" % app_filter[:40]
+                     if str(app_filter or "").strip() else "")
+            count_note = (" (%s %d of %d%s windows)"
+                          % (edge, need, len(candidates), scope))
+        else:
+            count_note = None
+    return _finalize_window_targets(
+        verb, action, selected, (), False, app_filter=app_filter,
+        requested_count=None, count_note=count_note)
+
+
+def _parse_qualified_window_command(command_text):
+    """Deterministic multi-window plan with exclusions (no vision).
+
+    "minimize all the windows on my screen except for the brave browser"
+    becomes one minimize_hwnd step per enumerated window minus the
+    exclusions; so does a counted set ("the two terminal windows") or an
+    app-named target ("the brave window"). Returns None when the text is
+    not a qualified window command; a FAILED plan dict (honest reason)
+    when it is but has no usable targets, so the caller reports instead
+    of vision-planning.
+    """
+    normalized = _normalize_text(command_text)
+    m = _QUALIFIED_WINDOW_RE.search(normalized)
+    if m:
+        verb = m.group(1).lower()
+        action = _QUALIFIED_VERB_ACTION.get(verb)
+        if not action:
+            return None
+        quantifier = (m.group(2) or "").lower()
+
+        app_filter = ""
+        fm = _QUALIFIED_APP_FILTER_RE.search(normalized)
+        if fm:
+            app_filter = re.sub(r"\s+", " ",
+                                (fm.group(1) or "")).strip().lower()
+            if app_filter in ("", "the", "my"):
+                app_filter = ""
+
+        exclusions, except_clause_named = _parse_window_exclusions(normalized)
+        windows = _list_managable_windows()
+        if not windows:
+            return _failed_window_plan(
+                "I couldn't list the open windows, sir — please try again.")
+        remember_window_enumeration(windows)
+        if app_filter:
+            windows = [w for w in windows
+                       if _match_window_token(
+                           str(w.get("title") or "").lower(), app_filter)]
+            if not windows:
+                return _failed_window_plan(
+                    "I couldn't find any %s windows, sir."
+                    % app_filter[:60])
+
+        skip_hwnds = set()
+        if quantifier == "other":
+            # "all OTHER windows" — everything but the foreground one.
+            try:
+                import ctypes
+                fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            except Exception:
+                fg = 0
+            if fg:
+                skip_hwnds = {fg}
+        return _finalize_window_targets(
+            verb, action, windows, exclusions, except_clause_named,
+            app_filter=app_filter,
+            requested_count=_window_count_for_quantifier(quantifier),
+            skip_hwnds=skip_hwnds)
+
+    # [LIVE FIX 24 / B18] an app-named target without a quantifier.
+    am = _APPNAMED_WINDOW_RE.search(normalized)
+    if not am:
+        return None
+    verb = str(am.group(1) or "").lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    noun = str(am.group("noun") or "").lower()
+    app_filter = _extract_appnamed_filter(am.group("object"))
+    if app_filter is None:
+        return None
+    exclusions, except_clause_named = _parse_window_exclusions(normalized)
+    windows = _list_managable_windows()
+    if not windows:
+        return _failed_window_plan(
+            "I couldn't list the open windows, sir — please try again.")
+    remember_window_enumeration(windows)
+    filtered = [w for w in windows
+                if _match_window_token(
+                    str(w.get("title") or "").lower(), app_filter)]
+    if not filtered:
+        return _failed_window_plan(
+            "I couldn't find any %s windows, sir." % app_filter[:60])
+    requested = 1 if noun in _APPNAMED_SINGULAR_NOUNS else None
+    return _finalize_window_targets(
+        verb, action, filtered, exclusions, except_clause_named,
+        app_filter=app_filter, requested_count=requested)
 
 
 def _parse_key_sequence(raw_keys):
@@ -1016,6 +1469,7 @@ def _parse_clear_field_command(command_text):
 
 def _build_direct_plan(command_text):
     for parser in (
+        _parse_referenced_window_command,
         _parse_qualified_window_command,
         _parse_windows_shell_command,
         _parse_window_command,
@@ -3854,13 +4308,15 @@ def _plan_gate(plan):
     return _gate
 
 
-def _execute_plan_tagged(plan, command_text):
+def _execute_plan_tagged(plan, command_text, ttl=None):
     """Execute (or queue) a plan, returning (status, spoken_text).
 
     [LIVE FIX 21] chain steps need the outcome MACHINE-readable: "queued"
     (a confirmation prompt is armed — the chain must stop), "executed"
     (the summary), or "blocked" (any failure/refusal reason). The strings
     are byte-identical to what _execute_or_queue always returned.
+    [LIVE FIX 24 / B21] *ttl* overrides the approval lifetime for the
+    queued plan — chain-armed steps outlive a single-turn approval.
     """
     # F19-enforcement: the control boundary is checked HERE, at the point of
     # effect, not only where the request arrived. A plan produced before the
@@ -3906,7 +4362,7 @@ def _execute_plan_tagged(plan, command_text):
         # request creation keeps that token, so a revocation during planning
         # cannot be laundered into fresh authority by re-stamping it here.
         plan.setdefault("screen_generation", screen_state.generation())
-        screen_state.set_pending_plan(plan, command_text)
+        screen_state.set_pending_plan(plan, command_text, ttl=ttl)
         _write_screen_command_log(command_text, plan, "PENDING_CONFIRMATION")
         spoken = screen_state.pending_spoken()
         if spoken:
@@ -4116,6 +4572,27 @@ def _notify_action_executed(command_text, summary):
         pass
 
 
+_plan_confirmed_callback = None
+
+
+def set_plan_confirmed_callback(callback):
+    """Register callback(chain_context, summary) after a confirmed execution.
+
+    [LIVE FIX 24 / B21] lets the brain resume a chain whose step armed the
+    just-confirmed plan — confirming one step must not strand the rest.
+    """
+    global _plan_confirmed_callback
+    _plan_confirmed_callback = callback
+
+
+def _notify_plan_confirmed(chain_context, summary):
+    try:
+        if _plan_confirmed_callback is not None:
+            _plan_confirmed_callback(chain_context, summary)
+    except Exception as exc:
+        logging.warning("[CHAIN] confirmed-plan callback failed: %s", exc)
+
+
 def maybe_handle_screen_control_message(text):
     # F19: exact, negation-aware enable/disable commands are resolved BEFORE
     # anything else — including pending-consent consumption. "Turn screen
@@ -4193,12 +4670,31 @@ def maybe_handle_screen_control_message(text):
             screen_state.add_interaction("confirm", summary, plan=plan)
             _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTED")
             _notify_action_executed(cmd_text, summary)
+            try:
+                chain_context = plan.get("chain_context")
+            except Exception:
+                chain_context = None
+            if isinstance(chain_context, dict):
+                _notify_plan_confirmed(dict(chain_context), summary)
             return summary
         if answer == approvals._NO:
             plan = screen_state.pop_pending_plan()
             screen_state.clear_pending_plan()
             _write_screen_command_log(plan.get("command_text", "pending command") if plan else "pending command", plan or {}, "CANCELLED")
             return "Cancelled the pending screen action, sir."
+
+    # [LIVE FIX 24 / B21] a bare confirmation with no live plan but a
+    # recently-expired one gets the honest expiry reply — never chat
+    # improvisation about the lapsed approval.
+    try:
+        _expired_confirm = (
+            approvals.verdict(text) == approvals._YES
+            and approvals.recently_expired())
+    except Exception:
+        _expired_confirm = None
+    if _expired_confirm:
+        return ("That confirmation has closed, sir — say it once more "
+                "and I'll redo it.")
 
     # Bug #10: "Try again" / "repeat that" support.
     if screen_state.is_enabled() and _RETRY_RE.search(_normalize_text(text)):

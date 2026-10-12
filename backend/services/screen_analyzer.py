@@ -85,6 +85,10 @@ _SCREEN_QUESTION_PATTERNS = [
     # and answered from the job snapshot without ever looking.
     r"\bwhat(?:'s| is) running (?:on |in )?(?:my |the )?screen\b",
     r"\bwhat(?:'s| is) open (?:on |in )?(?:my |the )?screen\b",
+    # [LIVE FIX 24 / B24] a question asking to identify open windows ("can
+    # you identify the three windows ... that you are trying to minimize")
+    # is screen Q&A even with no "screen" word in it.
+    r"\bcan\s+you\s+(?:identify|name|list)\b[^.?!]{0,80}\bwindo",
     # Hindi / Hinglish
     r"\bscreen pe kya hai\b",
     r"\bscreen pe kya ho raha\b",

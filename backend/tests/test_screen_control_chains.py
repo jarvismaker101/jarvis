@@ -224,7 +224,7 @@ class ChainStepTests(unittest.TestCase):
         ], "source": "x", "command_text": "x"}
         calls = []
 
-        def fake_step(step):
+        def fake_step(step, **kw):
             calls.append(step["text"])
             if step["index"] == 1:
                 return {"kind": "screen_control", "status": "armed",

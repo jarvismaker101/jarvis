@@ -118,9 +118,45 @@ _SCREEN_CONTROL_RE = re.compile(
     # screen click — never a web-search step. Bare "search" alone keeps
     # its own meaning (chain-level submit vs lookup).
     r"|\b(click|double-?click|right-?click|tap|press|hit)\s+(?:the\s+)?"
-    r"(?:search|submit)\b",
+    r"(?:search|submit)\b"
+    # [LIVE FIX 24 / B22] submitting what was just typed ("search what
+    # you typed") is a screen submit — never a web-search step.
+    r"|\b(?:search|submit|look\s+it\s+up|find\s+it)\b[^.?!]{0,48}"
+    r"\bwhat\s+(?:you|i)\s+(?:just\s+)?typed\b"
+    # [LIVE FIX 24 / B22] the gerund form ("clicking enter") is the same
+    # complete submit command as "press enter".
+    r"|\bclick(?:ing)?\s+enter\b",
     re.IGNORECASE,
 )
+
+#: [LIVE FIX 24 / B22] the submit-what-was-typed shape, shared by the
+#: classifier branch above, the step rewrite, and the sibling strip.
+_SUBMIT_TYPED_RE = re.compile(
+    r"\b(?:search|submit|look\s+it\s+up|find\s+it)\b[^.?!]{0,48}"
+    r"\bwhat\s+(?:you|i)\s+(?:just\s+)?typed\b",
+    re.IGNORECASE)
+
+#: [LIVE FIX 24 / B22] a "not X" correction fragment ("not tab search")
+#: revises the previous action — a fragment that merges into the next
+#: clause, never a standalone research step.
+_NOT_CORRECTION_RE = re.compile(
+    r"^\s*not\b[^.?!]{1,40}$",
+    re.IGNORECASE)
+
+
+def _is_submit_shape(text):
+    """True when the clause is a submit of already-typed input."""
+    t = str(text or "")
+    if _BARE_SUBMIT_RE.match(t):
+        return True
+    if _SUBMIT_TYPED_RE.search(t):
+        return True
+    if re.search(r"\bclick(?:ing)?\s+enter\b", t, re.IGNORECASE):
+        return True
+    if (re.search(r"\bsearch\s+(?:icon|button)\b", t, re.IGNORECASE)
+            and re.search(r"\benter\b", t, re.IGNORECASE)):
+        return True
+    return False
 
 #: A screen_control step that points at the previous step's target
 #: ("minimize the terminal, then close it") runs after it — the executor
@@ -248,6 +284,11 @@ def classify_clause(text):
     t = (text or "").strip()
     if not t:
         return None
+    # [LIVE FIX 24 / B22] a leading "not X" correction fragment ("not tab
+    # search") revises the previous action — it merges into the next
+    # clause instead of classifying on its own keywords.
+    if _NOT_CORRECTION_RE.match(t):
+        return None
     # [LIVE FIX 22 / B9] control-before-screen: "click the search bar ON MY
     # SCREEN" is a control, not a look — the screen phrase used to win and
     # the clause became a look step. Look-only clauses ("look at my
@@ -297,6 +338,19 @@ def build_chain(text):
             if merged:
                 merged[-1]["text"] = merged[-1]["text"] + " and " + clause
             continue
+        # [LIVE FIX 24 / B22] "search what you typed" is the submit action
+        # itself — rewrite to the canonical step text so the planner and
+        # the ack narrate "press enter", never a web search.
+        if kind == "screen_control" and _SUBMIT_TYPED_RE.search(clause):
+            clause = "press enter"
+        # [LIVE FIX 24 / B22] a restated submit ("...by clicking enter or
+        # the search icon") is the same action as the submit step before
+        # it — not a second step.
+        if (merged and merged[-1]["kind"] == "screen_control"
+                and kind == "screen_control"
+                and _is_submit_shape(merged[-1]["text"])
+                and _is_submit_shape(clause)):
+            continue
         # [LIVE FIX 21] screen_control clauses never merge: each is its own
         # planned+executed step ("minimize all terminals then click the
         # search bar" is two actions, not one command).
@@ -327,6 +381,12 @@ def build_chain(text):
             r"\b(?:click|double-?click|right-?click|tap|press|hit)\s+"
             r"(?:the\s+)?(?:search|submit)\b", " ",
             lookup_text, flags=re.IGNORECASE)
+        # [LIVE FIX 24 / B22] a "search icon/button" is a UI target and
+        # "search what you typed" is a submit — neither is a lookup.
+        lookup_text = re.sub(
+            r"\bsearch\s+(?:icon|button|tab)\b", " ",
+            lookup_text, flags=re.IGNORECASE)
+        lookup_text = _SUBMIT_TYPED_RE.sub(" ", lookup_text)
         if (m["kind"] == "screen" and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):
