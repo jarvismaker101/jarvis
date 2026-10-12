@@ -22,6 +22,28 @@ import re
 
 _MAX_STEPS = 6
 
+#: [LIVE FIX 26 / B40] stray UI/punctuation glyphs that leak into typed
+#: commands (the "✕" stop-marker, bullets, arrows) and must never reach
+#: parsing or the spoken ack. Only leading/trailing runs are stripped —
+#: interior content ("mr.beast", file names) is untouched.
+_STRAY_LEAD_RE = re.compile(
+    r"^[\s\u2715\u2716\u2717\u2718\u2719\u271a\u00d7\u00b7\u2022\u2023"
+    r"\u25e6\u25aa\u25ab\u2192\u00bb>\-–—*#+]+")
+_STRAY_TAIL_RE = re.compile(
+    r"[\s\u2715\u2716\u2717\u2718\u2719\u271a\u00d7\u00b7\u2022\u2023"
+    r"\u25e6\u25aa\u25ab\u2192\u00bb>\-–—*#+.,;!]+$")
+
+
+def _strip_stray_glyphs(text):
+    """Drop leading/trailing stray UI glyphs from a command. Never raises."""
+    try:
+        t = str(text or "")
+    except Exception:
+        return ""
+    t = _STRAY_LEAD_RE.sub("", t)
+    t = _STRAY_TAIL_RE.sub("", t)
+    return t
+
 #: Clause separators: commas/semicolons, "and"/"then" families, and the
 #: common Hinglish connectors. Splitting is intentionally liberal — the
 #: strict chain acceptance below is what keeps single jobs intact.
@@ -268,7 +290,9 @@ def split_clauses(text):
     parts = _CLAUSE_SPLIT_RE.split(text or "")
     out = []
     for part in parts:
-        part = (part or "").strip(" \t,;.")
+        # [LIVE FIX 26 / B40] a stray leading glyph ("✕ click…") must not
+        # survive into a clause — it defeats anchored matchers below.
+        part = _strip_stray_glyphs((part or "").strip(" \t,;."))
         if len(part) < 3:
             continue
         out.append(part)
@@ -281,7 +305,9 @@ def split_clauses(text):
 #: verb and ends on a target noun or a screen phrase, so "click the font
 #: type dropdown" / "click the type button" never split.
 _JUXTAPOSED_TYPE_RE = re.compile(
-    r"^(?P<left>(?:(?:please|kindly|jarvis)\b[\s,]*)?"
+    # [LIVE FIX 26 / B38] anchor on the first control verb, not absolute
+    # start — a stray leading glyph must never defeat the split.
+    r"^[^\w]*(?P<left>(?:(?:please|kindly|jarvis)\b[\s,]*)?"
     r"(?:click|double-?click|right-?click|tap|select|focus|hover|press|hit)\b.*?"
     r"(?:\b(?:bar|box|field|button|icon|link|tab|textbox|input|window|it|this|"
     r"that|there)"
@@ -294,6 +320,21 @@ _JUXT_RIGHT_BLOCK_RE = re.compile(
 #: The same file-noun guard _SCREEN_CONTROL_RE applies to "type <content>".
 _JUXT_FILE_NOUN_RE = re.compile(
     r"\b(?:file|folder|directory|report|document|note|txt|script|code)\b",
+    re.IGNORECASE)
+
+
+#: [LIVE FIX 26 / B39] ordinal-play is a COMPLETE screen action ("play the
+#: first video") — it never grows a research sibling, even when a trailing
+#: relative clause names the search ("…that appears for the search").
+_ORDINAL_PLAY_RE = re.compile(
+    r"\bplay\b[^.?!]{0,32}\bthe\s+(?:first|second|third|fourth|fifth|"
+    r"top|next|last)\b",
+    re.IGNORECASE)
+#: [LIVE FIX 26 / B39] a trailing result-reference ("for the search", "that
+#: appears") is a noun pointing at the results, never a lookup request.
+_TRAILING_RESULT_RE = re.compile(
+    r"\s+(?:for\s+the\s+(?:search|results?)|that\s+appears?"
+    r"(?:\s+for\s+the\s+search)?|from\s+the\s+search)\s*$",
     re.IGNORECASE)
 
 
@@ -354,7 +395,7 @@ def build_chain(text):
     no tool clause is present, and a task (file write) clause, if any, is
     last.
     """
-    raw = (text or "").strip()
+    raw = _strip_stray_glyphs((text or "").strip())
     if not raw or _FUTURE_TALK_RE.match(raw):
         return None
     clauses = split_clauses(raw)
@@ -425,6 +466,9 @@ def build_chain(text):
             r"\bsearch\s+(?:icon|button|tab)\b", " ",
             lookup_text, flags=re.IGNORECASE)
         lookup_text = _SUBMIT_TYPED_RE.sub(" ", lookup_text)
+        # [LIVE FIX 26 / B39] a trailing result-reference ("for the search",
+        # "that appears") names the results, never a lookup request.
+        lookup_text = _TRAILING_RESULT_RE.sub(" ", lookup_text)
         if (m["kind"] == "screen" and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):
@@ -432,7 +476,10 @@ def build_chain(text):
         # [LIVE FIX 21] same for a CONTROL clause carrying a lookup
         # ("click the search bar to search for flights") — the lookup
         # half must not die with the click.
+        # [LIVE FIX 26 / B39] ordinal-play is a complete screen action and
+        # never grows a sibling.
         if (m["kind"] == "screen_control"
+                and not _ORDINAL_PLAY_RE.search(m["text"])
                 and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):
@@ -508,8 +555,10 @@ def _short_control_label(text):
 
     [LIVE FIX 22 / B9] the chain ack narrates what each step will do
     instead of repeating "control your screen" for every step.
+    [LIVE FIX 26 / B40] a stray leading glyph never eats real content out
+    of the 7-word window.
     """
-    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = re.sub(r"\s+", " ", _strip_stray_glyphs(text)).strip()
     t = _SC_LABEL_FILLER_RE.sub("", t)
     t = _SC_LABEL_TAIL_RE.sub("", t)
     label = " ".join(t.split()[:7])

@@ -253,6 +253,15 @@ TEXT_ENTRY_CONTROL_TYPES = {
 
 def _strip_leading_fillers(text):
     cleaned = text.strip()
+    # [LIVE FIX 26 / B40] a stray leading UI glyph ("✕ minimize…") is not
+    # a filler word — drop it before filler matching.
+    try:
+        cleaned = re.sub(
+            r"^[\s\u2715\u2716\u2717\u2718\u2719\u271a\u00d7\u00b7"
+            r"\u2022\u2023\u25e6\u25aa\u25ab\u2192\u00bb>\-–—*#+]+",
+            "", cleaned)
+    except Exception:
+        pass
     while True:
         updated = LEADING_FILLER_PATTERN.sub("", cleaned).strip()
         if updated == cleaned:
@@ -261,9 +270,45 @@ def _strip_leading_fillers(text):
     return cleaned.strip(" ,.")
 
 
+#: [LIVE FIX 26 / B41] STT doubles letters ("miinimize"). A doubled (or
+#: tripled) letter inside a KNOWN control verb is a typo, never a different
+#: word — rescue it before matching. Only runs when a doubled letter is
+#: present, and only rewrites whole-word fuzzy-verb hits, so legitimate
+#: doubles ("button") and unrelated words are untouched. Transpositions /
+#: substitutions stay with the classifier.
+_TYPO_VERBS = (
+    "minimize", "minimise", "maximize", "maximise", "restore",
+    "click", "scroll", "type", "press", "close", "open", "play",
+)
+_TYPO_VERB_RES = tuple(
+    (v, re.compile(r"\b" + "+".join(v) + r"\b")) for v in _TYPO_VERBS)
+_DOUBLED_LETTER_RE = re.compile(r"(.)\1")
+
+
+def _repair_verb_typos(text):
+    """Canonicalize doubled-letter control verbs. Never raises."""
+    try:
+        t = str(text or "")
+    except Exception:
+        return text
+    try:
+        if not _DOUBLED_LETTER_RE.search(t):
+            return t
+    except Exception:
+        return t
+    for canon, rx in _TYPO_VERB_RES:
+        try:
+            if rx.search(t):
+                t = rx.sub(canon, t)
+        except Exception:
+            pass
+    return t
+
+
 def _normalize_text(text):
     cleaned = _strip_leading_fillers(text)
-    return " ".join(cleaned.lower().split())
+    cleaned = " ".join(cleaned.lower().split())
+    return _repair_verb_typos(cleaned)
 
 
 def _escape_xml_attr(value):
@@ -725,6 +770,8 @@ _APPNAMED_BARE_FILLERS = frozenset({
     "window", "windows", "app", "apps", "application", "applications",
     "program", "programs", "on", "at", "my", "screen", "desktop",
     "please", "sir", "jarvis", "again", "now", "once",
+    # [LIVE FIX 26 / B35] "visible" describes the set, never an app.
+    "visible",
 })
 
 
@@ -747,6 +794,189 @@ def _parse_window_exclusions(normalized):
             # "except for the browser" names no app — keep every browser.
             exclusions.extend(list(_BROWSER_TOKENS))
     return exclusions, except_clause_named
+
+
+#: [LIVE FIX 26 / B33] ordinal/positional exclusions ("except the first
+#: window", "except the last one") resolve POSITIONALLY against the spatially
+#: sorted enumeration — never by name matching (which can only match
+#: title/process/class and silently drops the exclusion).
+_POSITIONAL_WORDS = {
+    "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
+    "top": 0, "topmost": 0, "uppermost": 0, "leftmost": 0,
+    "last": -1, "bottom": -1, "bottommost": -1, "rightmost": -1,
+    "final": -1,
+}
+_POSITIONAL_EXCLUDE_RE = re.compile(
+    r"\b(?:except|excluding|exclude|but\s+not|leaving|leave|"
+    r"other\s+than)\b"
+    r"[^.?!]{0,48}\b(first|second|third|fourth|fifth|top(?:most)?|"
+    r"uppermost|leftmost|last|bottom(?:most)?|rightmost|final)\b"
+    r"(?:\s+(?:one|window|windows|app|apps))?",
+    re.IGNORECASE)
+
+
+def _parse_positional_exclusion(normalized):
+    """An ordinal exclusion word ("first") in an except-clause, else None."""
+    try:
+        m = _POSITIONAL_EXCLUDE_RE.search(normalized or "")
+    except Exception:
+        return None
+    if not m:
+        return None
+    return str(m.group(1) or "").lower() or None
+
+
+#: [LIVE FIX 26 / B35] a window verb aimed at a pronoun/quantifier ("minimize
+#: all of them", "minimize them", "minimize everything") — the referent is
+#: the recently-discussed set, resolved below against a fresh enumeration
+#: filtered by the recent window app. Never matches when a window noun
+#: follows (those belong to the qualified/appnamed branches).
+_PRONOUN_WINDOW_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b"
+    r"[^.?!]{0,32}?\b(all\s+of\s+them|them|those|these|everything|"
+    r"all)\b"
+    r"(?:\s+(?:please|sir|jarvis|now|again))?\s*[.?!]*\s*$",
+    re.IGNORECASE)
+
+#: [LIVE FIX 26 / B35] a bare plural window object ("minimize the windows
+#: visible on my screen") is minimize-all-visible — never an app filter
+#: ("visible") and never vision. Singular stays with B18 active-window.
+_BARE_PLURAL_WINDOW_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b"
+    r"\s+(?:the\s+|my\s+|these\s+|those\s+)?"
+    r"(windows|apps|applications|programs)\b",
+    re.IGNORECASE)
+_BARE_PLURAL_TAIL_OK = re.compile(
+    r"^(?:[\s.?!]*(?:visible|on\s+(?:my|the)\s+(?:screen|desktop)|please|"
+    r"sir|jarvis|now|all|open|up|that\s+are\s+(?:open|visible)))*"
+    r"[\s.?!]*$",
+    re.IGNORECASE)
+
+
+def _app_filter_from_command(cmd):
+    """App word of a window command ("terminal"), else "".
+
+    Reads the same qualified/appnamed shapes the planner uses, so the
+    pronoun resolver borrows exactly what the user last named. Never raises.
+    """
+    try:
+        t = _normalize_text(cmd)
+        m = _QUALIFIED_WINDOW_RE.search(t)
+        if m:
+            span = t[m.start(2):m.end()]
+            fm = _QUALIFIED_APP_FILTER_RE.match(span)
+            if fm:
+                f = re.sub(r"[^a-z0-9.+#\- ]", " ",
+                           (fm.group(1) or "").lower())
+                f = re.sub(r"\s+", " ", f).strip()
+                if f not in ("", "the", "my"):
+                    return f[:60]
+        for cand in _APPNAMED_WINDOW_RE.finditer(t):
+            try:
+                f = _extract_appnamed_filter(cand.group("object"))
+            except Exception:
+                f = None
+            if f:
+                return f
+    except Exception:
+        pass
+    return ""
+
+
+def _recent_window_app():
+    """App filter from the most recent window command, else "".
+
+    Prefers the newest dispatched request (B27 ledger), then the recent
+    interaction history. Never raises.
+    """
+    try:
+        req = screen_state.get_last_request() or {}
+        app = _app_filter_from_command(str(req.get("command") or ""))
+        if app:
+            return app
+    except Exception:
+        pass
+    try:
+        recent = screen_state.get_recent_interactions() or []
+        for entry in reversed(recent[-3:]):
+            app = _app_filter_from_command(
+                str((entry or {}).get("command") or ""))
+            if app:
+                return app
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_pronoun_window_command(normalized):
+    """Deterministic plan for "minimize all of them", else None.
+
+    Re-enumerates the CURRENT screen (the user is looking at it now) and
+    filters by the recently-discussed window app, if any. A FAILED plan
+    (honest reason) when the text matches but has no usable targets.
+    """
+    try:
+        m = _PRONOUN_WINDOW_RE.search(normalized or "")
+    except Exception:
+        return None
+    if not m:
+        return None
+    verb = str(m.group(1) or "").lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    app = _recent_window_app()
+    windows = _list_managable_windows()
+    if not windows:
+        return _failed_window_plan(
+            "I couldn't list the open windows, sir — please try again.")
+    remember_window_enumeration(windows)
+    if app:
+        windows = [w for w in windows
+                   if _window_matches_filter(w, app)]
+        if not windows:
+            return _failed_window_plan(
+                "I couldn't find any %s windows, sir." % app[:60])
+    exclusions, except_clause_named = _parse_window_exclusions(
+        normalized)
+    positional_exclude = _parse_positional_exclusion(normalized)
+    return _finalize_window_targets(
+        verb, action, windows, exclusions, except_clause_named,
+        app_filter=app, positional_exclude=positional_exclude)
+
+
+def _parse_bare_plural_window_command(normalized):
+    """Deterministic minimize-all for a bare plural ("minimize the windows
+    visible on my screen"), else None. An except-clause in the tail is
+    honored; any other substantive trailing content declines (compound
+    commands belong elsewhere)."""
+    try:
+        m = _BARE_PLURAL_WINDOW_RE.search(normalized or "")
+    except Exception:
+        return None
+    if not m:
+        return None
+    verb = str(m.group(1) or "").lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    tail = normalized[m.end():]
+    exclusions, except_clause_named = _parse_window_exclusions(tail)
+    positional_exclude = _parse_positional_exclusion(tail)
+    if not exclusions and not positional_exclude:
+        try:
+            if not _BARE_PLURAL_TAIL_OK.match(tail or ""):
+                return None
+        except Exception:
+            return None
+    windows = _list_managable_windows()
+    if not windows:
+        return _failed_window_plan(
+            "I couldn't list the open windows, sir — please try again.")
+    remember_window_enumeration(windows)
+    return _finalize_window_targets(
+        verb, action, windows, exclusions, except_clause_named,
+        positional_exclude=positional_exclude)
 
 
 def _failed_window_plan(reason):
@@ -1030,8 +1260,23 @@ def _match_window_token(title_lower, token):
 #: A Windows Terminal tab is titled "Windows PowerShell"/"Command
 #: Prompt"; its owning process (windowsterminal/cmd/conhost) and its
 #: window class are the only reliable signal.
-_TERMINAL_PROCS = frozenset({"windowsterminal", "wt", "openconsole", "cmd",
-                             "powershell", "pwsh", "conhost"})
+_TERMINAL_PROCS = frozenset({"windowsterminal", "windowsterminalpreview",
+                             "wt", "openconsole", "cmd", "powershell",
+                             "pwsh", "conhost", "warp", "alacritty",
+                             "hyper", "mintty", "wezterm", "kitty",
+                             "tabby", "conemu", "cmder"})
+#: [LIVE FIX 26 / B34] title words that identify a terminal when the owning
+#: process could not be resolved (empty process only — a browser tab ABOUT
+#: terminals must never match). VSCode ("code") is deliberately NOT a
+#: terminal process: an editor window is not a terminal window.
+_TERMINAL_FAMILY_TOKENS = frozenset({
+    "terminal", "windows terminal", "console", "command prompt", "cmd",
+    "powershell", "power shell",
+})
+_TERMINAL_TITLE_WORDS = frozenset({
+    "terminal", "powershell", "prompt", "console", "bash", "pwsh",
+    "shell", "cmd",
+})
 _WINDOW_APP_ALIASES = {
     "terminal": _TERMINAL_PROCS,
     "windows terminal": frozenset({"windowsterminal", "openconsole"}),
@@ -1075,13 +1320,25 @@ def _window_matches_filter(window, token):
     if process and (process == t.replace(" ", "")
                     or process in _WINDOW_APP_ALIASES.get(t, ())):
         return True
-    return bool(wclass and wclass in _WINDOW_CLASS_ALIASES.get(t, ()))
+    if wclass and wclass in _WINDOW_CLASS_ALIASES.get(t, ()):
+        return True
+    # [LIVE FIX 26 / B34] the process lookup failed (empty) but the title
+    # names a terminal ("Windows PowerShell", "Command Prompt"). Only for
+    # terminal-family tokens, so unrelated windows never match.
+    if not process and t in _TERMINAL_FAMILY_TOKENS:
+        try:
+            title_words = set(re.findall(r"[a-z0-9]+", title_lower))
+        except Exception:
+            title_words = set()
+        if title_words & _TERMINAL_TITLE_WORDS:
+            return True
+    return False
 
 
 def _finalize_window_targets(verb, action, candidates, exclusions=(),
                              except_clause_named=False, app_filter="",
                              requested_count=None, count_note=None,
-                             skip_hwnds=()):
+                             skip_hwnds=(), positional_exclude=None):
     """Turn enumerated windows into an honest per-window plan (no vision).
 
     Applies exclusions, drops no-op minimizes, honors an explicit count,
@@ -1089,6 +1346,7 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
     """
     kept_out = []
     kept_tokens = []
+    positional_kept = ""
     targets = []
     try:
         ordered = _sort_windows_spatially(candidates)
@@ -1106,6 +1364,23 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
             kept_tokens.append(hit)
             continue
         targets.append(w)
+    # [LIVE FIX 26 / B33] an ordinal exclusion ("except the first window")
+    # removes a POSITION from the ordered survivors — never a name match.
+    # Out-of-range (like a name that matches nothing) excludes nothing.
+    if positional_exclude:
+        try:
+            idx = _POSITIONAL_WORDS.get(str(positional_exclude).lower())
+        except Exception:
+            idx = None
+        if idx is not None and targets:
+            try:
+                if (idx == -1 or 0 <= idx < len(targets)):
+                    _picked = targets.pop(idx)
+                    kept_out.append(_picked.get("title"))
+                    positional_kept = "the %s window" % str(
+                        positional_exclude).lower()
+            except Exception:
+                pass
     try:
         skips = {int(h) for h in (skip_hwnds or ()) if int(h or 0)}
     except (TypeError, ValueError):
@@ -1124,6 +1399,8 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
     # minimized: say so honestly, never "no windows" or "found only 0".
     # (dropped_iconic holds exactly the exclusion/skip survivors that the
     # no-op drop removed, so exclusions and "other"-skips never leak in.)
+    # [LIVE FIX 26 / B34] scope the claim to what was actually matched — a
+    # subset-scoped no-op must never read as a global claim.
     if (verb in ("minimize", "minimise") and not targets and not kept_out
             and dropped_iconic and str(app_filter or "").strip()):
         label = str(app_filter).strip()[:60]
@@ -1133,7 +1410,7 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
             "summary": (
                 "That %s window is already minimized, sir." % label
                 if len(dropped_iconic) == 1 else
-                "All %d %s windows are already minimized, sir."
+                "The %d %s windows I can see are already minimized, sir."
                 % (len(dropped_iconic), label)),
             "needs_confirmation": False,
             "reason": "",
@@ -1218,10 +1495,17 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         names = sorted(
             {str(t[:1].upper() + t[1:]) for t in kept_tokens if t},
             key=len)[:2]
-        if not names:
+        if not names and not positional_kept:
             names = sorted(
                 {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
                 key=len)[:2]
+        if positional_kept:
+            # [LIVE FIX 26 / B33] a positional keep reads as a phrase
+            # ("Leaving the first window.") — never a bare capitalized token
+            # ("Leaving First.") or a raw title fallback.
+            names = [positional_kept] + [
+                n for n in names
+                if positional_kept not in n.lower()]
         summary += " Leaving %s." % ", ".join(names)[:80]
     effect = ("Minimize" if verb.startswith("minim")
               else "Maximize" if verb.startswith("maxim") else "Restore")
@@ -1385,6 +1669,16 @@ def _parse_qualified_window_command(command_text):
     of vision-planning.
     """
     normalized = _normalize_text(command_text)
+    # [LIVE FIX 26 / B35] pronoun ("minimize all of them") and bare-plural
+    # ("minimize the windows visible on my screen") shapes are disjoint
+    # from the quantified/app-named shapes below — resolve them first so
+    # they never defer to vision.
+    _pronoun = _parse_pronoun_window_command(normalized)
+    if _pronoun is not None:
+        return _pronoun
+    _bare = _parse_bare_plural_window_command(normalized)
+    if _bare is not None:
+        return _bare
     m = _QUALIFIED_WINDOW_RE.search(normalized)
     if m:
         verb = m.group(1).lower()
@@ -1409,6 +1703,26 @@ def _parse_qualified_window_command(command_text):
 
         exclusions, except_clause_named = _parse_window_exclusions(
             normalized[m.start():])
+        # [LIVE FIX 26 / B33] an ordinal exclusion ("except the first
+        # window") is positional, never a name match.
+        positional_exclude = _parse_positional_exclusion(
+            normalized[m.start():])
+        # [LIVE FIX 26 / B42] "all non-Brave windows" is an EXCLUSION (all
+        # windows except Brave), never a literal app filter named
+        # "non-brave".
+        if app_filter:
+            try:
+                _non = re.match(r"^non[-\s]+(.+)$", app_filter)
+                _non_app = re.sub(
+                    r"\s+", " ", (_non.group(1) if _non else "").strip()
+                    )[:60] if _non else ""
+            except Exception:
+                _non_app = ""
+            if _non_app:
+                app_filter = ""
+                if _non_app not in (exclusions or []):
+                    exclusions = list(exclusions or []) + [_non_app]
+                except_clause_named = True
         windows = _list_managable_windows()
         if not windows:
             return _failed_window_plan(
@@ -1436,7 +1750,7 @@ def _parse_qualified_window_command(command_text):
             verb, action, windows, exclusions, except_clause_named,
             app_filter=app_filter,
             requested_count=_window_count_for_quantifier(quantifier),
-            skip_hwnds=skip_hwnds)
+            skip_hwnds=skip_hwnds, positional_exclude=positional_exclude)
 
     # [LIVE FIX 24 / B18] an app-named target without a quantifier.
     # [LIVE FIX 25 / B25] first NAMED target wins: a bare object ("the
@@ -1457,6 +1771,8 @@ def _parse_qualified_window_command(command_text):
     noun = str(am.group("noun") or "").lower()
     exclusions, except_clause_named = _parse_window_exclusions(
         normalized[am.start():])
+    positional_exclude = _parse_positional_exclusion(
+        normalized[am.start():])
     windows = _list_managable_windows()
     if not windows:
         return _failed_window_plan(
@@ -1470,7 +1786,8 @@ def _parse_qualified_window_command(command_text):
     requested = 1 if noun in _APPNAMED_SINGULAR_NOUNS else None
     return _finalize_window_targets(
         verb, action, filtered, exclusions, except_clause_named,
-        app_filter=app_filter, requested_count=requested)
+        app_filter=app_filter, requested_count=requested,
+        positional_exclude=positional_exclude)
 
 
 def _parse_key_sequence(raw_keys):
@@ -4794,7 +5111,7 @@ def maybe_handle_screen_control_message(text):
     if toggle == "on":
         if screen_state.is_enabled():
             return "Screen controls are already on, sir."
-        screen_state.set_enabled(True)
+        screen_state.set_enabled(True, reason="voice/typed toggle on")
         screen_state.clear_interactions()
         return "Screen controls are on, sir."
     if toggle == "off":
@@ -4802,7 +5119,7 @@ def maybe_handle_screen_control_message(text):
             return "Screen controls are already off, sir."
         # Disabling bumps the control generation and drops any pending plan /
         # approval, so an in-flight multi-step plan cannot continue.
-        screen_state.set_enabled(False)
+        screen_state.set_enabled(False, reason="voice/typed toggle off")
         screen_state.clear_interactions()
         return "Screen controls are off, sir."
 

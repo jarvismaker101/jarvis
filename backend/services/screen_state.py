@@ -12,6 +12,9 @@ Fable-5 audit G2:
 """
 
 import contextlib
+import logging
+import os
+import tempfile
 import threading
 import time
 
@@ -31,6 +34,11 @@ _MAX_HISTORY = 5
 #: older success from the interaction ledger.
 _last_request = {"command": "", "ts": 0.0}
 
+#: [LIVE FIX 26 / B36+B37] a chain refused solely for controls-off, so a
+#: post-enable "now do that task" can rebuild it instead of the user
+#: re-typing the whole command. Cleared on any toggle or accepted chain.
+_last_refused_chain = {"source": "", "ts": 0.0}
+
 #: Bumped every time screen control is enabled or disabled. A plan stamped
 #: with an older generation can never execute.
 _generation = 0
@@ -39,8 +47,87 @@ _generation = 0
 APPROVAL_TTL = 120.0
 
 
+#: [LIVE FIX 26 / B36] durable toggle path (tests override via env).
+def _toggle_state_path():
+    try:
+        override = os.getenv("JARVIS_SCREEN_STATE_PATH")
+        if override:
+            return override
+    except Exception:
+        pass
+    try:
+        return os.path.join(tempfile.gettempdir(),
+                            "jarvis_screen_toggle.json")
+    except Exception:
+        return ""
+
+
+_hydrated = False
+
+
+def _persist_toggle_locked():
+    """Write the enable flag to the shared store. Caller holds _state_lock."""
+    try:
+        path = _toggle_state_path()
+        if not path:
+            return
+        import json as _json
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"enabled": bool(_enabled),
+                                  "ts": time.time()}))
+        try:
+            os.replace(tmp, path)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _rehydrate_toggle_locked():
+    """Restore the enable flag once per process. Caller holds _state_lock."""
+    global _hydrated, _enabled
+    if _hydrated:
+        return
+    _hydrated = True
+    try:
+        import sys as _sys
+        # Never let a live toggle file leak into the test suite, unless a
+        # test explicitly points at its own file via the env override.
+        if ((os.getenv("PYTEST_CURRENT_TEST") or "pytest" in _sys.modules)
+                and not os.getenv("JARVIS_SCREEN_STATE_PATH")):
+            return
+        path = _toggle_state_path()
+        if not path or not os.path.exists(path):
+            return
+        import json as _json
+        with open(path, "r", encoding="utf-8") as fh:
+            data = _json.load(fh)
+        if isinstance(data, dict) and data.get("enabled") is True:
+            _enabled = True
+            logging.warning(
+                "[SCREEN-TOGGLE] rehydrated enabled=True from %s", path)
+    except Exception:
+        pass
+
+
+def _toggle_caller():
+    """First stack frame outside this module (for toggle attribution)."""
+    try:
+        import traceback as _tb
+        for frame in reversed(_tb.extract_stack()[:-1]):
+            name = str(frame.filename or "").replace("\\", "/")
+            if not name.endswith("/screen_state.py"):
+                base = name.rsplit("/", 1)[-1]
+                return "%s:%s" % (base, frame.name)
+    except Exception:
+        pass
+    return "?"
+
+
 def is_enabled():
     with _state_lock:
+        _rehydrate_toggle_locked()
         return _enabled
 
 
@@ -58,21 +145,35 @@ def bump_generation():
         return _generation
 
 
-def set_enabled(enabled):
+def set_enabled(enabled, reason=""):
     """Enable/disable screen control.
 
     Disabling (or re-enabling) bumps the control generation and drops the
     pending plan and approval: consent granted under the old generation must
     not survive into the new one.
+
+    [LIVE FIX 26 / B36] every transition is attributed (caller + reason) in
+    the log and persisted to the shared store, so a silent ON->OFF can be
+    traced and never lost to a restart. Disabling clears any refused chain
+    (it cannot run while off); ENABLING preserves it so a post-enable
+    "now do that task" rebuilds it (B37).
     """
-    global _enabled, _pending_plan, _pending_approval
+    global _enabled, _pending_plan, _pending_approval, _last_refused_chain
     with _state_lock:
         _enabled = bool(enabled)
         bump_generation()
         if not _enabled:
+            _last_refused_chain = {"source": "", "ts": 0.0}
             _pending_plan = None
             _pending_approval = None
             approvals.cancel("screen control disabled")
+        try:
+            logging.warning(
+                "[SCREEN-TOGGLE] set_enabled(%s) reason=%s caller=%s",
+                bool(enabled), str(reason or "")[:80], _toggle_caller())
+        except Exception:
+            pass
+        _persist_toggle_locked()
         return _enabled
 
 
@@ -297,6 +398,41 @@ def get_last_request():
             return dict(_last_request)
     except Exception:
         return {"command": "", "ts": 0.0}
+
+
+def note_refused_chain(source):
+    """Remember a chain refused solely for controls-off.
+
+    [LIVE FIX 26 / B36+B37] so a post-enable "now do that task" rebuilds it.
+    Never raises.
+    """
+    global _last_refused_chain
+    try:
+        with _state_lock:
+            _last_refused_chain = {
+                "source": tool_policy.redact_for_egress(source),
+                "ts": time.time()}
+    except Exception:
+        pass
+
+
+def get_refused_chain():
+    """A safe copy of the remembered refused chain ("" when none)."""
+    try:
+        with _state_lock:
+            return dict(_last_refused_chain)
+    except Exception:
+        return {"source": "", "ts": 0.0}
+
+
+def clear_refused_chain():
+    """Drop the remembered refused chain. Never raises."""
+    global _last_refused_chain
+    try:
+        with _state_lock:
+            _last_refused_chain = {"source": "", "ts": 0.0}
+    except Exception:
+        pass
 
 
 def format_history_for_prompt():

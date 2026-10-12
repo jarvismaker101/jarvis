@@ -788,6 +788,16 @@ class _SpeakStopWorker:
         if not ok and status is None and self._is_stale_socket():
             self._close_connection()
             ok, status = self._attempt()
+        if not ok:
+            # [LIVE FIX 26 / B43] warn only on FINAL failure — a first-attempt
+            # stale-socket transient that the immediate re-dial fixes is a
+            # recovery, not a failure, and must not look like one in the log.
+            try:
+                _exc = getattr(self, "_last_error", None)
+            except Exception:
+                _exc = None
+            if _exc is not None:
+                self._warn_error(_exc)
         elapsed_ms = (time.monotonic() - self._started) * 1000.0
         with self._lock:
             self.stats["last_ms"] = round(elapsed_ms, 1)
@@ -820,10 +830,10 @@ class _SpeakStopWorker:
                 self._warn_auth(status)
         except Exception as exc:
             # Drop the connection so the NEXT attempt dials fresh instead of
-            # reusing a socket the server has already closed.
+            # reusing a socket the server has already closed. The warning is
+            # emitted by _deliver only if the re-dial also fails (B43).
             self._close_connection()
             self._last_error = exc
-            self._warn_error(exc)
             ok = False
         return ok, status
 

@@ -2742,13 +2742,17 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "Keep responses short unless asked for detail. "
             # [LIVE FIX 25 / B31] screen actions belong to the
             # screen-control system, never to chat prose.
+            # [LIVE FIX 26 / B37+B41] never fabricate a command phrase for
+            # the user to repeat ("say 'click the …'") — ask what they want
+            # done, in their own words.
             "Screen actions (clicking, typing, pressing keys, opening, "
             "playing, minimizing or moving windows) are run only by the "
             "screen-control system, which asks for its own confirmations. "
             "Never offer to do a screen action, never ask the user to "
             "confirm one, and never say a confirmation is needed — if "
-            "they want something done on the screen, tell them to say "
-            "the exact action (for example 'click the search icon'). "
+            "they want something done on the screen, ask what they want "
+            "done, in their own words, and never invent a command phrase "
+            "for them to repeat. "
             "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
@@ -2796,13 +2800,17 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "instead of agreeing. "
             # [LIVE FIX 25 / B31] screen actions belong to the
             # screen-control system, never to chat prose.
+            # [LIVE FIX 26 / B37+B41] never fabricate a command phrase for
+            # the user to repeat ("say 'click the …'") — ask what they want
+            # done, in their own words.
             "Screen actions (clicking, typing, pressing keys, opening, "
             "playing, minimizing or moving windows) are run only by the "
             "screen-control system, which asks for its own confirmations. "
             "Never offer to do a screen action, never ask the user to "
             "confirm one, and never say a confirmation is needed — if "
-            "they want something done on the screen, tell them to say "
-            "the exact action (for example 'click the search icon'). "
+            "they want something done on the screen, ask what they want "
+            "done, in their own words, and never invent a command phrase "
+            "for them to repeat. "
             "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
@@ -7585,6 +7593,52 @@ def _repeatable_last_command():
     return ""
 
 
+#: [LIVE FIX 26 / B37] deictic re-run ("now do that task", "do that task",
+#: "run that again", "do that now") — the user points at the last REQUESTED
+#: thing, not a bare "again". Distinct from the whole-task repeat (which
+#: needs whole/entire/over) and from bare continue. Never matches a fresh
+#: action request (those name their own verb+object, not "that").
+_DEICTIC_RERUN_RE = re.compile(
+    r"^\s*(?:(?:please|kindly|jarvis|ok(?:ay)?|now|sir)\s*,?\s*)*"
+    r"(?:(?:do|run|perform|try|execute)\s+(?:that|this)\s+"
+    r"(?:task|thing|job|request|action|command)\b"
+    r"|(?:do|run)\s+(?:the\s+)?task\b"
+    r"|(?:do|run|go\s+ahead\s+and\s+do)\s+that\b"
+    r"|do\s+that\s+now\b"
+    r"|go\s+ahead\s+and\s+do\s+that\b)"
+    r"(?:\s*,?\s*(?:please|sir|jarvis|now|again))?[\s.!]*$",
+    re.IGNORECASE)
+
+
+def _deictic_rerun_source():
+    """Command text for a deictic re-run, else "".
+
+    Priority: a refused chain (B36 — the task that never ran), then the
+    newest screen request (B27 ledger), then the last repeatable action
+    (B32). A source that is itself deictic is never returned (no loops).
+    Never raises.
+    """
+    try:
+        from backend.services import screen_state as _ss
+        _ref = _ss.get_refused_chain() or {}
+        _src = str(_ref.get("source") or "").strip()
+        if _src and not _DEICTIC_RERUN_RE.match(_src):
+            return _src
+        _req = _ss.get_last_request() or {}
+        _cmd = str(_req.get("command") or "").strip()
+        if _cmd and not _DEICTIC_RERUN_RE.match(_cmd):
+            return _cmd
+    except Exception:
+        pass
+    try:
+        _last = _repeatable_last_command() or ""
+        if _last and not _DEICTIC_RERUN_RE.match(_last.strip()):
+            return _last
+    except Exception:
+        pass
+    return ""
+
+
 _WIN_CORR_VERB_RE = re.compile(
     r"\b(minimize|minimise|maximize|maximise|restore)\b", re.IGNORECASE)
 _WIN_CORR_NOUN_RE = re.compile(
@@ -9768,7 +9822,23 @@ def handle_multi_intent(msg, plan, from_voice=False, voice_compact=False,
     if refusal:
         # [LIVE FIX 23 / B17] controls off: refuse honestly up front,
         # never start a worker whose every step is about to be refused.
+        # [LIVE FIX 26 / B36+B37] remember the source so a post-enable
+        # "now do that task" rebuilds it instead of re-typing.
+        try:
+            from backend.services import screen_state as _screen_state
+            _src = (plan.get("source") or plan.get("command_text") or "")
+            if str(_src or "").strip():
+                _screen_state.note_refused_chain(str(_src))
+        except Exception:
+            pass
         return refusal
+    # [LIVE FIX 26 / B36] a chain that starts supersedes any remembered
+    # refused chain.
+    try:
+        from backend.services import screen_state as _screen_state2
+        _screen_state2.clear_refused_chain()
+    except Exception:
+        pass
     try:
         # [LIVE FIX 24 / B22] a new chain supersedes a previous chain's
         # still-pending approval (the "not tab search" rejection dies with
@@ -10877,6 +10947,57 @@ def _process_message_inner(
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, _rerun_reply)
         return _rerun_reply
+
+    # ── [LIVE FIX 26 / B37] deictic re-run ("now do that task", "do that
+    # task") re-runs the last REQUESTED command — a refused chain, the
+    # newest screen request, or the last action — instead of falling to
+    # chat. Runs after the whole-task repeat (which needs whole/entire/
+    # over) and before resume (this is a re-run, not a tail resume).
+    if (not msg.lower().startswith("command")
+            and _DEICTIC_RERUN_RE.match(msg.strip())):
+        try:
+            _deictic_cmd = _deictic_rerun_source()
+        except Exception as exc:
+            logging.warning("[CHAIN] deictic re-run failed: %s", exc)
+            _deictic_cmd = ""
+        if _deictic_cmd:
+            print("[REPEAT] Deictic re-run -> %s" % _deictic_cmd[:80])
+            try:
+                from backend.services import screen_state as _ss2
+                _ss2.clear_refused_chain()
+            except Exception:
+                pass
+            _remember_user_turn(msg)
+            try:
+                _deictic_reply = _process_message_inner(
+                    _deictic_cmd, from_voice=from_voice, sync_voice=sync_voice,
+                    voice_compact=voice_compact,
+                    commit_response=commit_response,
+                    stream_reply=None, progress=progress,
+                    request_id=request_id)
+            except Exception as exc:
+                logging.warning("[CHAIN] deictic re-route failed: %s", exc)
+                _deictic_reply = None
+            if _deictic_reply is None:
+                _deictic_reply = ("I couldn't run that just now, sir — "
+                                  "say it once more and I'll do it.")
+            try:
+                add_message("assistant", _deictic_reply)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _deictic_reply)
+            return _deictic_reply
+        _remember_user_turn(msg)
+        _idle_reply = ("I don't have a recent request to run, sir — "
+                       "say it once more and I'll do it.")
+        try:
+            add_message("assistant", _idle_reply)
+        except Exception:
+            pass
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, _idle_reply)
+        return _idle_reply
 
     # ── [LIVE FIX 22 / B10] unfinished-chain feedback ("you didn't do
     # the next steps", "do the rest", "continue") resumes the stored

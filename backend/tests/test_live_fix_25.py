@@ -135,11 +135,19 @@ class TestB26ProcessAliasMatching:
             "minimize all the terminal windows")
         assert plan["ok"] and not plan["steps"]
         assert (plan["summary"]
-                == "All 2 terminal windows are already minimized, sir.")
+                == "The 2 terminal windows I can see are already "
+                   "minimized, sir.")
 
-    def test_title_only_fakes_unchanged(self):
-        assert not sc._window_matches_filter(
+    def test_title_only_terminal_matches_when_process_unknown(self):
+        # [LIVE FIX 26 / B34] title fallback when the process lookup failed
+        # (empty process); a known non-terminal process never title-matches.
+        assert sc._window_matches_filter(
             {"title": "Windows PowerShell"}, "terminal")
+        assert not sc._window_matches_filter(
+            {"title": "Untitled - Notepad"}, "terminal")
+        assert not sc._window_matches_filter(
+            {"title": "YouTube - Brave", "process": "brave"},
+            "terminal")
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Win32 only")
     def test_enumeration_carries_process_keys(self):
