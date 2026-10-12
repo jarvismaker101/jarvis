@@ -212,7 +212,9 @@ class B21ConfirmPathTests(unittest.TestCase):
     def test_chat_cannot_narrate_a_click(self):
         out = brain._strip_unverified_action_claims(
             "Clicking 'Tab search', sir.", "chat")
-        self.assertIn("Nothing was started", out)
+        # LIVE FIX 27 / B50: the fallback is neutral (it must never assert
+        # nothing was started) — the gate still speaks no claim.
+        self.assertEqual(out, brain._CHAT_SCREEN_FALLBACK)
 
     def test_confirmed_chain_step_resumes_the_tail(self):
         plan = {"ok": True, "source": "click then type",

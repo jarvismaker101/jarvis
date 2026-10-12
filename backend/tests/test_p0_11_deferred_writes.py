@@ -274,7 +274,7 @@ class NoWriteBeforeFirstDeltaTests(unittest.TestCase):
             "path": "llm",
             "messages": [{"role": "system", "content": "sys"}],
             "system_prompt": "sys",
-            "query": "hello",
+            "query": "i am testing the chat stream",
         }
 
         class _Racer:
@@ -325,14 +325,17 @@ class NoWriteBeforeFirstDeltaTests(unittest.TestCase):
              patch.object(brain, "classify_intent",
                           return_value={"intent": "chat", "steps": [],
                                         "task_description": "",
-                                        "query": "hello"}), \
+                                        "query": "i am testing the chat stream"}), \
              patch.object(brain, "maybe_handle_screen_control_message",
                           return_value=None), \
              patch.object(brain, "force_research", return_value=False), \
              patch.object(brain, "is_explicit_task_request", return_value=False), \
              patch.object(brain, "is_code_tool_request", return_value=False), \
              patch.object(brain, "should_search", return_value=False):
-            response = brain.process_message("hello", sync_voice=False,
+            # NOTE: bare "hello" is a deterministic greeting since
+            # LIVE FIX 27 / B51 and never streams — contentful chat here.
+            response = brain.process_message("i am testing the chat stream",
+                                             sync_voice=False,
                                              stream_reply=deltas.append)
 
         self.assertEqual(deltas, ["Hello ", "sir."])

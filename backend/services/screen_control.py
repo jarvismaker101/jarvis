@@ -979,6 +979,155 @@ def _parse_bare_plural_window_command(normalized):
         positional_exclude=positional_exclude)
 
 
+#: [LIVE FIX 27 / B45] a completion correction ("minimize the rest also",
+#: "you only minimized one window minimize the rest also", "minimize the
+#: remaining windows", "minimize the rest of the notepad windows") acts on
+#: what the previous command left behind — never vision. An explicit
+#: except-clause wins; otherwise the exclusions of the most recent window
+#: command are inherited (so "... except brave" stays excepted).
+_REST_WINDOW_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b"
+    r"(?P<object>(?:(?!\b(?:minimi[sz]e|maximi[sz]e|restore)\b)[^.?!]){0,80}?)"
+    r"\b(?:the\s+rest|the\s+remaining|the\s+others?)\b"
+    r"(?P<tail>[^.?!]{0,80})[.?!]*$",
+    re.IGNORECASE)
+_REST_TAIL_FILLERS = frozenset({
+    "also", "too", "please", "sir", "jarvis", "now", "again", "all",
+    "of", "the", "a", "an", "my", "on", "at", "screen", "desktop",
+    "visible", "open", "up", "that", "are", "left", "still",
+})
+#: Structural words of the rest shape itself ("the rest OF THE notepad
+#: WINDOWS") — never stray content, never an app word either.
+_REST_STRUCTURAL_WORDS = frozenset({
+    "of", "the", "a", "an", "my", "window", "windows", "app", "apps",
+    "application", "applications", "program", "programs",
+})
+
+
+def _inherited_window_exclusions():
+    """Name exclusions of the most recent window command, else ([], False).
+
+    Reads the newest dispatched request (B27 ledger), then recent
+    interactions. The most recent WINDOW command defines the context: when
+    it names no exclusions, nothing is inherited from older ones. Never
+    raises.
+    """
+    try:
+        candidates = []
+        req = screen_state.get_last_request() or {}
+        if str(req.get("command") or "").strip():
+            candidates.append(str(req.get("command")))
+        try:
+            recent = screen_state.get_recent_interactions() or []
+        except Exception:
+            recent = []
+        for entry in reversed(recent[-5:]):
+            cmd = str((entry or {}).get("command") or "").strip()
+            if cmd and cmd not in candidates:
+                candidates.append(cmd)
+        _verb = re.compile(
+            r"\b(minimize|minimise|maximize|maximise|restore)\b",
+            re.IGNORECASE)
+        _noun = re.compile(r"\bwindows?\b", re.IGNORECASE)
+        for cmd in candidates:
+            try:
+                norm = _normalize_text(cmd)
+            except Exception:
+                continue
+            if not norm or not _verb.search(norm) or not _noun.search(norm):
+                continue
+            excl, named = _parse_window_exclusions(norm)
+            if named:
+                return list(excl), True
+            return [], False
+    except Exception:
+        pass
+    return [], False
+
+
+def _parse_rest_window_command(command_text):
+    """Deterministic plan for "minimize the rest / the remaining windows".
+
+    Targets the CURRENT screen minus exclusions (explicit, else inherited
+    from the previous window command). A FAILED plan dict when the shape
+    matches but nothing remains — never vision. Returns None for
+    non-rest shapes. Never raises.
+    """
+    try:
+        normalized = _normalize_text(command_text)
+    except Exception:
+        return None
+    if not normalized:
+        return None
+    try:
+        matches = list(_REST_WINDOW_RE.finditer(normalized))
+    except Exception:
+        return None
+    if not matches:
+        return None
+    # [LIVE FIX 25 / B25] feedback precedes the command ("you only minimized
+    # one window minimize the rest also") — the LAST verb owns the span, so
+    # quoted feedback never feeds the filter.
+    m = matches[-1]
+    verb = str(m.group(1) or "").lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    tail = str(m.group("tail") or "")
+    exclusions, except_clause_named = _parse_window_exclusions(tail)
+    app = ""
+    try:
+        em = _EXCEPT_CLAUSE_RE.search(tail)
+        app_text = tail[:em.start()] if em else tail
+        # "the rest OF THE notepad windows" — the partitive is not an app
+        # word, and neither are rest-tail fillers ("also", "too").
+        app_text = re.sub(r"^\s*of\s+(?:the\s+|my\s+)?", " ",
+                          app_text, flags=re.IGNORECASE)
+        app_text = " ".join(
+            w for w in re.split(r"\s+", app_text)
+            if w and w.lower() not in _REST_TAIL_FILLERS)
+        app = _extract_appnamed_filter(app_text) or ""
+    except Exception:
+        app = ""
+    if not exclusions and not except_clause_named:
+        try:
+            rest_words = [w for w in re.findall(r"[a-z0-9]+", tail.lower())
+                          if w not in _REST_TAIL_FILLERS
+                          and w not in _REST_STRUCTURAL_WORDS]
+            # The app words and the except-clause were consumed above; any
+            # other substantive word means this is not a pure rest shape.
+            app_words = set(re.findall(r"[a-z0-9]+", app.lower()))
+            stray = [w for w in rest_words
+                     if w not in app_words and w != "except"
+                     and not (em and w in
+                              re.findall(r"[a-z0-9]+",
+                                         tail[em.start():].lower()))]
+            if stray:
+                return None
+        except Exception:
+            return None
+    if not except_clause_named:
+        try:
+            exclusions, except_clause_named = _inherited_window_exclusions()
+        except Exception:
+            exclusions, except_clause_named = [], False
+    windows = _list_managable_windows()
+    if not windows:
+        return _failed_window_plan(
+            "I couldn't list the open windows, sir — please try again.")
+    remember_window_enumeration(windows)
+    if app:
+        windows = [w for w in windows
+                   if _window_matches_filter(w, app)]
+        if not windows:
+            return _failed_window_plan(
+                "I couldn't find any %s windows, sir." % app[:60])
+    plan = _finalize_window_targets(
+        verb, action, windows, exclusions, except_clause_named,
+        app_filter=app)
+    return plan
+
+
 def _failed_window_plan(reason):
     """A failed direct plan with the honest spoken reason."""
     return {
@@ -1122,6 +1271,30 @@ def _list_managable_windows():
                             return True
                     except Exception:
                         pass
+                # [LIVE FIX 27 / B44] DWM-cloaked ghost windows (suspended
+                # UWP hosts, shell-cloaked Settings/Search) report
+                # IsWindowVisible but are on NO screen — counting or
+                # "minimizing" them produces false claims ("Minimizing 5
+                # windows" while the user sees one move). Fail open: a
+                # missing DWM must never empty the enumeration.
+                try:
+                    _cloak = wintypes.DWORD(0)
+                    if ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                            wintypes.HWND(hwnd), wintypes.DWORD(14),
+                            ctypes.byref(_cloak),
+                            ctypes.sizeof(_cloak)) == 0:
+                        if int(_cloak.value):
+                            return True
+                except Exception:
+                    pass
+                # [LIVE FIX 27 / B44] a window on no monitor is not "on my
+                # screen" either (fully off-screen strays). Minimized
+                # windows keep their monitor, so this never drops those.
+                try:
+                    if not user32.MonitorFromWindow(hwnd, 0):
+                        return True
+                except Exception:
+                    pass
                 try:
                     iconic = bool(user32.IsIconic(hwnd))
                 except Exception:
@@ -1960,6 +2133,7 @@ def _parse_clear_field_command(command_text):
 
 def _build_direct_plan(command_text):
     for parser in (
+        _parse_rest_window_command,
         _parse_referenced_window_command,
         _parse_qualified_window_command,
         _parse_windows_shell_command,
@@ -5097,6 +5271,206 @@ def _notify_plan_confirmed(chain_context, summary):
         logging.warning("[CHAIN] confirmed-plan callback failed: %s", exc)
 
 
+#: [LIVE FIX 27 / B47] a window-count QUESTION ("how many windows are open
+#: on my screen", "tell me how many windows are open") is answered from the
+#: live enumeration — never routed to the vision planner (PART A used to
+#: claim it via the "open" verb) and never to chat.
+_WINDOW_COUNT_Q_RE = re.compile(
+    r"\bhow\s+many\s+(?:windows?|apps?|applications?|programs?)\b",
+    re.IGNORECASE)
+_WINDOW_CMD_VERB_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore|close|closed)\b",
+    re.IGNORECASE)
+
+
+def _parse_window_count_question(command_text):
+    """Deterministic answer for a window-count question, else None.
+
+    Returns the spoken reply string (never a plan). Declines when a window
+    command verb precedes the count phrase (feedback on a command, not a
+    question). Never raises.
+    """
+    try:
+        normalized = _normalize_text(command_text)
+    except Exception:
+        return None
+    if not normalized:
+        return None
+    try:
+        m = _WINDOW_COUNT_Q_RE.search(normalized)
+    except Exception:
+        return None
+    if not m:
+        return None
+    try:
+        if _WINDOW_CMD_VERB_RE.search(normalized[:m.start()]):
+            return None
+    except Exception:
+        return None
+    try:
+        windows = _list_managable_windows()
+    except Exception:
+        windows = []
+    if not windows:
+        return "I don't see any windows open right now, sir."
+    try:
+        remember_window_enumeration(windows)
+    except Exception:
+        pass
+    try:
+        screen_state.note_window_question(command_text)
+    except Exception:
+        pass
+    open_wins = [w for w in windows if not w.get("iconic")]
+    minimized_n = len(windows) - len(open_wins)
+    if not open_wins:
+        if minimized_n == 1:
+            return ("No windows are open on your screen right now, sir — "
+                    "1 minimized.")
+        return ("No windows are open on your screen right now, sir — "
+                "%d minimized." % minimized_n)
+    noun = "window" if len(open_wins) == 1 else "windows"
+    reply = ("You have %d %s open on your screen, sir"
+             % (len(open_wins), noun))
+    if minimized_n == 1:
+        reply += ", with 1 more minimized."
+    elif minimized_n > 1:
+        reply += ", with %d more minimized." % minimized_n
+    else:
+        reply += "."
+    return reply
+
+
+#: [LIVE FIX 27 / B46] a past-tense window-state question ("have you
+#: minimized all windows?", "did you minimize the notepad windows?") is
+#: verified against the live enumeration — chat must never claim inability
+#: for what can be checked deterministically. Present-tense verbs stay
+#: with the command path; "close" cannot be verified (closed windows
+#: vanish) and declines.
+_WINDOW_STATE_Q_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s+)?"
+    r"(?:have\s+you|did\s+you)\s+"
+    r"(?P<verb>minimized|minimised|maximized|maximised|restored)\s+"
+    r"(?P<rest>[^.?!]{0,80})[.?!]*$",
+    re.IGNORECASE)
+_WINDOW_STATE_SCOPE_FILLERS = frozenset({
+    "all", "every", "each", "these", "those", "the", "a", "an", "my",
+    "window", "windows", "app", "apps", "application", "applications",
+    "program", "programs", "on", "at", "my", "screen", "desktop",
+    "please", "sir", "jarvis", "now", "open", "everything",
+})
+
+
+def _window_state_scope(rest):
+    """App scope words of a state question ("" = all windows)."""
+    try:
+        words = [w for w in re.findall(r"[a-z0-9]+", str(rest or "").lower())
+                 if w not in _WINDOW_STATE_SCOPE_FILLERS]
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(words)).strip()[:60]
+
+
+def _parse_window_state_question(command_text):
+    """Deterministic answer for a window-state question, else None.
+
+    Returns the spoken reply string (never a plan). Never raises.
+    """
+    try:
+        normalized = _normalize_text(command_text)
+    except Exception:
+        return None
+    if not normalized:
+        return None
+    try:
+        m = _WINDOW_STATE_Q_RE.match(normalized)
+    except Exception:
+        return None
+    if not m:
+        return None
+    verb = str(m.group("verb") or "").lower()
+    scope = _window_state_scope(m.group("rest"))
+    try:
+        windows = _list_managable_windows()
+    except Exception:
+        windows = []
+    if not windows:
+        return "I don't see any windows open right now, sir."
+    try:
+        remember_window_enumeration(windows)
+    except Exception:
+        pass
+    try:
+        screen_state.note_window_question(command_text)
+    except Exception:
+        pass
+    if scope:
+        windows = [w for w in windows
+                   if _window_matches_filter(w, scope)]
+        if not windows:
+            return ("I couldn't find any %s windows, sir."
+                    % scope[:60])
+    label = scope if scope else "windows"
+    singular = (len(windows) == 1)
+    if not scope:
+        subject = ("the window is" if singular
+                   else "all %d windows are" % len(windows))
+    else:
+        subject = ("the %s window is" % label if singular
+                   else "the %s windows are" % label)
+    if verb.startswith("minim"):
+        still_open = [w for w in windows if not w.get("iconic")]
+        if not still_open:
+            return "Yes, sir — %s minimized." % subject
+        names = ", ".join(
+            str(w.get("title") or "a window")[:40] for w in still_open[:3])
+        if not scope:
+            return ("No, sir — %d of %d windows are still open: %s."
+                    % (len(still_open), len(windows), names))
+        return ("No, sir — %s still open: %s."
+                % (label, names))
+    if verb.startswith("restor"):
+        iconic = [w for w in windows if w.get("iconic")]
+        if not iconic:
+            return "Yes, sir — %s on screen." % subject
+        names = ", ".join(
+            str(w.get("title") or "a window")[:40] for w in iconic[:3])
+        if not scope:
+            return ("No, sir — %d of %d windows are still minimized: %s."
+                    % (len(iconic), len(windows), names))
+        return ("No, sir — %s still minimized: %s."
+                % (label, names))
+    # maximized: verified live per-hwnd (maximized state is not enumerated).
+    unmaxed = []
+    try:
+        import ctypes as _st_ctypes
+        _u32 = _st_ctypes.windll.user32
+        for w in windows:
+            try:
+                hwnd = int(w.get("hwnd") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not hwnd:
+                continue
+            try:
+                if _u32.IsWindow(hwnd) and not _u32.IsZoomed(hwnd):
+                    unmaxed.append(w)
+            except Exception:
+                continue
+    except Exception:
+        return ("I couldn't verify the window state just now, sir — "
+                "please try again.")
+    if not unmaxed:
+        return "Yes, sir — %s maximized." % subject
+    names = ", ".join(
+        str(w.get("title") or "a window")[:40] for w in unmaxed[:3])
+    if not scope:
+        return ("No, sir — %d of %d windows are not maximized: %s."
+                % (len(unmaxed), len(windows), names))
+    return ("No, sir — %s not maximized: %s."
+            % (label, names))
+
+
 def maybe_handle_screen_control_message(text):
     # F19: exact, negation-aware enable/disable commands are resolved BEFORE
     # anything else — including pending-consent consumption. "Turn screen
@@ -5199,6 +5573,25 @@ def maybe_handle_screen_control_message(text):
     if _expired_confirm:
         return ("That confirmation has closed, sir — say it once more "
                 "and I'll redo it.")
+
+    # [LIVE FIX 27 / B46+B47] window questions are READ-ONLY answers from
+    # the live enumeration — never commands, never vision, never chat.
+    # Runs after the approval gates (a verdict is never a question) and
+    # before the retry/command routers (PART A would claim "open" in "how
+    # many windows are OPEN" as an action verb). The toggle does not apply:
+    # looking is not controlling (vision Q&A never needed it either).
+    # Separate guards: one net's failure must never sink the other.
+    try:
+        _window_qa = _parse_window_count_question(text)
+    except Exception:
+        _window_qa = None
+    if _window_qa is None:
+        try:
+            _window_qa = _parse_window_state_question(text)
+        except Exception:
+            _window_qa = None
+    if _window_qa is not None:
+        return _window_qa
 
     # Bug #10: "Try again" / "repeat that" support.
     # [LIVE FIX 25 / B27] the NEWEST request wins: a failed attempt (no

@@ -268,7 +268,7 @@ class TestB29ConfirmDuringPlanningAndLiveGate:
     def test_live_gate_never_speaks_single_sentence_claim(self):
         out = "".join(brain._gate_live_deltas(
             ["Clicking 'Tab", " search', sir."]))
-        assert "Clicking" not in out and "Nothing was started" in out
+        assert "Clicking" not in out and out == brain._CHAT_SCREEN_FALLBACK
 
     def test_live_gate_passthrough_is_byte_identical(self):
         assert ("".join(brain._gate_live_deltas(
@@ -278,7 +278,8 @@ class TestB29ConfirmDuringPlanningAndLiveGate:
     def test_live_gate_fallback_spoken_once(self):
         out = "".join(brain._gate_live_deltas(
             ["Clicking it now, sir. ", "Typing it now, sir."]))
-        assert out.count("Nothing was started") == 1
+        assert out.count("Understood, sir") == 1
+        assert out.endswith("Typing it now, sir.")
 
     def test_live_gate_keeps_restart_dedup(self):
         assert ("".join(brain._gate_live_deltas(

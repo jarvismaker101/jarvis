@@ -1,3 +1,4 @@
+import concurrent.futures
 import contextlib
 import json
 import itertools
@@ -278,6 +279,29 @@ def _enrich_screen_answer(answer_id, capture_id, request_id, tip, evidence,
 _screen_qa_callback = None
 _screen_qa_busy = threading.Lock()
 
+#: [LIVE FIX 27 / B48] overall bound for one screen analysis (seconds). The
+#: vision cascade has no total deadline — a hung provider (the Fireworks
+#: write-timeout hang) held the turn AND the busy lock for minutes of dead
+#: air. Past the bound the turn answers honestly; the orphaned call's
+#: result is discarded (it never pushes — pushes happen only in the route).
+SCREEN_QA_TIMEOUT = 75.0
+_screen_qa_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="screen-qa")
+
+
+def _analyze_screen_bounded(question):
+    """Run analyze_screen with an overall bound. Never raises.
+
+    Returns the analysis dict, or None on timeout/error (the caller then
+    answers with the honest-failure line).
+    """
+    try:
+        fut = _screen_qa_executor.submit(analyze_screen, question)
+        return fut.result(timeout=SCREEN_QA_TIMEOUT)
+    except Exception as exc:
+        logging.warning("[SCREEN] analysis failed or timed out: %s", exc)
+        return None
+
 
 def set_screen_qa_callback(cb):
     """Register a callback(text) invoked when a background screen Q&A completes."""
@@ -412,14 +436,16 @@ _CHAT_REROUTE_FALLBACK = (
 #: [LIVE FIX 25 / B31] fallback when the stripped sentences were about
 #: the SCREEN (a cut claim or a cut screen-action offer): never the
 #: folder/file question — a minimize request has no folder.
+#: [LIVE FIX 27 / B50] neutral: it must never assert nothing was started —
+#: screen work may genuinely have run before the chat turn.
 _CHAT_SCREEN_FALLBACK = (
-    "Nothing was started on the screen, sir — say exactly what you want "
-    "done there and I'll do it."
+    "Understood, sir — say exactly what you'd like me to do and I'll "
+    "do it."
 )
 
-#: Every fallback chat may speak. All three pass the gate unchanged
-#: (each carries "nothing was started", which the offer exemption
-#: covers, and none matches the claim or authority patterns).
+#: Every fallback chat may speak. The two "nothing was started" fallbacks
+#: pass via the offer exemption; the screen fallback matches no claim or
+#: authority pattern at all, so it passes on its own.
 _CHAT_FALLBACKS = frozenset({_CHAT_NO_ACTION_FALLBACK,
                              _CHAT_REROUTE_FALLBACK,
                              _CHAT_SCREEN_FALLBACK})
@@ -1150,6 +1176,19 @@ _GREETING_LIKE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 27 / B51] a BARE greeting ("hi jarvis", "hello", "hey",
+#: "good morning") carries no request — answering deterministically keeps
+#: the chat model from free-associating (the live "Python decorators"
+#: hallucination) and arming a search offer on nothing. Must contain a
+#: real greeting word: bare "jarvis"/"sir" and contentful turns ("i said
+#: hi", "hi, what is python") stay with the normal route.
+_BARE_GREETING_RE = re.compile(
+    r"^(?:(?:please|kindly|ok(?:ay)?)\s*,?\s*)*"
+    r"(?:hi|hey|hello|yo|good\s+(?:morning|afternoon|evening|night))\b"
+    r"(?:[\s,.!?]*\b(?:jarvis|sir|please)\b)?[\s,.!?]*$",
+    re.IGNORECASE,
+)
+
 # Question-shaped chat (optional hey/ok/hi/hello/jarvis fillers, then an
 # interrogative — "whats" counts as "what"). Non-question chat stays chat.
 _QUESTION_SHAPED_RE = re.compile(
@@ -1381,6 +1420,17 @@ def _remember_chat_offer(user_msg, reply):
                     _last_offer["superseded"] = True
             return
         query = _resolve_reference_query(user_msg)
+        try:
+            if _BARE_GREETING_RE.match(str(user_msg or "").strip()):
+                # [LIVE FIX 27 / B51] a greeting answers nothing — a stale
+                # offer dies with it instead of arming on hallucinated
+                # context ("hi jarvis" -> "Python decorators").
+                with _offer_lock:
+                    if _last_offer:
+                        _last_offer["superseded"] = True
+                return
+        except Exception:
+            pass
         with _offer_lock:
             _last_offer = {
                 "kind": "search",
@@ -7598,6 +7648,9 @@ def _repeatable_last_command():
 #: thing, not a bare "again". Distinct from the whole-task repeat (which
 #: needs whole/entire/over) and from bare continue. Never matches a fresh
 #: action request (those name their own verb+object, not "that").
+#: [LIVE FIX 27 / B50] retry phrasing ("try my last query again", "retry my
+#: last question", "run my last request again") is the same gesture aimed
+#: at the last QUERY — it must re-run instead of falling to chat.
 _DEICTIC_RERUN_RE = re.compile(
     r"^\s*(?:(?:please|kindly|jarvis|ok(?:ay)?|now|sir)\s*,?\s*)*"
     r"(?:(?:do|run|perform|try|execute)\s+(?:that|this)\s+"
@@ -7605,7 +7658,10 @@ _DEICTIC_RERUN_RE = re.compile(
     r"|(?:do|run)\s+(?:the\s+)?task\b"
     r"|(?:do|run|go\s+ahead\s+and\s+do)\s+that\b"
     r"|do\s+that\s+now\b"
-    r"|go\s+ahead\s+and\s+do\s+that\b)"
+    r"|go\s+ahead\s+and\s+do\s+that\b"
+    r"|(?:try|retry|repeat|re-?do|re-?run|run)\s+"
+    r"(?:my\s+|the\s+|that\s+|this\s+)?last\s+"
+    r"(?:query|question|request|command)\b)"
     r"(?:\s*,?\s*(?:please|sir|jarvis|now|again))?[\s.!]*$",
     re.IGNORECASE)
 
@@ -7614,7 +7670,9 @@ def _deictic_rerun_source():
     """Command text for a deictic re-run, else "".
 
     Priority: a refused chain (B36 — the task that never ran), then the
-    newest screen request (B27 ledger), then the last repeatable action
+    NEWEST of the newest screen request (B27 ledger), the last deterministic
+    window question (B50 — "try my last query again" after a count/state
+    answer), and the last vision question — then the last repeatable action
     (B32). A source that is itself deictic is never returned (no loops).
     Never raises.
     """
@@ -7624,12 +7682,43 @@ def _deictic_rerun_source():
         _src = str(_ref.get("source") or "").strip()
         if _src and not _DEICTIC_RERUN_RE.match(_src):
             return _src
-        _req = _ss.get_last_request() or {}
-        _cmd = str(_req.get("command") or "").strip()
-        if _cmd and not _DEICTIC_RERUN_RE.match(_cmd):
-            return _cmd
     except Exception:
         pass
+    cands = []
+
+    def _take(text, ts):
+        try:
+            t = str(text or "").strip()
+            stamp = float(ts or 0.0)
+            if (t and stamp > 0.0
+                    and time.time() - stamp < 300.0
+                    and not _DEICTIC_RERUN_RE.match(t)):
+                cands.append((stamp, t))
+        except Exception:
+            pass
+
+    try:
+        from backend.services import screen_state as _ss
+        _req = _ss.get_last_request() or {}
+        _take(_req.get("command"), _req.get("ts"))
+    except Exception:
+        pass
+    try:
+        from backend.services import screen_state as _ssq
+        _wq = _ssq.get_last_window_question() or {}
+        _take(_wq.get("question"), _wq.get("ts"))
+    except Exception:
+        pass
+    try:
+        with _screen_qa_last_lock:
+            _sqq = str(_screen_qa_last.get("question") or "")
+            _sqts = float(_screen_qa_last.get("at") or 0.0)
+        _take(_sqq, _sqts)
+    except Exception:
+        pass
+    if cands:
+        cands.sort(key=lambda c: c[0])
+        return cands[-1][1]
     try:
         _last = _repeatable_last_command() or ""
         if _last and not _DEICTIC_RERUN_RE.match(_last.strip()):
@@ -11470,7 +11559,12 @@ def _process_message_inner(
         if intent_name in ("screen", "region"):
             print(f"[INTENT] {intent_name} intent — analysing screen.")
             if not _screen_qa_busy.acquire(blocking=False):
-                return "Still analysing your screen, sir. One moment."
+                # [LIVE FIX 27 / B49] the busy line must never promise a
+                # follow-up: nothing is queued behind the lock, and the
+                # in-flight analysis may itself fail. An honest
+                # wait-and-ask instead of "one moment" with no moment.
+                return ("I'm still working on your last screen question, "
+                        "sir — ask again in a moment.")
             try:
                 # Conversation continuity: a screen Q&A is a real exchange.
                 # Both halves land in history like any chat turn, so a
@@ -11496,7 +11590,24 @@ def _process_message_inner(
                 if retry_q is not None:
                     print("[SCREEN] Question retry — re-asking with the "
                           "pointed area as focus.")
-                result = analyze_screen(retry_q or msg)
+                result = _analyze_screen_bounded(retry_q or msg)
+                if result is None:
+                    # [LIVE FIX 27 / B48] the vision chain died or hung past
+                    # the bound — an honest spoken failure with the normal
+                    # commit/push path, never dead air. The orphaned call's
+                    # result is discarded (no push ever happens for it).
+                    result = {
+                        "tip": ("I couldn't analyse your screen just now, "
+                                "sir — say it once more and I'll try "
+                                "again."),
+                        "evidence": [],
+                        "topic": "",
+                        "creator": "",
+                        "grounding_links": [],
+                        "show_images": False,
+                        "region": None,
+                        "observation_id": "",
+                    }
                 tip = result.get("tip") or "I couldn't analyse the screen, sir."
                 # Fix 17: remember this question + how it went, so the NEXT
                 # "look again" retries it instead of falling to chat.
@@ -11814,6 +11925,32 @@ def _process_message_inner(
         except Exception as exc:
             logging.warning("[TASK] No-pending confirmation guard failed: %s",
                             exc)
+        # [LIVE FIX 27 / B51] a bare greeting carries no request — answer
+        # deterministically instead of letting the chat model free-associate
+        # (the live "Python decorators" hallucination on "hi jarvis") and
+        # arm a search offer on nothing. Runs after every upgrading net had
+        # its chance, before the router/chat model.
+        try:
+            _is_bare_greeting = bool(
+                _BARE_GREETING_RE.match(msg.strip()))
+        except Exception:
+            _is_bare_greeting = False
+        if _is_bare_greeting:
+            if racer is not None:
+                try:
+                    racer.cancel()
+                except Exception:
+                    pass
+            print("[INTENT] Bare greeting -> deterministic reply")
+            _remember_user_turn(msg)
+            response = "Hello, sir. How can I assist you today?"
+            try:
+                add_message("assistant", response)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, response)
+            return response
         # [S6] ONE call, two jobs: the intent router classified this turn AND
         # wrote the answer, so a plain conversational turn no longer pays for a
         # second chat completion. The reply is used ONLY here - after every

@@ -77,12 +77,12 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         # build must return llm path
         fake_built = {
             "path": "llm",
-            "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+            "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "i am testing the chat stream"}],
             "system_prompt": "sys",
-            "query": "hi",
+            "query": "i am testing the chat stream",
         }
 
-        chat_intent = {"intent": "chat", "steps": [], "query": "hi", "task_description": "", "original": "hi"}
+        chat_intent = {"intent": "chat", "steps": [], "query": "i am testing the chat stream", "task_description": "", "original": "i am testing the chat stream"}
 
         with patch.object(brain, "_build_chat_messages", return_value=fake_built), \
              patch.object(brain, "_stream_chat_deltas", side_effect=fake_stream), \
@@ -93,7 +93,7 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
              patch.object(brain, "is_explicit_task_request", return_value=False), \
              patch.object(brain, "is_code_tool_request", return_value=False):
 
-            resp = brain.process_message("hi", sync_voice=False, stream_reply=collector)
+            resp = brain.process_message("i am testing the chat stream", sync_voice=False, stream_reply=collector)
 
         # deltas reached stream
         self.assertEqual(collected, deltas)
@@ -103,7 +103,7 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         hist = self.get_history()
         self.assertEqual(len(hist), 2)
         self.assertEqual(hist[0]["role"], "user")
-        self.assertEqual(hist[0]["content"], "hi")
+        self.assertEqual(hist[0]["content"], "i am testing the chat stream")
         self.assertEqual(hist[1]["role"], "assistant")
         self.assertEqual(hist[1]["content"], "Hello sir.")
         self.assertFalse(close_tracker["closed"], "chat path should not have closed due to cancel")
@@ -239,8 +239,8 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
         collected = []
         def collector(d):
             collected.append(d)
-        fake_built = {"path": "llm", "messages": [{"role":"system","content":"sys"}], "system_prompt":"sys", "query":"hi"}
-        fallback = {"intent": "chat", "steps": [], "query": "hi", "task_description": "", "original": "hi"}
+        fake_built = {"path": "llm", "messages": [{"role":"system","content":"sys"}], "system_prompt":"sys", "query":"i am testing the chat stream"}
+        fallback = {"intent": "chat", "steps": [], "query": "i am testing the chat stream", "task_description": "", "original": "i am testing the chat stream"}
 
         def fake_stream(messages, temperature, max_tokens, cancel=None):
             class Gen:
@@ -260,7 +260,7 @@ class ChatRaceStreamVsRouterTests(unittest.TestCase):
              patch.object(brain, "is_explicit_task_request", return_value=False), \
              patch.object(brain, "is_code_tool_request", return_value=False):
 
-            resp = brain.process_message("hello", sync_voice=False, stream_reply=collector)
+            resp = brain.process_message("i am testing the chat stream", sync_voice=False, stream_reply=collector)
 
         self.assertEqual(collected, deltas)
         self.assertEqual(resp, "fallback ok")

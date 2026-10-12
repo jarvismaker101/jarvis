@@ -753,7 +753,11 @@ class ScreenQuestionNetTests(unittest.TestCase):
              patch.object(brain, "is_task_request", return_value=False), \
              patch.object(brain, "analyze_screen") as analyze, \
              patch.object(brain, "handle_chat", return_value="hello sir") as chat:
-            response = brain.process_message("hello jarvis", sync_voice=False)
+            # NOTE: bare greetings ("hello jarvis") are answered
+            # deterministically since LIVE FIX 27 / B51 and never reach
+            # the chat model — this test uses contentful chat instead.
+            response = brain.process_message("i am feeling happy today jarvis",
+                                             sync_voice=False)
         analyze.assert_not_called()
         chat.assert_called_once()
         self.assertEqual(response, "hello sir")

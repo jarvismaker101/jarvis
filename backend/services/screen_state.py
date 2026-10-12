@@ -369,10 +369,11 @@ def get_recent_interactions():
 
 
 def clear_interactions():
-    global _interaction_history, _last_request
+    global _interaction_history, _last_request, _last_window_question
     with _state_lock:
         _interaction_history = []
         _last_request = {"command": "", "ts": 0.0}
+        _last_window_question = {"question": "", "ts": 0.0}
 
 
 def note_request(command):
@@ -398,6 +399,33 @@ def get_last_request():
             return dict(_last_request)
     except Exception:
         return {"command": "", "ts": 0.0}
+
+
+#: [LIVE FIX 27 / B50] the newest deterministic window question (count /
+#: state-verify answer), so "try my last query again" re-runs the actual
+#: last QUERY — the B27 request ledger only holds control commands, and
+#: the vision-question ledger only holds vision Q&A.
+_last_window_question = {"question": "", "ts": 0.0}
+
+
+def note_window_question(question):
+    """Record the newest answered window question. Never raises."""
+    global _last_window_question
+    try:
+        with _state_lock:
+            _last_window_question = {
+                "question": str(question or ""), "ts": time.time()}
+    except Exception:
+        pass
+
+
+def get_last_window_question():
+    """A safe copy of the newest answered window question."""
+    try:
+        with _state_lock:
+            return dict(_last_window_question)
+    except Exception:
+        return {"question": "", "ts": 0.0}
 
 
 def note_refused_chain(source):
