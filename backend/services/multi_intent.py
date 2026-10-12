@@ -20,7 +20,7 @@ None and the turn keeps its normal single-intent routing.
 
 import re
 
-_MAX_STEPS = 4
+_MAX_STEPS = 6
 
 #: Clause separators: commas/semicolons, "and"/"then" families, and the
 #: common Hinglish connectors. Splitting is intentionally liberal — the
@@ -73,10 +73,20 @@ _RESEARCH_RE = re.compile(
 #: "task"). A bare "scroll down" / "press enter" / "minimize" names no
 #: target but is a complete command on its own, so those shapes match
 #: without a target noun.
+#: [LIVE FIX 22 / B9] element-level follow-on verbs ("backspace whatever is
+#: written in it", "type mr.beast", "play the first video", bare "search"
+#: handled at chain level): a spoken control sequence is one verb per
+#: clause, so backspace/type-content/ordinal-play match without a UI noun.
+#: "copy" stays OUT of the bare list ("copy it" is the task replicate);
+#: "delete/clear/erase" only match field-content shapes, never file/folder
+#: nouns ("delete the folder" stays a task); "type <content>" is blocked
+#: when a file noun follows ("type the report in the file" stays a task);
+#: ordinal "play the first/next X" is a screen click while plain "play X"
+#: stays a tool request.
 _SCREEN_CONTROL_RE = re.compile(
     r"\b(click|double-?click|right-?click|tap|press|hit|type|enter|write|"
-    r"scroll|drag|drop|move|hover|select|focus|minimize|minimise|maximize|"
-    r"maximise|restore|switch|close)\b[^.?!]{0,48}\b(screen|windows?|"
+    r"copy|scroll|drag|drop|move|hover|select|focus|minimize|minimise|maximize|"
+    r"maximise|restore|switch|close|paste|cut)\b[^.?!]{0,48}\b(screen|windows?|"
     r"desktop|button|link|tabs?|icon|checkbox|menu|toolbar|search\s*bar|"
     r"search\s*box|text\s*box|textbox|field|mouse|cursor|apps?|"
     r"applications?|dialog|popup)\b"
@@ -87,7 +97,22 @@ _SCREEN_CONTROL_RE = re.compile(
     # A control verb aimed at the previous step's target ("and click it",
     # "then close that") is a follow-on control step, not a fragment.
     r"|\b(click|double-?click|right-?click|tap|press|type|scroll|"
-    r"minimize|minimise|close)\s+(it|this|that|them|these|those)\b",
+    r"minimize|minimise|close)\s+(it|this|that|them|these|those)\b"
+    # [LIVE FIX 22 / B9] field-content editing without a named target.
+    r"|\bbackspace\b"
+    r"|\b(?:backspace|delete|clear|erase)\b[^.?!]{0,48}\b(?:whatever|"
+    r"what(?:'s| is)?\s+\w+|in\s+(?:it|this|that)|it|this|that|all|"
+    r"everything|field|box|bar|text)\b"
+    # [LIVE FIX 22 / B9] typing content into the focused element ("type
+    # mr.beast") — blocked when a file noun follows (file writes stay task).
+    r"|^\s*(?:(?:please|kindly|jarvis)\b[^.?!]{0,12})?type\b"
+    r"(?![^.?!]{0,48}\b(?:file|folder|directory|report|document|note|txt|"
+    r"script|code)\b)[^.?!]{0,48}\S"
+    r"|\bpaste\b|\bcut\b"
+    # [LIVE FIX 22 / B9] ordinal play is a screen click ("play the first
+    # video"); plain "play X" stays a tool request.
+    r"|\bplay\b[^.?!]{0,32}\bthe\s+(?:first|second|third|fourth|fifth|"
+    r"top|next|last)\b",
     re.IGNORECASE,
 )
 
@@ -96,6 +121,13 @@ _SCREEN_CONTROL_RE = re.compile(
 #: re-plans against the fresh screen, so the dependency is ordering-only.
 _SC_PRONOUN_RE = re.compile(
     r"\b(it|this|that|them|these|those)\b", re.IGNORECASE)
+
+#: [LIVE FIX 22 / B9] a bare submit clause ("search", "search it",
+#: "submit", "press enter") means "submit what I just typed" when it
+#: follows a control step — never a web-search step.
+_BARE_SUBMIT_RE = re.compile(
+    r"^\s*(?:search(?:\s+it)?|submit(?:\s+it)?|(?:press|hit)\s+enter)\s*$",
+    re.IGNORECASE)
 
 _TASK_WRITE_RE = re.compile(
     r"\b(create|make|write|save|put|store)\b[^.?!]{0,60}"
@@ -210,14 +242,14 @@ def classify_clause(text):
     t = (text or "").strip()
     if not t:
         return None
-    if _SCREEN_RE.search(t):
-        return "screen"
-    # [LIVE FIX 21] control-before-research: "click the search bar" IS a
-    # screen action even though it contains the word "search" — research
-    # clauses ("search the web for X", "look up Y") carry no control verb
-    # aimed at a UI target, so they still fall through below.
+    # [LIVE FIX 22 / B9] control-before-screen: "click the search bar ON MY
+    # SCREEN" is a control, not a look — the screen phrase used to win and
+    # the clause became a look step. Look-only clauses ("look at my
+    # screen") carry no control verb so they still fall through below.
     if _SCREEN_CONTROL_RE.search(t):
         return "screen_control"
+    if _SCREEN_RE.search(t):
+        return "screen"
     if _RESEARCH_RE.search(t):
         return "research"
     # [LIVE FIX 21] control verbs act on the screen/windows; file verbs
@@ -248,6 +280,13 @@ def build_chain(text):
     merged = []
     for clause in clauses:
         kind = classify_clause(clause)
+        # [LIVE FIX 22 / B9] a bare submit ("and then search", "then hit
+        # enter") right after a control step means "submit what I just
+        # typed" — a control step, never a web-search step.
+        if (merged and merged[-1]["kind"] == "screen_control"
+                and _BARE_SUBMIT_RE.match(clause)):
+            merged.append({"kind": "screen_control", "text": "press enter"})
+            continue
         if kind is None:
             if merged:
                 merged[-1]["text"] = merged[-1]["text"] + " and " + clause
@@ -346,17 +385,38 @@ _LABELS = {
 _FOLDER_CLAUSE_RE = re.compile(r"\b(folder|directory)\b", re.IGNORECASE)
 
 
+_SC_LABEL_FILLER_RE = re.compile(
+    r"^(?:please\s+|kindly\s+|jarvis\s*,?\s*)+", re.IGNORECASE)
+_SC_LABEL_TAIL_RE = re.compile(
+    r"\s+(?:on|at)\s+(?:my|the)\s+screen\s*$", re.IGNORECASE)
+
+
+def _short_control_label(text):
+    """Compact verb-object for a control step ("type mr.beast").
+
+    [LIVE FIX 22 / B9] the chain ack narrates what each step will do
+    instead of repeating "control your screen" for every step.
+    """
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = _SC_LABEL_FILLER_RE.sub("", t)
+    t = _SC_LABEL_TAIL_RE.sub("", t)
+    label = " ".join(t.split()[:7])
+    if len(label) > 42:
+        label = label[:42].rstrip() + "…"
+    return label or "control your screen"
+
+
 def _step_label(step):
     """What this step will actually do — folder jobs never say "file"."""
     kind = step.get("kind")
     text = step.get("text") or ""
     if kind == "screen_control":
-        # [LIVE FIX 21] window management reads as windows, the rest as
-        # on-screen control — the ack narrates the chain truthfully.
+        # [LIVE FIX 22 / B9] window management reads as windows, the rest
+        # narrates its own verb-object — the ack stays truthful per step.
         if re.search(r"\b(minimize|minimise|maximize|maximise|restore)\b",
                      text, re.IGNORECASE):
             return "manage your windows"
-        return "control your screen"
+        return _short_control_label(text)
     if kind == "task" and _TASK_REPLICATE_RE.search(text):
         # [LIVE FIX 12] A replication rebuilds the on-screen structure —
         # never "save it to a file".

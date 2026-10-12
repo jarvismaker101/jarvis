@@ -171,6 +171,43 @@ def restore_foreground_window():
     user32.ShowWindow(hwnd, SW_RESTORE)
 
 
+#: [LIVE FIX 22] window-state actions bound to an explicit window handle —
+#: "minimize all except Brave" must act on enumerated windows, never on
+#: whatever holds focus at step time.
+_HWND_STATE_ACTIONS = {
+    "minimize_hwnd": SW_MINIMIZE,
+    "maximize_hwnd": SW_MAXIMIZE,
+    "restore_hwnd": SW_RESTORE,
+}
+
+
+def set_window_state_by_hwnd(hwnd, show_cmd):
+    """Minimize/maximize/restore one window by identity, not focus.
+
+    Returns True when the state was set; False when the window closed
+    between plan and execution (skip it, never stop the rest of the
+    plan for it). Raises honestly on an unusable handle.
+    """
+    try:
+        hwnd = int(hwnd or 0)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "That window target was not usable, sir - I stopped instead "
+            "of acting on the wrong window.")
+    if not hwnd:
+        raise RuntimeError(
+            "That window target was not usable, sir - I stopped instead "
+            "of acting on the wrong window.")
+    try:
+        alive = user32.IsWindow(hwnd)
+    except Exception:
+        alive = 0
+    if not alive:
+        return False
+    user32.ShowWindow(hwnd, show_cmd)
+    return True
+
+
 def click(x, y, button="left", clicks=1):
     _ensure_dpi_awareness()
     move_mouse(x, y)
@@ -519,6 +556,11 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
                 maximize_foreground_window()
             elif action == "restore_window":
                 restore_foreground_window()
+            elif action in _HWND_STATE_ACTIONS:
+                # [LIVE FIX 22] per-window identity action — a window that
+                # closed mid-plan is skipped, the rest still run.
+                set_window_state_by_hwnd(
+                    step.get("hwnd"), _HWND_STATE_ACTIONS[action])
             elif action == "scroll":
                 scroll(step.get("direction", "down"), step.get("amount", 600))
             elif action == "type":

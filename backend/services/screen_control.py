@@ -345,6 +345,19 @@ _SCREEN_CMD_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 22 / B9] bare element-level shapes that name no UI noun but
+#: are complete commands on their own ("type mr.beast", "press enter",
+#: "backspace whatever is written in it", "play the first video").
+#: Only consulted with controls ON, so questions and chat never match.
+_SCREEN_CMD_BARE_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+)?(?:type|enter)\s+\S"
+    r"|^\s*(?:please\s+|kindly\s+)?(?:press|hit|tap)\s+\S"
+    r"|\bbackspace\b"
+    r"|\bplay\b[^.?!]{0,32}\bthe\s+(?:first|second|third|fourth|fifth|"
+    r"top|next|last)\b",
+    re.IGNORECASE,
+)
+
 # PART A - screen phrase + action verb detection anywhere (regardless of toggle)
 # [LIVE FIX 20 / bug 7b] window verbs belong here too: with controls ON, a
 # mid-sentence/Hinglish "minimize ... window" must reach the capable path
@@ -407,7 +420,13 @@ def _looks_like_screen_command(text):
     if screen_state.is_enabled():
         has_ui_noun = bool(_SCREEN_CMD_UI_NOUN.search(normalized))
         has_action = bool(_SCREEN_CMD_ACTION_RE.search(normalized))
-        return has_ui_noun and has_action
+        if has_ui_noun and has_action:
+            return True
+        # [LIVE FIX 22 / B9] bare element shapes ("type mr.beast") carry
+        # no UI noun — matched directly so chain steps and single
+        # commands reach the direct parsers.
+        if _SCREEN_CMD_BARE_RE.search(normalized):
+            return True
     return False
 
 
@@ -557,6 +576,258 @@ def _parse_window_command(command_text):
     return None
 
 
+#: [LIVE FIX 22] a window-management verb aimed at MANY windows ("minimize
+#: all the windows except Brave"). The instant direct plan above only
+#: touches the ACTIVE window, so these defer here — to a deterministic
+#: per-window plan, never to the vision model (which cannot honor
+#: exclusions: its only window primitive minimizes the foreground).
+_QUALIFIED_WINDOW_RE = re.compile(
+    r"\b(minimize|minimise|maximize|maximise|restore)\b"
+    r"[^.?!]{0,64}\b(all|every|each|other|another|sab|sabhi|saare|saari|"
+    r"sare)\b[^.?!]{0,64}\b(windows?|apps?|applications?|programs?)\b",
+    re.IGNORECASE,
+)
+
+#: Optional app filter between the quantifier and "windows" ("minimize all
+#: the TERMINAL windows").
+_QUALIFIED_APP_FILTER_RE = re.compile(
+    r"\b(?:all|every|each|other|another|sab|sabhi|saare|saari|sare)\b"
+    r"\s+(?:the\s+|my\s+)?(.*?)\s*\b(?:windows?|apps?|applications?|"
+    r"programs?)\b",
+    re.IGNORECASE,
+)
+
+_EXCEPT_CLAUSE_RE = re.compile(
+    r"\b(?:except|excluding|exclude|but\s+not|leaving|leave|keep(?:ing)?"
+    r"(?:\s+open)?)\b\s*(?:for\s+|open\s+)?(.+?)\s*$",
+    re.IGNORECASE,
+)
+_EXCEPT_SPLIT_RE = re.compile(r"\s+and\s+|\s*,\s*|\s+or\s+|\s+plus\s+",
+                              re.IGNORECASE)
+_EXCEPT_FILLERS = frozenset({
+    "the", "a", "an", "my", "for", "open", "browser", "app", "apps",
+    "application", "applications", "window", "windows", "please", "sir",
+    "on", "my", "screen",
+})
+_BROWSER_TOKENS = ("brave", "chrome", "msedge", "edge", "firefox",
+                   "opera", "vivaldi", "arc")
+
+_QUALIFIED_VERB_ACTION = {
+    "minimize": "minimize_hwnd",
+    "minimise": "minimize_hwnd",
+    "maximize": "maximize_hwnd",
+    "maximise": "maximize_hwnd",
+    "restore": "restore_hwnd",
+}
+
+
+def _list_managable_windows():
+    """Visible titled top-level windows, oldest API, no model involved.
+
+    Skips Jarvis's own windows, untitled helpers and the Program Manager.
+    Returns [{"hwnd", "title", "iconic"}]; [] when enumeration is
+    unavailable. Never raises.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return []
+    out = []
+    try:
+        from backend.services.screen_capture import (
+            is_own_window as _is_own_window)
+    except Exception:
+        _is_own_window = None
+    try:
+        proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND,
+                                  wintypes.LPARAM)
+
+        def _cb(hwnd, _lp):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, len(buf))
+                title = (buf.value or "").strip()
+                if not title or title.lower() == "program manager":
+                    return True
+                if _is_own_window is not None:
+                    try:
+                        if _is_own_window(hwnd):
+                            return True
+                    except Exception:
+                        pass
+                try:
+                    iconic = bool(user32.IsIconic(hwnd))
+                except Exception:
+                    iconic = False
+                out.append({"hwnd": int(hwnd), "title": title,
+                            "iconic": iconic})
+            except Exception:
+                pass
+            return True
+
+        _cb_ref = proc(_cb)
+        user32.EnumWindows(_cb_ref, 0)
+    except Exception:
+        return []
+    return out
+
+
+def _match_window_token(title_lower, token):
+    """True when an exclusion/filter token names this window title."""
+    token = (token or "").strip().lower()
+    if not token:
+        return False
+    if token in title_lower:
+        return True
+    words = [w for w in re.split(r"\s+", token) if w]
+    return bool(words) and all(w in title_lower for w in words)
+
+
+def _parse_qualified_window_command(command_text):
+    """Deterministic all-windows plan with exclusions (no vision).
+
+    "minimize all the windows on my screen except for the brave browser"
+    becomes one minimize_hwnd step per enumerated window minus the
+    exclusions. Returns None when the text is not a qualified window
+    command; a FAILED plan dict (honest reason) when it is but has no
+    usable targets, so the caller reports instead of vision-planning.
+    """
+    normalized = _normalize_text(command_text)
+    m = _QUALIFIED_WINDOW_RE.search(normalized)
+    if not m:
+        return None
+    verb = m.group(1).lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    quantifier = (m.group(2) or "").lower()
+
+    app_filter = ""
+    fm = _QUALIFIED_APP_FILTER_RE.search(normalized)
+    if fm:
+        app_filter = re.sub(r"\s+", " ", (fm.group(1) or "")).strip().lower()
+        if app_filter in ("", "the", "my"):
+            app_filter = ""
+
+    exclusions = []
+    except_clause_named = False
+    em = _EXCEPT_CLAUSE_RE.search(normalized)
+    if em:
+        except_clause_named = True
+        raw = (em.group(1) or "").strip()
+        parts = [p.strip() for p in _EXCEPT_SPLIT_RE.split(raw) if p.strip()]
+        for part in parts:
+            words = [w for w in re.split(r"\s+", part.lower())
+                     if w and w not in _EXCEPT_FILLERS]
+            token = " ".join(words).strip()
+            if token:
+                exclusions.append(token)
+        if not exclusions and "browser" in raw.lower():
+            # "except for the browser" names no app — keep every browser.
+            exclusions.extend(list(_BROWSER_TOKENS))
+
+    windows = _list_managable_windows()
+    if not windows:
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "I couldn't list the open windows, sir — "
+                      "please try again.",
+            "steps": [],
+        }
+    if app_filter:
+        windows = [w for w in windows
+                   if _match_window_token(w["title"].lower(), app_filter)]
+        if not windows:
+            return {
+                "ok": False,
+                "confidence": 0.0,
+                "summary": "",
+                "needs_confirmation": False,
+                "reason": "I couldn't find any %s windows, sir."
+                          % app_filter[:60],
+                "steps": [],
+            }
+
+    kept_out = []
+    targets = []
+    for w in windows:
+        title_lower = w["title"].lower()
+        if any(_match_window_token(title_lower, e) for e in exclusions):
+            kept_out.append(w["title"])
+            continue
+        targets.append(w)
+    if quantifier == "other":
+        # "all OTHER windows" — everything but the foreground one.
+        try:
+            import ctypes
+            fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:
+            fg = 0
+        if fg:
+            skipped = [w for w in targets if w["hwnd"] == fg]
+            kept_out.extend(w["title"] for w in skipped)
+            targets = [w for w in targets if w["hwnd"] != fg]
+    if verb in ("minimize", "minimise"):
+        # Minimizing an already-minimized window is a no-op — drop those.
+        targets = [w for w in targets if not w.get("iconic")]
+    if except_clause_named and not exclusions:
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "I couldn't tell which app to leave open, sir — "
+                      "name it once and I'll leave it.",
+            "steps": [],
+        }
+    if not targets:
+        if kept_out:
+            return {
+                "ok": True,
+                "confidence": 0.99,
+                "summary": "Everything else is already put away, sir.",
+                "needs_confirmation": False,
+                "reason": "",
+                "steps": [],
+            }
+        return {
+            "ok": False,
+            "confidence": 0.0,
+            "summary": "",
+            "needs_confirmation": False,
+            "reason": "There are no windows to %s, sir."
+                      % ("minimize" if verb.startswith("minim")
+                         else verb.rstrip("e") + "e"),
+            "steps": [],
+        }
+    noun = "window" if len(targets) == 1 else "windows"
+    summary = "%s %d %s, sir." % (
+        "Minimizing" if verb.startswith("minim")
+        else "Maximizing" if verb.startswith("maxim") else "Restoring",
+        len(targets), noun)
+    if kept_out:
+        kept = sorted({t for t in kept_out}, key=len)[:2]
+        summary += " Leaving %s." % ", ".join(kept)[:80]
+    return {
+        "ok": True,
+        "confidence": 0.99,
+        "summary": summary,
+        "needs_confirmation": False,
+        "reason": "",
+        "steps": [{"action": action, "hwnd": w["hwnd"],
+                   "title": w["title"],
+                   "description": "Minimize '%s'" % w["title"][:80]}
+                  for w in targets],
+    }
+
+
 def _parse_key_sequence(raw_keys):
     normalized = " ".join(raw_keys.lower().split())
     for source, target in KEY_PHRASE_REPLACEMENTS:
@@ -686,11 +957,52 @@ def _parse_type_command(command_text):
     }
 
 
+#: [LIVE FIX 22 / B9] field-content editing as a direct (instant, no
+#: vision) plan: "backspace whatever is written in it" selects all and
+#: deletes (a bare "backspace" is one keypress). Bare "clear" alone is
+#: NOT matched — in a terminal that means clear-screen, not clear-field.
+_CLEAR_FIELD_RE = re.compile(
+    r"^(?:backspace(?:\s+(?:whatever.*|everything|all|it))?|"
+    r"(?:clear|erase)(?:\s+(?:the\s+)?(?:field|text|box|search(?:\s+bar|"
+    r"\s+box)?|whatever.*|everything|all|it|this|that))|"
+    r"select\s+all\s+(?:and\s+)?delete)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_clear_field_command(command_text):
+    cleaned = _strip_leading_fillers(command_text)
+    if re.match(r"^backspace$", cleaned, flags=re.IGNORECASE):
+        return {
+            "ok": True,
+            "confidence": 0.98,
+            "summary": "Pressing backspace, sir.",
+            "needs_confirmation": _is_risky_command(command_text),
+            "reason": "",
+            "steps": [{"action": "press", "keys": ["backspace"]}],
+        }
+    if not _CLEAR_FIELD_RE.match(cleaned):
+        return None
+    return {
+        "ok": True,
+        "confidence": 0.98,
+        "summary": "Clearing that, sir.",
+        "needs_confirmation": False,
+        "reason": "",
+        "steps": [
+            {"action": "press", "keys": ["ctrl", "a"]},
+            {"action": "press", "keys": ["delete"]},
+        ],
+    }
+
+
 def _build_direct_plan(command_text):
     for parser in (
+        _parse_qualified_window_command,
         _parse_windows_shell_command,
         _parse_window_command,
         _parse_scroll_command,
+        _parse_clear_field_command,
         _parse_press_command,
         _parse_type_command,
     ):
@@ -3716,6 +4028,9 @@ def set_action_notifier(callback):
     needs a cross-executor record of what actually ran. Screen-control
     reports its two execution sites (immediate plans, confirmed plans);
     toggles, refusals and queued-for-confirmation plans never report.
+    [LIVE FIX 22 / B11] the request itself is also reported (empty
+    summary) at dispatch, so a failed or still-running attempt stays
+    repeatable and recallable; success overwrites it with the result.
     """
     global _action_notifier
     _action_notifier = callback
@@ -3849,6 +4164,9 @@ def maybe_handle_screen_control_message(text):
     direct_plan = _build_direct_plan(command_text)
     if direct_plan:
         direct_plan["screen_generation"] = request_generation
+        # [LIVE FIX 22 / B11] register the request BEFORE the outcome: a
+        # failed attempt still leaves the command repeatable/recallable.
+        _notify_action_executed(command_text, "")
         return _execute_or_queue(direct_plan, command_text)
 
     # Vision plans are slow -- guard against duplicates and run in background.
@@ -3874,4 +4192,8 @@ def maybe_handle_screen_control_message(text):
             _vision_busy.release()
 
     threading.Thread(target=_bg_vision, daemon=True).start()
+    # [LIVE FIX 22 / B11] register the vision request now — its result
+    # lands later on the background thread, but a failure there must not
+    # leave "Again." pointing at an older action.
+    _notify_action_executed(command_text, "")
     return "Working on it, sir."

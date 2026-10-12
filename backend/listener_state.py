@@ -147,6 +147,17 @@ def mark_user_speaking(speaking):
 
         changed = _user_speaking != speaking
         _user_speaking = speaking
+    if speaking and changed:
+        # [LIVE FIX 22 / B11] the user is looking at their target NOW —
+        # Jarvis's overlay may own the foreground by the time a screen
+        # command captures, so record the non-Jarvis foreground window
+        # while it is still live. Fast Win32 reads only; never raises.
+        try:
+            from backend.services.screen_capture import (
+                note_foreground_target as _note_fg)
+            _note_fg()
+        except Exception:
+            pass
     if changed:
         # [P1-15] "hearing" is a transition too: publish it immediately.
         _notify_state_hooks()

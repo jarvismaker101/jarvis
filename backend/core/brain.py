@@ -943,9 +943,18 @@ _SEARCH_SHAPED_VERB_RE = re.compile(
     r"google|research|find\s+(?:anything|something|it|this|that|out))\b",
     re.IGNORECASE,
 )
+#: [LIVE FIX 22 / B10] a "search BAR/box/field" is a UI target, not a
+#: lookup request — "clicking in the search bar" must never read as a
+#: web-search verb. Stripped before the verb test (same strip Rank 2
+#: uses for chain classification).
+_SEARCH_UI_PHRASE_RE = re.compile(
+    r"search\s*(?:bar|box|field)", re.IGNORECASE)
 _SEARCH_TOOL_GUARD_RE = re.compile(
-    r"\b(open|launch|play|pause|close|go\s+to|navigate|visit|click|type|"
-    r"press|scroll|switch)\b",
+    r"\b(open(?:ing|ed)?|launch(?:ing|ed)?|play(?:ing|ed)?|pause[sd]?|"
+    r"clos(?:e|ing|ed)|go\s+to|navigate[sd]?|visit(?:ing|ed)?|"
+    r"click(?:ing|ed)?|typ(?:e|ing|ed)|press(?:ing|ed)?|"
+    r"scroll(?:ing|ed)?|switch(?:ing|ed)?|minimiz(?:e|ing|ed)|"
+    r"maximiz(?:e|ing)|select(?:ing|ed)?|tap(?:ped|ping)?)\b",
     re.IGNORECASE,
 )
 _SEARCH_APP_GUARD_RE = re.compile(
@@ -978,6 +987,9 @@ def is_search_shaped_message(msg):
     if (_SEARCH_HOWTO_GUARD_RE.match(t) or _SEARCH_PAST_GUARD_RE.match(t)
             or _SEARCH_FUTURE_GUARD_RE.match(t)):
         return False
+    # [LIVE FIX 22 / B10] strip UI targets first: "the search bar" is not
+    # a lookup verb, and progressive control verbs ("clicking") veto.
+    t = _SEARCH_UI_PHRASE_RE.sub(" ", t)
     if _SEARCH_TOOL_GUARD_RE.search(t) or _SEARCH_APP_GUARD_RE.search(t):
         return False
     return bool(_SEARCH_SHAPED_VERB_RE.search(t))
@@ -2222,10 +2234,11 @@ _MEMORY_RECALL_RE = re.compile(
     # a position in the conversation, answerable only from the turns.
     r"|\b(?:second|2nd|third|3rd|fourth|4th|fifth|5th)\s*(?:to\s+)?"
     r"last\s+(?:reply|replies|exchange|exchanges|message|messages|"
-    r"answer|answers|response|responses)\b"
+    r"answer|answers|response|responses|request|requests|command|"
+    r"commands|action|actions)\b"
     r"|\b(?:last|latest|most\s+recent|previous)\s+(?:reply|replies|"
     r"exchange|exchanges|message|messages|answer|answers|response|"
-    r"responses)\b"
+    r"responses|request|requests|command|commands|action|actions)\b"
     r"|\bwhat\s+did\s+i\s+(?:just\s+|already\s+)?(?:ask|say|tell)"
     r"(?:\s+you)?\b"
     r")"
@@ -4075,6 +4088,64 @@ def answer_status_question(msg):
     if status == "needs_input":
         return "Sir, I asked a question before continuing."
     return "Sir, nothing is running right now."
+
+
+#: [LIVE FIX 22 / B12] "what was my last (screen control) request?" is
+#: answered from the action registry, never from chat recall — the chat
+#: model cannot see uncommitted turns and used to deny any request
+#: existed. The registry holds the last request even when it never
+#: finished (done False), so the answer stays truthful either way.
+_LAST_ACTION_QUESTION_RE = re.compile(
+    r"\bwhat\s+was\s+my\s+last\s+(?:screen\s+control\s+)?"
+    r"(?:request|command|action)\b"
+    r"|\bwhat\s+did\s+i\s+(?:just\s+|last\s+)?ask\s+(?:you\s+)?"
+    r"to\s+do\b"
+    r"|\b(?:tell\s+me\s+)?my\s+last\s+(?:screen\s+control\s+)?"
+    r"(?:request|command|action)\b",
+    re.IGNORECASE,
+)
+
+
+def _answer_last_action_question(msg):
+    """Grounded reply for a last-action recall question, or None.
+
+    Reads get_last_action() (falling back to the newest screen-control
+    interaction) and reports the request plus its outcome. Never raises.
+    """
+    try:
+        if not _LAST_ACTION_QUESTION_RE.search(msg or ""):
+            return None
+        last = get_last_action() or {}
+        cmd = str(last.get("command") or "").strip()
+        if not cmd:
+            try:
+                from backend.services import screen_state as _screen_state
+                recent = _screen_state.get_recent_interactions() or []
+            except Exception:
+                recent = []
+            if recent:
+                try:
+                    cmd = str((recent[-1] or {}).get("command") or ""
+                              ).strip()
+                except Exception:
+                    cmd = ""
+            if not cmd:
+                return ("Sir, I don't have a recent action recorded — "
+                        "tell me what to do and I'll do it.")
+            return ('Sir, your last screen request was "%s."'
+                    % _mi_clip(cmd, 140))
+        summary = str(last.get("summary") or "").strip()
+        if last.get("done") and summary:
+            return ('Sir, your last request was "%s" — %s'
+                    % (_mi_clip(cmd, 140), _mi_clip(summary, 140)))
+        if last.get("done"):
+            return ('Sir, your last request was "%s" — done.'
+                    % _mi_clip(cmd, 140))
+        return ('Sir, your last request was "%s" — it didn\'t finish '
+                'cleanly, so say "again" and I\'ll retry it.'
+                % _mi_clip(cmd, 140))
+    except Exception:
+        return None
 
 
 # ── Dual-voice mute: while an opencode task runs, only opencode speaks ──
@@ -6483,6 +6554,17 @@ def _mi_screen_control_step(step):
     if not text:
         return {"kind": "screen_control", "status": "failed",
                 "fragment": "I had nothing to do on the screen for that step."}
+    # [LIVE FIX 22 / B9] ordinal play is a screen click ("play the first
+    # video" starts playback by clicking it) — rephrase for the planner,
+    # which plans clicks, not media verbs.
+    try:
+        if re.match(
+                r"^\s*play\b[^.?!]{0,32}\bthe\s+(?:first|second|third|"
+                r"fourth|fifth|top|next|last)\b",
+                text, flags=re.IGNORECASE):
+            text = re.sub(r"(?i)^\s*play\b", "click", text, count=1)
+    except Exception:
+        pass
     try:
         plan = plan_command(text)
     except Exception as exc:
@@ -6878,18 +6960,27 @@ def _next_activity_seq():
 #: recorded: re-arming a handed-off task blindly could double-run it.
 _LAST_ACTION_TTL = 1800.0
 _last_action_lock = threading.Lock()
-_last_action = {"kind": "", "command": "", "summary": "", "seq": 0,
-                "at": 0.0}
+_last_action = {"kind": "", "command": "", "summary": "", "done": False,
+                "seq": 0, "at": 0.0}
 
 
 def note_executed_action(kind, command, summary=""):
-    """Record a successfully executed action for bare-repeat resolution."""
+    """Record the last screen-control/chain request and its outcome.
+
+    [LIVE FIX 22 / B11] the registry is written TWICE per action: once
+    with an empty summary when the request is accepted ("done" False),
+    once with the result when it finishes ("done" True). A bare "Again."
+    after a failed or still-running attempt therefore retries THAT
+    request instead of a stale earlier success — and last-action recall
+    can report the request even when it never completed.
+    """
     try:
         with _last_action_lock:
             _last_action.update({
                 "kind": str(kind or ""),
                 "command": str(command or ""),
                 "summary": str(summary or ""),
+                "done": bool(summary),
                 "seq": _next_activity_seq(),
                 "at": time.time(),
             })
@@ -6903,8 +6994,8 @@ def get_last_action():
         with _last_action_lock:
             return dict(_last_action)
     except Exception:
-        return {"kind": "", "command": "", "summary": "", "seq": 0,
-                "at": 0.0}
+        return {"kind": "", "command": "", "summary": "", "done": False,
+                "seq": 0, "at": 0.0}
 
 
 #: Bare repetition with no other content — "minimize it again" (referent +
@@ -8564,6 +8655,135 @@ _CHAIN_FOLLOWUP_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: [LIVE FIX 22 / B10] feedback that the last chain stopped early ("you
+#: only stopped after clicking … didn't do the next steps", "do the
+#: rest", "continue"). Unlike _CHAIN_FOLLOWUP_RE this carries no new
+#: step — it resumes the stored chain's unfinished tail. The
+#: you-only/just branch names a STOPPAGE ("stopped", "didn't finish",
+#: "wrong") — a bare "you just researched/told me" is a correction
+#: reference, never a complaint, and must reach its own gate.
+_CHAIN_COMPLAINT_RE = re.compile(
+    r"\b(?:you\s+(?:only|just)\s+(?:stopped|skipped|missed)\b"
+    r"|you\s+(?:didn'?t|did\s+not|never)\s+(?:do|finish|complete)\b"
+    r"|didn'?t\s+(?:do|finish)\b"
+    r"|(?:do|finish|complete)\s+the\s+(?:rest|remaining)\b"
+    r"|\bthe\s+next\s+steps?\b"
+    r"|\byou\s+stopped\b"
+    r"|\byou\s+(?:only|just)\s+\w+[^.?!]{0,40}\b(?:wrong|instead)\b)",
+    re.IGNORECASE,
+)
+
+#: Bare "continue" resumes a stored chain but never earns the honest-idle
+#: reply on its own — alone it may belong to another conversation.
+#: Anchored: "continue the story" is chat, only a standalone continue
+#: resumes.
+_CHAIN_CONTINUE_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s*)?"
+    r"(?:continue|go\s+on|carry\s+on)\s*[.,!]*\s*$",
+    re.IGNORECASE)
+
+#: [LIVE FIX 22 / B10] chain-specific feedback (names the stoppage, not
+#: just "continue"): when no chain is resumable this still gets an honest
+#: reply instead of falling through to chat improvisation.
+_CHAIN_COMPLAINT_SPECIFIC_RE = re.compile(
+    r"\b(?:you\s+(?:only|just)\s+\w+|you\s+(?:didn'?t|did\s+not|never)\s+"
+    r"(?:do|finish|complete)|didn'?t\s+(?:do|finish)|"
+    r"(?:do|finish|complete)\s+the\s+(?:rest|remaining)|"
+    r"the\s+next\s+steps?|you\s+stopped\b)",
+    re.IGNORECASE,
+)
+
+
+def _resume_chain_unfinished(msg, from_voice=False, voice_compact=False):
+    """Resume the stored chain's unfinished tail after a complaint.
+
+    Returns the ack line (the worker re-runs from the first non-ok step)
+    or None when there is nothing resumable — the turn then keeps its
+    normal routing. Never raises.
+    """
+    global _mi_chain_active
+    try:
+        _complaint = _CHAIN_COMPLAINT_RE.search(msg or "")
+        _cont = _CHAIN_CONTINUE_RE.search(msg or "") if not _complaint else None
+        if not _complaint and not _cont:
+            return None
+        # Chain-specific feedback with nothing resumable still gets an
+        # honest reply — never chat improvisation about the stoppage.
+        # (Bare "continue" alone does not earn it.)
+        _honest_idle = (
+            "Sir, I don't have any unfinished steps from that — say it "
+            "once more and I'll run it from the top."
+            if (_complaint and _CHAIN_COMPLAINT_SPECIFIC_RE.search(
+                msg or "")) else None)
+        last = _take_chain_plan()
+        if last is None:
+            return _honest_idle
+        plan = dict(last.get("plan") or {})
+        steps = list(plan.get("steps") or [])
+        if not steps:
+            return _honest_idle
+        results = [dict(r) for r in (last.get("results") or [])]
+        try:
+            from backend.services import screen_state as _screen_state
+            pending = bool(_screen_state.has_pending_plan())
+        except Exception:
+            pending = False
+        try:
+            pending = pending or bool(
+                task_agent_module.has_pending_task_confirmation())
+        except Exception:
+            pass
+        if pending:
+            return ("Sir, an action is waiting for your confirmation — "
+                    "confirm it and I'll carry on with the rest.")
+        # A stale "armed" (consent resolved since) counts as done — same
+        # rule as chain continuation, so resume never re-runs it.
+        prefix = list(results)
+        for i, r in enumerate(prefix):
+            if r.get("status") == "armed" and not pending:
+                r = dict(r)
+                r["status"] = "ok"
+                r["fragment"] = "Confirmed earlier. " + str(
+                    r.get("fragment") or "")
+                prefix[i] = r
+        start = len(prefix)
+        for i, r in enumerate(prefix):
+            if r.get("status") != "ok":
+                start = i
+                break
+        if start >= len(steps):
+            return _honest_idle
+        with _MI_CHAIN_LOCK:
+            if _mi_chain_active:
+                return ("Sir, another chained task is already running — "
+                        "one moment.")
+            _mi_chain_active = True
+        try:
+            threading.Thread(
+                target=_run_multi_intent_chain,
+                args=(msg, plan, prefix[:start], start),
+                daemon=True).start()
+        except Exception as exc:
+            with _MI_CHAIN_LOCK:
+                _mi_chain_active = False
+            logging.warning("[CHAIN] resume start failed: %s", exc)
+            return None
+        # The repeat registry points at the ORIGINAL request, not the
+        # complaint — "Again." re-runs the work, not the feedback.
+        try:
+            note_executed_action(
+                "chain", str(plan.get("source") or plan.get(
+                    "command_text") or msg),
+                "Sir, continuing where it stopped.")
+        except Exception:
+            pass
+        if voice_compact:
+            return "Sir, on it — continuing where it stopped."
+        return "Sir, continuing where it stopped."
+    except Exception as exc:
+        logging.warning("[CHAIN] resume failed: %s", exc)
+        return None
+
 
 def _remember_chain_plan(plan, results):
     """Keep the last finished chain for follow-up extension."""
@@ -9553,6 +9773,27 @@ def _process_message_inner(
         except Exception as exc:
             logging.warning("[STATUS] Grounded answer failed: %s", exc)
 
+    # ── [LIVE FIX 22 / B12] last-action recall ("what was my last screen
+    # control request?") answers from the action registry, not chat
+    # memory. Runs with the other grounded pre-classifier gates so the
+    # chat fast path can never deny the request existed.
+    if not msg.lower().startswith("command"):
+        try:
+            _last_action_reply = _answer_last_action_question(msg)
+        except Exception as exc:
+            logging.warning("[RECALL] last-action answer failed: %s", exc)
+            _last_action_reply = None
+        if _last_action_reply is not None:
+            print("[RECALL] Grounded last-action answer:", msg)
+            _remember_user_turn(msg)
+            try:
+                add_message("assistant", _last_action_reply)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _last_action_reply)
+            return _last_action_reply
+
     # ── [LIVE FIX 21] chain continuation ("then click the search bar")
     # A follow-up clause extends the last finished chain instead of
     # starting over: the stored prefix satisfies its consumes links and
@@ -9622,6 +9863,29 @@ def _process_message_inner(
                 if from_voice and sync_voice:
                     sync_voice_log(voice_log_message, chain_reply)
                 return chain_reply
+
+    # ── [LIVE FIX 22 / B10] unfinished-chain feedback ("you didn't do
+    # the next steps", "do the rest", "continue") resumes the stored
+    # chain's tail instead of falling through to research/chat. Runs
+    # before the search-shaped gate (a complaint about the search BAR
+    # must never become a web search) and after the chain gates above.
+    if not msg.lower().startswith("command"):
+        try:
+            _resume_reply = _resume_chain_unfinished(
+                msg, from_voice=from_voice, voice_compact=voice_compact)
+        except Exception as exc:
+            logging.warning("[CHAIN] resume gate failed: %s", exc)
+            _resume_reply = None
+        if _resume_reply is not None:
+            print("[CHAIN] resumed unfinished tail")
+            _remember_user_turn(msg)
+            try:
+                add_message("assistant", _resume_reply)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _resume_reply)
+            return _resume_reply
 
     # ── Live fix: offered search + search-shaped requests ──
     # "execute it / just do it / don't ask questions" consumes the search
@@ -9761,6 +10025,18 @@ def _process_message_inner(
         _mark_latency_duration(request_id, "preroute_screen_control", _t)
         if screen_control_response is not None:
             _clear_browser_clarification()
+            # [LIVE FIX 22 / B12-B13] a screen-control turn is a real
+            # exchange — without the user half, recall ("what was my 4th
+            # last request") answers from a history that never saw it.
+            _remember_user_turn(msg)
+            # The background ("Working on it") result commits itself on
+            # delivery; synchronous results commit here like chat turns.
+            if (commit_response
+                    and screen_control_response != "Working on it, sir."):
+                try:
+                    add_message("assistant", screen_control_response)
+                except Exception:
+                    pass
             if from_voice and sync_voice:
                 sync_voice_log(voice_log_message, screen_control_response)
             return screen_control_response
