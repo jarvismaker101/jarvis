@@ -43,6 +43,14 @@ _last_refused_chain = {"source": "", "ts": 0.0}
 #: with an older generation can never execute.
 _generation = 0
 
+#: [LIVE FIX 28 / B-STOP] the newest user-requested stop of screen work
+#: (unix timestamp, 0.0 when none). A stop bumps the generation like a
+#: toggle (in-flight plans refuse at the gate), and the timestamp lets
+#: background completions tell "stopped by the user" apart from "controls
+#: toggled" — a stopped result is swallowed (the stop reply already
+#: spoke), never narrated as a confusing post-stop failure.
+_last_stop_ts = 0.0
+
 #: Default lifetime of a pending approval (seconds).
 APPROVAL_TTL = 120.0
 
@@ -143,6 +151,34 @@ def bump_generation():
     with _state_lock:
         _generation += 1
         return _generation
+
+
+def note_stop(reason=""):
+    """Record a user-requested stop of screen work.
+
+    [LIVE FIX 28 / B-STOP] bumps the control generation (every in-flight
+    plan refuses at the gate from here on) and stamps the stop time, so
+    background completions landing after the stop stay silent instead of
+    narrating stale results. Returns the stop timestamp. Never raises.
+    """
+    global _generation, _last_stop_ts
+    try:
+        with _state_lock:
+            _generation += 1
+            _last_stop_ts = time.time()
+            return _last_stop_ts
+    except Exception:
+        return 0.0
+
+
+def stopped_after(ts):
+    """True when a stop was noted after unix timestamp *ts*. Never raises."""
+    try:
+        with _state_lock:
+            stamp = float(ts or 0.0)
+            return bool(_last_stop_ts and _last_stop_ts > stamp)
+    except Exception:
+        return False
 
 
 def set_enabled(enabled, reason=""):

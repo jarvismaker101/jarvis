@@ -158,12 +158,41 @@ _SUBMIT_TYPED_RE = re.compile(
     r"\bwhat\s+(?:you|i)\s+(?:just\s+)?typed\b",
     re.IGNORECASE)
 
-#: [LIVE FIX 24 / B22] a "not X" correction fragment ("not tab search")
+#: [LIVE FIX 22 / B22] a "not X" correction fragment ("not tab search")
 #: revises the previous action — a fragment that merges into the next
 #: clause, never a standalone research step.
 _NOT_CORRECTION_RE = re.compile(
     r"^\s*not\b[^.?!]{1,40}$",
     re.IGNORECASE)
+
+#: [LIVE FIX 28 / B56] a BARE pronoun-tail restatement of a window command
+#: ("minimize the two terminal windows on my screen, minimize both of
+#: them") is the SAME action restated — one control clause, never a second
+#: step (and never a vision fallback for the pronoun tail).
+_BARE_WINDOW_PRONOUN_RE = re.compile(
+    r"^\s*(?:minimi[sz]e|maximi[sz]e|restore)\s+"
+    r"(?:(?:all|both)\s+of\s+)?(?:it|them|both|everything|those|these|all)\b"
+    r"[\s.,!]*$",
+    re.IGNORECASE)
+
+#: [LIVE FIX 28 / B62] a past-tense FEEDBACK fragment ("last time you
+#: didn't type in the YouTube search bar", "you actually typed in the
+#: browser's URL bar") revises the previous run — never a standalone step.
+_PAST_FEEDBACK_RE = re.compile(
+    r"^\s*(?:last\s+time\b|you\s+actually\b|you\s+were\s+supposed\s+to\b|"
+    r"earlier\s+you\b|previously\s+you\b)",
+    re.IGNORECASE)
+
+#: [LIVE FIX 28 / B56] a "screen" clause is only a LOOK when it carries a
+#: look verb; a topic-only screen phrase ("all the windows on my screen",
+#: "this terminal window on my screen") is the LOCATOR of an adjacent
+#: control action — it folds into the neighbouring control clause instead
+#: of splitting a deterministic action into look-then-do vision steps.
+_LOOK_VERB_RE = re.compile(
+    r"\b(look|check|see|read|watch|analyse|analyze|scan|view|examine)\b",
+    re.IGNORECASE)
+_QUESTION_WORD_RE = re.compile(
+    r"\b(what|which|who|where|when|why|how)\b", re.IGNORECASE)
 
 
 def _is_submit_shape(text):
@@ -364,7 +393,9 @@ def classify_clause(text):
     # [LIVE FIX 24 / B22] a leading "not X" correction fragment ("not tab
     # search") revises the previous action — it merges into the next
     # clause instead of classifying on its own keywords.
-    if _NOT_CORRECTION_RE.match(t):
+    # [LIVE FIX 28 / B62] same for a past-tense feedback fragment ("last
+    # time you didn't type ...").
+    if _NOT_CORRECTION_RE.match(t) or _PAST_FEEDBACK_RE.match(t):
         return None
     # [LIVE FIX 22 / B9] control-before-screen: "click the search bar ON MY
     # SCREEN" is a control, not a look — the screen phrase used to win and
@@ -404,8 +435,37 @@ def build_chain(text):
     if not clauses:
         return None
     merged = []
+    _pending_topic = None
     for clause in clauses:
         kind = classify_clause(clause)
+        # [LIVE FIX 28 / B56] a stashed topic-only screen phrase leads the
+        # next CONTROL clause ("all the windows on my screen" + "minimize
+        # them" -> one control clause), so one deterministic job never
+        # becomes a look-then-do chain. Before any other kind it keeps its
+        # own step (the historical look behaviour).
+        if _pending_topic:
+            if kind == "screen_control":
+                clause = _pending_topic + " and " + clause
+                _pending_topic = None
+            else:
+                merged.append({"kind": "screen", "text": _pending_topic})
+                _pending_topic = None
+        # [LIVE FIX 28 / B56] a screen clause with no look verb and no
+        # control verb and no question word is a TOPIC phrase ("all the
+        # windows on my screen"): fold it into an adjacent control clause,
+        # or stash it to lead the next one. Real looks ("look at my
+        # screen"), screen questions, and clauses carrying their own
+        # research request keep their own step.
+        if (kind == "screen" and not _LOOK_VERB_RE.search(clause)
+                and not _SCREEN_CONTROL_RE.search(clause)
+                and not _QUESTION_WORD_RE.search(clause)
+                and not _RESEARCH_RE.search(clause)
+                and not clause.strip().endswith("?")):
+            if merged and merged[-1]["kind"] == "screen_control":
+                merged[-1]["text"] = merged[-1]["text"] + " and " + clause
+                continue
+            _pending_topic = clause
+            continue
         # [LIVE FIX 22 / B9] a bare submit ("and then search", "then hit
         # enter") right after a control step means "submit what I just
         # typed" — a control step, never a web-search step.
@@ -422,6 +482,16 @@ def build_chain(text):
         # the ack narrate "press enter", never a web search.
         if kind == "screen_control" and _SUBMIT_TYPED_RE.search(clause):
             clause = "press enter"
+        # [LIVE FIX 28 / B56] a bare pronoun-tail restatement of the
+        # previous window command ("...minimize both of them") is the same
+        # action — merge, never a second step.
+        if (merged and merged[-1]["kind"] == "screen_control"
+                and kind == "screen_control"
+                and _BARE_WINDOW_PRONOUN_RE.match(clause)
+                and re.search(r"\bwindows?\b", merged[-1]["text"],
+                              re.IGNORECASE)):
+            merged[-1]["text"] = merged[-1]["text"] + " and " + clause
+            continue
         # [LIVE FIX 24 / B22] a restated submit ("...by clicking enter or
         # the search icon") is the same action as the submit step before
         # it — not a second step.
@@ -469,6 +539,11 @@ def build_chain(text):
         # [LIVE FIX 26 / B39] a trailing result-reference ("for the search",
         # "that appears") names the results, never a lookup request.
         lookup_text = _TRAILING_RESULT_RE.sub(" ", lookup_text)
+        # [LIVE FIX 28 / B62] "whatever search result comes up" names the
+        # ON-PAGE results of a control action — never a web-lookup request;
+        # the bare "search" word there used to grow a bogus research sibling.
+        lookup_text = re.sub(r"\b(?:search|query)\s+results?\b", " ",
+                             lookup_text, flags=re.IGNORECASE)
         if (m["kind"] == "screen" and _RESEARCH_RE.search(lookup_text)
                 and not (i + 1 < len(merged)
                          and merged[i + 1]["kind"] == "research")):

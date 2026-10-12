@@ -32,11 +32,29 @@ class _ScreenStateGuard:
     def __enter__(self):
         screen_state.clear_refused_chain()
         screen_state.clear_interactions()
+        # [LIVE FIX 28] earlier files in a combined run leave screen-QA and
+        # window-question ledger entries behind (300s TTL outlives the
+        # suite) — the deictic source must start clean here.
+        try:
+            from backend.core import brain as _brain
+            with _brain._screen_qa_last_lock:
+                _brain._screen_qa_last.update(
+                    {"question": "", "at": 0.0, "miss": False, "seq": 0})
+        except Exception:
+            pass
+        try:
+            screen_state.note_window_question("")
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc):
         screen_state.clear_refused_chain()
         screen_state.clear_interactions()
+        try:
+            screen_state.note_window_question("")
+        except Exception:
+            pass
         try:
             if screen_state.is_enabled() != self._was_enabled:
                 screen_state.set_enabled(self._was_enabled, reason="test-restore")

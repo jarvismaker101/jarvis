@@ -33,6 +33,8 @@ from backend.services.screen_control import (
     set_plan_confirmed_callback,
     set_response_callback,
 )
+from backend.services import screen_control as _screen_control_mod
+from backend.services import screen_state as screen_state
 from backend.services.task_agent import (
     consume_task_confirmation,
     handle_task_message,
@@ -409,6 +411,18 @@ _PHYS_VERB = (r"(?:click(?:ing)?|tap|press|typ(?:e|ing)|minimi[sz]e|"
 _CHAT_SCREEN_AUTHORITY_RE = re.compile(
     r"\b(?:shall|should|may|can|could)\s+i\b[^.!?]{0,60}?\b"
     + _PHYS_VERB + r"\b"
+    # [LIVE FIX 28 / B53] a first-person ability offer ("I can minimize
+    # those windows for you", "I can clear the desktop") is the same
+    # physical-action offer — chat has no screen authority, and with
+    # controls off it contradicted the honest off-refusal.
+    r"|\bi\s+(?:can|could|will|'ll|am\s+going\s+to)\b[^.!?]{0,60}?\b"
+    + _PHYS_VERB + r"\b"
+    # [LIVE FIX 28 / B53] a bare proceed ask rides the cut offer ("Shall
+    # I proceed with that?") — chat has nothing to proceed WITH.
+    r"|\b(?:shall|should)\s+i\s+"
+    r"(?:proceed|go\s+ahead|carry\s+on|continue)\b"
+    r"|\bi\s+can\s+(?:clear|put\s+away|tidy|handle|manage)\b"
+    r"[^.!?]{0,60}?\b(?:desktop|screen|windows?)\b"
     r"|\b(?:do\s+you\s+want|would\s+you\s+like|want)\s+me\s+to\b"
     r"[^.!?]{0,60}?\b" + _PHYS_VERB + r"\b"
     r"|\bsay\s+confirm\b"
@@ -466,6 +480,14 @@ def _chat_claim_fallback(cut_sentences):
     """The honest fallback that fits what was cut. Never raises."""
     try:
         blob = " ".join(cut_sentences or [])
+        # [LIVE FIX 28 / B53] a cut SCREEN offer ("I can clear the desktop",
+        # "I can minimize those windows") speaks the screen fallback — the
+        # reroute fallback's "nothing was started" asserts screen state it
+        # cannot know (B50's rule).
+        if (any(_CHAT_SCREEN_AUTHORITY_RE.search(s)
+                for s in (cut_sentences or []))
+                and not _FILEISH_RE.search(blob)):
+            return _CHAT_SCREEN_FALLBACK
         if _SCREENISH_RE.search(blob):
             return _CHAT_SCREEN_FALLBACK
         if _FILEISH_RE.search(blob):
@@ -473,6 +495,18 @@ def _chat_claim_fallback(cut_sentences):
     except Exception:
         pass
     return _CHAT_REROUTE_FALLBACK
+
+
+# [LIVE FIX 28 / B53] the interview question that rides a cut screen
+# offer ("Which application window would you like to keep open?",
+# "Just tell me which application you would like to keep visible.") is
+# part of the offer — chat must not interview the user about screen
+# actions it can never perform.
+_SCREEN_INTERVIEW_RE = re.compile(
+    r"\b(?:which|what)\b[^.?!]{0,60}?\b(?:app|application|application's|"
+    r"window|windows|program)\b[^.?!]{0,50}?\b(?:keep|leave|visible|open|"
+    r"alongside|stay|remain)\b",
+    re.IGNORECASE)
 
 
 def _strip_unverified_action_claims(text, role):
@@ -502,6 +536,15 @@ def _strip_unverified_action_claims(text, role):
             cut.append(s)
         else:
             kept.append(s)
+    # [LIVE FIX 28 / B53] when a screen offer was cut, its interview
+    # question goes with it — the whole reply becomes the honest fallback.
+    if cut and any(_CHAT_SCREEN_AUTHORITY_RE.search(s) for s in cut):
+        _kept2 = [s for s in kept
+                  if not _SCREEN_INTERVIEW_RE.search(s)]
+        if len(_kept2) != len(kept):
+            logging.warning("[R13] chat screen interview stripped: %r",
+                            text[:160])
+            kept = _kept2
     # If every sentence was a claim (the classic "I will get that created
     # right away, sir." turn), say the honest fallback instead of silence.
     if not kept or not any(s.strip() for s in kept):
@@ -635,7 +678,9 @@ _BARE_AFFIRM_RE = re.compile(
     r"(?:yes|yeah|yep|yup|sure|ok(?:ay)?|confirm(?:ed)?|"
     r"confirm\s+(?:the\s+)?(?:screen\s+)?action|do\s+it|go\s+ahead|"
     r"proceed|haan|han|theek\s+hai|kar\s*do)"
-    r"(?:\s*[,.!]?\s*(?:please|sir|jarvis)\s*[,.!]?)?\s*$",
+    # [LIVE FIX 28 / B54] trailing punctuation never needs a word after
+    # it: "Proceed." used to fall through to the chat model.
+    r"(?:[\s,.!]*(?:please|sir|jarvis))?[\s,.!]*$",
     re.IGNORECASE)
 
 #: [LIVE FIX 25] approval vocabulary only ("confirm", "confirm screen
@@ -704,6 +749,22 @@ def _bare_confirm_without_plan_reply(msg):
             return ("That step is still being prepared, sir — I'll ask for "
                     "your confirmation the moment it's ready.")
         if _APPROVAL_WORD_RE.match(t):
+            # [LIVE FIX 28 / B54] "Proceed." accepting the assistant's own
+            # offer re-runs the newest screen request (merge-and-re-route)
+            # instead of "nothing was started" — the offer WAS on the table.
+            try:
+                _req = _ss.get_last_request() or {}
+                _cmd = str(_req.get("command") or "").strip()
+                _ts = float(_req.get("ts") or 0.0)
+            except Exception:
+                _cmd, _ts = "", 0.0
+            if (_cmd and time.time() - _ts < 300.0
+                    and not _DEICTIC_RERUN_RE.match(_cmd)):
+                _out = _sc.maybe_handle_screen_control_message(_cmd)
+                if _out is not None:
+                    print("[SCREEN] Approval re-runs the last request:",
+                          _cmd[:80])
+                    return _out
             return ("There's no screen action waiting for your confirmation, "
                     "sir — nothing was started.")
         return None
@@ -744,6 +805,11 @@ def _notify_async_reply(text, spoken=None):
     except Exception:
         pass
     if _async_reply_callback is None:
+        # [LIVE FIX 28 / B59] a dropped background report must be visible
+        # in the log — silent drops read as dead air later.
+        logging.warning(
+            "[NOTIFY] no async reply callback registered — reply dropped: %r",
+            str(text)[:160])
         return False
     try:
         _async_reply_callback(text, spoken)
@@ -1696,6 +1762,15 @@ def is_definitely_plain_chat(msg):
     # Any signal another route could claim wins over the fast path.
     try:
         if is_screen_question(msg) or is_region_question(msg):
+            return False
+    except Exception:
+        return False
+    # [LIVE FIX 28 / B52] a window-management imperative dressed in person
+    # pronouns ("My screen, just minimize all the windows except the Jarvis
+    # window") is never definitely-plain-chat — the screen preroute answers
+    # it (or honestly refuses with controls off).
+    try:
+        if _screen_control_mod.looks_like_window_command(text):
             return False
     except Exception:
         return False
@@ -2798,11 +2873,14 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "Screen actions (clicking, typing, pressing keys, opening, "
             "playing, minimizing or moving windows) are run only by the "
             "screen-control system, which asks for its own confirmations. "
-            "Never offer to do a screen action, never ask the user to "
+            "Never offer to do a screen action, never say you can minimize, "
+            "close, clear or tidy windows, never ask the user to "
             "confirm one, and never say a confirmation is needed — if "
             "they want something done on the screen, ask what they want "
             "done, in their own words, and never invent a command phrase "
-            "for them to repeat. "
+            "for them to repeat. When they ask for a screen action, never "
+            "interview them about which app or window to keep open; "
+            "acknowledge briefly and let the screen system take it. "
             "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
@@ -2856,11 +2934,14 @@ def _build_chat_messages(user_message, voice_compact=False, speculative=False, h
             "Screen actions (clicking, typing, pressing keys, opening, "
             "playing, minimizing or moving windows) are run only by the "
             "screen-control system, which asks for its own confirmations. "
-            "Never offer to do a screen action, never ask the user to "
+            "Never offer to do a screen action, never say you can minimize, "
+            "close, clear or tidy windows, never ask the user to "
             "confirm one, and never say a confirmation is needed — if "
             "they want something done on the screen, ask what they want "
             "done, in their own words, and never invent a command phrase "
-            "for them to repeat. "
+            "for them to repeat. When they ask for a screen action, never "
+            "interview them about which app or window to keep open; "
+            "acknowledge briefly and let the screen system take it. "
             "You may still offer to look something up online. "
             "If this is a spoken conversation, sound natural and answer in one or two short sentences unless more detail is requested."
         )
@@ -5957,6 +6038,15 @@ def handle_stop_message(msg, from_voice=False):
             request_research_stop()
         except Exception:
             pass
+    # [LIVE FIX 28 / B-STOP] a stop kills SCREEN actions too: bump the
+    # control generation (every in-flight plan refuses at the effect gate),
+    # drop the armed plan/approval, and stamp the stop time so background
+    # screen completions land silent instead of narrating stale refusals.
+    try:
+        screen_state.note_stop(reason="stop requested")
+        screen_state.clear_pending_plan()
+    except Exception as exc:
+        logging.warning("[STOP] screen cancellation failed: %s", exc)
     try:
         set_narration_enabled(False)
     except Exception:
@@ -7111,6 +7201,44 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
         return {"kind": "screen_control", "status": "armed",
                 "fragment": str(out), "prompt": str(out)}
     if status == "executed":
+        out_text = str(out or "")
+        # [LIVE FIX 28 / browser-style loop] the same discipline the browser
+        # agent uses: do the step, LOOK at the result (post-action
+        # verification), and when the look is unsure RESOLVE — re-plan
+        # against the fresh screen and retry once — before proceeding or
+        # reporting. Bounded to one retry, stop-aware, and honest either way.
+        if "not fully sure it worked" in out_text.lower():
+            resolved = ""
+            if not _chain_stop_requested():
+                try:
+                    plan2 = plan_command(text)
+                except Exception:
+                    plan2 = None
+                if (isinstance(plan2, dict) and plan2.get("ok")
+                        and plan2.get("steps")
+                        and not _chain_stop_requested()):
+                    try:
+                        status2, out2 = _execute_plan_tagged(
+                            plan2, text, ttl=_MI_CHAIN_APPROVAL_TTL)
+                    except Exception:
+                        status2, out2 = "blocked", ""
+                    if status2 == "queued":
+                        # The retry armed its own confirmation — drop it;
+                        # the user never asked for this second attempt.
+                        try:
+                            screen_state.clear_pending_plan()
+                        except Exception:
+                            pass
+                    elif (status2 == "executed"
+                          and "not fully sure" not in str(out2 or "").lower()):
+                        resolved = str(out2)
+            if resolved:
+                print("[CHAIN] step resolved on the second attempt:",
+                      resolved[:80])
+                return {"kind": "screen_control", "status": "ok",
+                        "fragment": resolved, "output_content": resolved}
+            return {"kind": "screen_control", "status": "ok",
+                    "fragment": out_text, "output_content": out_text}
         return {"kind": "screen_control", "status": "ok",
                 "fragment": str(out), "output_content": str(out)}
     return {"kind": "screen_control", "status": "failed",
@@ -7118,23 +7246,41 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
 
 
 def _mi_screen_step(step):
-    """Run one screen-analysis step; returns its result record."""
+    """Run one screen-analysis step; returns its result record.
+
+    [LIVE FIX 28 / B59] the analysis runs under the SAME overall bound as
+    the screen Q&A route (SCREEN_QA_TIMEOUT): an unbounded analyze_screen
+    hang here used to hold the whole chain worker — no report ever landed
+    and every later chain said "another chained task is already running".
+    Stop-aware: a look requested before a stop reports stopped.
+    """
     if _chain_stop_requested():
         # [LIVE FIX 23 / B15] no new look starts after the stop.
         return {"kind": "screen", "status": "stopped",
                 "fragment": "Stopped by your request."}
+    started = time.time()
     if not _screen_qa_busy.acquire(timeout=30):
         return {"kind": "screen", "status": "failed",
                 "fragment": "I couldn't look at the screen — another "
                             "screen analysis is running."}
     try:
-        result = analyze_screen(step.get("text") or "") or {}
+        if _chain_stop_requested():
+            return {"kind": "screen", "status": "stopped",
+                    "fragment": "Stopped by your request."}
+        result = _analyze_screen_bounded(step.get("text") or "") or {}
     except Exception as exc:
         return {"kind": "screen", "status": "failed",
                 "fragment": "I couldn't analyse the screen (%s)."
                             % _mi_clip(exc, 80)}
     finally:
         _screen_qa_busy.release()
+    try:
+        if screen_state.stopped_after(started):
+            # [LIVE FIX 28 / B-STOP] the user stopped while the look ran.
+            return {"kind": "screen", "status": "stopped",
+                    "fragment": "Stopped by your request."}
+    except Exception:
+        pass
     tip = str(result.get("tip") or "").strip()
     topic = str(result.get("topic") or "").strip()
     creator = str(result.get("creator") or "").strip()
@@ -9530,6 +9676,10 @@ def _finish_multi_intent(plan, results, tail_from=0):
     reply = _mi_clip(reply, 1400)
     _record_chain_run(plan, reply)
     _remember_chain_plan(plan, results)
+    # [LIVE FIX 28 / B59] the closing summary must be traceable: if it is
+    # ever swallowed downstream (speech suppressed, callback missing) the
+    # log still shows exactly what was produced and when.
+    print("[CHAIN-REPORT]", str(reply)[:300])
     _notify_async_reply(reply)
 
 
@@ -11590,7 +11740,12 @@ def _process_message_inner(
                 if retry_q is not None:
                     print("[SCREEN] Question retry — re-asking with the "
                           "pointed area as focus.")
+                _qa_started = time.time()
                 result = _analyze_screen_bounded(retry_q or msg)
+                if screen_state.stopped_after(_qa_started):
+                    # [LIVE FIX 28 / B-STOP] the stop already spoke its
+                    # report — stale findings are never narrated after it.
+                    return "Stopped by your request, sir."
                 if result is None:
                     # [LIVE FIX 27 / B48] the vision chain died or hung past
                     # the bound — an honest spoken failure with the normal

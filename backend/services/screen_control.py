@@ -423,7 +423,12 @@ _SCREEN_PHRASE_RE = re.compile(
     r"(?:on|at)\s+(?:my\s+|the\s+)?screen|"
     r"(?:on|at)\s+(?:my\s+|the\s+)?desktop|"
     r"screen\s+(?:pe|par|mein|me)\b|"
-    r"anything\s+visible)\b",
+    r"anything\s+visible)\b"
+    # [LIVE FIX 28 / B52] a LEADING topic mention ("My screen, just
+    # minimize all the windows except the Jarvis window") is the same
+    # screen reference — only the "on/at my screen" form used to match,
+    # so the imperative fell to the chat model.
+    r"|^\s*(?:my|the|your|jarvis'?s?)\s+(?:screen|desktop)\b",
     re.IGNORECASE,
 )
 
@@ -466,13 +471,75 @@ def _is_missing_element_failure(reason):
     return any(p in lower for p in _MISSING_ELEMENT_PATTERNS)
 
 
+#: [LIVE FIX 28 / B60] a contradiction/correction that REPORTS what Jarvis
+#: said ("you said there's no terminal window, now you say two are open",
+#: "abhi to tumne bola tha ki meri screen pe koi terminal window nahi hai")
+#: is conversation ABOUT the screen — never a command, even though it names
+#: a UI noun and a state verb ("window open hai").
+_PAST_REPORT_RE = re.compile(
+    r"\b(?:you\s+(?:said|told|mentioned|reported|claimed|answered)|"
+    r"tumne\s+(?:bola|kaha|kahaa|bataya|batay[ae])|"
+    r"bo[l]a\s+tha|kahaa?\s+tha|bolt[ae]?\s+th[ie])\b",
+    re.IGNORECASE)
+
+#: [LIVE FIX 28 / B52] a window-management shape carries no screen phrase
+#: ("Your window, except for that, minimize everything else") but is still
+#: a screen command, never chat — even with controls off (the honest off
+#: reply beats a chat improvisation about minimizing windows).
+_WINDOW_NOUN_SHAPE_RE = re.compile(
+    r"\b(?:minimi[sz]e|maximi[sz]e|restore)\b[^.?!]{0,64}\bwindows?\b"
+    # [LIVE FIX 28 / B52] the noun may lead ("Your window, except for
+    # that, minimize everything else").
+    r"|\bwindows?\b[^.?!]{0,64}\b(?:minimi[sz]e|maximi[sz]e|restore)\b",
+    re.IGNORECASE)
+
+
+def looks_like_window_command(text):
+    """Toggle-independent window-management shape, for the chat fast path.
+
+    True for "minimize the X windows ..."-style imperatives so a screen
+    command dressed in person pronouns ("my screen", "jarvis") never reads
+    as definitely-plain-chat. Questions about actions stay False. Never
+    raises.
+    """
+    try:
+        normalized = _normalize_text(text)
+    except Exception:
+        return False
+    if not normalized:
+        return False
+    try:
+        if _INTERROGATIVE_PREFIX_RE.search(normalized):
+            return False
+        if _QUESTION_ABOUT_ACTION_RE.search(text):
+            return False
+    except Exception:
+        return False
+    return bool(_WINDOW_NOUN_SHAPE_RE.search(normalized))
+
+
 def _looks_like_screen_command(text):
     normalized = _normalize_text(text)
     if not normalized:
         return False
+    # [LIVE FIX 28 / B60] a contradiction/correction that reports what
+    # Jarvis said is conversation about the screen, never a command — but
+    # only when no window-management verb follows anywhere: "you said
+    # minimize the rest also" stays a command (the rest parser reads the
+    # feedback prefix), while "you said there's no terminal window, now
+    # you say two are open" (state verbs only, "open hai") is conversation.
+    if _PAST_REPORT_RE.search(normalized) and not re.search(
+            r"\b(?:minimi[sz]e|maximi[sz]e|restore)\b", normalized):
+        return False
     # PART A: anywhere action verb + screen phrase -> screen command regardless of toggle
-    if _SCREEN_ACTION_VERBS_RE.search(normalized) and _SCREEN_PHRASE_RE.search(normalized):
-        if not _INTERROGATIVE_PREFIX_RE.search(normalized):
+    if _SCREEN_ACTION_VERBS_RE.search(normalized) and (
+            _SCREEN_PHRASE_RE.search(normalized)
+            or _WINDOW_NOUN_SHAPE_RE.search(normalized)):
+        # [LIVE FIX 28 / B52] the window-noun shape widened PART A, so the
+        # B24 question-about-an-action guard applies here too ("can you
+        # identify the three windows ... that you are trying to minimize").
+        if (not _INTERROGATIVE_PREFIX_RE.search(normalized)
+                and not _QUESTION_ABOUT_ACTION_RE.search(text)):
             return True
     if _SCREEN_CMD_HIGH_CONFIDENCE.search(normalized):
         return True
@@ -737,6 +804,12 @@ _EXCEPT_CLAUSE_RE = re.compile(
     r"(?:\s+open)?)\b\s*(?:for\s+|open\s+)?(.+?)\s*$",
     re.IGNORECASE,
 )
+
+#: [LIVE FIX 28 / B52] an ANAPHORIC except-clause ("except for that",
+#: "except it") names no app — it points at the previous window command's
+#: exclusions, which are inherited below.
+_ANAPHORA_EXCEPT_TOKENS = frozenset(
+    {"that", "it", "this", "those", "these", "the same"})
 _EXCEPT_SPLIT_RE = re.compile(r"\s+and\s+|\s*,\s*|\s+or\s+|\s+plus\s+",
                               re.IGNORECASE)
 _EXCEPT_FILLERS = frozenset({
@@ -775,7 +848,7 @@ _APPNAMED_BARE_FILLERS = frozenset({
 })
 
 
-def _parse_window_exclusions(normalized):
+def _parse_window_exclusions(normalized, _inherit=True):
     """Parse an "except X" clause; returns (exclusions, named)."""
     exclusions = []
     except_clause_named = False
@@ -793,6 +866,18 @@ def _parse_window_exclusions(normalized):
         if not exclusions and "browser" in raw.lower():
             # "except for the browser" names no app — keep every browser.
             exclusions.extend(list(_BROWSER_TOKENS))
+        # [LIVE FIX 28 / B52] "except for that" inherits the most recent
+        # window command's exclusions (the merge-and-re-route rule); when
+        # nothing is inherited the caller still clarifies, because
+        # except_clause_named stays True.
+        if (_inherit and exclusions
+                and all(t in _ANAPHORA_EXCEPT_TOKENS for t in exclusions)):
+            try:
+                inherited, _named = _inherited_window_exclusions()
+            except Exception:
+                inherited, _named = [], False
+            if inherited:
+                exclusions = list(inherited)
     return exclusions, except_clause_named
 
 
@@ -988,7 +1073,7 @@ def _parse_bare_plural_window_command(normalized):
 _REST_WINDOW_RE = re.compile(
     r"\b(minimize|minimise|maximize|maximise|restore)\b"
     r"(?P<object>(?:(?!\b(?:minimi[sz]e|maximi[sz]e|restore)\b)[^.?!]){0,80}?)"
-    r"\b(?:the\s+rest|the\s+remaining|the\s+others?)\b"
+    r"\b(?:the\s+rest|the\s+remaining|the\s+others?|everything\s+else)\b"
     r"(?P<tail>[^.?!]{0,80})[.?!]*$",
     re.IGNORECASE)
 _REST_TAIL_FILLERS = frozenset({
@@ -1036,7 +1121,9 @@ def _inherited_window_exclusions():
                 continue
             if not norm or not _verb.search(norm) or not _noun.search(norm):
                 continue
-            excl, named = _parse_window_exclusions(norm)
+            # [LIVE FIX 28 / B52] the inherited parse never inherits again
+            # (an anaphoric ledger command must not recurse).
+            excl, named = _parse_window_exclusions(norm, _inherit=False)
             if named:
                 return list(excl), True
             return [], False
@@ -1508,6 +1595,29 @@ def _window_matches_filter(window, token):
     return False
 
 
+def _kept_out_names(kept_out, kept_tokens, positional_kept):
+    """Human names for the kept-open windows (B16 cleanup, capped at 2).
+
+    Shared by the summary line and the already-done accountability line.
+    Never raises.
+    """
+    try:
+        names = sorted(
+            {str(t[:1].upper() + t[1:]) for t in kept_tokens if t},
+            key=len)[:2]
+        if not names and not positional_kept:
+            names = sorted(
+                {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
+                key=len)[:2]
+        if positional_kept:
+            names = [positional_kept] + [
+                n for n in names
+                if positional_kept not in n.lower()]
+        return names
+    except Exception:
+        return []
+
+
 def _finalize_window_targets(verb, action, candidates, exclusions=(),
                              except_clause_named=False, app_filter="",
                              requested_count=None, count_note=None,
@@ -1636,10 +1746,39 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
                               % (wanted, total_matches, scope))
     if not targets:
         if kept_out:
+            # [LIVE FIX 28 / B57] an unaccountable "Everything else is
+            # already put away" read as a lie when the user could still SEE
+            # windows up: the reply must name what the enumeration actually
+            # sees, so the user can catch an enumeration gap immediately.
+            # Two honest cases: the non-excluded windows were all already
+            # minimized (dropped_iconic), or the enumeration saw ONLY the
+            # kept windows (nothing else at all).
+            names = _kept_out_names(kept_out, kept_tokens, positional_kept)
+            up_list = (", ".join(names)[:80] if names
+                       else "the windows you asked to keep")
+            if dropped_iconic:
+                return {
+                    "ok": True,
+                    "confidence": 0.99,
+                    "summary": (
+                        "Everything else is already put away, sir — the only "
+                        "window up is %s." % up_list
+                        if len(kept_out) == 1 else
+                        "Everything else is already put away, sir — the only "
+                        "ones up are %s." % up_list),
+                    "needs_confirmation": False,
+                    "reason": "",
+                    "steps": [],
+                }
             return {
                 "ok": True,
                 "confidence": 0.99,
-                "summary": "Everything else is already put away, sir.",
+                "summary": (
+                    "Nothing left to put away, sir — the only window up "
+                    "is %s." % up_list
+                    if len(kept_out) == 1 else
+                    "Nothing left to put away, sir — the only ones up are "
+                    "%s." % up_list),
                 "needs_confirmation": False,
                 "reason": "",
                 "steps": [],
@@ -1665,20 +1804,7 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         # [LIVE FIX 23 / B16] name the exclusion the user actually said
         # ("Leaving Brave.") — never the raw window title with its tab
         # notification count ("Leaving (22) YouTube - Brave.").
-        names = sorted(
-            {str(t[:1].upper() + t[1:]) for t in kept_tokens if t},
-            key=len)[:2]
-        if not names and not positional_kept:
-            names = sorted(
-                {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
-                key=len)[:2]
-        if positional_kept:
-            # [LIVE FIX 26 / B33] a positional keep reads as a phrase
-            # ("Leaving the first window.") — never a bare capitalized token
-            # ("Leaving First.") or a raw title fallback.
-            names = [positional_kept] + [
-                n for n in names
-                if positional_kept not in n.lower()]
+        names = _kept_out_names(kept_out, kept_tokens, positional_kept)
         summary += " Leaving %s." % ", ".join(names)[:80]
     effect = ("Minimize" if verb.startswith("minim")
               else "Maximize" if verb.startswith("maxim") else "Restore")
@@ -1830,6 +1956,76 @@ def _parse_referenced_window_command(command_text):
         requested_count=None, count_note=count_note)
 
 
+#: [LIVE FIX 28 / B56] a TOPIC-led window command ("this terminal window on
+#: my screen, minimize it", "there are two terminal windows on my screen
+#: right now, minimize both of them", "all the windows on my screen,
+#: minimize them"): the topic phrase carries the app and the count and the
+#: trailing verb+pronoun acts on it. This shape used to split into a
+#: look-then-do CHAIN (vision first, report often never landing) — it is
+#: one deterministic plan.
+_TOPIC_PRONOUN_WINDOW_RE = re.compile(
+    r"\b(?P<count>one|two|three|four|five|six|seven|eight|nine|ten|\d+|"
+    r"both|all|every|this|that|these|those|sab|saare|sabhi)\b\s+"
+    r"(?:(?P<app>[a-z0-9.+#\- ]{1,40}?)\s+)?windows?\b"
+    r"[^.?!]{0,48}?\b(?:on|at)\s+(?:my|the)\s+(?:screen|desktop)\b"
+    r"[^.?!]{0,48}?\b(?P<verb>minimi[sz]e|maximi[sz]e|restore)\b\s+"
+    r"(?P<pron>it|them|both(?:\s+of\s+(?:it|them))?|"
+    r"all(?:\s+of\s+(?:it|them))?|everything|those|these)\b",
+    re.IGNORECASE)
+
+_TOPIC_COUNT_ONES = frozenset({"this", "that", "one"})
+_TOPIC_COUNT_ALL = frozenset({"all", "every", "these", "those",
+                              "sab", "saare", "sabhi"})
+_TOPIC_APP_STRIP = _TOPIC_COUNT_ONES | _TOPIC_COUNT_ALL | {"the", "my",
+                                                           "a", "an"}
+
+
+def _parse_topic_pronoun_window_command(normalized):
+    """Deterministic plan for a topic-led window command, else None.
+
+    "this terminal window on my screen, minimize it" -> the terminal
+    windows enumerated fresh, filtered by the topic app, capped by the
+    topic count. A FAILED plan (honest reason) when the shape matches but
+    has no usable targets. Never raises.
+    """
+    try:
+        m = _TOPIC_PRONOUN_WINDOW_RE.search(normalized or "")
+    except Exception:
+        return None
+    if not m:
+        return None
+    verb = str(m.group("verb") or "").lower()
+    action = _QUALIFIED_VERB_ACTION.get(verb)
+    if not action:
+        return None
+    app = re.sub(r"\s+", " ", str(m.group("app") or "").strip().lower())
+    app = " ".join(w for w in app.split()
+                   if w and w not in _REFERENCE_FILLERS
+                   and w not in _TOPIC_APP_STRIP)[:60]
+    count_token = str(m.group("count") or "").lower()
+    if count_token in _TOPIC_COUNT_ONES:
+        requested = 1
+    elif count_token in _TOPIC_COUNT_ALL:
+        requested = None
+    else:
+        requested = _window_count_for_quantifier(count_token)
+    windows = _list_managable_windows()
+    if not windows:
+        return _failed_window_plan(
+            "I couldn't list the open windows, sir — please try again.")
+    remember_window_enumeration(windows)
+    if app:
+        windows = [w for w in windows if _window_matches_filter(w, app)]
+        if not windows:
+            return _failed_window_plan(
+                "I couldn't find any %s windows, sir." % app[:60])
+    exclusions, except_clause_named = _parse_window_exclusions(
+        normalized[m.start():])
+    return _finalize_window_targets(
+        verb, action, windows, exclusions, except_clause_named,
+        app_filter=app, requested_count=requested)
+
+
 def _parse_qualified_window_command(command_text):
     """Deterministic multi-window plan with exclusions (no vision).
 
@@ -1842,6 +2038,12 @@ def _parse_qualified_window_command(command_text):
     of vision-planning.
     """
     normalized = _normalize_text(command_text)
+    # [LIVE FIX 28 / B56] the topic-led shape ("this terminal window on my
+    # screen, minimize it") is the most specific window shape — resolve it
+    # before the pronoun/bare/quantified branches.
+    _topic = _parse_topic_pronoun_window_command(normalized)
+    if _topic is not None:
+        return _topic
     # [LIVE FIX 26 / B35] pronoun ("minimize all of them") and bare-plural
     # ("minimize the windows visible on my screen") shapes are disjoint
     # from the quantified/app-named shapes below — resolve them first so
@@ -3834,6 +4036,23 @@ def _score_band_limits(value):
     return None
 
 
+#: [LIVE FIX 28 / B61] address-bar vocabulary in an accessible name: a
+#: browser's URL entry often ALSO says "search" ("Address and search bar",
+#: "Search or enter address"), so "click the YouTube search bar" used to
+#: resolve to the omnibox instead of the page's own field.
+_ADDRESS_BAR_VOCAB_RE = re.compile(
+    r"\b(?:address|url|omnibox|enter\s+(?:address|url|link|search\s+or)"
+    r"|search\s+or\s+enter|type\s+a?\s*url)\b",
+    re.IGNORECASE)
+
+#: [LIVE FIX 28 / B61] a target that names a specific app/site — the
+#: candidate must carry that same word to stay unpunished.
+_APP_SITE_WORD_RE = re.compile(
+    r"\b(youtube|google|gmail|wikipedia|amazon|netflix|github|reddit|"
+    r"instagram|facebook|stackoverflow|chatgpt|maps|drive|docs)\b",
+    re.IGNORECASE)
+
+
 def _score_ui_element_match(target, elem):
     name = elem.get("name", "")
     ctype = elem.get("control_type", "")
@@ -3841,6 +4060,18 @@ def _score_ui_element_match(target, elem):
     raw = max(_score_text_match(target, name), _score_text_match(target, label))
     if raw <= 0:
         return 0.0
+
+    # [LIVE FIX 28 / B61] "the youtube search bar" is the page's own field,
+    # never the browser's address entry: when the target names an app/site
+    # and the candidate is address-bar vocabulary that does NOT carry that
+    # app word, penalize it below the in-page field.
+    try:
+        if (_ADDRESS_BAR_VOCAB_RE.search(label)
+                and _APP_SITE_WORD_RE.search(str(target or ""))
+                and not _APP_SITE_WORD_RE.search(str(name or ""))):
+            raw *= 0.5
+    except Exception:
+        pass
 
     # F29: bonuses order candidates WITHIN their match class only. They are
     # never allowed to lift a materially different target — "Save As" on a
@@ -5636,6 +5867,13 @@ def maybe_handle_screen_control_message(text):
         return None
 
     if not screen_state.is_enabled():
+        # [LIVE FIX 28 / B55] an off-refused request is still a request:
+        # note it in the ledger so a post-enable "now do that task" re-runs
+        # it instead of "I don't have a recent request".
+        try:
+            screen_state.note_request(text)
+        except Exception:
+            pass
         return "Screen controls are off. Say turn on screen controls first."
 
     command_text = _strip_leading_fillers(text)
@@ -5663,12 +5901,24 @@ def maybe_handle_screen_control_message(text):
         return "Still working on the last screen command, sir."
 
     def _bg_vision():
+        started = time.time()
         try:
             vision_plan = _plan_with_tree(command_text)
             if isinstance(vision_plan, dict):
                 # Pin the plan to the generation captured before planning.
                 vision_plan["screen_generation"] = request_generation
             result = _execute_or_queue(vision_plan, command_text)
+            # [LIVE FIX 28 / B-STOP] a user stop during the planning or the
+            # execution makes this result stale: the stop reply already
+            # spoke, and a post-stop refusal narrated minutes later only
+            # confuses. Drop it (it still lands in the audit log).
+            try:
+                if screen_state.stopped_after(started):
+                    print("[SCREEN] dropped post-stop vision result:",
+                          str(result)[:80])
+                    return
+            except Exception:
+                pass
             if _response_callback:
                 _response_callback(result)
             else:
