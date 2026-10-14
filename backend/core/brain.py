@@ -480,11 +480,12 @@ def _chat_claim_fallback(cut_sentences):
     """The honest fallback that fits what was cut. Never raises."""
     try:
         blob = " ".join(cut_sentences or [])
-        # [LIVE FIX 28 / B53] a cut SCREEN offer ("I can clear the desktop",
-        # "I can minimize those windows") speaks the screen fallback — the
-        # reroute fallback's "nothing was started" asserts screen state it
-        # cannot know (B50's rule).
+        # [LIVE FIX 28 / B53 + LIVE FIX 29 / B67] a cut SCREEN offer or a
+        # standalone screen-interview question speaks the screen fallback —
+        # the reroute fallback's "nothing was started" asserts screen state
+        # it cannot know (B50's rule).
         if (any(_CHAT_SCREEN_AUTHORITY_RE.search(s)
+                or _SCREEN_INTERVIEW_RE.search(s)
                 for s in (cut_sentences or []))
                 and not _FILEISH_RE.search(blob)):
             return _CHAT_SCREEN_FALLBACK
@@ -497,15 +498,25 @@ def _chat_claim_fallback(cut_sentences):
     return _CHAT_REROUTE_FALLBACK
 
 
-# [LIVE FIX 28 / B53] the interview question that rides a cut screen
-# offer ("Which application window would you like to keep open?",
-# "Just tell me which application you would like to keep visible.") is
-# part of the offer — chat must not interview the user about screen
-# actions it can never perform.
+# [LIVE FIX 28 / B53 + LIVE FIX 29 / B67] the interview question about which
+# window/application to keep open/visible or act on ("Please tell me which
+# window you want to keep visible.", "Which application window would you like
+# to keep open?"). Chat must never interview the user about screen actions it
+# cannot perform, even when no offer sentence accompanied the question.
 _SCREEN_INTERVIEW_RE = re.compile(
     r"\b(?:which|what)\b[^.?!]{0,60}?\b(?:app|application|application's|"
     r"window|windows|program)\b[^.?!]{0,50}?\b(?:keep|leave|visible|open|"
-    r"alongside|stay|remain)\b",
+    r"alongside|stay|remain|minimi[sz]e|maximi[sz]e|restore|close|hide)\b",
+    re.IGNORECASE)
+
+#: Bare apology/courtesy opener ("My apologies, sir.", "I'm sorry, sir.") that
+#: carries no standalone answer once the following screen-interview question
+#: is stripped.
+_BARE_COURTESY_SENTENCE_RE = re.compile(
+    r"^\s*(?:my\s+apologies|i(?:'m|\s+am)\s+sorry|apologies|"
+    r"sorry(?:\s+about\s+that)?|pardon\s+me|forgive\s+me|understood|"
+    r"certainly|of\s+course)"
+    r"(?:\s*,\s*sir)?[\s.!]*$",
     re.IGNORECASE)
 
 
@@ -518,6 +529,12 @@ def _strip_unverified_action_claims(text, role):
     own authoritative sentences (they are constructed from verified events
     upstream) — this gate only strips recognised action claims that leaked
     in from free-form model prose.
+
+    [LIVE FIX 29 / B67] a screen-interview question is cut UNCONDITIONALLY
+    (not only when a screen offer was also cut): a standalone "Please tell me
+    which window you want to keep visible." must never reach the user. The
+    short-TTL pending screen-interview slot is armed so the follow-up answer
+    resolves deterministically (B68).
     """
     if not text:
         return text
@@ -525,26 +542,41 @@ def _strip_unverified_action_claims(text, role):
         return text
     sentences = re.split(r"(?<=[.!?])\s+", str(text).strip())
     kept, cut = [], []
+    interview_cut = False
     for s in sentences:
         claim = (bool(_ACTION_CLAIM_RE.search(s))
                  and not _ACTION_OFFER_RE.search(s))
-        # [LIVE FIX 25 / B31] a physical-action offer or approval ask is
-        # cut even though it is offer-shaped; lookup offers contain no
-        # physical verb and still pass.
+        is_interview = bool(_SCREEN_INTERVIEW_RE.search(s))
+        if is_interview:
+            interview_cut = True
+        # [LIVE FIX 25 / B31 + LIVE FIX 29 / B67] a physical-action offer,
+        # approval ask, or screen-interview question is cut even when no
+        # other claim was made; lookup offers contain no physical verb and
+        # still pass.
         if (claim or _INCAPABILITY_CLAIM_RE.search(s)
-                or _CHAT_SCREEN_AUTHORITY_RE.search(s)):
+                or _CHAT_SCREEN_AUTHORITY_RE.search(s)
+                or is_interview):
             cut.append(s)
         else:
             kept.append(s)
-    # [LIVE FIX 28 / B53] when a screen offer was cut, its interview
-    # question goes with it — the whole reply becomes the honest fallback.
-    if cut and any(_CHAT_SCREEN_AUTHORITY_RE.search(s) for s in cut):
-        _kept2 = [s for s in kept
-                  if not _SCREEN_INTERVIEW_RE.search(s)]
-        if len(_kept2) != len(kept):
-            logging.warning("[R13] chat screen interview stripped: %r",
-                            text[:160])
-            kept = _kept2
+    if interview_cut:
+        logging.warning("[R13] chat screen interview stripped: %r",
+                        text[:160])
+        try:
+            _set_pending_screen_interview(
+                verb=_last_window_action_verb() or "minimize")
+        except Exception:
+            pass
+    # [LIVE FIX 29 / B67] when a screen offer or screen interview was cut and
+    # the only remaining sentences are bare apologies ("My apologies, sir."),
+    # drop them so the reply becomes the honest screen fallback instead of a
+    # dangling apology.
+    if cut and any(_CHAT_SCREEN_AUTHORITY_RE.search(s)
+                   or _SCREEN_INTERVIEW_RE.search(s) for s in cut):
+        non_courtesy = [s for s in kept
+                        if not _BARE_COURTESY_SENTENCE_RE.match(s)]
+        if not non_courtesy:
+            kept = []
     # If every sentence was a claim (the classic "I will get that created
     # right away, sir." turn), say the honest fallback instead of silence.
     if not kept or not any(s.strip() for s in kept):
@@ -4246,6 +4278,28 @@ def _browser_prewarm_due(contract):
         return False
 
 
+def _is_window_or_screen_control_job(text):
+    """True when *text* describes an OS window-management job.
+
+    [LIVE FIX 29 / B68+B69] browser automation cannot minimize/maximize/
+    restore OS windows — a job shaped like one belongs to screen_control,
+    never to the opencode/browser handoff. Never raises.
+    """
+    try:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        from backend.services import screen_control as _sc
+        if _sc.looks_like_window_command(raw):
+            return True
+    except Exception:
+        pass
+    return bool(
+        _WIN_CORR_VERB_RE.search(str(text or ""))
+        and _WIN_CORR_NOUN_RE.search(str(text or ""))
+    )
+
+
 def handle_opencode_task(task_description, original_message,
                          from_voice=False, voice_compact=False, contract=None):
     """Route a complex command to the opencode agent.
@@ -4258,6 +4312,23 @@ def handle_opencode_task(task_description, original_message,
     F16: *contract* (when supplied) is the already-frozen execution decision;
     it is stored with the armed confirmation so execution cannot re-decide.
     """
+    # [LIVE FIX 29 / B68+B69] a window-management job is a screen-control
+    # action, not a browser task — deflect it deterministically before any
+    # opencode preview is armed (the browser agent cannot minimize windows).
+    if (_is_window_or_screen_control_job(task_description)
+            or _is_window_or_screen_control_job(original_message)):
+        cmd = (task_description
+               if _is_window_or_screen_control_job(task_description)
+               else original_message)
+        try:
+            sc_reply = maybe_handle_screen_control_message(cmd)
+        except Exception as exc:
+            logging.warning("[TASK] Window-management deflection failed: %s",
+                            exc)
+            sc_reply = None
+        if sc_reply is not None:
+            print("[TASK] Window-management job -> screen_control:", cmd)
+            return sc_reply
     _arm_opencode_confirmation(task_description, original_message,
                                contract=contract)
     # L-6: while the user reads the confirmation prompt, warm the MCP
@@ -4319,6 +4390,33 @@ _STATUS_SUMMARY_REF_RE = re.compile(
     r"\b(?:it|that|this|them|those|these)\b"
     r"|\b(?:task|job|work|file|folder|report|duplicate|replica"
     r"|structure|plan|request)\b",
+    re.IGNORECASE,
+)
+
+#: [LIVE FIX 29 / B66] done-question shapes that ask whether recent work
+#: finished ("are you done?", "is it done?", "did you finish?"). When no task
+#: result is recorded, these consult the last-action registry (screen_control
+#: / chain) so a completed screen action is not answered as idle.
+_DONE_STATUS_QUESTION_RE = re.compile(
+    r"\b(?:"
+    r"are\s+you\s+(?:done|finished|complete|completed)\b"
+    r"|is\s+(?:it|that|this|the\s+\w+\s+(?:task|action|command|job))\s+"
+    r"(?:done|finished|complete|completed)\b"
+    r"|did\s+you\s+(?:finish|complete)\b"
+    r"|did\s+you\s+do\s+(?:it|that|this|them|those|the\s+"
+    r"(?:task|job|file|folder|work|thing|browser|report|duplicate|"
+    r"replica|structure|plan|request|action|command))\b"
+    r"|have\s+you\s+(?:finished|completed|done)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Fix-16 guard for B66: a question naming an unrelated lookup topic ("did you
+#: finish the online search for this skin?") must never hear the stored screen
+#: action summary.
+_UNRELATED_STATUS_TOPIC_RE = re.compile(
+    r"\b(?:online\s+search|web\s+search|search\s+for|research\s+on|"
+    r"look\s+up)\b",
     re.IGNORECASE,
 )
 
@@ -4469,9 +4567,10 @@ def _status_snapshot():
     """R12: read the live operational state in one consistent snapshot.
 
     Sources: armed opencode/native confirmations, the running flag, the
-    S18 action queue, the pending browser clarification, and the last
-    verified native result. Returns a plain dict — the speaker below only
-    reads this, never live globals.
+    S18 action queue, the pending browser clarification, the last
+    verified native result, and the last executed screen/chain action.
+    Returns a plain dict — the speaker below only reads this, never live
+    globals.
     """
     try:
         with _opencode_confirm_lock:
@@ -4505,6 +4604,25 @@ def _status_snapshot():
                 or getattr(result, "detail", "") or task_text or "")
     except Exception:
         pass
+    # [LIVE FIX 29 / B66] the TTL-bounded last SCREEN/chain action, so a
+    # done-question about a completed screen action is not answered as idle.
+    last_action = {}
+    try:
+        act = get_last_action() or {}
+        act_cmd = str(act.get("command") or "").strip()
+        act_at = float(act.get("at") or 0.0)
+        if act_cmd and act_at > 0.0 and (time.time() - act_at) < _LAST_ACTION_TTL:
+            last_action = {
+                "kind": str(act.get("kind") or ""),
+                "command": act_cmd[:160],
+                "summary": re.sub(
+                    r"\s+", " ", str(act.get("summary") or "")
+                ).strip()[:160],
+                "done": bool(act.get("done")),
+                "at": act_at,
+            }
+    except Exception:
+        last_action = {}
     return {
         "pending_opencode": bool(pending_opencode),
         "pending_native": bool(pending_native),
@@ -4515,6 +4633,7 @@ def _status_snapshot():
         "clarification": bool(clarification),
         "last_status": last_status,
         "last_summary": re.sub(r"\s+", " ", last_summary).strip()[:160],
+        "last_action": last_action,
     }
 
 
@@ -4597,6 +4716,27 @@ def answer_status_question(msg):
         return "Sir, the task was stopped. No further changes were verified."
     if status == "needs_input":
         return "Sir, I asked a question before continuing."
+    # [LIVE FIX 29 / B66] no task result recorded: a done-question consults
+    # the TTL-bounded last-action registry (screen_control / chain) so a
+    # completed, verified screen action is not answered as idle. A question
+    # naming an unrelated lookup topic never hears the screen summary.
+    last_action = snap.get("last_action") or {}
+    if (last_action and _DONE_STATUS_QUESTION_RE.search(text)
+            and not _UNRELATED_STATUS_TOPIC_RE.search(text)):
+        if last_action.get("done"):
+            tail = _status_summary_tail(
+                last_action.get("summary") or last_action.get("command") or ""
+            )
+            if tail:
+                clipped = _voice_clip(tail, 140)
+                if not clipped.endswith((".", "!", "?")):
+                    clipped += "."
+                return "Yes, sir — done: %s" % clipped
+            return "Yes, sir — done."
+        cmd_tail = _voice_clip(
+            last_action.get("command") or "the last action", 100
+        )
+        return "No, sir — %s did not finish cleanly." % cmd_tail
     return "Sir, nothing is running right now."
 
 
@@ -4716,14 +4856,34 @@ ACTION_QUEUED_REPLY = ("Sir, I'll run that as soon as the current task "
                        "finishes — it's queued.")
 
 
+def _is_non_queueable_feedback(msg):
+    """[LIVE FIX 29 / B70] True when *msg* is route feedback or a complaint
+    about work not being done, rather than a new action request that should
+    sit in the S18 queue. Never raises."""
+    try:
+        text = str(msg or "").strip()
+        if not text:
+            return False
+        if _is_engine_route_correction(text):
+            return True
+        if _SCREEN_ACTION_COMPLAINT_RE.match(text):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _queue_action_request(msg, from_voice):
     """Hold an action request made while a task runs.
 
     Returns the polite hold reply when the request was queued (or the queue
-    is full), or None when no task is running and the caller must proceed
-    with the normal dispatch.
+    is full), or None when no task is running — or when the turn is route
+    feedback / a complaint that must bypass the hold ([LIVE FIX 29 / B70]) —
+    and the caller must proceed with the normal dispatch.
     """
     if not _opencode_task_running:
+        return None
+    if _is_non_queueable_feedback(msg):
         return None
     with _action_queue_lock:
         if len(_pending_action_requests) >= MAX_QUEUED_ACTIONS:
@@ -6569,6 +6729,107 @@ def _get_pending_screen_clarify():
     return state
 
 
+# ── [LIVE FIX 29 / B68] the short-TTL screen-interview answer slot ──────────
+# When chat (or a gate) ever asks the user WHICH window/application to keep
+# or act on, the bare one-word answer ("brave") must resolve that question
+# deterministically through screen_control — never reach the intent router
+# (which used to read it as a fresh task and arm the browser agent).
+_pending_screen_interview = None
+_SCREEN_INTERVIEW_TTL = 120.0
+
+_BARE_WINDOW_ANSWER_RE = re.compile(
+    r"^\s*(?:the\s+|just\s+|only\s+|keep\s+|leave\s+)?"
+    r"(?P<token>[a-zA-Z0-9_.\-]+(?:\s+[a-zA-Z0-9_.\-]+){0,2}?)"
+    r"(?:\s+(?:window|app|application|browser|program))?"
+    r"[\s.!]*$",
+    re.IGNORECASE,
+)
+_NON_APP_BARE_TOKEN_RE = re.compile(
+    r"^(?:yes|yeah|yep|yup|no|nope|nah|cancel|stop|confirm|again|repeat|"
+    r"continue|status|nothing|none|all|everything|what|which|who|where|"
+    r"when|why|how|hi|hello|hey|thanks|thank\s+you|ok|okay|sure)$",
+    re.IGNORECASE,
+)
+
+
+def _set_pending_screen_interview(verb="minimize"):
+    """Register a short-TTL slot after a screen-interview question."""
+    global _pending_screen_interview
+    try:
+        with _confirmation_lock:
+            _pending_screen_interview = {
+                "verb": str(verb or "minimize").lower(),
+                "at": time.time(),
+            }
+    except Exception:
+        pass
+
+
+def _clear_pending_screen_interview():
+    global _pending_screen_interview
+    try:
+        with _confirmation_lock:
+            _pending_screen_interview = None
+    except Exception:
+        pass
+
+
+def _get_pending_screen_interview():
+    try:
+        with _confirmation_lock:
+            state = (dict(_pending_screen_interview)
+                     if _pending_screen_interview else None)
+    except Exception:
+        return None
+    if not state:
+        return None
+    if time.time() - float(state.get("at") or 0.0) > _SCREEN_INTERVIEW_TTL:
+        _clear_pending_screen_interview()
+        return None
+    return state
+
+
+def _consume_pending_screen_interview(msg):
+    """Resolve a bare 1-3 word window/app answer ('brave') against a pending
+    screen-interview slot, routing "minimize all the windows on my screen
+    except for the <token> window" through maybe_handle_screen_control_message.
+
+    [LIVE FIX 29 / B68] returns None when no slot is open, *msg* is not a
+    bare app answer, or the answer is a control word (yes/no/stop/…).
+    Never raises.
+    """
+    state = _get_pending_screen_interview()
+    if state is None:
+        return None
+    raw = str(msg or "").strip()
+    if not raw or len(raw.split()) > 4:
+        return None
+    try:
+        if (is_status_question(raw) or _memory_recall_request(raw)
+                or is_bare_stop(raw) or is_stop_everything(raw)):
+            return None
+    except Exception:
+        pass
+    m = _BARE_WINDOW_ANSWER_RE.match(raw)
+    if not m:
+        return None
+    token = str(m.group("token") or "").strip()
+    if not token or _NON_APP_BARE_TOKEN_RE.match(token):
+        return None
+    _clear_pending_screen_interview()
+    verb = str(state.get("verb") or _last_window_action_verb() or "minimize")
+    rewritten = (
+        "%s all the windows on my screen except for the %s window"
+        % (verb, token)
+    )
+    print("[SCREEN] Resolved pending screen-interview answer ->", rewritten)
+    try:
+        return maybe_handle_screen_control_message(rewritten)
+    except Exception as exc:
+        logging.warning("[SCREEN] Pending interview answer failed: %s", exc)
+        return None
+
+
 def _mi_extract_screen_query(clause, topic, content, correction=""):
     """Read the SPECIFIC thing the user pointed at from the screen report.
 
@@ -7748,6 +8009,84 @@ def _screen_command_relook(msg):
         return ""
 
 
+#: [LIVE FIX 29 / B67] a user complaint that a requested window/screen action
+#: was not performed ("i asked you to minimize but you didnt", "you didnt
+#: minimize them", "you didnt do it"). Re-plans the stored command fresh —
+#: never a chat interview, never a replay of stale steps.
+_SCREEN_ACTION_COMPLAINT_RE = re.compile(
+    r"^\s*(?:(?:no|nope|hey|wait|jarvis|sir|but)\s*[,.!]?\s*)*"
+    r"(?:"
+    r"i\s+(?:asked|told|said(?:\s+for)?)\s+you\s+to\s+"
+    r"(?P<asked_verb>minimi[sz]e|maximi[sz]e|restore|click|tap|press|"
+    r"typ(?:e|ing)|scroll|close|do)\b[^.?!]{0,60}?\b"
+    r"(?:but\s+)?you\s+(?:didn'?t|did\s+not|haven'?t|have\s+not|never)\b"
+    r"(?:\s+(?:do|minimi[sz]e|maximi[sz]e|restore|click|press|type|it|"
+    r"that|them|anything)\b)*"
+    r"|you\s+(?:didn'?t|did\s+not|haven'?t|have\s+not|never)\s+"
+    r"(?:minimi[sz]e|maximi[sz]e|restore|click|tap|press|type|scroll|close)"
+    r"(?:\s+(?:it|that|them|those|the\s+windows?|anything))?\b"
+    r"|you\s+(?:didn'?t|did\s+not|never)\s+do\s+(?:it|that|this|them)\b"
+    r"|(?:it|they|the\s+windows?)\s+(?:didn'?t|did\s+not|aren'?t|are\s+not|"
+    r"weren'?t|were\s+not)\s+(?:minimi[sz]ed?|maximi[sz]ed?|restored?)\b"
+    r")"
+    r"[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_screen_action_complaint(msg):
+    """True when *msg* complains that a screen/window action was not done."""
+    try:
+        text = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if not text or _memory_recall_request(text) or is_status_question(text):
+            return False
+        return bool(_SCREEN_ACTION_COMPLAINT_RE.match(text))
+    except Exception:
+        return False
+
+
+def _screen_action_complaint_command(msg):
+    """The recent screen/window command to re-plan fresh for a complaint,
+    or "" when no recent screen action exists within TTL. Never raises.
+    """
+    try:
+        if not _is_screen_action_complaint(msg):
+            return ""
+        # A complaint that does not name a window/screen verb ("you didn't do
+        # it") defers to the chain-resume gate when an unfinished chain is
+        # waiting; an explicit verb ("minimize") always re-plans here.
+        m = _SCREEN_ACTION_COMPLAINT_RE.match(
+            re.sub(r"\s+", " ", str(msg or "")).strip()
+        )
+        asked_verb = (m.group("asked_verb") or "").lower() if m else ""
+        explicit_win_verb = bool(
+            _WIN_CORR_VERB_RE.search(str(msg or ""))
+            or (asked_verb and asked_verb != "do")
+        )
+        if not explicit_win_verb:
+            chain = _take_chain_plan()
+            if chain and isinstance(chain.get("plan"), dict):
+                steps = chain["plan"].get("steps") or []
+                results = chain.get("results") or []
+                if len(results) < len(steps):
+                    return ""
+        last = get_last_action() or {}
+        cmd = str(last.get("command") or "").strip()
+        at = float(last.get("at") or 0.0)
+        if (str(last.get("kind") or "") in ("screen_control", "chain")
+                and cmd and (time.time() - at) < _LAST_ACTION_TTL):
+            return cmd
+        from backend.services import screen_state as _screen_state
+        req = _screen_state.get_last_request() or {}
+        req_cmd = str(req.get("command") or "").strip()
+        req_ts = float(req.get("ts") or 0.0)
+        if req_cmd and (time.time() - req_ts) < _LAST_ACTION_TTL:
+            return req_cmd
+        return ""
+    except Exception:
+        return ""
+
+
 #: [LIVE FIX 25 / B32] whole-task repeat ("do the whole task again",
 #: "start it all over again") re-runs the stored chain from step 1.
 #: "do the whole task" WITHOUT "again" is deliberately NOT matched — that
@@ -7968,17 +8307,36 @@ _SCREEN_ACTION_CORRECTION_RE = re.compile(
     r"(?:on\s+)?(?P<target>[^,;.!?]{2,80}?)\s*"
     r"(?:[,;]\s*|\s+)?(?:(?:but|and)\s+)?"
     r"(?:instead\b[^.!?]*|you(?:'re|\s+are|\s+were)?\s+"
-    r"(?:click|press|tap)\w*\b[^.!?]*)?"
+    r"(?:click|press|tap|typ|select|hit)\w*\b[^.!?]*)?"
     r"[\s.!?]*$",
     re.IGNORECASE)
 #: "you clicked the tab search instead of the search icon".
 _SCREEN_ACTION_INSTEAD_OF_RE = re.compile(
     r"^\s*(?:(?:no|nope|jarvis|sir|wait)\s*[,.!]?\s*)?"
     r"you(?:\s+are|'re|\s+were)?\s+(?P<verb>click(?:ing|ed)|press(?:ing|ed)|"
-    r"tap(?:ping|ped)|select(?:ing|ed))\s+(?:on\s+)?[^,;.!?]{2,60}?\s+"
+    r"tap(?:ping|ped)|typ(?:e|ing|ed)|select(?:ing|ed))\s+"
+    r"(?:(?:on|in|into)\s+)?[^,;.!?]{2,60}?\s+"
     r"instead\s+of\s+"
-    r"(?:clicking\s+|pressing\s+|tapping\s+)?(?:on\s+)?"
+    r"(?:clicking\s+|pressing\s+|tapping\s+|typing\s+)?(?:(?:on|in|into)\s+)?"
     r"(?P<target>[^,;.!?]{2,80}?)[\s.!?]*$",
+    re.IGNORECASE)
+#: [LIVE FIX 29 / B63] affirmative-but-contrast correction: both verbs are
+#: positive ("you are clicking in the youtube search bar but typing in the
+#: browser url bar"), with the FIRST target the intended element and the
+#: SECOND verb+target the misdirected follow-on action. The negation-shaped
+#: nets above deliberately never match this (there is no "not"/"instead").
+_SCREEN_ACTION_CONTRAST_RE = re.compile(
+    r"^\s*(?:(?:no|nope|jarvis|sir|wait|hey)\s*[,.!]?\s*)?"
+    r"you(?:\s+are|'re|\s+were)?\s+"
+    r"(?P<verb>click(?:ing|ed)?|press(?:ing|ed)?|tap(?:ping|ped)?|"
+    r"select(?:ing|ed)?|hit(?:ting)?)\s+"
+    r"(?:on\s+)?(?P<target>[^,;.!?]{2,80}?)\s*"
+    r"(?:[,;]\s*|\s+)(?:but|and(?:\s+then)?|yet|while)\s+"
+    r"(?:you(?:\s+are|'re|\s+were)?\s+|instead\s+)?"
+    r"(?P<verb2>typ(?:e|ing|ed)|click(?:ing|ed)?|press(?:ing|ed)?|"
+    r"tap(?:ping|ped)?|enter(?:ing|ed)?|writ(?:e|ing)|select(?:ing|ed)?)\s+"
+    r"(?:(?:in|into|on|at)\s+)?(?P<wrong_target>[^,;.!?]{2,80}?)"
+    r"[\s.!?]*$",
     re.IGNORECASE)
 _CORR_UI_TARGET_RE = re.compile(
     r"\b(?:button|link|bar|box|field|tab|icon|checkbox|dropdown|menu|"
@@ -8013,11 +8371,62 @@ def _recent_screen_activity():
         return False
 
 
+def _recent_typed_command():
+    """The most recent 'type ...' step, for an affirmative-but-contrast
+    correction.
+
+    [LIVE FIX 29 / B63] "you are clicking X but typing in Y" must re-run BOTH
+    the corrected click and the typed payload: the payload is read from the
+    active chain, the last-action registry, or the screen interaction ledger
+    — never invented. Returns "" when nothing typed is recent. Never raises.
+    """
+    try:
+        chain = _take_chain_plan()
+        if chain and isinstance(chain.get("plan"), dict):
+            for step in reversed(chain["plan"].get("steps") or []):
+                st = str((step or {}).get("text") or "").strip()
+                if re.match(r"^(?:type|enter|write)\b", st, re.IGNORECASE):
+                    return st
+    except Exception:
+        pass
+    try:
+        last = get_last_action() or {}
+        if (time.time() - float(last.get("at") or 0.0)) < _LAST_ACTION_TTL:
+            cmd = str(last.get("command") or "").strip()
+            if re.match(r"^(?:type|enter|write)\b", cmd, re.IGNORECASE):
+                return cmd
+            built = multi_intent.build_chain(cmd) if cmd else None
+            if built and isinstance(built.get("steps"), list):
+                for step in reversed(built["steps"]):
+                    st = str((step or {}).get("text") or "").strip()
+                    if re.match(r"^(?:type|enter|write)\b", st, re.IGNORECASE):
+                        return st
+    except Exception:
+        pass
+    try:
+        from backend.services import screen_state as _screen_state
+        for entry in reversed(_screen_state.get_recent_interactions() or []):
+            cmd = str((entry or {}).get("command") or "").strip()
+            if re.match(r"^(?:type|enter|write)\b", cmd, re.IGNORECASE):
+                return cmd
+    except Exception:
+        pass
+    return ""
+
+
 def _screen_action_correction_command(msg):
-    """Rewrite a click/press/type target correction to a command, else None."""
+    """Rewrite a click/press/type target correction to a command, else None.
+
+    [LIVE FIX 29 / B63] also handles the affirmative-but-contrast shape
+    ("you are clicking X but typing in Y"): the corrected click is rebuilt,
+    and when the second verb is a typing verb the recent typed payload is
+    appended so the whole corrective chain re-runs.
+    """
     try:
         text = re.sub(r"\s+", " ", str(msg or "")).strip()
-        m = (_SCREEN_ACTION_CORRECTION_RE.match(text)
+        m_contrast = _SCREEN_ACTION_CONTRAST_RE.match(text)
+        m = (m_contrast
+             or _SCREEN_ACTION_CORRECTION_RE.match(text)
              or _SCREEN_ACTION_INSTEAD_OF_RE.match(text))
         if not m:
             return None
@@ -8035,11 +8444,212 @@ def _screen_action_correction_command(msg):
             return None
         if verb != "type" and not _CORR_UI_TARGET_RE.search(target):
             return None
+        if m_contrast is not None:
+            wrong_target = re.sub(
+                r"\s+([,.])", r"\1", m_contrast.group("wrong_target") or ""
+            ).strip(" ,.")
+            if (not wrong_target
+                    or _CORR_VAGUE_RE.match(wrong_target)
+                    or not _CORR_UI_TARGET_RE.search(wrong_target)
+                    or wrong_target.lower() == target.lower()):
+                return None
         if not _recent_screen_activity():
             return None
-        return "%s %s" % (verb, target)
+        base_cmd = "%s %s" % (verb, target)
+        if m_contrast is not None:
+            verb2 = str(m_contrast.group("verb2") or "").lower()
+            if verb2.startswith(("typ", "enter", "writ")):
+                typed_cmd = _recent_typed_command()
+                if typed_cmd:
+                    return "%s, then %s" % (base_cmd, typed_cmd)
+        return base_cmd
     except Exception:
         return None
+
+
+#: [LIVE FIX 29 / B65+B70] engine/route correction ("that is not a browser
+#: taks its a screen command", "its not a browser task"). Requires a negation
+#: of the browser/opencode/task route so genuine browser-task requests
+#: ("take over the browser task and login to X") never match. Tolerates the
+#: STT typos seen live ("taks", "scrren").
+_ENGINE_ROUTE_CORRECTION_RE = re.compile(
+    r"^\s*(?:(?:no|nope|hey|wait|jarvis|sir|but)\s*[,.!]?\s*)*"
+    r"(?:"
+    r"(?:that|this|it)(?:['\u2019]?s|\s+is|\s+was)?\s+not\s+a?\s*"
+    r"(?:browser|opencode|web)\s*(?:ta(?:sk|ks)s?|job|agent|command)\b"
+    r"[^.!?]{0,80}?\b(?:scr+[ae]*n|window|desktop)\s+"
+    r"(?:command|control|action|ta(?:sk|ks)|job)s?\b"
+    r"|(?:that|this|it)(?:['\u2019]?s|\s+is|\s+was)?\s+a\s+"
+    r"(?:scr+[ae]*n|window|desktop)\s+"
+    r"(?:command|control|action)s?\b[^.!?]{0,60}?\bnot\s+a?\s*"
+    r"(?:browser|opencode|web)?\s*(?:ta(?:sk|ks)s?|job|agent)\b"
+    r"|(?:that|this|it)(?:['\u2019]?s|\s+is|\s+was)?\s+not\s+a?\s*"
+    r"(?:browser|opencode)\s*(?:ta(?:sk|ks)s?|job|agent)\b"
+    r"|not\s+a\s+(?:browser|opencode)\s*(?:ta(?:sk|ks)s?|job|agent)\b"
+    r"[^.!?]{0,60}?\b(?:scr+[ae]*n|window|desktop)\b"
+    r")[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_engine_route_correction(msg):
+    """True when *msg* corrects a wrong browser/task route toward screen
+    control. Never raises."""
+    try:
+        text = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if not text or len(text) > 160:
+            return False
+        if _memory_recall_request(text) or is_status_question(text):
+            return False
+        if (is_bare_stop(text) or is_stop_everything(text)
+                or is_stop_task_target(text) or is_stop_research(text)):
+            return False
+        if not _ENGINE_ROUTE_CORRECTION_RE.match(text):
+            return False
+        # A turn that names the screen explicitly is always a route
+        # correction; a bare "its not a browser task" needs live context.
+        has_screen_word = bool(
+            re.search(r"\b(?:scr+[ae]*n|window|desktop)\b", text, re.IGNORECASE)
+        )
+        if has_screen_word:
+            return True
+        with _opencode_confirm_lock:
+            has_oc_pending = bool(_pending_opencode_task)
+        return (bool(_opencode_task_running)
+                or has_oc_pending
+                or _recent_screen_activity())
+    except Exception:
+        return False
+
+
+def _last_reroutable_screen_command(fallback_task=""):
+    """The most recent screen command to re-route after an engine correction.
+
+    Ordered: an armed plan's command, the newest screen request ledger, the
+    cross-executor last-action registry, the continuable chain's first
+    non-ok control step, then a screen-shaped task description. "" when
+    nothing recent exists. Never raises.
+    """
+    # 1. A screen plan is armed right now — its command is the live request.
+    try:
+        from backend.services import screen_state as _screen_state
+        if _screen_state.has_pending_plan():
+            plan = _screen_state.get_pending_plan() or {}
+            cmd = str(plan.get("command_text") or "").strip()
+            if cmd:
+                return cmd
+    except Exception:
+        pass
+    # 2. The newest screen request ledger (any outcome).
+    try:
+        from backend.services import screen_state as _screen_state
+        req = _screen_state.get_last_request() or {}
+        req_cmd = str(req.get("command") or "").strip()
+        req_ts = float(req.get("ts") or 0.0)
+        if req_cmd and (time.time() - req_ts) < _LAST_ACTION_TTL:
+            return req_cmd
+    except Exception:
+        pass
+    # 3. The cross-executor last-action registry.
+    try:
+        last = get_last_action() or {}
+        last_cmd = str(last.get("command") or "").strip()
+        last_at = float(last.get("at") or 0.0)
+        if last_cmd and (time.time() - last_at) < _LAST_ACTION_TTL:
+            if str(last.get("kind") or "") == "screen_control":
+                return last_cmd
+            from backend.services import screen_control as _sc
+            if _sc._looks_like_screen_command(last_cmd):
+                return last_cmd
+    except Exception:
+        pass
+    # 4. The continuable chain: its first non-ok control step, else its last.
+    try:
+        chain = _take_chain_plan()
+        if chain and isinstance(chain.get("plan"), dict):
+            steps = chain["plan"].get("steps") or []
+            results = chain.get("results") or []
+            for idx, step in enumerate(steps):
+                if step.get("kind") == "screen_control":
+                    if idx >= len(results) or (results[idx] or {}).get(
+                            "status") != "ok":
+                        st = str(step.get("text") or "").strip()
+                        if st:
+                            return st
+            for step in reversed(steps):
+                if step.get("kind") == "screen_control":
+                    st = str(step.get("text") or "").strip()
+                    if st:
+                        return st
+    except Exception:
+        pass
+    # 5. The dropped opencode preview itself held a screen/window command.
+    try:
+        if fallback_task:
+            from backend.services import screen_control as _sc
+            if (_sc.looks_like_window_command(fallback_task)
+                    or _sc._looks_like_screen_command(fallback_task)):
+                return str(fallback_task).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _handle_engine_route_correction(msg, from_voice=False):
+    """Cancel a misrouted browser/opencode task or preview and re-route the
+    last screen command through maybe_handle_screen_control_message.
+
+    [LIVE FIX 29 / B65+B70] returns the spoken reply when the turn IS an
+    engine correction, else None. Never raises.
+    """
+    if not _is_engine_route_correction(msg):
+        return None
+    global _pending_opencode_task
+    dropped_desc = ""
+    with _opencode_confirm_lock:
+        if _pending_opencode_task:
+            dropped_desc = str(
+                _pending_opencode_task.get("task_description")
+                or _pending_opencode_task.get("original_message")
+                or ""
+            )
+        _pending_opencode_task = None
+    _clear_browser_clarification()
+    was_running = bool(_opencode_task_running)
+    if was_running:
+        try:
+            handle_stop_message("stop the browser task", from_voice=from_voice)
+        except Exception as exc:
+            logging.warning("[CORRECTION] Engine-correction stop failed: %s",
+                            exc)
+        try:
+            set_opencode_task_running(False)
+        except Exception:
+            pass
+    cmd = _last_reroutable_screen_command(fallback_task=dropped_desc)
+    if cmd:
+        try:
+            from backend.services import screen_state as _screen_state
+            if _screen_state.has_pending_plan():
+                _screen_state.clear_pending_plan()
+        except Exception:
+            pass
+        try:
+            sc_reply = maybe_handle_screen_control_message(cmd)
+        except Exception as exc:
+            logging.warning("[CORRECTION] Engine-correction re-route failed: %s",
+                            exc)
+            sc_reply = None
+        if sc_reply is not None:
+            if was_running:
+                return ("Understood, sir — I'll stop that and run it as a "
+                        "screen command. %s" % sc_reply)
+            return sc_reply
+    if was_running:
+        return ("Understood, sir — I'll stop that and run it as a screen "
+                "command. Tell me what you'd like me to do on the screen.")
+    return ("Understood, sir — say the screen command you'd like me to run "
+            "and I'll do it.")
 
 
 #: [Live fix] The last replicate attempt (any path): its text, when it ran
@@ -10255,10 +10865,37 @@ def _consume_confirmation(answer):
     return None
 
 
+def _disarm_non_screen_confirmations():
+    """Wipe research and opencode previews when a screen plan arms.
+
+    [LIVE FIX 29 / B64] one approval surface at a time: a fresh screen
+    consent ask supersedes a stale research/opencode one, so a later "yes"
+    can only ever mean the screen plan the user is actually looking at.
+    """
+    global _pending_confirmation, _pending_opencode_task
+    try:
+        with _confirmation_lock:
+            _pending_confirmation = None
+    except Exception:
+        pass
+    try:
+        with _opencode_confirm_lock:
+            _pending_opencode_task = None
+    except Exception:
+        pass
+
+
+try:
+    from backend.services import screen_state as _ss_hook
+    _ss_hook.set_on_pending_plan_armed(_disarm_non_screen_confirmations)
+except Exception:
+    pass
+
+
 def _disarm_other_gates_if_task_gate_armed():
     """Only one gate may be armed at a time — a task-agent confirmation takes
-    precedence over the research and opencode ones. Arming is synchronous, so
-    a wiped gate can at worst skip one question."""
+    precedence over the research, opencode, and standalone screen ones. Arming
+    is synchronous, so a wiped gate can at worst skip one question."""
     global _pending_confirmation, _pending_opencode_task
     if not has_pending_task_confirmation():
         return
@@ -10266,6 +10903,17 @@ def _disarm_other_gates_if_task_gate_armed():
         _pending_confirmation = None
     with _opencode_confirm_lock:
         _pending_opencode_task = None
+    # [LIVE FIX 29 / B64] a live chain-armed screen step is preserved (its
+    # confirmation resumes the chain tail); a standalone pending screen plan
+    # is superseded.
+    try:
+        from backend.services import screen_state as _screen_state
+        if _screen_state.has_pending_plan():
+            plan = _screen_state.get_pending_plan() or {}
+            if not isinstance(plan.get("chain_context"), dict):
+                _screen_state.clear_pending_plan()
+    except Exception:
+        pass
 
 
 def _arm_opencode_confirmation(task_description, original_message,
@@ -10276,7 +10924,10 @@ def _arm_opencode_confirmation(task_description, original_message,
     with the armed confirmation, so the engine the user is consenting to is
     the engine that runs — a settings change in between cannot swap it.
 
-    Also wipes the research gate so only one gate stays armed at a time.
+    [LIVE FIX 29 / B64] also wipes the research gate and any NON-chain pending
+    screen plan, so only one approval surface stays armed at a time. A live
+    chain-armed screen step is preserved — its confirmation still resumes the
+    chain tail.
     """
     global _pending_opencode_task, _pending_confirmation
     if contract is None:
@@ -10294,11 +10945,21 @@ def _arm_opencode_confirmation(task_description, original_message,
             contract = None
     with _confirmation_lock:
         _pending_confirmation = None
+    try:
+        from backend.services import screen_state as _screen_state
+        if _screen_state.has_pending_plan():
+            pending_plan = _screen_state.get_pending_plan() or {}
+            if not isinstance(pending_plan.get("chain_context"), dict):
+                _screen_state.clear_pending_plan()
+    except Exception:
+        pass
+    now = time.time()
     with _opencode_confirm_lock:
         _pending_opencode_task = {
             "task_description": task_description,
             "original_message": original_message,
-            "expires": time.time() + CONFIRM_WINDOW_SECONDS,
+            "armed_at": now,
+            "expires": now + CONFIRM_WINDOW_SECONDS,
             "contract": contract,
         }
 
@@ -10311,6 +10972,13 @@ def _consume_opencode_confirmation(answer):
     under the new name; "yes, a quick look" holds and asks once
     ("create, or only check?"); "yes, don't create it" declines. Extra
     actions never inherit the old yes.
+
+    [LIVE FIX 29 / B64+B69] the opencode gate never SHADOWS a live armed
+    screen plan: when a chain-armed screen step or a fresher screen approval
+    is pending, the opencode preview is dropped and the turn falls through to
+    maybe_handle_screen_control_message (where approvals.verdict executes the
+    screen plan and the chain tail resumes). A window-management job can
+    never launch the browser agent — it is deflected to screen_control.
 
     Returns the spoken reply when the answer resolves the gate, else None
     when nothing is pending, the window lapsed, or the answer is unclear
@@ -10325,6 +10993,23 @@ def _consume_opencode_confirmation(answer):
     if time.time() > pending["expires"]:
         print("[TASK] opencode confirmation window expired — skipped.")
         return None
+    # [LIVE FIX 29 / B64] never shadow a live chain-armed screen plan or a
+    # fresher screen approval: drop the opencode preview and let the turn
+    # reach maybe_handle_screen_control_message where approvals.verdict
+    # consumes the screen plan.
+    try:
+        from backend.services import screen_state as _screen_state
+        if _screen_state.has_pending_plan():
+            sc_plan = _screen_state.get_pending_plan() or {}
+            sc_rec = _screen_state.get_pending_approval()
+            sc_created = float(getattr(sc_rec, "created_at", 0.0) or 0.0)
+            oc_armed = float(pending.get("armed_at") or 0.0)
+            if (isinstance(sc_plan.get("chain_context"), dict)
+                    or sc_created >= oc_armed):
+                print("[TASK] Yielding confirmation to live armed screen plan.")
+                return None
+    except Exception:
+        pass
     try:
         from backend.services.task_agent import agent as _ta
         verdict = _ta.classify_confirmation(answer)
@@ -10353,6 +11038,28 @@ def _consume_opencode_confirmation(answer):
     if verdict == "unclear":
         print("[TASK] opencode confirmation answered with something else — skipped.")
         return None
+    # [LIVE FIX 29 / B69] an armed opencode confirmation whose task
+    # description is pure window management must never launch the browser
+    # agent — deflect to the deterministic screen-control path instead.
+    task_desc = str(pending.get("task_description") or "")
+    orig_msg = str(pending.get("original_message") or "")
+    if (_is_window_or_screen_control_job(task_desc)
+            or _is_window_or_screen_control_job(orig_msg)):
+        target_cmd = (task_desc
+                      if _is_window_or_screen_control_job(task_desc)
+                      else orig_msg)
+        print("[TASK] Deflecting window-management confirmation to "
+              "screen_control:", target_cmd)
+        try:
+            sc_reply = maybe_handle_screen_control_message(target_cmd)
+        except Exception as exc:
+            logging.warning("[TASK] Window-management deflection failed: %s",
+                            exc)
+            sc_reply = None
+        if sc_reply is not None:
+            return sc_reply
+        return ("Understood, sir — say that window command once more and "
+                "I'll run it on your screen.")
     if verdict == "inspect":
         # Re-arm: the write is HELD, not discarded — a clear "create" next
         # turn both disambiguates and approves the exact displayed effect.
@@ -10887,10 +11594,38 @@ def _process_message_inner(
                       "cleared")
         except Exception:
             pass
+        # [LIVE FIX 29 / B63] a correction supersedes any wrongly-armed
+        # research/opencode preview too — one live request at a time.
+        try:
+            _disarm_non_screen_confirmations()
+        except Exception:
+            pass
         return _process_message_inner(
             _act_corr_cmd, from_voice=from_voice, sync_voice=sync_voice,
             voice_compact=voice_compact, commit_response=commit_response,
             stream_reply=None, progress=progress, request_id=request_id)
+
+    # ── [LIVE FIX 29 / B65+B70] engine/route correction ("that is not a
+    # browser taks its a screen command", "its not a browser task") drops
+    # any wrongly-armed opencode confirmation (or stops a misrouted running
+    # browser task) and re-routes the last requested screen command through
+    # maybe_handle_screen_control_message — never chat.
+    try:
+        _engine_corr_reply = _handle_engine_route_correction(
+            msg, from_voice=from_voice)
+    except Exception as exc:
+        logging.warning("[CORRECTION] Engine-route correction failed: %s", exc)
+        _engine_corr_reply = None
+    if _engine_corr_reply is not None:
+        print("[CORRECTION] Engine route revised to screen_control:", msg)
+        _remember_user_turn(msg)
+        try:
+            add_message("assistant", _engine_corr_reply)
+        except Exception:
+            pass
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, _engine_corr_reply)
+        return _engine_corr_reply
 
     # ── Live fix: "name it X" answers a pending folder-name ask ──
     # The chain folder step asked WHICH name to use; the next turn names it
@@ -10915,6 +11650,25 @@ def _process_message_inner(
             return file_reply
     except Exception as exc:
         logging.warning("[CHAIN] File-name answer failed: %s", exc)
+
+    # ── [LIVE FIX 29 / B68] a bare 1-3 word window/app answer ("brave")
+    # resolves a pending screen-interview slot deterministically through
+    # screen_control instead of reaching the task router (which used to
+    # arm the browser agent for a window-management job).
+    try:
+        interview_reply = _consume_pending_screen_interview(msg)
+    except Exception as exc:
+        logging.warning("[SCREEN] Pending interview answer failed: %s", exc)
+        interview_reply = None
+    if interview_reply is not None:
+        _remember_user_turn(msg)
+        try:
+            add_message("assistant", interview_reply)
+        except Exception:
+            pass
+        if from_voice and sync_voice:
+            sync_voice_log(voice_log_message, interview_reply)
+        return interview_reply
 
     # ── R8: one turn, two jobs (status + work) ──
     # "Are you doing the queued task? Also create a folder named x" is NOT
@@ -11237,6 +11991,50 @@ def _process_message_inner(
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, _idle_reply)
         return _idle_reply
+
+    # ── [LIVE FIX 29 / B67] screen-action complaint ("i asked you to
+    # minimize but you didnt", "you didnt minimize them") re-plans the
+    # recent window/screen command fresh instead of falling to chat (which
+    # used to interview the user about a screen action). Runs after the
+    # chain gates and before resume (an explicit verb re-plans here; a bare
+    # "you didn't do it" defers to the chain-resume gate below).
+    if not msg.lower().startswith("command") and _is_screen_action_complaint(msg):
+        _comp_cmd = _screen_action_complaint_command(msg)
+        if _comp_cmd:
+            print("[REPEAT] Screen complaint re-run -> %s" % _comp_cmd[:80])
+            _remember_user_turn(msg)
+            try:
+                _comp_reply = _process_message_inner(
+                    _comp_cmd, from_voice=from_voice, sync_voice=sync_voice,
+                    voice_compact=voice_compact,
+                    commit_response=commit_response,
+                    stream_reply=None, progress=progress,
+                    request_id=request_id)
+            except Exception as exc:
+                logging.warning("[REPEAT] Screen complaint re-run failed: %s",
+                                exc)
+                _comp_reply = None
+            if _comp_reply is not None:
+                try:
+                    add_message("assistant", _comp_reply)
+                except Exception:
+                    pass
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, _comp_reply)
+                return _comp_reply
+        # Nothing recent to redo and no unfinished chain either — answer
+        # honestly rather than falling through to chat.
+        if _take_chain_plan() is None:
+            _remember_user_turn(msg)
+            _no_redo = ("I don't have a recent screen action to redo, sir — "
+                        "tell me what you'd like me to do and I'll do it.")
+            try:
+                add_message("assistant", _no_redo)
+            except Exception:
+                pass
+            if from_voice and sync_voice:
+                sync_voice_log(voice_log_message, _no_redo)
+            return _no_redo
 
     # ── [LIVE FIX 22 / B10] unfinished-chain feedback ("you didn't do
     # the next steps", "do the rest", "continue") resumes the stored
@@ -11857,6 +12655,20 @@ def _process_message_inner(
 
         # ── Complex task — hand off to opencode agent ──
         if intent_name == "task":
+            # [LIVE FIX 29 / B70] route feedback about the RUNNING task
+            # bypasses the S18 queue and stops/re-routes immediately.
+            if _is_engine_route_correction(msg):
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                corr_reply = _handle_engine_route_correction(
+                    msg, from_voice=from_voice)
+                if corr_reply is not None:
+                    if from_voice and sync_voice:
+                        sync_voice_log(voice_log_message, corr_reply)
+                    return corr_reply
             # [S18] a task-class request made WHILE a task runs cannot take
             # the machinery — it waits in the action queue instead.
             held = _queue_action_request(msg, from_voice)
@@ -11912,6 +12724,33 @@ def _process_message_inner(
                     sync_voice_log(voice_log_message, replicate_reply)
                 return replicate_reply
             description = intent.get("task_description") or msg
+            # [LIVE FIX 29 / B68] a task description that is pure OS window
+            # management ("Minimize all windows except for the Brave browser
+            # window.") belongs to screen_control, never the opencode/browser
+            # handoff.
+            if _is_window_or_screen_control_job(description):
+                if racer is not None:
+                    try:
+                        racer.cancel()
+                    except Exception:
+                        pass
+                print("[TASK] Window-management task description -> "
+                      "screen_control:", description)
+                _remember_user_turn(msg)
+                sc_reply = None
+                try:
+                    sc_reply = maybe_handle_screen_control_message(description)
+                except Exception as exc:
+                    logging.warning("[TASK] Window-management deflection "
+                                    "failed: %s", exc)
+                if sc_reply is not None:
+                    try:
+                        add_message("assistant", sc_reply)
+                    except Exception:
+                        pass
+                    if from_voice and sync_voice:
+                        sync_voice_log(voice_log_message, sc_reply)
+                    return sc_reply
             # Live fix: a file/folder task ("create a text file inside that
             # folder and write …") is NATIVE work — it goes to the code-tool
             # planner (where "that folder" resolves from the notebook), never
@@ -11951,6 +12790,20 @@ def _process_message_inner(
     # routing so simple commands like "open youtube in chrome" are executed
     # by the executor, not swallowed by the task agent's planning reply.
     if not msg.lower().startswith("command") and is_task_request(msg):
+        # [LIVE FIX 29 / B70] same engine-correction bypass as the intent
+        # branch: route feedback stops the wrong task and re-routes now.
+        if _is_engine_route_correction(msg):
+            if racer is not None:
+                try:
+                    racer.cancel()
+                except Exception:
+                    pass
+            corr_reply = _handle_engine_route_correction(
+                msg, from_voice=from_voice)
+            if corr_reply is not None:
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, corr_reply)
+                return corr_reply
         # [S18] same hold as the intent-task branch above: task-shaped
         # requests queue while the machinery is busy.
         held = _queue_action_request(msg, from_voice)

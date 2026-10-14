@@ -251,6 +251,18 @@ def effect_gate(stamp=None):
         yield
 
 
+#: [LIVE FIX 29 / B64] invoked whenever a screen plan arms for consent, so
+#: the brain can disarm superseded research/opencode previews without a
+#: circular import (the brain registers the callback).
+_on_pending_plan_armed = None
+
+
+def set_on_pending_plan_armed(callback):
+    """Register callback() fired when a screen plan is armed for consent."""
+    global _on_pending_plan_armed
+    _on_pending_plan_armed = callback
+
+
 def set_pending_plan(plan, command_text="", ttl=None, scope="screen"):
     """Store a plan awaiting consent, bound to an approval record.
 
@@ -269,7 +281,13 @@ def set_pending_plan(plan, command_text="", ttl=None, scope="screen"):
             )
         except Exception:
             _pending_approval = None
-        return _pending_plan
+        cb = _on_pending_plan_armed
+    if cb is not None:
+        try:
+            cb()
+        except Exception:
+            pass
+    return _pending_plan
 
 
 def get_pending_plan():
