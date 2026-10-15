@@ -194,12 +194,13 @@ def set_enabled(enabled, reason=""):
     (it cannot run while off); ENABLING preserves it so a post-enable
     "now do that task" rebuilds it (B37).
     """
-    global _enabled, _pending_plan, _pending_approval, _last_refused_chain
+    global _enabled, _pending_plan, _pending_approval, _last_refused_chain, _last_request
     with _state_lock:
         _enabled = bool(enabled)
         bump_generation()
         if not _enabled:
             _last_refused_chain = {"source": "", "ts": 0.0}
+            _last_request = {"command": "", "ts": 0.0}
             _pending_plan = None
             _pending_approval = None
             approvals.cancel("screen control disabled")
@@ -422,11 +423,12 @@ def get_recent_interactions():
         return list(_interaction_history)
 
 
-def clear_interactions():
+def clear_interactions(preserve_last_request=False):
     global _interaction_history, _last_request, _last_window_question
     with _state_lock:
         _interaction_history = []
-        _last_request = {"command": "", "ts": 0.0}
+        if not preserve_last_request:
+            _last_request = {"command": "", "ts": 0.0}
         _last_window_question = {"question": "", "ts": 0.0}
 
 

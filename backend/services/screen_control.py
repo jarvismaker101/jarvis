@@ -1343,6 +1343,28 @@ _PHANTOM_WINDOW_TITLES = frozenset({
 
 _LEADING_BADGE_RE = re.compile(r"^\s*\(\d+\)\s*")
 
+#: [LIVE FIX 31 / B79] Top-level console/terminal classes that must never be
+#: dropped by the WS_EX_TOOLWINDOW hover-ghost heuristic.
+_TERMINAL_WINDOW_CLASSES = frozenset({
+    "consolewindowclass",
+    "cascadia_hosting_window_class",
+    "pseudoconsolewindow",
+    "virtualconsoleclass",
+    "mintty",
+})
+
+#: [LIVE FIX 31 / B79] Per-HWND drop diagnostics from the latest
+#: _list_managable_windows() pass (debug-logged, never spoken).
+_last_window_enum_drops = []
+
+
+def _get_last_window_enum_drops():
+    """Return a copy of the per-HWND drop records from the last enumeration."""
+    try:
+        return [dict(d) for d in (_last_window_enum_drops or [])]
+    except Exception:
+        return []
+
 
 def _clean_window_title(title):
     """Strip leading notification badges like '(50) WhatsApp' -> 'WhatsApp'."""
@@ -1360,6 +1382,7 @@ def _list_managable_windows():
     Returns [{"hwnd", "title", "iconic", "rect", "process", "window_class"}];
     [] when enumeration is unavailable. Never raises.
     """
+    global _last_window_enum_drops
     try:
         import ctypes
         from ctypes import wintypes
@@ -1367,6 +1390,7 @@ def _list_managable_windows():
     except Exception:
         return []
     out = []
+    drops = []
     # [LIVE FIX 30 / B71] dedup repeated EnumWindows callbacks on one hwnd.
     seen_hwnds = set()
     try:
@@ -1374,6 +1398,24 @@ def _list_managable_windows():
             is_own_window as _is_own_window)
     except Exception:
         _is_own_window = None
+
+    def _note_drop(hwnd_int, title, reason, detail=""):
+        try:
+            rec = {
+                "hwnd": int(hwnd_int or 0),
+                "title": str(title or ""),
+                "reason": str(reason or ""),
+                "detail": str(detail or ""),
+            }
+            drops.append(rec)
+            if title:
+                logging.debug(
+                    "[WIN-ENUM] drop hwnd=%s title=%r reason=%s detail=%s",
+                    rec["hwnd"], rec["title"][:80], rec["reason"], rec["detail"],
+                )
+        except Exception:
+            pass
+
     try:
         proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND,
                                   wintypes.LPARAM)
@@ -1389,7 +1431,9 @@ def _list_managable_windows():
                 if not _hwnd_int or _hwnd_int in seen_hwnds:
                     return True
                 seen_hwnds.add(_hwnd_int)
-                if not user32.IsWindowVisible(hwnd):
+                # [LIVE FIX 31 / B79] Fail-open revalidation on IsWindowVisible.
+                if (not user32.IsWindowVisible(hwnd)
+                        and not user32.IsWindowVisible(hwnd)):
                     return True
                 buf = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, buf, len(buf))
@@ -1398,37 +1442,48 @@ def _list_managable_windows():
                     return True
                 # [LIVE FIX 30 / B71] shell/IME ghosts that report visible.
                 if title.strip().lower() in _PHANTOM_WINDOW_TITLES:
+                    _note_drop(_hwnd_int, title, "phantom_title")
                     return True
-                # [LIVE FIX 30 / B71] toolwindows (tooltips, palettes) that
-                # are not app windows. Fail open: only drop when the ex-style
-                # read returns a real int > 0, so elevated-window 0-returns
-                # and test stubs never drop. Minimized (iconic) toolwindows
-                # are real put-away windows — never hover-ghosts — so the
-                # drop applies to visible (non-iconic) windows only.
+                try:
+                    _cls_buf = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, _cls_buf, len(_cls_buf))
+                    window_class = (_cls_buf.value or "").strip()
+                except Exception:
+                    window_class = ""
+                # [LIVE FIX 30 / B71 + LIVE FIX 31 / B79] toolwindows (tooltips,
+                # palettes) that are not app windows. Fail open: revalidate
+                # GetWindowLongW once before dropping, never drop iconic windows,
+                # and never drop top-level terminal/console classes.
                 try:
                     _ex = user32.GetWindowLongW(hwnd, -20)
                     if (isinstance(_ex, int) and _ex > 0
-                            and (_ex & 0x80) and not (_ex & 0x40000)):
-                        try:
-                            _is_iconic_pre = bool(user32.IsIconic(hwnd))
-                        except Exception:
-                            _is_iconic_pre = False
-                        if not _is_iconic_pre:
-                            return True
+                            and (_ex & 0x80) and not (_ex & 0x40000)
+                            and window_class.lower() not in _TERMINAL_WINDOW_CLASSES):
+                        _ex2 = user32.GetWindowLongW(hwnd, -20)
+                        if (isinstance(_ex2, int) and _ex2 > 0
+                                and (_ex2 & 0x80) and not (_ex2 & 0x40000)):
+                            try:
+                                _is_iconic_pre = bool(user32.IsIconic(hwnd))
+                            except Exception:
+                                _is_iconic_pre = False
+                            if not _is_iconic_pre:
+                                _note_drop(
+                                    _hwnd_int, title, "toolwindow_exstyle",
+                                    detail="ex=0x%x class=%s" % (_ex2, window_class),
+                                )
+                                return True
                 except Exception:
                     pass
                 if _is_own_window is not None:
                     try:
                         if _is_own_window(hwnd):
+                            _note_drop(_hwnd_int, title, "own_window")
                             return True
                     except Exception:
                         pass
-                # [LIVE FIX 27 / B44] DWM-cloaked ghost windows (suspended
-                # UWP hosts, shell-cloaked Settings/Search) report
-                # IsWindowVisible but are on NO screen — counting or
-                # "minimizing" them produces false claims ("Minimizing 5
-                # windows" while the user sees one move). Fail open: a
-                # missing DWM must never empty the enumeration.
+                # [LIVE FIX 27 / B44 + LIVE FIX 31 / B79] DWM-cloaked ghost
+                # windows. Revalidate once before dropping so a transient
+                # transition poll never drops a live window.
                 try:
                     _cloak = wintypes.DWORD(0)
                     if ctypes.windll.dwmapi.DwmGetWindowAttribute(
@@ -1436,24 +1491,36 @@ def _list_managable_windows():
                             ctypes.byref(_cloak),
                             ctypes.sizeof(_cloak)) == 0:
                         if int(_cloak.value):
-                            return True
-                except Exception:
-                    pass
-                # [LIVE FIX 27 / B44] a window on no monitor is not "on my
-                # screen" either (fully off-screen strays). Minimized
-                # windows keep their monitor, so this never drops those.
-                try:
-                    if not user32.MonitorFromWindow(hwnd, 0):
-                        return True
+                            _cloak2 = wintypes.DWORD(0)
+                            if (ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                                    wintypes.HWND(hwnd), wintypes.DWORD(14),
+                                    ctypes.byref(_cloak2),
+                                    ctypes.sizeof(_cloak2)) == 0
+                                    and int(_cloak2.value)):
+                                _note_drop(
+                                    _hwnd_int, title, "dwm_cloaked",
+                                    detail="cloak=%d" % int(_cloak2.value),
+                                )
+                                return True
                 except Exception:
                     pass
                 try:
                     iconic = bool(user32.IsIconic(hwnd))
                 except Exception:
                     iconic = False
+                # [LIVE FIX 27 / B44 + LIVE FIX 31 / B79] off-monitor check.
+                # Revalidate once before dropping; iconic windows keep their
+                # placement and are never dropped for monitor=0.
+                try:
+                    if (not iconic
+                            and not user32.MonitorFromWindow(hwnd, 0)
+                            and not user32.MonitorFromWindow(hwnd, 0)):
+                        _note_drop(_hwnd_int, title, "off_monitor")
+                        return True
+                except Exception:
+                    pass
                 # [LIVE FIX 24 / B19] capture bounds so references like
-                # "the first two" resolve spatially (top-left first), the
-                # same order a screen answer describes.
+                # "the first two" resolve spatially (top-left first).
                 try:
                     _rect = wintypes.RECT()
                     _has_rect = bool(user32.GetWindowRect(
@@ -1469,9 +1536,10 @@ def _list_managable_windows():
                     }
                 else:
                     rect_info = None
-                # [LIVE FIX 30 / B71] non-iconic zero/negative-area windows
-                # with a populated rect are ghosts — drop them. A 0,0,0,0
-                # rect (mock/unpopulated origin rect) never drops.
+                # [LIVE FIX 30 / B71 + LIVE FIX 31 / B79] non-iconic
+                # zero/negative-area windows with a populated rect are ghosts —
+                # revalidate IsIconic + GetWindowRect once before dropping so a
+                # window mid-minimize/restore transition is not lost.
                 try:
                     if (not iconic and isinstance(rect_info, dict)
                             and not (int(rect_info.get("left") or 0) == 0
@@ -1480,24 +1548,45 @@ def _list_managable_windows():
                                      and int(rect_info.get("height") or 0) == 0)
                             and (int(rect_info.get("width") or 0) <= 0
                                  or int(rect_info.get("height") or 0) <= 0)):
-                        return True
+                        try:
+                            iconic = bool(user32.IsIconic(hwnd))
+                        except Exception:
+                            pass
+                        if not iconic:
+                            _rect2 = wintypes.RECT()
+                            if user32.GetWindowRect(hwnd, ctypes.byref(_rect2)):
+                                _w2 = int(_rect2.right - _rect2.left)
+                                _h2 = int(_rect2.bottom - _rect2.top)
+                                if _w2 > 0 and _h2 > 0:
+                                    rect_info = {
+                                        "left": int(_rect2.left),
+                                        "top": int(_rect2.top),
+                                        "width": _w2,
+                                        "height": _h2,
+                                    }
+                                elif not (int(_rect2.left) == 0
+                                          and int(_rect2.top) == 0
+                                          and _w2 == 0 and _h2 == 0):
+                                    _note_drop(
+                                        _hwnd_int, title, "zero_area_rect",
+                                        detail="rect=%r" % (rect_info,),
+                                    )
+                                    return True
+                            else:
+                                _note_drop(
+                                    _hwnd_int, title, "zero_area_rect",
+                                    detail="rect=%r" % (rect_info,),
+                                )
+                                return True
                 except Exception:
                     pass
-                # [LIVE FIX 25 / B26] owning process + window class, so
-                # app words ("terminal") match windows whose TITLE never
-                # names them ("Windows PowerShell").
+                # [LIVE FIX 25 / B26] owning process + window class.
                 try:
                     _pid = wintypes.DWORD(0)
                     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid))
                     process = _process_image_name(_pid.value, pid_cache)
                 except Exception:
                     process = ""
-                try:
-                    _cls = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, _cls, len(_cls))
-                    window_class = (_cls.value or "").strip()
-                except Exception:
-                    window_class = ""
                 out.append({"hwnd": int(hwnd), "title": title,
                             "iconic": iconic, "rect": rect_info,
                             "process": process, "window_class": window_class})
@@ -1509,6 +1598,13 @@ def _list_managable_windows():
         user32.EnumWindows(_cb_ref, 0)
     except Exception:
         return []
+    _last_window_enum_drops = drops
+    try:
+        logging.debug(
+            "[WIN-ENUM] complete kept=%d dropped=%d", len(out), len(drops)
+        )
+    except Exception:
+        pass
     return out
 
 
@@ -1576,9 +1672,11 @@ def _recent_window_enumeration():
 
 def _clear_window_enumeration():
     """Forget the stored enumeration (tests call this for isolation)."""
+    global _last_window_enum_drops
     try:
         with _window_enum_lock:
             _last_window_enumeration.update({"windows": [], "at": 0.0})
+        _last_window_enum_drops = []
     except Exception:
         pass
     return []
@@ -1661,16 +1759,25 @@ def _window_matches_filter(window, token):
         return True
     if wclass and wclass in _WINDOW_CLASS_ALIASES.get(t, ()):
         return True
-    # [LIVE FIX 26 / B34] the process lookup failed (empty) but the title
-    # names a terminal ("Windows PowerShell", "Command Prompt"). Only for
-    # terminal-family tokens, so unrelated windows never match.
-    if not process and t in _TERMINAL_FAMILY_TOKENS:
+    # [LIVE FIX 26 / B34 + LIVE FIX 31 / B79] terminal-family fallback on
+    # title words ("Windows PowerShell", "Command Prompt"), including when
+    # the owning process resolved to a hosted child binary (e.g. python
+    # inside a console). Browser processes are excluded so a browser tab
+    # ABOUT terminals never matches.
+    if t in _TERMINAL_FAMILY_TOKENS:
         try:
-            title_words = set(re.findall(r"[a-z0-9]+", title_lower))
+            _proc_l = str(process or "").lower()
         except Exception:
-            title_words = set()
-        if title_words & _TERMINAL_TITLE_WORDS:
-            return True
+            _proc_l = ""
+        if _proc_l not in ("brave", "brave.exe", "chrome", "chrome.exe",
+                           "msedge", "msedge.exe", "edge", "firefox",
+                           "firefox.exe", "opera", "vivaldi"):
+            try:
+                title_words = set(re.findall(r"[a-z0-9]+", title_lower))
+            except Exception:
+                title_words = set()
+            if title_words & _TERMINAL_TITLE_WORDS:
+                return True
     return False
 
 
@@ -1960,6 +2067,23 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
             int(h) for h in (skip_hwnds or ()) if int(h or 0)})
     except (TypeError, ValueError):
         _skip_list = []
+    try:
+        _dropped_iconic_hwnds = [
+            int(w.get("hwnd") or 0)
+            for w in (dropped_iconic or [])
+            if int(w.get("hwnd") or 0)
+        ]
+    except Exception:
+        _dropped_iconic_hwnds = []
+    try:
+        logging.debug(
+            "[WIN-PLAN] verb=%s candidates=%d targets=%d kept_out=%d "
+            "dropped_iconic=%d app_filter=%r",
+            verb, len(_deduped or []), len(targets), len(kept_out),
+            len(_dropped_iconic_hwnds), app_filter,
+        )
+    except Exception:
+        pass
     _window_op = {
         "verb": verb,
         "action": action,
@@ -1968,6 +2092,7 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         "kept_names": list(_kept_names or []),
         "plan_time_open_hwnds": list(plan_time_open_hwnds or []),
         "plan_time_iconic_hwnds": list(plan_time_iconic_hwnds or []),
+        "dropped_iconic_hwnds": list(_dropped_iconic_hwnds),
         "exclusions": list(exclusions or []),
         "skip_hwnds": list(_skip_list),
     }
@@ -5008,12 +5133,14 @@ def _typed_targets(steps):
     return typed
 
 
-def _read_typed_field_values(typed, hwnd=None):
-    """F41: read back the field each type step wrote into.
+def _read_typed_field_values(typed, hwnd=None, include_control=False):
+    """F41 / B80: read back the field each type step wrote into.
 
-    Returns a list of ``(intended_text, observed_value)``, or **None** when the
-    values could not be observed at all. None means uncertainty, and uncertainty
-    must never be reported as verified success.
+    Returns a list of ``(intended_text, observed_value)`` (or
+    ``(intended_text, observed_value, control_dict)`` when *include_control*
+    is True), or **None** when the values could not be observed at all. None
+    means uncertainty, and uncertainty must never be reported as verified
+    success.
     """
     if not typed:
         return []
@@ -5036,18 +5163,33 @@ def _read_typed_field_values(typed, hwnd=None):
     observed = []
     for target in typed:
         control = None
-        runtime_id = target.get("ui_runtime_id") or ""
+        runtime_id = (
+            target.get("ui_runtime_id") or target.get("runtime_id") or ""
+        )
         if runtime_id:
             control = by_runtime.get(runtime_id)
-        if control is None and target.get("ui_uid"):
-            control = by_uid.get(target["ui_uid"])
+        if control is None and (target.get("ui_uid") or target.get("uid")):
+            control = by_uid.get(target.get("ui_uid") or target.get("uid"))
         if control is None:
             # No identity survived planning: the keyboard went to whatever
             # held focus, so that is the only field we can honestly inspect.
             control = focused
         if control is None or control.get("value") is None:
             return None
-        observed.append((target["text"], str(control["value"])))
+        if include_control:
+            observed.append((
+                target["text"],
+                str(control["value"]),
+                {
+                    "uid": str(control.get("uid") or ""),
+                    "runtime_id": str(control.get("runtime_id") or ""),
+                    "control_type": str(control.get("control_type") or ""),
+                    "name": str(control.get("name") or ""),
+                    "focused": bool(control.get("focused")),
+                },
+            ))
+        else:
+            observed.append((target["text"], str(control["value"])))
     return observed
 
 
@@ -5134,8 +5276,8 @@ _POSTCONDITION_CAPTURE_ACTIONS = frozenset({
 
 _ADDRESS_BAR_FALLBACK_RE = re.compile(
     r"\b(?:address\s*(?:and\s+search\s+)?bar|url\s*bar|omnibox|location\s*bar|"
-    r"search\s+or\s+type\s+(?:web\s+)?address|brave\s+search\s*bar|"
-    r"browser(?:'s)?\s+(?:url|address|search)\s*bar)\b",
+    r"search\s+or\s+type\s+(?:(?:a\s+)?(?:web\s+)?address|url)|"
+    r"brave\s+search\s*bar|browser(?:'s)?\s+(?:url|address|search)\s*bar)\b",
     re.IGNORECASE,
 )
 
@@ -5206,13 +5348,13 @@ def _has_page_search_bar_intent(command_text, steps_description="",
 
 def _verify_not_wrong_bar(command_text, steps_description, steps,
                           capture=None, hwnd=None, intent_context=""):
-    """[LIVE FIX 30 / B73] Wrong-field cross-check for T3.
+    """[LIVE FIX 30 / B73 + LIVE FIX 31 / B80] Wrong-field cross-check.
 
     When the step (directly or via chain/pronoun inheritance) targets a page
     search bar rather than the browser address bar, returns False if:
       (a) step/summary metadata names the browser address/URL bar, OR
       (b) live readback via _typed_targets(steps) ->
-          _read_typed_field_values(typed, hwnd=hwnd) and
+          _read_typed_field_values(typed, hwnd=hwnd, include_control=True) and
           screen_ui_elements.read_control_values(hwnd=hwnd) shows the focused
           control or the control holding the typed text is an address/URL bar.
     Returns None when no mismatch is detected. Never raises.
@@ -5228,6 +5370,7 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
         if addr_re.search(str(steps_description or "")):
             return False
         target_runtime_ids = set()
+        target_uids = set()
         for s in (steps or []):
             if not isinstance(s, dict):
                 continue
@@ -5235,6 +5378,10 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
                 target_runtime_ids.add(str(s.get("ui_runtime_id")))
             if s.get("runtime_id"):
                 target_runtime_ids.add(str(s.get("runtime_id")))
+            if s.get("ui_uid"):
+                target_uids.add(str(s.get("ui_uid")))
+            if s.get("uid"):
+                target_uids.add(str(s.get("uid")))
             meta = " ".join(
                 str(s.get(k) or "")
                 for k in ("description", "name", "label", "target", "ui_name")
@@ -5242,10 +5389,7 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
             if meta and addr_re.search(meta):
                 return False
 
-        # Part (b)(i): Intended-vs-observed tuple readback via real signatures:
-        #   typed = _typed_targets(steps)
-        #   pairs = _read_typed_field_values(typed, hwnd=hwnd)
-        #       -> [(intended, observed), ...]
+        # Part (b)(i): Intended-vs-observed readback with control identity.
         typed = []
         typed_targets_fn = globals().get("_typed_targets")
         if callable(typed_targets_fn):
@@ -5259,6 +5403,10 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
                     target_runtime_ids.add(str(t_item.get("runtime_id")))
                 if t_item.get("ui_runtime_id"):
                     target_runtime_ids.add(str(t_item.get("ui_runtime_id")))
+                if t_item.get("uid"):
+                    target_uids.add(str(t_item.get("uid")))
+                if t_item.get("ui_uid"):
+                    target_uids.add(str(t_item.get("ui_uid")))
                 t_name = str(t_item.get("name") or t_item.get("description") or "")
                 if t_name and addr_re.search(t_name):
                     return False
@@ -5267,20 +5415,40 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
         read_fields_fn = globals().get("_read_typed_field_values")
         if callable(read_fields_fn) and typed:
             try:
-                pairs = list(read_fields_fn(typed, hwnd=hwnd) or [])
+                try:
+                    pairs = list(
+                        read_fields_fn(typed, hwnd=hwnd, include_control=True)
+                        or []
+                    )
+                except TypeError:
+                    pairs = list(read_fields_fn(typed, hwnd=hwnd) or [])
             except Exception:
                 pairs = []
 
         intended_texts = []
-        observed_matched_intended = False
         for pair in pairs:
             if isinstance(pair, (tuple, list)) and len(pair) >= 2:
                 intended = str(pair[0] or "").strip().lower()
                 observed = str(pair[1] or "").strip().lower()
+                ctrl_meta = (
+                    pair[2]
+                    if len(pair) >= 3 and isinstance(pair[2], dict)
+                    else None
+                )
                 if intended:
                     intended_texts.append(intended)
-                    if observed and intended in observed:
-                        observed_matched_intended = True
+                if isinstance(ctrl_meta, dict):
+                    c_name = str(ctrl_meta.get("name") or "").strip()
+                    if c_name and addr_re.search(c_name):
+                        if (ctrl_meta.get("focused")
+                                or (intended and intended in observed)
+                                or (ctrl_meta.get("runtime_id")
+                                    and str(ctrl_meta.get("runtime_id"))
+                                    in target_runtime_ids)
+                                or (ctrl_meta.get("uid")
+                                    and str(ctrl_meta.get("uid"))
+                                    in target_uids)):
+                            return False
         if not intended_texts:
             for raw_t in (_typed_texts_from_steps(steps or []) or []):
                 if str(raw_t or "").strip():
@@ -5288,7 +5456,7 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
 
         # Part (b)(ii): Live UIA control readback via
         # screen_ui_elements.read_control_values(hwnd=hwnd)
-        #   -> [{"name", "focused", "runtime_id", "value"}, ...]
+        #   -> [{"uid", "runtime_id", "control_type", "name", "focused", "value"}, ...]
         controls = []
         try:
             from backend.services.screen_ui_elements import read_control_values
@@ -5303,21 +5471,20 @@ def _verify_not_wrong_bar(command_text, steps_description, steps,
             if not ctrl_name or not addr_re.search(ctrl_name):
                 continue
             ctrl_rid = str(ctrl.get("runtime_id") or "")
+            ctrl_uid = str(ctrl.get("uid") or "")
             ctrl_val = str(ctrl.get("value") or "").strip().lower()
             # 1. The focused control after clicking/typing is the address bar.
             if ctrl.get("focused"):
                 return False
-            # 2. A planned/typed target runtime_id belongs to the address bar.
+            # 2. A planned/typed target runtime_id/uid belongs to the address bar.
             if ctrl_rid and ctrl_rid in target_runtime_ids:
                 return False
-            # 3. The address bar's value holds the text that was just typed
-            #    (or _read_typed_field_values confirmed the text landed in
-            #    this address-bar control).
+            if ctrl_uid and ctrl_uid in target_uids:
+                return False
+            # 3. The address bar's value holds the text that was just typed.
             if intended_texts and ctrl_val and any(
                 t and t in ctrl_val for t in intended_texts
             ):
-                return False
-            if observed_matched_intended and ctrl_rid and not target_runtime_ids:
                 return False
     except Exception:
         return None
@@ -6228,6 +6395,12 @@ def _execute_plan_tagged(plan, command_text, ttl=None, _allow_retry=True):
             )
     except Exception as exc:
         logging.warning("Post-action verification failed: %s", exc)
+    # [LIVE FIX 31 / B81] Expose verification outcome on the plan dict
+    # (outside steps, so plan_hash is unaffected) for chain-step resolve.
+    try:
+        plan["verified"] = verified
+    except Exception:
+        pass
 
     # [LIVE FIX 30 / B73] Single-command silent resolve runs ONLY for
     # pointer/scroll plans (click/double_click/right_click/scroll/move/
@@ -6994,7 +7167,9 @@ def maybe_handle_screen_control_message(text):
         if screen_state.is_enabled():
             return "Screen controls are already on, sir."
         screen_state.set_enabled(True, reason="voice/typed toggle on")
-        screen_state.clear_interactions()
+        # [LIVE FIX 31 / B78] Preserve an off-refused request across toggle-ON
+        # so a post-enable "now do that task" / "try again" can re-run it.
+        screen_state.clear_interactions(preserve_last_request=True)
         return "Screen controls are on, sir."
     if toggle == "off":
         if not screen_state.is_enabled():
@@ -7202,11 +7377,13 @@ def maybe_handle_screen_control_message(text):
         return None
 
     if not screen_state.is_enabled():
-        # [LIVE FIX 28 / B55] an off-refused request is still a request:
-        # note it in the ledger so a post-enable "now do that task" re-runs
-        # it instead of "I don't have a recent request".
+        # [LIVE FIX 28 / B55 + LIVE FIX 31 / B78] an off-refused request is
+        # still a request: note it in the ledger so a post-enable "now do
+        # that task" re-runs it instead of "I don't have a recent request".
+        # Never overwrite a real command with a bare retry phrase.
         try:
-            screen_state.note_request(text)
+            if not _RETRY_RE.search(_normalize_text(text)):
+                screen_state.note_request(text)
         except Exception:
             pass
         return "Screen controls are off. Say turn on screen controls first."

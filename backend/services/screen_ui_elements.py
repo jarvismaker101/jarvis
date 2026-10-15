@@ -304,17 +304,11 @@ def _walk(wrapper, out, max_elements, max_depth, depth, parent_uid=""):
         _element_cache[child_uid] = {
             "created_at": time.monotonic(),
             "wrapper": child,
-            # F42: the semantic runtime identity is stored with the wrapper
-            # so a cache that expires mid-approval can be rewalked and the
-            # SAME control re-resolved instead of clicking stale coords.
             "runtime_id": runtime_id,
-            # F42: the cache entry is scoped to the window (and process)
-            # it was walked from. A wrapper from window A must never
-            # satisfy a lookup aimed at window B, and a replaced window
-            # reusing an HWND is detected by the process mismatch.
             "hwnd": _cache_hwnd,
             "process_id": _cache_process_id,
             "control_type": ctype,
+            "name": name,
             "observation_id": _observation_id,
         }
 
@@ -501,9 +495,9 @@ def _read_wrapper_value(wrapper):
 
 
 def read_control_values(hwnd=None):
-    """F41: current value and focus state for every control in ONE fresh walk.
+    """F41 / B80: current value, name, and focus state for every control in ONE fresh walk.
 
-    Returns a list of ``{uid, runtime_id, control_type, focused, value}``.
+    Returns a list of ``{uid, runtime_id, control_type, name, focused, value}``.
     ``value`` is None when the control exposes no readable value, which the
     caller must treat as "cannot verify", never as "verified".
     """
@@ -514,12 +508,20 @@ def read_control_values(hwnd=None):
     for elem in elements:
         uid = elem.get("uid") or ""
         record = _element_cache.get(uid) if isinstance(_element_cache, dict) else None
+        wrapper = (record or {}).get("wrapper")
+        ctrl_name = str(elem.get("name") or (record or {}).get("name") or "").strip()
+        if not ctrl_name and wrapper is not None:
+            try:
+                ctrl_name = str(wrapper.element_info.name or "").strip()
+            except Exception:
+                ctrl_name = ""
         out.append({
             "uid": uid,
             "runtime_id": elem.get("runtime_id") or "",
             "control_type": elem.get("control_type") or "",
+            "name": ctrl_name,
             "focused": bool(elem.get("focused")),
-            "value": _read_wrapper_value((record or {}).get("wrapper")),
+            "value": _read_wrapper_value(wrapper),
         })
     return out
 

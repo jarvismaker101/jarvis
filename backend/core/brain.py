@@ -7623,6 +7623,10 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
     if intent_ctx and isinstance(plan, dict):
         plan["intent_context"] = intent_ctx
     try:
+        _pre_hist_len = len(screen_state.get_recent_interactions() or [])
+    except Exception:
+        _pre_hist_len = 0
+    try:
         try:
             status, out = _execute_plan_tagged(
                 plan, text, ttl=_MI_CHAIN_APPROVAL_TTL, _allow_retry=False)
@@ -7647,12 +7651,41 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
 
     out_text = str(out or "")
     out_lower = out_text.lower()
-    # [LIVE FIX 30 / B73] generic execute → look → execute: resolve an unsure
-    # look OR a transient blocked failure with one fresh re-plan — never for
+    had_type_step = any(
+        isinstance(s, dict)
+        and str(s.get("action") or "").lower() == "type"
+        for s in (plan.get("steps") or [])
+    )
+    # [LIVE FIX 31 / B81] Read verification outcome from plan["verified"] or
+    # the newly recorded screen_state interaction entry. When _execute_plan_tagged
+    # is stubbed in a test and records neither, default to True unless the
+    # uncertainty marker is present in out_text.
+    verified_state = True
+    if "not fully sure it worked" in out_lower:
+        verified_state = False
+    elif isinstance(plan, dict) and "verified" in plan:
+        verified_state = plan.get("verified")
+    else:
+        try:
+            _post_hist = screen_state.get_recent_interactions() or []
+            if len(_post_hist) > _pre_hist_len and isinstance(_post_hist[-1], dict):
+                verified_state = _post_hist[-1].get("verified", True)
+        except Exception:
+            verified_state = True
+
+    unverified_type = (
+        status == "executed"
+        and had_type_step
+        and verified_state is None
+    )
+    # [LIVE FIX 30 / B73 + LIVE FIX 31 / B81] generic execute → look → execute:
+    # resolve an unsure look, an unverified type step (verified is None), OR a
+    # transient blocked failure with one fresh re-plan — never for
     # deterministic refusals (controls off, low confidence, unknown action,
     # zero targets), which a retry cannot fix.
     needs_resolve = (
         (status == "executed" and "not fully sure it worked" in out_lower)
+        or unverified_type
         or (status == "blocked"
             and bool(_RECOVERABLE_BLOCKED_RE.search(out_lower))
             and not bool(_NON_RECOVERABLE_BLOCKED_RE.search(out_lower)))
@@ -7671,16 +7704,11 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
                 plan2 = dict(plan2)
                 if intent_ctx:
                     plan2["intent_context"] = intent_ctx
-                # [LIVE FIX 30 / B73] If the first attempt executed a
-                # type step that failed verification, inject Ctrl+A +
-                # Backspace immediately before the retry's type step (after
-                # any leading click step) so partial or misplaced text is
-                # cleared first.
-                had_type_step = any(
-                    isinstance(s, dict)
-                    and str(s.get("action") or "").lower() == "type"
-                    for s in (plan.get("steps") or [])
-                )
+                # [LIVE FIX 30 / B73 + LIVE FIX 31 / B81] If the first attempt
+                # executed a type step that failed or lacked verification,
+                # inject Ctrl+A + Backspace immediately before the retry's
+                # type step (after any leading click step) so partial or
+                # misplaced text is cleared first.
                 if status == "executed" and had_type_step:
                     plan2["steps"] = _inject_clear_before_retype(
                         list(plan2.get("steps") or [])
@@ -7702,7 +7730,13 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
                         pass
                 elif (status2 == "executed"
                       and "not fully sure" not in str(out2 or "").lower()):
-                    resolved = str(out2)
+                    verified2 = (
+                        plan2.get("verified")
+                        if isinstance(plan2, dict) and "verified" in plan2
+                        else True
+                    )
+                    if verified2 is True:
+                        resolved = str(out2)
                 elif status2 == "blocked" and out2:
                     retry_failed_msg = str(out2)
         if resolved:
@@ -7711,6 +7745,12 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
             return {"kind": "screen_control", "status": "ok",
                     "fragment": resolved, "output_content": resolved}
         if status == "executed":
+            if (unverified_type
+                    and "not fully sure it worked" not in out_text.lower()):
+                out_text = (
+                    "%s Though I'm not fully sure it worked - "
+                    "want me to try again?" % out_text.rstrip()
+                )
             return {"kind": "screen_control", "status": "ok",
                     "fragment": out_text, "output_content": out_text}
         return {"kind": "screen_control", "status": "failed",
@@ -8471,7 +8511,9 @@ def _deictic_rerun_source():
         from backend.services import screen_state as _ss
         _ref = _ss.get_refused_chain() or {}
         _src = str(_ref.get("source") or "").strip()
-        if _src and not _DEICTIC_RERUN_RE.match(_src):
+        _ref_ts = float(_ref.get("ts") or 0.0)
+        if (_src and (_ref_ts <= 0.0 or time.time() - _ref_ts < 300.0)
+                and not _DEICTIC_RERUN_RE.match(_src)):
             return _src
     except Exception:
         pass
