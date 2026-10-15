@@ -520,7 +520,10 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
 
     # [LIVE FIX 23 / B16] hwnds that refused their window state — the
     # plan ends with an honest partial report, never a blanket "done".
+    # [LIVE FIX 30 / B77] also track succeeded hwnds so the D-of-T count
+    # only counts window-state steps that actually ran.
     _hwnd_failed = []
+    _hwnd_succeeded = []
     for step in steps:
         action = (step.get("action") or "").lower()
 
@@ -606,9 +609,15 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
                 # closed mid-plan is skipped, the rest still run.
                 # [LIVE FIX 23 / B16] a window that REFUSES its state is
                 # recorded for the honest partial report below.
-                set_window_state_by_hwnd(
+                # [LIVE FIX 30 / B77] successes are tracked too (B77 D-of-T).
+                _ok_state = set_window_state_by_hwnd(
                     step.get("hwnd"), _HWND_STATE_ACTIONS[action],
                     failed=_hwnd_failed)
+                if _ok_state:
+                    try:
+                        _hwnd_succeeded.append(int(step.get("hwnd") or 0))
+                    except (TypeError, ValueError):
+                        pass
             elif action == "scroll":
                 scroll(step.get("direction", "down"), step.get("amount", 600))
             elif action == "type":
@@ -630,7 +639,11 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
         # [LIVE FIX 23 / B16] partial window-state failure: the windows
         # that moved stay moved — report exactly which ones refused, so
         # the caller never claims a blanket success.
+        # [LIVE FIX 30 / B77] count only window-state steps that ran
+        # (refused + succeeded hwnds); badge prefixes are stripped at the
+        # spoken boundary only (steps keep raw titles for plan_hash).
         refused = set(_hwnd_failed)
+        succeeded = set(_hwnd_succeeded)
         failed_titles = []
         total = 0
         verb = "minimize"
@@ -638,14 +651,16 @@ def execute_steps(steps, target_hwnd=None, gate=None, expected_pid=None):
             act = str(done_step.get("action") or "").lower()
             if act not in _HWND_STATE_ACTIONS:
                 continue
-            total += 1
             try:
                 handle = int(done_step.get("hwnd") or 0)
             except (TypeError, ValueError):
                 handle = 0
+            if handle in refused or handle in succeeded or not succeeded:
+                total += 1
             if handle in refused:
-                failed_titles.append(
-                    str(done_step.get("title") or "a window")[:60])
+                raw_t = str(done_step.get("title") or "a window").strip()
+                clean_t = re.sub(r"^\s*\(\d+\)\s*", "", raw_t).strip() or raw_t
+                failed_titles.append(clean_t[:60])
                 verb = {"minimize_hwnd": "minimize",
                         "maximize_hwnd": "maximize",
                         "restore_hwnd": "restore"}.get(act, "minimize")

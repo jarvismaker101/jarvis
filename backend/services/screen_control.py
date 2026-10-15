@@ -522,6 +522,12 @@ def _looks_like_screen_command(text):
     normalized = _normalize_text(text)
     if not normalized:
         return False
+    # [LIVE FIX 30 / B75] a confirm-question is never a screen command.
+    try:
+        if _CONFIRM_WHAT_Q_RE.search(text):
+            return False
+    except Exception:
+        pass
     # [LIVE FIX 28 / B60] a contradiction/correction that reports what
     # Jarvis said is conversation about the screen, never a command — but
     # only when no window-management verb follows anywhere: "you said
@@ -1198,6 +1204,13 @@ def _parse_rest_window_command(command_text):
             exclusions, except_clause_named = _inherited_window_exclusions()
         except Exception:
             exclusions, except_clause_named = [], False
+    # [LIVE FIX 30 / B71] fresh enumeration per command — a stale stored
+    # list must never serve "the first two that you mentioned" follow-ups;
+    # remember_window_enumeration right below stores the FRESH list.
+    try:
+        _clear_window_enumeration()
+    except Exception:
+        pass
     windows = _list_managable_windows()
     if not windows:
         return _failed_window_plan(
@@ -1318,6 +1331,28 @@ def _process_image_name(pid, cache=None):
     return name
 
 
+#: [LIVE FIX 30 / B71] Known Windows shell/IME ghost titles that report
+#: IsWindowVisible() but are never user-manageable application windows.
+_PHANTOM_WINDOW_TITLES = frozenset({
+    "program manager",
+    "default ime",
+    "msctfime ui",
+    "windows input experience",
+    "microsoft text input application",
+})
+
+_LEADING_BADGE_RE = re.compile(r"^\s*\(\d+\)\s*")
+
+
+def _clean_window_title(title):
+    """Strip leading notification badges like '(50) WhatsApp' -> 'WhatsApp'."""
+    try:
+        cleaned = _LEADING_BADGE_RE.sub("", str(title or "").strip()).strip()
+        return cleaned or str(title or "").strip()
+    except Exception:
+        return str(title or "").strip()
+
+
 def _list_managable_windows():
     """Visible titled top-level windows, oldest API, no model involved.
 
@@ -1332,6 +1367,8 @@ def _list_managable_windows():
     except Exception:
         return []
     out = []
+    # [LIVE FIX 30 / B71] dedup repeated EnumWindows callbacks on one hwnd.
+    seen_hwnds = set()
     try:
         from backend.services.screen_capture import (
             is_own_window as _is_own_window)
@@ -1345,6 +1382,13 @@ def _list_managable_windows():
 
         def _cb(hwnd, _lp):
             try:
+                try:
+                    _hwnd_int = int(hwnd or 0)
+                except (TypeError, ValueError):
+                    return True
+                if not _hwnd_int or _hwnd_int in seen_hwnds:
+                    return True
+                seen_hwnds.add(_hwnd_int)
                 if not user32.IsWindowVisible(hwnd):
                     return True
                 buf = ctypes.create_unicode_buffer(512)
@@ -1352,6 +1396,27 @@ def _list_managable_windows():
                 title = (buf.value or "").strip()
                 if not title or title.lower() == "program manager":
                     return True
+                # [LIVE FIX 30 / B71] shell/IME ghosts that report visible.
+                if title.strip().lower() in _PHANTOM_WINDOW_TITLES:
+                    return True
+                # [LIVE FIX 30 / B71] toolwindows (tooltips, palettes) that
+                # are not app windows. Fail open: only drop when the ex-style
+                # read returns a real int > 0, so elevated-window 0-returns
+                # and test stubs never drop. Minimized (iconic) toolwindows
+                # are real put-away windows — never hover-ghosts — so the
+                # drop applies to visible (non-iconic) windows only.
+                try:
+                    _ex = user32.GetWindowLongW(hwnd, -20)
+                    if (isinstance(_ex, int) and _ex > 0
+                            and (_ex & 0x80) and not (_ex & 0x40000)):
+                        try:
+                            _is_iconic_pre = bool(user32.IsIconic(hwnd))
+                        except Exception:
+                            _is_iconic_pre = False
+                        if not _is_iconic_pre:
+                            return True
+                except Exception:
+                    pass
                 if _is_own_window is not None:
                     try:
                         if _is_own_window(hwnd):
@@ -1404,6 +1469,20 @@ def _list_managable_windows():
                     }
                 else:
                     rect_info = None
+                # [LIVE FIX 30 / B71] non-iconic zero/negative-area windows
+                # with a populated rect are ghosts — drop them. A 0,0,0,0
+                # rect (mock/unpopulated origin rect) never drops.
+                try:
+                    if (not iconic and isinstance(rect_info, dict)
+                            and not (int(rect_info.get("left") or 0) == 0
+                                     and int(rect_info.get("top") or 0) == 0
+                                     and int(rect_info.get("width") or 0) == 0
+                                     and int(rect_info.get("height") or 0) == 0)
+                            and (int(rect_info.get("width") or 0) <= 0
+                                 or int(rect_info.get("height") or 0) <= 0)):
+                        return True
+                except Exception:
+                    pass
                 # [LIVE FIX 25 / B26] owning process + window class, so
                 # app words ("terminal") match windows whose TITLE never
                 # names them ("Windows PowerShell").
@@ -1607,7 +1686,7 @@ def _kept_out_names(kept_out, kept_tokens, positional_kept):
             key=len)[:2]
         if not names and not positional_kept:
             names = sorted(
-                {re.sub(r"^\(\d+\)\s*", "", t) for t in kept_out},
+                {_clean_window_title(t) for t in kept_out if t},
                 key=len)[:2]
         if positional_kept:
             names = [positional_kept] + [
@@ -1626,15 +1705,57 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
 
     Applies exclusions, drops no-op minimizes, honors an explicit count,
     and reports honestly when nothing usable remains. Never raises.
+
+    [LIVE FIX 30 / B71] records plan_time_open_hwnds / plan_time_iconic_hwnds
+    per candidate BEFORE exclusion filtering (postcondition scoping), dedups
+    candidate hwnds, and holds already-iconic excluded windows in
+    kept_out_iconic (merged into kept_out only when kept_out is otherwise
+    empty, so minimize never inflates "Leaving").
     """
     kept_out = []
     kept_tokens = []
+    kept_out_iconic = []
     positional_kept = ""
     targets = []
+    # [LIVE FIX 30 / B71] plan-time snapshot BEFORE any filtering, so the
+    # postcondition look can scope "still open" to windows that existed then
+    # (user-restored/opened mid-run windows are never swept up).
+    plan_time_open_hwnds = []
+    plan_time_iconic_hwnds = []
     try:
-        ordered = _sort_windows_spatially(candidates)
+        _seen_cand = set()
+        _deduped = []
+        for _cw in (candidates or []):
+            try:
+                _ch = int((_cw or {}).get("hwnd") or 0)
+            except (TypeError, ValueError):
+                _ch = 0
+            if _ch and _ch in _seen_cand:
+                continue
+            if _ch:
+                _seen_cand.add(_ch)
+            _deduped.append(_cw)
     except Exception:
-        ordered = list(candidates or [])
+        _deduped = list(candidates or [])
+    try:
+        for _cw in (_deduped or []):
+            try:
+                _ch = int((_cw or {}).get("hwnd") or 0)
+            except (TypeError, ValueError):
+                continue
+            if _ch:
+                plan_time_open_hwnds.append(_ch)
+                try:
+                    if (_cw or {}).get("iconic"):
+                        plan_time_iconic_hwnds.append(_ch)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        ordered = _sort_windows_spatially(_deduped)
+    except Exception:
+        ordered = list(_deduped or [])
     for w in ordered:
         try:
             title_lower = str(w.get("title") or "").lower()
@@ -1643,6 +1764,15 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         hit = next((e for e in (exclusions or [])
                     if _window_matches_filter(w, e)), None)
         if hit is not None:
+            # [LIVE FIX 30 / B71] already-minimized exclusions are not
+            # "kept open" — hold them aside so "Leaving X" never names a
+            # window that was already put away.
+            try:
+                if w.get("iconic") and verb in ("minimize", "minimise"):
+                    kept_out_iconic.append(w.get("title"))
+                    continue
+            except Exception:
+                pass
             kept_out.append(w.get("title"))
             kept_tokens.append(hit)
             continue
@@ -1670,9 +1800,22 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         skips = set()
     if skips:
         # "all OTHER windows" — everything but the foreground one.
+        # [LIVE FIX 30 / B71] skip survivors get the same iconic hold-aside.
         skipped = [w for w in targets if int(w.get("hwnd") or 0) in skips]
-        kept_out.extend(w.get("title") for w in skipped)
+        for _sw in skipped:
+            try:
+                if ((_sw or {}).get("iconic")
+                        and verb in ("minimize", "minimise")):
+                    kept_out_iconic.append((_sw or {}).get("title"))
+                else:
+                    kept_out.append((_sw or {}).get("title"))
+            except Exception:
+                kept_out.append((_sw or {}).get("title"))
         targets = [w for w in targets if int(w.get("hwnd") or 0) not in skips]
+    # [LIVE FIX 30 / B71] already-iconic exclusions merge back only when
+    # nothing else is kept out, so minimize never inflates "Leaving".
+    if kept_out_iconic and not kept_out:
+        kept_out.extend(kept_out_iconic)
     dropped_iconic = []
     if verb in ("minimize", "minimise"):
         # Minimizing an already-minimized window is a no-op — drop those.
@@ -1808,12 +1951,33 @@ def _finalize_window_targets(verb, action, candidates, exclusions=(),
         summary += " Leaving %s." % ", ".join(names)[:80]
     effect = ("Minimize" if verb.startswith("minim")
               else "Maximize" if verb.startswith("maxim") else "Restore")
+    try:
+        _kept_names = _kept_out_names(kept_out, kept_tokens, positional_kept)
+    except Exception:
+        _kept_names = []
+    try:
+        _skip_list = sorted({
+            int(h) for h in (skip_hwnds or ()) if int(h or 0)})
+    except (TypeError, ValueError):
+        _skip_list = []
+    _window_op = {
+        "verb": verb,
+        "action": action,
+        "app_filter": str(app_filter or ""),
+        "requested_count": requested_count,
+        "kept_names": list(_kept_names or []),
+        "plan_time_open_hwnds": list(plan_time_open_hwnds or []),
+        "plan_time_iconic_hwnds": list(plan_time_iconic_hwnds or []),
+        "exclusions": list(exclusions or []),
+        "skip_hwnds": list(_skip_list),
+    }
     return {
         "ok": True,
         "confidence": 0.99,
         "summary": summary,
         "needs_confirmation": False,
         "reason": "",
+        "window_op": dict(_window_op),
         "steps": [{"action": action, "hwnd": w["hwnd"],
                    "title": w["title"],
                    "description": "%s '%s'" % (effect, w["title"][:80])}
@@ -2098,6 +2262,11 @@ def _parse_qualified_window_command(command_text):
                 if _non_app not in (exclusions or []):
                     exclusions = list(exclusions or []) + [_non_app]
                 except_clause_named = True
+        # [LIVE FIX 30 / B71] fresh enumeration per command (see rest parser).
+        try:
+            _clear_window_enumeration()
+        except Exception:
+            pass
         windows = _list_managable_windows()
         if not windows:
             return _failed_window_plan(
@@ -2148,6 +2317,11 @@ def _parse_qualified_window_command(command_text):
         normalized[am.start():])
     positional_exclude = _parse_positional_exclusion(
         normalized[am.start():])
+    # [LIVE FIX 30 / B71] fresh enumeration per command (see rest parser).
+    try:
+        _clear_window_enumeration()
+    except Exception:
+        pass
     windows = _list_managable_windows()
     if not windows:
         return _failed_window_plan(
@@ -4952,20 +5126,248 @@ def _verify_hwnd_state_steps(steps):
         return None
 
 
-def _verify_action_with_steps(steps_description, steps=None, hwnd=None):
+#: [LIVE FIX 30 / B73] actions with a local postcondition worth capturing.
+_POSTCONDITION_CAPTURE_ACTIONS = frozenset({
+    "click", "double_click", "right_click", "type", "press", "hotkey",
+    "scroll", "minimize_window", "maximize_window", "restore_window",
+})
+
+_ADDRESS_BAR_FALLBACK_RE = re.compile(
+    r"\b(?:address\s*(?:and\s+search\s+)?bar|url\s*bar|omnibox|location\s*bar|"
+    r"search\s+or\s+type\s+(?:web\s+)?address|brave\s+search\s*bar|"
+    r"browser(?:'s)?\s+(?:url|address|search)\s*bar)\b",
+    re.IGNORECASE,
+)
+
+_PAGE_SEARCH_BAR_INTENT_RE = re.compile(
+    r"\b(?:youtube|page|site|video|in-?page)\s+search\s*(?:bar|box|field|input)\b"
+    r"|\bsearch\s*(?:bar|box|field|input)\b"
+    r"|\bnot\s+(?:in\s+)?(?:the\s+)?(?:brave|browser|chrome|edge|address|url)\s+"
+    r"(?:search\s+)?(?:bar|box)\b",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_ADDRESS_BAR_INTENT_RE = re.compile(
+    r"(?<!not\s)(?<!not\sthe\s)\b(?:address\s*bar|url\s*bar|omnibox|location\s*bar)\b",
+    re.IGNORECASE,
+)
+
+#: [LIVE FIX 30 / B73] Pronoun/follow-up typing shape ("type mr.beast
+#: in it click enter", "type X there") whose bar target was named in the
+#: preceding chain step or interaction.
+_PRONOUN_BAR_FOLLOWUP_RE = re.compile(
+    r"\b(?:type|enter|write|paste|click)\b[^.?!]{0,60}"
+    r"\b(?:in|into|inside|on|at)\s+(?:it|that|this|there)\b"
+    r"|^\s*(?:please\s+|kindly\s+)?(?:type|enter|write)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_page_search_bar_intent(command_text, steps_description="",
+                                intent_context=""):
+    """[LIVE FIX 30 / B73] True when the current step or its chain/
+    prior-step context targets an on-page search bar rather than the browser
+    address/URL bar.
+    """
+    cmd_str = str(command_text or "")
+    if _EXPLICIT_ADDRESS_BAR_INTENT_RE.search(cmd_str):
+        return False
+    direct_blob = "%s %s" % (cmd_str, str(steps_description or ""))
+    if _PAGE_SEARCH_BAR_INTENT_RE.search(direct_blob):
+        return True
+    # (a) Check threaded chain context (prior steps + chain source text).
+    ctx_str = str(intent_context or "")
+    if ctx_str and not _EXPLICIT_ADDRESS_BAR_INTENT_RE.search(ctx_str):
+        if _PAGE_SEARCH_BAR_INTENT_RE.search(ctx_str):
+            return True
+    # (b) Pronoun/follow-up shape ("type mr.beast in it") inherits search-bar
+    # intent from the immediately preceding screen interaction — within TTL.
+    if _PRONOUN_BAR_FOLLOWUP_RE.search(cmd_str):
+        try:
+            recent = screen_state.get_recent_interactions() or []
+            if recent:
+                last_entry = recent[-1] or {}
+                try:
+                    _age = time.time() - float(last_entry.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    _age = 0.0
+                if _age <= _last_action_ttl():
+                    prev_blob = "%s %s" % (
+                        str(last_entry.get("command") or ""),
+                        str(last_entry.get("action") or ""),
+                    )
+                    if (not _EXPLICIT_ADDRESS_BAR_INTENT_RE.search(prev_blob)
+                            and _PAGE_SEARCH_BAR_INTENT_RE.search(prev_blob)):
+                        return True
+        except Exception:
+            pass
+    return False
+
+
+def _verify_not_wrong_bar(command_text, steps_description, steps,
+                          capture=None, hwnd=None, intent_context=""):
+    """[LIVE FIX 30 / B73] Wrong-field cross-check for T3.
+
+    When the step (directly or via chain/pronoun inheritance) targets a page
+    search bar rather than the browser address bar, returns False if:
+      (a) step/summary metadata names the browser address/URL bar, OR
+      (b) live readback via _typed_targets(steps) ->
+          _read_typed_field_values(typed, hwnd=hwnd) and
+          screen_ui_elements.read_control_values(hwnd=hwnd) shows the focused
+          control or the control holding the typed text is an address/URL bar.
+    Returns None when no mismatch is detected. Never raises.
+    """
+    try:
+        if not _has_page_search_bar_intent(
+            command_text, steps_description, intent_context=intent_context
+        ):
+            return None
+        addr_re = globals().get("_ADDRESS_BAR_VOCAB_RE") or _ADDRESS_BAR_FALLBACK_RE
+
+        # Part (a): Step/plan metadata check.
+        if addr_re.search(str(steps_description or "")):
+            return False
+        target_runtime_ids = set()
+        for s in (steps or []):
+            if not isinstance(s, dict):
+                continue
+            if s.get("ui_runtime_id"):
+                target_runtime_ids.add(str(s.get("ui_runtime_id")))
+            if s.get("runtime_id"):
+                target_runtime_ids.add(str(s.get("runtime_id")))
+            meta = " ".join(
+                str(s.get(k) or "")
+                for k in ("description", "name", "label", "target", "ui_name")
+            )
+            if meta and addr_re.search(meta):
+                return False
+
+        # Part (b)(i): Intended-vs-observed tuple readback via real signatures:
+        #   typed = _typed_targets(steps)
+        #   pairs = _read_typed_field_values(typed, hwnd=hwnd)
+        #       -> [(intended, observed), ...]
+        typed = []
+        typed_targets_fn = globals().get("_typed_targets")
+        if callable(typed_targets_fn):
+            try:
+                typed = list(typed_targets_fn(steps or []) or [])
+            except Exception:
+                typed = []
+        for t_item in typed:
+            if isinstance(t_item, dict):
+                if t_item.get("runtime_id"):
+                    target_runtime_ids.add(str(t_item.get("runtime_id")))
+                if t_item.get("ui_runtime_id"):
+                    target_runtime_ids.add(str(t_item.get("ui_runtime_id")))
+                t_name = str(t_item.get("name") or t_item.get("description") or "")
+                if t_name and addr_re.search(t_name):
+                    return False
+
+        pairs = []
+        read_fields_fn = globals().get("_read_typed_field_values")
+        if callable(read_fields_fn) and typed:
+            try:
+                pairs = list(read_fields_fn(typed, hwnd=hwnd) or [])
+            except Exception:
+                pairs = []
+
+        intended_texts = []
+        observed_matched_intended = False
+        for pair in pairs:
+            if isinstance(pair, (tuple, list)) and len(pair) >= 2:
+                intended = str(pair[0] or "").strip().lower()
+                observed = str(pair[1] or "").strip().lower()
+                if intended:
+                    intended_texts.append(intended)
+                    if observed and intended in observed:
+                        observed_matched_intended = True
+        if not intended_texts:
+            for raw_t in (_typed_texts_from_steps(steps or []) or []):
+                if str(raw_t or "").strip():
+                    intended_texts.append(str(raw_t).strip().lower())
+
+        # Part (b)(ii): Live UIA control readback via
+        # screen_ui_elements.read_control_values(hwnd=hwnd)
+        #   -> [{"name", "focused", "runtime_id", "value"}, ...]
+        controls = []
+        try:
+            from backend.services.screen_ui_elements import read_control_values
+            controls = list(read_control_values(hwnd=hwnd) or [])
+        except Exception:
+            controls = []
+
+        for ctrl in controls:
+            if not isinstance(ctrl, dict):
+                continue
+            ctrl_name = str(ctrl.get("name") or "").strip()
+            if not ctrl_name or not addr_re.search(ctrl_name):
+                continue
+            ctrl_rid = str(ctrl.get("runtime_id") or "")
+            ctrl_val = str(ctrl.get("value") or "").strip().lower()
+            # 1. The focused control after clicking/typing is the address bar.
+            if ctrl.get("focused"):
+                return False
+            # 2. A planned/typed target runtime_id belongs to the address bar.
+            if ctrl_rid and ctrl_rid in target_runtime_ids:
+                return False
+            # 3. The address bar's value holds the text that was just typed
+            #    (or _read_typed_field_values confirmed the text landed in
+            #    this address-bar control).
+            if intended_texts and ctrl_val and any(
+                t and t in ctrl_val for t in intended_texts
+            ):
+                return False
+            if observed_matched_intended and ctrl_rid and not target_runtime_ids:
+                return False
+    except Exception:
+        return None
+    return None
+
+
+def _verify_action_with_steps(steps_description, steps=None, hwnd=None,
+                              command_text="", intent_context=""):
     """Verify action state locally first; cloud vision is opt-in."""
     hwnd_verdict = _verify_hwnd_state_steps(steps)
     if hwnd_verdict is not None:
         return hwnd_verdict
-    need_capture = bool(_typed_texts_from_steps(steps)) or _cloud_verification_enabled()
+
+    wrong_bar = _verify_not_wrong_bar(
+        command_text, steps_description, steps,
+        hwnd=hwnd, intent_context=intent_context,
+    )
+    if wrong_bar is False:
+        return False
+
+    has_actionable_step = any(
+        isinstance(s, dict)
+        and str(s.get("action") or "").lower() in _POSTCONDITION_CAPTURE_ACTIONS
+        for s in (steps or [])
+    )
+    need_capture = (
+        bool(_typed_texts_from_steps(steps))
+        or has_actionable_step
+        or _cloud_verification_enabled()
+    )
 
     if need_capture:
         try:
             time.sleep(0.25)  # let the UI settle
             capture = capture_active_window()
-        except RuntimeError:
+        except Exception:
             capture = None
-        local_result = _verify_action_locally(steps or [], capture, hwnd=hwnd)
+        # Run wrong-bar check AFTER settle so read_control_values and
+        # _read_typed_field_values observe the post-action focus/values and
+        # override a target-relative local_result = True.
+        wrong_bar_after = _verify_not_wrong_bar(
+            command_text, steps_description, steps,
+            capture=capture, hwnd=hwnd, intent_context=intent_context,
+        )
+        if wrong_bar_after is False:
+            return False
+        try:
+            local_result = _verify_action_locally(steps or [], capture, hwnd=hwnd)
+        except Exception:
+            local_result = None
         if local_result is not None:
             return local_result
         if capture is None:
@@ -5096,6 +5498,46 @@ def _write_screen_command_log(command, plan, status, error=None, verified=None, 
         logging.warning("Failed to write screen command log: %s", exc)
 
 
+#: [LIVE FIX 30 / B77+B72] per-window state step actions routed through the
+#: enumeration-only postcondition look + reconcile path.
+_HWND_WINDOW_ACTIONS = frozenset({
+    "minimize_hwnd", "maximize_hwnd", "restore_hwnd",
+})
+
+_PARTIAL_HWND_ERR_RE = re.compile(
+    r"I managed to (minimize|maximize|restore) (\d+) of (\d+) windows, sir "
+    r"— (.+?) wouldn't \1",
+    re.IGNORECASE,
+)
+
+
+def _is_hwnd_zoomed(hwnd):
+    """True when *hwnd* is maximized (IsZoomed); False on error so failed
+    maximizes surface as leftovers instead of self-certifying.
+    """
+    try:
+        import ctypes as _z_ctypes
+        _u32 = _z_ctypes.windll.user32
+        h = int(hwnd or 0)
+        if not h or not _u32.IsWindow(h):
+            return False
+        return bool(_u32.IsZoomed(h))
+    except Exception:
+        return False
+
+
+def _last_action_ttl():
+    """Shared TTL horizon with brain._LAST_ACTION_TTL = 1800.0."""
+    try:
+        import sys
+        brain_mod = sys.modules.get("backend.core.brain")
+        if brain_mod is not None:
+            return float(getattr(brain_mod, "_LAST_ACTION_TTL", 1800.0))
+    except Exception:
+        pass
+    return 1800.0
+
+
 def _maybe_adjust_for_window_move(plan):
     """P1-C / F42: re-acquire the PLANNED window and refuse an altered target.
 
@@ -5204,7 +5646,426 @@ def _plan_gate(plan):
     return _gate
 
 
-def _execute_plan_tagged(plan, command_text, ttl=None):
+def _collect_window_plan_leftovers(plan, steps):
+    """ENUMERATION-ONLY postcondition look for per-window state plans.
+
+    [LIVE FIX 30 / B72] No capture_active_window anywhere in the window path —
+    minimized/maximized state is read from the live enumeration (+ IsZoomed
+    for maximize). Returns [{"hwnd", "title", "action"}] for windows that
+    missed their target state. Never raises.
+    """
+    leftovers = []
+    try:
+        plan = plan if isinstance(plan, dict) else {}
+        hwnd_steps = [
+            s for s in (steps or [])
+            if isinstance(s, dict)
+            and str(s.get("action") or "").lower() in _HWND_WINDOW_ACTIONS
+        ]
+        if not hwnd_steps:
+            return []
+        try:
+            live_windows = _list_managable_windows() or []
+        except Exception:
+            live_windows = []
+        if live_windows:
+            try:
+                remember_window_enumeration(live_windows)
+            except Exception:
+                pass
+        by_hwnd = {}
+        for w in live_windows:
+            try:
+                if isinstance(w, dict) and int(w.get("hwnd") or 0):
+                    by_hwnd[int(w.get("hwnd"))] = w
+            except (TypeError, ValueError):
+                continue
+        # Step 1: per targeted hwnd.
+        for s in hwnd_steps:
+            try:
+                h = int(s.get("hwnd") or 0)
+            except (TypeError, ValueError):
+                h = 0
+            if not h:
+                continue
+            act = str(s.get("action") or "").lower()
+            live = by_hwnd.get(h)
+            if live is None:
+                # Vanished hwnds contribute nothing when a live list exists
+                # (closed mid-run is a skip, not a failure). The empty-
+                # enumeration fallback below handles the no-list case.
+                continue
+            try:
+                live_title = str(live.get("title") or s.get("title")
+                                 or "a window")
+            except Exception:
+                live_title = "a window"
+            if act == "minimize_hwnd":
+                if not live.get("iconic"):
+                    leftovers.append({"hwnd": h, "title": live_title,
+                                      "action": act})
+            elif act == "restore_hwnd":
+                if live.get("iconic"):
+                    leftovers.append({"hwnd": h, "title": live_title,
+                                      "action": act})
+            elif act == "maximize_hwnd":
+                if not _is_hwnd_zoomed(h):
+                    leftovers.append({"hwnd": h, "title": live_title,
+                                      "action": act})
+        if not live_windows:
+            # Unit-test/no-enumeration fallback: only when the hwnd
+            # postcondition itself reports failure.
+            try:
+                _hv = _verify_hwnd_state_steps(hwnd_steps)
+            except Exception:
+                _hv = None
+            if _hv is False:
+                for s in hwnd_steps:
+                    try:
+                        h = int(s.get("hwnd") or 0)
+                    except (TypeError, ValueError):
+                        h = 0
+                    leftovers.append({
+                        "hwnd": h,
+                        "title": _clean_window_title(
+                            str(s.get("title") or "a window")),
+                        "action": str(s.get("action") or "").lower(),
+                    })
+            return leftovers
+        # Step 2: sweep live windows for verb-state mismatches — only for
+        # uncounted plans (a counted "first N" plan honestly leaves the rest).
+        try:
+            wop = plan.get("window_op") or {}
+        except Exception:
+            wop = {}
+        if not isinstance(wop, dict):
+            wop = {}
+        if wop.get("requested_count") is not None:
+            return leftovers
+        verb = str(wop.get("verb") or "").lower()
+        if not verb:
+            try:
+                _a0 = str((hwnd_steps[0] or {}).get("action") or "").lower()
+            except Exception:
+                _a0 = ""
+            verb = ({"minimize_hwnd": "minimize",
+                     "maximize_hwnd": "maximize",
+                     "restore_hwnd": "restore"}.get(_a0, ""))
+        if verb not in ("minimize", "minimise", "maximize", "maximise",
+                        "restore"):
+            return leftovers
+        try:
+            skip_set = {int(h) for h in (wop.get("skip_hwnds") or ())
+                        if int(h or 0)}
+        except (TypeError, ValueError):
+            skip_set = set()
+        try:
+            plan_open = {int(h) for h in (wop.get("plan_time_open_hwnds") or ())
+                         if int(h or 0)}
+        except (TypeError, ValueError):
+            plan_open = set()
+        try:
+            plan_iconic = {int(h) for h in
+                           (wop.get("plan_time_iconic_hwnds") or ())
+                           if int(h or 0)}
+        except (TypeError, ValueError):
+            plan_iconic = set()
+        app_filter = str(wop.get("app_filter") or "").strip()
+        exclusions = list(wop.get("exclusions") or [])
+        have = {int(lo.get("hwnd") or 0) for lo in leftovers}
+        for w in live_windows:
+            try:
+                if not isinstance(w, dict):
+                    continue
+                h = int(w.get("hwnd") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not h or h in have or h in skip_set:
+                continue
+            # User-restored/opened mid-run windows are never swept up.
+            if verb in ("minimize", "minimise"):
+                if h in plan_iconic:
+                    continue
+                if plan_open and h not in plan_open:
+                    continue
+            if app_filter:
+                try:
+                    if not _window_matches_filter(w, app_filter):
+                        continue
+                except Exception:
+                    continue
+            if exclusions:
+                try:
+                    if any(_window_matches_filter(w, e) for e in exclusions):
+                        continue
+                except Exception:
+                    pass
+            if verb in ("minimize", "minimise"):
+                if not w.get("iconic"):
+                    leftovers.append({
+                        "hwnd": h,
+                        "title": str(w.get("title") or "a window"),
+                        "action": "minimize_hwnd"})
+                    have.add(h)
+            elif verb in ("maximize", "maximise"):
+                if not _is_hwnd_zoomed(h):
+                    leftovers.append({
+                        "hwnd": h,
+                        "title": str(w.get("title") or "a window"),
+                        "action": "maximize_hwnd"})
+                    have.add(h)
+            else:
+                if w.get("iconic"):
+                    leftovers.append({
+                        "hwnd": h,
+                        "title": str(w.get("title") or "a window"),
+                        "action": "restore_hwnd"})
+                    have.add(h)
+    except Exception:
+        pass
+    return leftovers
+
+
+def _reconcile_window_plan_outcome(plan, command_text, error=None,
+                                   started_ts=0.0, allow_retry=True):
+    """Reconcile a per-window state plan into (status, spoken, verified).
+
+    [LIVE FIX 30 / B77+B72] Collects enumeration-only leftovers, does ONE
+    bounded retry over leftover hwnds, then reports D-of-T honestly with a
+    "Say '<verb> the rest'" re-run offer (request noted so the rest parser
+    resolves). Never raises.
+    """
+    try:
+        plan = plan if isinstance(plan, dict) else {}
+        steps = [s for s in (plan.get("steps") or [])
+                 if isinstance(s, dict)
+                 and str(s.get("action") or "").lower() in _HWND_WINDOW_ACTIONS]
+        try:
+            leftovers = _collect_window_plan_leftovers(plan, steps)
+        except Exception:
+            leftovers = []
+        # Seed from the executor's partial report when the look found none.
+        try:
+            m_err = (_PARTIAL_HWND_ERR_RE.search(str(error or ""))
+                     if error else None)
+        except Exception:
+            m_err = None
+        if not leftovers and m_err:
+            try:
+                names = [n.strip() for n in
+                         str(m_err.group(4) or "").split(",") if n.strip()]
+            except Exception:
+                names = []
+            try:
+                _seed_act = {"minimize": "minimize_hwnd",
+                             "maximize": "maximize_hwnd",
+                             "restore": "restore_hwnd"}.get(
+                                 str(m_err.group(1) or "").lower(),
+                                 "minimize_hwnd")
+            except Exception:
+                _seed_act = "minimize_hwnd"
+            leftovers = [{"hwnd": -(i + 1),
+                          "title": _clean_window_title(n),
+                          "action": _seed_act}
+                         for i, n in enumerate(names[:3]) if n]
+        # ONE bounded retry over leftover hwnds.
+        if leftovers and allow_retry:
+            try:
+                stopped = screen_state.stopped_after(started_ts)
+            except Exception:
+                stopped = False
+            try:
+                gen_ok = bool(
+                    screen_state.guard(plan.get("screen_generation"))[0])
+            except Exception:
+                gen_ok = False
+            if not stopped and gen_ok:
+                _titles = {}
+                for s in steps:
+                    try:
+                        _titles[int(s.get("hwnd") or 0)] = str(
+                            s.get("title") or "a window")
+                    except (TypeError, ValueError):
+                        continue
+                retry_steps = []
+                for lo in leftovers:
+                    try:
+                        h = int((lo or {}).get("hwnd") or 0)
+                    except (TypeError, ValueError):
+                        h = 0
+                    if h <= 0:
+                        continue
+                    act = str((lo or {}).get("action") or "").lower()
+                    if act not in _HWND_WINDOW_ACTIONS:
+                        act = "minimize_hwnd"
+                    raw_t = _titles.get(h) or str((lo or {}).get("title")
+                                                  or "a window")
+                    retry_steps.append({"action": act, "hwnd": h,
+                                        "title": raw_t,
+                                        "description": "%s '%s'" % (
+                                            {"minimize_hwnd": "Minimize",
+                                             "maximize_hwnd": "Maximize",
+                                             "restore_hwnd": "Restore"}.get(
+                                                 act, "Minimize"),
+                                            raw_t[:80])})
+                if retry_steps:
+                    try:
+                        execute_steps(retry_steps, gate=_plan_gate(plan))
+                        error = None
+                        m_err = None
+                    except Exception as exc:
+                        error = str(exc)
+                        try:
+                            m_err = (_PARTIAL_HWND_ERR_RE.search(error)
+                                     if error else None)
+                        except Exception:
+                            m_err = None
+                    try:
+                        leftovers = _collect_window_plan_leftovers(plan, steps)
+                    except Exception:
+                        pass
+                    if not leftovers and error:
+                        try:
+                            m_err = (_PARTIAL_HWND_ERR_RE.search(error)
+                                     if error else None)
+                        except Exception:
+                            m_err = None
+                        if m_err:
+                            try:
+                                names = [n.strip() for n in
+                                         str(m_err.group(4) or "").split(",")
+                                         if n.strip()]
+                            except Exception:
+                                names = []
+                            try:
+                                _seed_act = {
+                                    "minimize": "minimize_hwnd",
+                                    "maximize": "maximize_hwnd",
+                                    "restore": "restore_hwnd"}.get(
+                                        str(m_err.group(1) or "").lower(),
+                                        "minimize_hwnd")
+                            except Exception:
+                                _seed_act = "minimize_hwnd"
+                            leftovers = [
+                                {"hwnd": -(i + 1),
+                                 "title": _clean_window_title(n),
+                                 "action": _seed_act}
+                                for i, n in enumerate(names[:3]) if n]
+        # Non-partial error with no leftovers: honest block, no retry.
+        if error and not leftovers:
+            try:
+                _is_partial = bool(_PARTIAL_HWND_ERR_RE.search(str(error)))
+            except Exception:
+                _is_partial = False
+            if not _is_partial:
+                return ("blocked", str(error), False)
+        # moved_count from live state over targeted hwnds; fall back to the
+        # partial-report groups, else steps-minus-leftovers.
+        total = len(steps)
+        moved_count = None
+        try:
+            _live = _list_managable_windows() or []
+            _by_h = {}
+            for w in _live:
+                try:
+                    if isinstance(w, dict) and int(w.get("hwnd") or 0):
+                        _by_h[int(w.get("hwnd"))] = w
+                except (TypeError, ValueError):
+                    continue
+            if _by_h:
+                _mc = 0
+                for s in steps:
+                    try:
+                        h = int(s.get("hwnd") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    _lw = _by_h.get(h)
+                    if _lw is None:
+                        continue
+                    act = str(s.get("action") or "").lower()
+                    if act == "minimize_hwnd" and _lw.get("iconic"):
+                        _mc += 1
+                    elif act == "restore_hwnd" and not _lw.get("iconic"):
+                        _mc += 1
+                    elif (act == "maximize_hwnd"
+                            and _is_hwnd_zoomed(h)):
+                        _mc += 1
+                moved_count = _mc
+        except Exception:
+            moved_count = None
+        if moved_count is None:
+            if m_err:
+                try:
+                    moved_count = int(m_err.group(2))
+                    total = int(m_err.group(3))
+                except (TypeError, ValueError):
+                    moved_count = max(0, total - len(leftovers))
+            else:
+                moved_count = max(0, total - len(leftovers))
+        try:
+            wop = plan.get("window_op") or {}
+        except Exception:
+            wop = {}
+        if not isinstance(wop, dict):
+            wop = {}
+        verb = str(wop.get("verb") or "").lower()
+        if not verb and steps:
+            try:
+                _a0 = str(steps[0].get("action") or "").lower()
+            except Exception:
+                _a0 = ""
+            verb = ({"minimize_hwnd": "minimize", "maximize_hwnd": "maximize",
+                     "restore_hwnd": "restore"}.get(_a0, "minimize"))
+        if verb not in ("minimize", "minimise", "maximize", "maximise",
+                        "restore"):
+            verb = "minimize"
+        base_verb = (verb.rstrip("e") + "e"
+                     if verb.endswith("ise") else verb)
+        say_verb = {"minimise": "minimize", "maximise": "maximize"}.get(
+            verb, verb)
+        if leftovers:
+            # [LIVE FIX 30 / B77] spoken names are cleaned + capped at 3;
+            # steps keep raw titles so plan_hash never shifts.
+            names = ", ".join(
+                _clean_window_title(str((lo or {}).get("title")
+                                        or "a window"))[:60]
+                for lo in leftovers[:3])
+            done = max(0, moved_count if moved_count is not None else
+                       total - len(leftovers))
+            spoken = ("I managed to %s %d of %d windows, sir — %s wouldn't "
+                      "%s. Say '%s the rest' to try them again."
+                      % (base_verb, done, total, names, base_verb, say_verb))
+            try:
+                screen_state.note_request(command_text)
+            except Exception:
+                pass
+            return ("blocked", spoken, False)
+        # Clean: reconciled count line when the live count differs, else the
+        # plan summary (keeps "Leaving X" suffixes byte-identical).
+        summary = str(plan.get("summary") or "Done, sir.")
+        if moved_count is not None and moved_count != total:
+            noun = "window" if moved_count == 1 else "windows"
+            summary = "%s %d %s, sir." % (
+                base_verb[:1].upper() + base_verb[1:], moved_count, noun)
+            try:
+                _kn = list((wop or {}).get("kept_names") or [])
+            except Exception:
+                _kn = []
+            if _kn:
+                summary += " Leaving %s." % ", ".join(_kn)[:80]
+        return ("executed", summary, True)
+    except Exception as exc:
+        logging.warning("Window reconcile failed: %s", exc)
+        try:
+            return ("blocked",
+                    str(error or "I couldn't verify the windows, sir — "
+                                 "please try again."),
+                    False)
+        except Exception:
+            return ("blocked", "I couldn't verify the windows, sir.", False)
+
+
+def _execute_plan_tagged(plan, command_text, ttl=None, _allow_retry=True):
     """Execute (or queue) a plan, returning (status, spoken_text).
 
     [LIVE FIX 21] chain steps need the outcome MACHINE-readable: "queued"
@@ -5213,6 +6074,10 @@ def _execute_plan_tagged(plan, command_text, ttl=None):
     are byte-identical to what _execute_or_queue always returned.
     [LIVE FIX 24 / B21] *ttl* overrides the approval lifetime for the
     queued plan — chain-armed steps outlive a single-turn approval.
+    [LIVE FIX 30 / B77+B72] per-window state (hwnd) plans route through
+    _reconcile_window_plan_outcome (enumeration-only look + one bounded
+    retry). * _allow_retry* bounds the single-command + window retries;
+    it defaults True so all existing 2-3-arg callers are unaffected.
     """
     # F19-enforcement: the control boundary is checked HERE, at the point of
     # effect, not only where the request arrived. A plan produced before the
@@ -5289,6 +6154,19 @@ def _execute_plan_tagged(plan, command_text, ttl=None):
     if race_error:
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=race_error)
         return "blocked", race_error
+    try:
+        _exec_steps = plan.get("steps") or []
+    except Exception:
+        _exec_steps = []
+    is_hwnd_plan = any(
+        isinstance(s, dict)
+        and str(s.get("action") or "").lower() in _HWND_WINDOW_ACTIONS
+        for s in _exec_steps
+    )
+    try:
+        exec_started = time.time()
+    except Exception:
+        exec_started = 0.0
     error = None
     try:
         execute_steps(plan["steps"], target_hwnd=target_hwnd,
@@ -5300,7 +6178,34 @@ def _execute_plan_tagged(plan, command_text, ttl=None):
         # sequence after earlier steps had already fired.
         error = str(exc)
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=error)
-        return "blocked", error
+        if not is_hwnd_plan:
+            return "blocked", error
+    if is_hwnd_plan:
+        # [LIVE FIX 30 / B77+B72] ALL hwnd plans reconcile through the
+        # enumeration-only look — never an early return, never vision.
+        try:
+            status, spoken, verified = _reconcile_window_plan_outcome(
+                plan, command_text, error=error,
+                started_ts=exec_started, allow_retry=_allow_retry)
+        except Exception as exc:
+            logging.warning("Window reconcile failed: %s", exc)
+            status, spoken, verified = (
+                "blocked",
+                error or "I couldn't verify the windows, sir — "
+                         "please try again.",
+                False)
+        if status == "blocked":
+            _write_screen_command_log(command_text, plan, "EXECUTION_FAILED",
+                                      error=spoken)
+            _notify_action_executed(command_text, spoken)
+            return "blocked", spoken
+        screen_state.clear_pending_plan()
+        screen_state.add_interaction(command_text, spoken,
+                                     verified=verified, plan=plan)
+        _write_screen_command_log(command_text, plan, "EXECUTED",
+                                  verified=verified)
+        _notify_action_executed(command_text, spoken)
+        return "executed", spoken
     screen_state.clear_pending_plan()
 
     summary = plan.get("summary") or "Done, sir."
@@ -5310,12 +6215,57 @@ def _execute_plan_tagged(plan, command_text, ttl=None):
     # actions were reported as done without any postcondition at all.
     verified = None
     steps = plan.get("steps") or []
+    intent_ctx = str(plan.get("intent_context") or "")
     try:
-        verified = _verify_action_with_steps(
-            summary, steps=steps, hwnd=plan.get("hwnd"),
-        )
+        try:
+            verified = _verify_action_with_steps(
+                summary, steps=steps, hwnd=plan.get("hwnd"),
+                command_text=command_text, intent_context=intent_ctx,
+            )
+        except TypeError:
+            verified = _verify_action_with_steps(
+                summary, steps=steps, hwnd=plan.get("hwnd"),
+            )
     except Exception as exc:
         logging.warning("Post-action verification failed: %s", exc)
+
+    # [LIVE FIX 30 / B73] Single-command silent resolve runs ONLY for
+    # pointer/scroll plans (click/double_click/right_click/scroll/move/
+    # hover). Keyboard steps (type, hotkey, press) are excluded so partial
+    # text is never double-typed and Enter/Space never double-submits.
+    has_keyboard_step = any(
+        isinstance(s, dict)
+        and str(s.get("action") or "").lower() in ("type", "hotkey", "press")
+        for s in steps
+    )
+    if (verified is False and _allow_retry and not has_keyboard_step
+            and not screen_state.stopped_after(exec_started)
+            and screen_state.guard(plan.get("screen_generation"))[0]):
+        retry_plan = None
+        try:
+            if plan.get("source") == "Direct Match":
+                retry_plan = _build_direct_plan(_strip_leading_fillers(command_text))
+            else:
+                retry_plan = plan_command(command_text)
+        except Exception:
+            retry_plan = None
+        if (isinstance(retry_plan, dict) and retry_plan.get("ok")
+                and retry_plan.get("steps")
+                and not screen_state.stopped_after(exec_started)):
+            retry_plan.setdefault(
+                "screen_generation",
+                plan.get("screen_generation", screen_state.generation()),
+            )
+            if intent_ctx:
+                retry_plan["intent_context"] = intent_ctx
+            r_status, r_out = _execute_plan_tagged(
+                retry_plan, command_text, ttl=ttl, _allow_retry=False
+            )
+            if r_status == "queued":
+                screen_state.clear_pending_plan()
+            elif (r_status == "executed"
+                  and "not fully sure it worked" not in str(r_out or "").lower()):
+                return "executed", r_out
 
     # Record in context memory
     screen_state.add_interaction(command_text, summary, verified=verified, plan=plan)
@@ -5702,6 +6652,333 @@ def _parse_window_state_question(command_text):
             % (label, names))
 
 
+#: [LIVE FIX 30 / B74] a window-count FEEDBACK turn ("3 windows are still
+#: open", "only minimized 1", "5 windows werent even there") — a complaint
+#: about the last window command, never a new plan and never a question.
+_WINDOW_COUNT_FEEDBACK_RE = re.compile(
+    r"(?:\b\d+\b[^.?!]{0,40}\bwindows?\b[^.?!]{0,40}\b"
+    r"(?:still\s+)?(?:open|left|up|visible)\b"
+    r"|\bwindows?\b[^.?!]{0,40}\b(?:still\s+)?(?:open|left|up|visible)\b"
+    r"|\bonly\s+(?:minimi[sz]ed?)\s+\d+\b"
+    r"|\b\d+\s+windows?\s+(?:werent|weren't|were\s+not)\b"
+    r"|\bwindows?\s+(?:werent|weren't|were\s+not)\b)",
+    re.IGNORECASE,
+)
+
+#: [LIVE FIX 30 / B74] an imperative window command is never feedback, even
+#: when it carries a count ("minimize 3 windows").
+_IMPERATIVE_WIN_CMD_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s*)?"
+    r"(?:minimi[sz]e|maximi[sz]e|restore)\b",
+    re.IGNORECASE,
+)
+
+#: [LIVE FIX 30 / B74] present-tense window-state question ("are 3 windows
+#: still open?", "is brave still minimized?"). Requires a windows/apps word
+#: so bare "are you still there?" never matches.
+_WINDOW_PRESENT_STATE_Q_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s*)?"
+    r"(?P<subj>are|is)\s+(?P<mid>[^.?!]{1,80}?)\s+still\s+"
+    r"(?P<state>open|left|up|visible|minimi[sz]ed?)\b[^.?!]*[.?!]*$",
+    re.IGNORECASE,
+)
+_WINDOW_PRESENT_NOUN_RE = re.compile(
+    r"\b(windows?|apps?|applications?|programs?)\b",
+    re.IGNORECASE,
+)
+_WINDOW_PRESENT_EXTRA_FILLERS = frozenset({
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+    "any", "of", "still",
+})
+_WINDOW_FEEDBACK_VERB_RE = re.compile(
+    r"\b(minimi[sz]e|maximi[sz]e|restore)\b",
+    re.IGNORECASE,
+)
+
+
+def _window_present_scope(mid):
+    """App scope words of a present-tense state question ("" = all)."""
+    try:
+        words = [w for w in re.findall(r"[a-z0-9]+", str(mid or "").lower())
+                 if w not in _WINDOW_STATE_SCOPE_FILLERS
+                 and w not in _WINDOW_PRESENT_EXTRA_FILLERS]
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(words)).strip()[:60]
+
+
+def _is_window_count_feedback(text):
+    """True when *text* reports a window count outcome (B74 feedback).
+
+    False on "?", on window count/state question shapes, on imperative
+    window commands, and on contradiction/correction reports about what
+    Jarvis said (B60: "you said no terminal window, now you say two are
+    open" is conversation, even when it names a count). Never raises.
+    """
+    try:
+        t = str(text or "")
+        if not t.strip():
+            return False
+        if "?" in t:
+            return False
+        normalized = _normalize_text(t)
+        if _WINDOW_COUNT_Q_RE.search(normalized):
+            return False
+        try:
+            if _WINDOW_STATE_Q_RE.match(normalized):
+                return False
+        except Exception:
+            pass
+        try:
+            _pq = globals().get("_WINDOW_PRESENT_STATE_Q_RE")
+            if _pq is not None and _pq.match(normalized):
+                return False
+        except Exception:
+            pass
+        if _IMPERATIVE_WIN_CMD_RE.search(t):
+            return False
+        # [LIVE FIX 30 / B74+B60] a past-report contradiction is conversation
+        # about the screen, never feedback — unless a window-management verb
+        # follows (same rule as _looks_like_screen_command).
+        try:
+            if _PAST_REPORT_RE.search(normalized) and not re.search(
+                    r"\b(?:minimi[sz]e|maximi[sz]e|restore)\b", normalized):
+                return False
+        except Exception:
+            pass
+        return bool(_WINDOW_COUNT_FEEDBACK_RE.search(t))
+    except Exception:
+        return False
+
+
+def _parse_present_window_state_question(command_text):
+    """Deterministic answer for a present-tense window-state question.
+
+    [LIVE FIX 30 / B74] "are 3 windows still open?" is verified against the
+    live enumeration. Returns the spoken reply, else None. Never raises.
+    """
+    try:
+        normalized = _normalize_text(command_text)
+    except Exception:
+        return None
+    if not normalized:
+        return None
+    try:
+        m = _WINDOW_PRESENT_STATE_Q_RE.match(normalized)
+    except Exception:
+        return None
+    if not m:
+        return None
+    if not _WINDOW_PRESENT_NOUN_RE.search(normalized):
+        return None
+    state = str(m.group("state") or "").lower()
+    scope = _window_present_scope(m.group("mid"))
+    try:
+        windows = _list_managable_windows()
+    except Exception:
+        windows = []
+    if not windows:
+        return "I don't see any windows open right now, sir."
+    try:
+        remember_window_enumeration(windows)
+    except Exception:
+        pass
+    try:
+        screen_state.note_window_question(command_text)
+    except Exception:
+        pass
+    if scope:
+        windows = [w for w in windows
+                   if _window_matches_filter(w, scope)]
+        if not windows:
+            return ("I couldn't find any %s windows, sir."
+                    % scope[:60])
+    still_open = [w for w in windows if not w.get("iconic")]
+    names = ", ".join(
+        str(w.get("title") or "a window")[:40] for w in still_open[:3])
+    singular = (len(windows) == 1)
+    open_query = not state.startswith("minim")
+    if open_query:
+        # Present-tense open query: Yes means still open.
+        if still_open:
+            if singular:
+                return ("Yes, sir — the window is still open: %s." % names)
+            return ("Yes, sir — %d of %d windows are still open: %s."
+                    % (len(still_open), len(windows), names))
+        if singular:
+            return "No, sir — the window is minimized."
+        return ("No, sir — all %d windows are minimized."
+                % len(windows))
+    if not still_open:
+        if singular:
+            return "Yes, sir — the window is minimized."
+        return ("Yes, sir — all %d windows are minimized."
+                % len(windows))
+    if singular:
+        return ("No, sir — the window is still open: %s." % names)
+    return ("No, sir — %d of %d windows are still open: %s."
+            % (len(still_open), len(windows), names))
+
+
+def _window_feedback_retry_command():
+    """The recent window command a count-feedback turn complains about.
+
+    [LIVE FIX 30 / B74] Newest first: live request ledger, then recent
+    interactions reversed ("confirm" entries resolve to the plan's
+    command_text). TTL-filtered; window-verb required; feedback excluded.
+    Returns "" when none. Never raises.
+    """
+    try:
+        cands = []
+        try:
+            req = screen_state.get_last_request() or {}
+            if str(req.get("command") or "").strip():
+                cands.append((str(req.get("command")),
+                              float(req.get("ts") or 0.0)))
+        except Exception:
+            pass
+        try:
+            for entry in reversed(
+                    screen_state.get_recent_interactions() or []):
+                cmd = str((entry or {}).get("command") or "").strip()
+                if cmd.strip().lower() == "confirm":
+                    try:
+                        cmd = str(((entry or {}).get("plan") or {}).get(
+                            "command_text") or cmd)
+                    except Exception:
+                        pass
+                if not cmd:
+                    continue
+                try:
+                    ts = float((entry or {}).get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                cands.append((cmd, ts))
+        except Exception:
+            pass
+        try:
+            ttl = _last_action_ttl()
+        except Exception:
+            ttl = 1800.0
+        now = time.time()
+        for cmd, ts in cands:
+            try:
+                if not cmd or (now - ts) > ttl:
+                    continue
+                if _is_window_count_feedback(cmd):
+                    continue
+                if _WINDOW_FEEDBACK_VERB_RE.search(cmd):
+                    return cmd
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+#: [LIVE FIX 30 / B75] a question asking WHAT is being confirmed — a query
+#: about the pending record, NEVER consent and NEVER a new plan.
+_CONFIRM_WHAT_Q_RE = re.compile(
+    r"\b(?:what|which|why|how)\b[^.?!]{0,64}\b"
+    r"(?:confirm(?:ing|ation)?|approve|approving|pending)\b"
+    r"|\b(?:confirm(?:ing)?|approve)\s+(?:what|which)\b"
+    r"|\bwhat\s+(?:is|are)\s+(?:pending|waiting)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_confirm_question(text):
+    """Deterministic answer for a confirm-question, else None.
+
+    [LIVE FIX 30 / B75] Live pending (armed by a real command) is restated
+    WITHOUT consuming; pending armed from count-feedback words (T6's bogus
+    click) is dropped with a warning; otherwise the recent window command
+    is offered for re-run, or an honest nothing-pending. Never raises.
+    """
+    try:
+        if not _CONFIRM_WHAT_Q_RE.search(str(text or "")):
+            return None
+    except Exception:
+        return None
+    try:
+        if screen_state.has_pending_plan():
+            try:
+                pend = screen_state.get_pending_plan() or {}
+            except Exception:
+                pend = {}
+            try:
+                pend_cmd = str(pend.get("command_text") or "")
+            except Exception:
+                pend_cmd = ""
+            try:
+                bogus = bool(pend_cmd and _is_window_count_feedback(pend_cmd))
+            except Exception:
+                bogus = False
+            if bogus:
+                try:
+                    print("[SCREEN] dropped feedback-built pending plan: %s"
+                          % pend_cmd[:80])
+                except Exception:
+                    pass
+                try:
+                    logging.warning(
+                        "Dropped feedback-built pending plan: %s",
+                        pend_cmd[:120])
+                except Exception:
+                    pass
+                try:
+                    screen_state.clear_pending_plan()
+                except Exception:
+                    pass
+            else:
+                try:
+                    spoken = (screen_state.pending_spoken()
+                              or str(pend.get("summary") or ""))
+                except Exception:
+                    spoken = ""
+                if spoken:
+                    return "I'm asking you to confirm: %s" % spoken
+                return ("I'm asking you to confirm that screen action, sir. "
+                        "Say confirm screen action to proceed, or say cancel.")
+        recent_cmd = ""
+        try:
+            req = screen_state.get_last_request() or {}
+            rc = str(req.get("command") or "").strip()
+            rts = float(req.get("ts") or 0.0)
+            if (rc and not _is_window_count_feedback(rc)
+                    and _WINDOW_FEEDBACK_VERB_RE.search(rc)
+                    and (time.time() - rts) <= _last_action_ttl()):
+                recent_cmd = rc
+        except Exception:
+            recent_cmd = ""
+        if not recent_cmd:
+            try:
+                for entry in reversed(
+                        screen_state.get_recent_interactions() or []):
+                    c = str((entry or {}).get("command") or "").strip()
+                    if not c or _is_window_count_feedback(c):
+                        continue
+                    if not _WINDOW_FEEDBACK_VERB_RE.search(c):
+                        continue
+                    try:
+                        age = (time.time()
+                               - float((entry or {}).get("ts") or 0.0))
+                    except (TypeError, ValueError):
+                        age = 0.0
+                    if age <= _last_action_ttl():
+                        recent_cmd = c
+                        break
+            except Exception:
+                recent_cmd = ""
+        if recent_cmd:
+            return ("Nothing is waiting for your confirmation right now, sir. "
+                    "To re-run '%s', say it again." % recent_cmd[:120])
+        return "Nothing is waiting for your confirmation right now, sir."
+    except Exception:
+        return None
+
+
 def maybe_handle_screen_control_message(text):
     # F19: exact, negation-aware enable/disable commands are resolved BEFORE
     # anything else — including pending-consent consumption. "Turn screen
@@ -5727,6 +7004,16 @@ def maybe_handle_screen_control_message(text):
         screen_state.set_enabled(False, reason="voice/typed toggle off")
         screen_state.clear_interactions()
         return "Screen controls are off, sir."
+
+    # [LIVE FIX 30 / B75] confirm-questions are answered from the live pending
+    # record (or honestly denied) — never consumed as consent, never planned
+    # as a click. Runs before the pending-plan verdict below.
+    try:
+        _confirm_q = _parse_confirm_question(text)
+    except Exception:
+        _confirm_q = None
+    if _confirm_q is not None:
+        return _confirm_q
 
     if screen_state.has_pending_plan():
         # F18: resolve the verdict with negation FIRST — "no, don't do it"
@@ -5821,8 +7108,56 @@ def maybe_handle_screen_control_message(text):
             _window_qa = _parse_window_state_question(text)
         except Exception:
             _window_qa = None
+    if _window_qa is None:
+        # [LIVE FIX 30 / B74] present-tense state Q, after the past-tense net.
+        try:
+            _window_qa = _parse_present_window_state_question(text)
+        except Exception:
+            _window_qa = None
     if _window_qa is not None:
         return _window_qa
+
+    # [LIVE FIX 30 / B74] count-feedback ("3 windows are still open") is a
+    # complaint about the last window command: re-plan that command fresh
+    # (toggle-gated), else answer with a census + re-run offer. Never vision.
+    try:
+        _count_fb = (_is_window_count_feedback(text)
+                     and screen_state.is_enabled())
+    except Exception:
+        _count_fb = False
+    if _count_fb:
+        try:
+            _clear_window_enumeration()
+        except Exception:
+            pass
+        try:
+            _fb_cmd = _window_feedback_retry_command()
+        except Exception:
+            _fb_cmd = ""
+        if _fb_cmd:
+            try:
+                _fb_plan = _build_direct_plan(_strip_leading_fillers(_fb_cmd))
+            except Exception:
+                _fb_plan = None
+            if (isinstance(_fb_plan, dict) and _fb_plan.get("ok")
+                    and _fb_plan.get("steps")):
+                _fb_plan["screen_generation"] = screen_state.generation()
+                _notify_action_executed(_fb_cmd, "")
+                try:
+                    screen_state.note_request(_fb_cmd)
+                except Exception:
+                    pass
+                return _execute_or_queue(_fb_plan, _fb_cmd)
+        try:
+            _census = _parse_window_count_question(
+                "how many windows are open on my screen")
+        except Exception:
+            _census = None
+        if _census:
+            if _census.startswith("You have "):
+                _census += (" Say 'minimize all windows' or 'minimize the rest'"
+                            " if you'd like me to put them away.")
+            return _census
 
     # Bug #10: "Try again" / "repeat that" support.
     # [LIVE FIX 25 / B27] the NEWEST request wins: a failed attempt (no

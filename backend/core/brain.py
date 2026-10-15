@@ -476,6 +476,62 @@ _FILEISH_RE = re.compile(
     re.IGNORECASE)
 
 
+#: [LIVE FIX 30 / B76] leftover phrasing in cut chat sentences
+#: ("the rest", "still left", "do it again") that earns a screen re-run offer.
+_LEFTOVER_CLAIM_RE = re.compile(
+    r"\b(remaining|rest|left|still|again|more|other|leaving)\b",
+    re.IGNORECASE,
+)
+
+
+def _recent_screen_rerun_offer(cut_sentences=None):
+    """A re-run offer for a cut leftover claim, else "".
+
+    [LIVE FIX 30 / B76] Requires screen on, a live window request (else the
+    last action under the same rule) within TTL, leftover phrasing in the cut
+    blob, and a window verb in the command. Never raises.
+    """
+    try:
+        from backend.services import screen_state as _screen_state
+        if not _screen_state.is_enabled():
+            return ""
+        blob = " ".join(cut_sentences or [])
+        if not blob or not _LEFTOVER_CLAIM_RE.search(blob):
+            return ""
+        cmd = ""
+        try:
+            req = _screen_state.get_last_request() or {}
+            rc = str(req.get("command") or "").strip()
+            rts = float(req.get("ts") or 0.0)
+            if rc and (time.time() - rts) < _LAST_ACTION_TTL:
+                cmd = rc
+        except Exception:
+            cmd = ""
+        if not cmd:
+            try:
+                last = get_last_action() or {}
+                lc = str(last.get("command") or "").strip()
+                lat = float(last.get("at") or 0.0)
+                if (lc and str(last.get("kind") or "")
+                        in ("screen_control", "chain")
+                        and (time.time() - lat) < _LAST_ACTION_TTL):
+                    cmd = lc
+            except Exception:
+                cmd = ""
+        if not cmd or not _WIN_CORR_VERB_RE.search(cmd):
+            return ""
+        try:
+            verb = _WIN_CORR_VERB_RE.search(cmd).group(1).lower()
+        except Exception:
+            verb = "minimize"
+        verb = {"minimise": "minimize", "maximise": "maximize"}.get(
+            verb, verb)
+        return ("Understood, sir — say '%s the rest' or 'do it again' and "
+                "I'll run that for you." % verb)
+    except Exception:
+        return ""
+
+
 def _chat_claim_fallback(cut_sentences):
     """The honest fallback that fits what was cut. Never raises."""
     try:
@@ -488,9 +544,9 @@ def _chat_claim_fallback(cut_sentences):
                 or _SCREEN_INTERVIEW_RE.search(s)
                 for s in (cut_sentences or []))
                 and not _FILEISH_RE.search(blob)):
-            return _CHAT_SCREEN_FALLBACK
+            return _recent_screen_rerun_offer(cut_sentences) or _CHAT_SCREEN_FALLBACK
         if _SCREENISH_RE.search(blob):
-            return _CHAT_SCREEN_FALLBACK
+            return _recent_screen_rerun_offer(cut_sentences) or _CHAT_SCREEN_FALLBACK
         if _FILEISH_RE.search(blob):
             return _CHAT_NO_ACTION_FALLBACK
     except Exception:
@@ -1803,6 +1859,18 @@ def is_definitely_plain_chat(msg):
     # it (or honestly refuses with controls off).
     try:
         if _screen_control_mod.looks_like_window_command(text):
+            return False
+    except Exception:
+        return False
+    # [LIVE FIX 30 / B76] a screen-action complaint or a bare re-look is
+    # never definitely-plain-chat — the complaint/retry nets own it.
+    try:
+        if _is_screen_action_complaint(text):
+            return False
+    except Exception:
+        return False
+    try:
+        if _screen_command_relook(text):
             return False
     except Exception:
         return False
@@ -6503,6 +6571,15 @@ def _confirmation_question():
 def _confirmation_verdict(answer):
     if not answer or not answer.strip():
         return None
+    # [LIVE FIX 30 / B75] a confirm-QUESTION ("what are you asking me to
+    # confirm?") is never consent — protects task/research/opencode previews
+    # from question-as-yes.
+    try:
+        from backend.services import approvals as _approvals_mod
+        if _approvals_mod._CONFIRM_QUESTION_RE.search(answer):
+            return None
+    except Exception:
+        pass
     if _CONFIRM_NO_RE.search(answer):
         return "no"
     if _CONFIRM_YES_RE.search(answer):
@@ -7391,6 +7468,105 @@ def _mi_aspect_suffix(clause, subject, query, obs_id):
     return [token for token in tokens if token[:4] not in query_low]
 
 
+#: [LIVE FIX 30 / B73] Only transient/partial execution failures may
+#: trigger a 1-shot re-plan in _mi_screen_control_step.
+_RECOVERABLE_BLOCKED_RE = re.compile(
+    r"(?:"
+    r"wouldn't\s+(?:minimize|maximize|restore)"
+    r"|focus\s+moved\s+to\s+another\s+window"
+    r"|did\s+not\s+come\s+to\s+the\s+foreground"
+    r"|could\s+not\s+bring\s+the\s+target\s+window\s+forward"
+    r"|another\s+window\s+moved\s+over\s+the\s+spot"
+    r"|no\s+window\s+under\s+the\s+spot"
+    r"|window\s+i\s+planned\s+against\s+is\s+gone"
+    r"|could\s+not\s+be\s+revalidated\s+in\s+the\s+live\s+accessibility\s+tree"
+    r"|window\s+moved|moved\s+since"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Deterministic planning/validation/permission refusals that must NEVER
+#: waste a second plan_command() pass.
+_NON_RECOVERABLE_BLOCKED_RE = re.compile(
+    r"(?:"
+    r"screen\s+controls\s+are\s+off|restarted|revoked"
+    r"|authorization\s+could\s+not\s+be\s+verified"
+    r"|not\s+confidently\s+enough|confidence\s+is\s+limited"
+    r"|don't\s+know\s+how\s+to\s+perform"
+    r"|window\s+target\s+was\s+not\s+usable"
+    r"|now\s+belongs\s+to\s+a\s+different\s+program"
+    r"|unsafe\s+key\s+token"
+    r"|couldn't\s+find\s+any|no\s+windows\s+to|found\s+only"
+    r"|need\s+a\s+window\s+count|couldn't\s+tell\s+which\s+app"
+    r"|couldn't\s+list\s+the\s+open\s+windows"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _inject_clear_before_retype(steps):
+    """[LIVE FIX 30 / B73] Insert Ctrl+A + Backspace immediately
+    before the first 'type' step on a chain retry unless a clear/select-all
+    step already precedes it. Placed at type_idx (after any leading click step)
+    so the clear lands inside the newly targeted field.
+    """
+    if not isinstance(steps, list) or not steps:
+        return steps
+    type_idx = None
+    for idx, s in enumerate(steps):
+        if isinstance(s, dict) and str(s.get("action") or "").lower() == "type":
+            type_idx = idx
+            break
+    if type_idx is None:
+        return steps
+    for prev in steps[:type_idx]:
+        if not isinstance(prev, dict):
+            continue
+        act = str(prev.get("action") or "").lower()
+        keys = [str(k or "").lower() for k in (prev.get("keys") or [])]
+        if act in ("hotkey", "press"):
+            if ("ctrl" in keys or "control" in keys) and "a" in keys:
+                return steps
+            if any(k in ("backspace", "delete") for k in keys):
+                return steps
+    clear_steps = [
+        {
+            "action": "hotkey",
+            "keys": ["ctrl", "a"],
+            "description": "Select existing text before retyping",
+        },
+        {
+            "action": "press",
+            "keys": ["backspace"],
+            "description": "Clear existing text before retyping",
+        },
+    ]
+    return list(steps[:type_idx]) + clear_steps + list(steps[type_idx:])
+
+
+def _mi_chain_intent_context(chain_plan, chain_index):
+    """[LIVE FIX 30 / B73] Prior step texts + original chain source
+    so pronoun steps ('type mr.beast in it') inherit earlier target intent.
+    """
+    if not isinstance(chain_plan, dict):
+        return ""
+    parts = []
+    try:
+        steps = chain_plan.get("steps") or []
+        limit = int(chain_index) if chain_index is not None else len(steps)
+        for prev in steps[: max(0, limit)]:
+            if isinstance(prev, dict) and prev.get("text"):
+                parts.append(str(prev.get("text")))
+    except Exception:
+        pass
+    src = str(
+        chain_plan.get("source") or chain_plan.get("command_text") or ""
+    ).strip()
+    if src:
+        parts.append(src)
+    return " | ".join(parts)
+
+
 def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
     """Run one screen-CONTROL step; returns its result record.
 
@@ -7443,9 +7619,16 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
         # execution, never fire a step the user already cancelled.
         return {"kind": "screen_control", "status": "stopped",
                 "fragment": "Stopped by your request."}
+    intent_ctx = _mi_chain_intent_context(chain_plan, chain_index)
+    if intent_ctx and isinstance(plan, dict):
+        plan["intent_context"] = intent_ctx
     try:
-        status, out = _execute_plan_tagged(
-            plan, text, ttl=_MI_CHAIN_APPROVAL_TTL)
+        try:
+            status, out = _execute_plan_tagged(
+                plan, text, ttl=_MI_CHAIN_APPROVAL_TTL, _allow_retry=False)
+        except TypeError:
+            status, out = _execute_plan_tagged(
+                plan, text, ttl=_MI_CHAIN_APPROVAL_TTL)
     except Exception as exc:
         return {"kind": "screen_control", "status": "failed",
                 "fragment": "That screen action failed (%s)."
@@ -7461,49 +7644,84 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
             pass
         return {"kind": "screen_control", "status": "armed",
                 "fragment": str(out), "prompt": str(out)}
-    if status == "executed":
-        out_text = str(out or "")
-        # [LIVE FIX 28 / browser-style loop] the same discipline the browser
-        # agent uses: do the step, LOOK at the result (post-action
-        # verification), and when the look is unsure RESOLVE — re-plan
-        # against the fresh screen and retry once — before proceeding or
-        # reporting. Bounded to one retry, stop-aware, and honest either way.
-        if "not fully sure it worked" in out_text.lower():
-            resolved = ""
-            if not _chain_stop_requested():
+
+    out_text = str(out or "")
+    out_lower = out_text.lower()
+    # [LIVE FIX 30 / B73] generic execute → look → execute: resolve an unsure
+    # look OR a transient blocked failure with one fresh re-plan — never for
+    # deterministic refusals (controls off, low confidence, unknown action,
+    # zero targets), which a retry cannot fix.
+    needs_resolve = (
+        (status == "executed" and "not fully sure it worked" in out_lower)
+        or (status == "blocked"
+            and bool(_RECOVERABLE_BLOCKED_RE.search(out_lower))
+            and not bool(_NON_RECOVERABLE_BLOCKED_RE.search(out_lower)))
+    )
+    if needs_resolve:
+        resolved = ""
+        retry_failed_msg = ""
+        if not _chain_stop_requested() and screen_state.is_enabled():
+            try:
+                plan2 = plan_command(text)
+            except Exception:
+                plan2 = None
+            if (isinstance(plan2, dict) and plan2.get("ok")
+                    and plan2.get("steps")
+                    and not _chain_stop_requested()):
+                plan2 = dict(plan2)
+                if intent_ctx:
+                    plan2["intent_context"] = intent_ctx
+                # [LIVE FIX 30 / B73] If the first attempt executed a
+                # type step that failed verification, inject Ctrl+A +
+                # Backspace immediately before the retry's type step (after
+                # any leading click step) so partial or misplaced text is
+                # cleared first.
+                had_type_step = any(
+                    isinstance(s, dict)
+                    and str(s.get("action") or "").lower() == "type"
+                    for s in (plan.get("steps") or [])
+                )
+                if status == "executed" and had_type_step:
+                    plan2["steps"] = _inject_clear_before_retype(
+                        list(plan2.get("steps") or [])
+                    )
                 try:
-                    plan2 = plan_command(text)
-                except Exception:
-                    plan2 = None
-                if (isinstance(plan2, dict) and plan2.get("ok")
-                        and plan2.get("steps")
-                        and not _chain_stop_requested()):
                     try:
                         status2, out2 = _execute_plan_tagged(
+                            plan2, text, ttl=_MI_CHAIN_APPROVAL_TTL,
+                            _allow_retry=False)
+                    except TypeError:
+                        status2, out2 = _execute_plan_tagged(
                             plan2, text, ttl=_MI_CHAIN_APPROVAL_TTL)
+                except Exception:
+                    status2, out2 = "blocked", ""
+                if status2 == "queued":
+                    try:
+                        screen_state.clear_pending_plan()
                     except Exception:
-                        status2, out2 = "blocked", ""
-                    if status2 == "queued":
-                        # The retry armed its own confirmation — drop it;
-                        # the user never asked for this second attempt.
-                        try:
-                            screen_state.clear_pending_plan()
-                        except Exception:
-                            pass
-                    elif (status2 == "executed"
-                          and "not fully sure" not in str(out2 or "").lower()):
-                        resolved = str(out2)
-            if resolved:
-                print("[CHAIN] step resolved on the second attempt:",
-                      resolved[:80])
-                return {"kind": "screen_control", "status": "ok",
-                        "fragment": resolved, "output_content": resolved}
+                        pass
+                elif (status2 == "executed"
+                      and "not fully sure" not in str(out2 or "").lower()):
+                    resolved = str(out2)
+                elif status2 == "blocked" and out2:
+                    retry_failed_msg = str(out2)
+        if resolved:
+            print("[CHAIN] step resolved on the second attempt:",
+                  resolved[:80])
+            return {"kind": "screen_control", "status": "ok",
+                    "fragment": resolved, "output_content": resolved}
+        if status == "executed":
             return {"kind": "screen_control", "status": "ok",
                     "fragment": out_text, "output_content": out_text}
+        return {"kind": "screen_control", "status": "failed",
+                "fragment": retry_failed_msg or out_text
+                or "That screen action didn't go through."}
+
+    if status == "executed":
         return {"kind": "screen_control", "status": "ok",
                 "fragment": str(out), "output_content": str(out)}
     return {"kind": "screen_control", "status": "failed",
-            "fragment": str(out or "That screen action didn't go through.")}
+            "fragment": out_text or "That screen action didn't go through."}
 
 
 def _mi_screen_step(step):
@@ -8040,7 +8258,61 @@ def _is_screen_action_complaint(msg):
         text = re.sub(r"\s+", " ", str(msg or "")).strip()
         if not text or _memory_recall_request(text) or is_status_question(text):
             return False
-        return bool(_SCREEN_ACTION_COMPLAINT_RE.match(text))
+        if _SCREEN_ACTION_COMPLAINT_RE.match(text):
+            return True
+        # [LIVE FIX 30 / B74] count-feedback is a complaint too.
+        return bool(_is_screen_count_feedback(text))
+    except Exception:
+        return False
+
+
+#: [LIVE FIX 30 / B74] a bare window-count feedback turn (full-match):
+#: optional "look at my screen" prefix, then a count-still-open /
+#: only-minimized-N / werent-there alternative. T6/T10 shapes.
+_SCREEN_COUNT_FEEDBACK_RE = re.compile(
+    r"^\s*(?:(?:look|check)\s+(?:at\s+)?(?:my\s+|the\s+)?screen\s*,?\s*)?"
+    r"(?:"
+    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?:more\s+)?windows?\s+(?:are\s+)?still\s+"
+    r"(?:open|left|up|visible)\b"
+    r"|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"windows?\s+(?:werent|weren't|were\s+not)\b"
+    r"|only\s+(?:minimi[sz]ed?)\s+(?:\d+|one|two|three)\b"
+    r"|you\s+only\s+(?:minimi[sz]ed?)\s+(?:\d+|one|two|three)\s+"
+    r"windows?\b"
+    r")"
+    r"[^.?!]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_screen_count_feedback(msg):
+    """True when *msg* is a bare window-count feedback turn (B74).
+
+    Vetoes "?", recall/status turns, and imperative-led turns ("minimize 3
+    windows" is a command). Never raises.
+    """
+    try:
+        text = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if not text or "?" in text:
+            return False
+        if _memory_recall_request(text) or is_status_question(text):
+            return False
+        if re.match(
+                r"^\s*(?:please\s+|kindly\s+|jarvis\s*,?\s*)?"
+                r"(?:minimi[sz]e|maximi[sz]e|restore)\b",
+                text, flags=re.IGNORECASE):
+            return False
+        # A past-report contradiction ("you said no window, now you say two
+        # are open") is conversation, never feedback — same rule as the
+        # screen_control net.
+        try:
+            if _screen_control_mod._PAST_REPORT_RE.search(text) and not re.search(
+                    r"\b(?:minimi[sz]e|maximi[sz]e|restore)\b", text):
+                return False
+        except Exception:
+            pass
+        return bool(_SCREEN_COUNT_FEEDBACK_RE.match(text))
     except Exception:
         return False
 
@@ -8052,6 +8324,12 @@ def _screen_action_complaint_command(msg):
     try:
         if not _is_screen_action_complaint(msg):
             return ""
+        # [LIVE FIX 30 / B74] count-feedback counts as an explicit window
+        # verb (the counts complain about a window command).
+        try:
+            is_count_fb = bool(_is_screen_count_feedback(msg))
+        except Exception:
+            is_count_fb = False
         # A complaint that does not name a window/screen verb ("you didn't do
         # it") defers to the chain-resume gate when an unfinished chain is
         # waiting; an explicit verb ("minimize") always re-plans here.
@@ -8062,7 +8340,35 @@ def _screen_action_complaint_command(msg):
         explicit_win_verb = bool(
             _WIN_CORR_VERB_RE.search(str(msg or ""))
             or (asked_verb and asked_verb != "do")
+            or is_count_fb
         )
+        if is_count_fb:
+            # A count-feedback turn never resumes an unfinished chain — it
+            # re-plans the window command the counts complain about, against
+            # a fresh enumeration. The last action must name a window verb
+            # within TTL; else the request ledger under the same rule; else "".
+            try:
+                _screen_control_mod._clear_window_enumeration()
+            except Exception:
+                pass
+            last = get_last_action() or {}
+            cmd = str(last.get("command") or "").strip()
+            at = float(last.get("at") or 0.0)
+            if (str(last.get("kind") or "") in ("screen_control", "chain")
+                    and cmd and (time.time() - at) < _LAST_ACTION_TTL
+                    and _WIN_CORR_VERB_RE.search(cmd)):
+                return cmd
+            try:
+                from backend.services import screen_state as _screen_state
+                req = _screen_state.get_last_request() or {}
+                req_cmd = str(req.get("command") or "").strip()
+                req_ts = float(req.get("ts") or 0.0)
+                if (req_cmd and (time.time() - req_ts) < _LAST_ACTION_TTL
+                        and _WIN_CORR_VERB_RE.search(req_cmd)):
+                    return req_cmd
+            except Exception:
+                pass
+            return ""
         if not explicit_win_verb:
             chain = _take_chain_plan()
             if chain and isinstance(chain.get("plan"), dict):
@@ -11626,6 +11932,43 @@ def _process_message_inner(
         if from_voice and sync_voice:
             sync_voice_log(voice_log_message, _engine_corr_reply)
         return _engine_corr_reply
+
+    # ── [LIVE FIX 30 / B75] Deterministic confirm-question gate ──
+    # Runs before the confirmation-consumption gates and the R12 status gate
+    # so "what are you asking me to confirm?" / "what is pending?" is
+    # answered directly from the live pending screen approval (or reports
+    # honestly that nothing is pending) when no non-screen task/opencode
+    # confirmation owns the turn.
+    if not msg.lower().startswith("command"):
+        try:
+            _non_screen_pending = bool(
+                task_agent_module.has_pending_task_confirmation()
+            )
+        except Exception:
+            _non_screen_pending = False
+        try:
+            with _opencode_confirm_lock:
+                _non_screen_pending = _non_screen_pending or bool(
+                    _pending_opencode_task
+                )
+        except Exception:
+            pass
+        if (not _non_screen_pending
+                or _screen_control_mod.screen_state.has_pending_plan()):
+            try:
+                _confirm_q_ans = _screen_control_mod._parse_confirm_question(msg)
+            except Exception:
+                _confirm_q_ans = None
+            if _confirm_q_ans is not None:
+                _remember_user_turn(msg)
+                if commit_response:
+                    try:
+                        add_message("assistant", _confirm_q_ans)
+                    except Exception:
+                        pass
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, _confirm_q_ans)
+                return _confirm_q_ans
 
     # ── Live fix: "name it X" answers a pending folder-name ask ──
     # The chain folder step asked WHICH name to use; the next turn names it

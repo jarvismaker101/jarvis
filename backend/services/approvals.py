@@ -57,6 +57,18 @@ _REAFFIRM_RE = re.compile(
 )
 
 
+#: [LIVE FIX 30 / B75] A question asking WHAT is being confirmed ("what are
+#: you asking me to confirm?", "confirm what?", "which action do I confirm?")
+#: is a query about the pending record, NEVER consent to execute it.
+_CONFIRM_QUESTION_RE = re.compile(
+    r"\b(?:what|which|why|how)\b[^.?!]{0,64}\b"
+    r"(?:confirm(?:ing|ation)?|approve|approving|pending)\b"
+    r"|\b(?:confirm(?:ing)?|approve)\s+(?:what|which)\b"
+    r"|\bwhat\s+(?:is|are)\s+(?:pending|waiting)\b",
+    re.IGNORECASE,
+)
+
+
 def verdict(text):
     """Return 'yes', 'no' or None for one user utterance.
 
@@ -67,6 +79,8 @@ def verdict(text):
         return None
     raw = str(text).strip()
     if not raw:
+        return None
+    if _CONFIRM_QUESTION_RE.search(raw):
         return None
     if _NEGATION_RE.search(raw):
         return _NO
