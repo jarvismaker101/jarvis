@@ -1,7 +1,10 @@
 """H4 + H5 + H6 (2026-09-23 audit) — staleness, revalidation, coordinate bounds.
 
-H4: plans carry their capture's epoch and the gate refuses when the screen
-was re-observed since (the confirmed preview described a different screen).
+H4: plans carry their capture's epoch; [LIVE FIX 34 / B99] the gate refuses
+when the screen was re-observed since a USER-CONFIRMED plan's capture (the
+confirmed preview described a different screen) — auto-executed plans are
+planned and executed in one breath and are not killed by a re-capture.
+
 H5: window identity is fail-closed (IsWindow + process match), hit-tests
 refuse when no window is under the point, and move/hover + window-state
 actions are revalidated like clicks.
@@ -28,14 +31,31 @@ class EpochGateTests(unittest.TestCase):
              "steps": [{"action": "click", "x": 10, "y": 10}]}, dict(CAPTURE))
         self.assertEqual(plan.get("capture_epoch"), 7)
 
-    def test_gate_refuses_when_epoch_moved(self):
-        plan = {"screen_generation": 1, "capture_epoch": 7}
+    def test_gate_refuses_when_confirmed_plan_epoch_moved(self):
+        # [LIVE FIX 34 / B99] the epoch guard protects the USER-CONFIRMED
+        # preview: a confirmed plan whose screen changed underneath it is
+        # refused.
+        plan = {"screen_generation": 1, "capture_epoch": 7,
+                "user_confirmed": True}
         with patch.object(screen_capture, "current_capture_epoch",
                           return_value=8):
             gate = screen_control._plan_gate(plan)
             with self.assertRaises(RuntimeError) as ctx:
                 gate()
         self.assertIn("screen changed", str(ctx.exception))
+
+    def test_auto_plan_ignores_epoch_moves(self):
+        # [LIVE FIX 34 / B99] an unconfirmed (auto-executed) plan is planned
+        # and executed in one breath; our own post-action verification mints
+        # a fresh capture epoch in between, and that must not kill a plan the
+        # user never previewed (the live 14:45:09 refusal).
+        plan = {"screen_generation": 1, "capture_epoch": 7}
+        marker = object()
+        with patch.object(screen_capture, "current_capture_epoch",
+                          return_value=8), \
+             patch("backend.services.screen_state.effect_gate",
+                   return_value=marker):
+            self.assertIs(screen_control._plan_gate(plan)(), marker)
 
     def test_gate_passes_when_epoch_unchanged(self):
         plan = {"screen_generation": 1, "capture_epoch": 7}

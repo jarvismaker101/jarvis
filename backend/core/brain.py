@@ -4397,6 +4397,34 @@ def handle_opencode_task(task_description, original_message,
         if sc_reply is not None:
             print("[TASK] Window-management job -> screen_control:", cmd)
             return sc_reply
+
+    # [LIVE FIX 32 / B87] A repeat/restart of a recent SCREEN chain or screen
+    # command ("Repeat the previous task from the beginning.", "do the task
+    # from start") must route to the chain/screen repeat machinery, never arm
+    # a generic task confirmation that defaults to the BROWSER agent.
+    if (_is_whole_task_repeat(original_message)
+            or _is_whole_task_repeat(task_description)
+            or _DEICTIC_RERUN_RE.match(str(original_message or "").strip())
+            or _DEICTIC_RERUN_RE.match(str(task_description or "").strip())):
+        try:
+            _chain_reply = _rerun_whole_chain(
+                str(original_message or task_description or ""),
+                from_voice=from_voice, voice_compact=voice_compact)
+        except Exception:
+            _chain_reply = None
+        if _chain_reply is not None:
+            print("[TASK] Repeat job deflected -> whole-chain rerun")
+            return _chain_reply
+        _rep_cmd = _repeatable_last_command() or _deictic_rerun_source()
+        if _rep_cmd:
+            try:
+                sc_reply = maybe_handle_screen_control_message(_rep_cmd)
+            except Exception:
+                sc_reply = None
+            if sc_reply is not None:
+                print("[TASK] Repeat job deflected -> screen_control:", _rep_cmd)
+                return sc_reply
+
     _arm_opencode_confirmation(task_description, original_message,
                                contract=contract)
     # L-6: while the user reads the confirmation prompt, warm the MCP
@@ -4410,7 +4438,9 @@ def handle_opencode_task(task_description, original_message,
         except Exception:
             pass
     suffix = "Do you want me to go ahead and execute it?"
-    task_text = task_description or original_message
+    # [LIVE FIX 32 / B87] never render a double period (".. Do you want me…")
+    # when an LLM-rewritten description already ends with one.
+    task_text = str(task_description or original_message or "").rstrip(".")
     prefix = "Sir, this is what I understood — "
     question = f"{prefix}{task_text}. {suffix}"
     if voice_compact and len(question) > 180:
@@ -7694,6 +7724,15 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
         resolved = ""
         retry_failed_msg = ""
         if not _chain_stop_requested() and screen_state.is_enabled():
+            # [LIVE FIX 32 / B84] Clear the UIA element cache before
+            # re-planning so a stale runtime_id / wrapper from the first
+            # attempt is never reused on the retry (the live loop in T6:
+            # "the control this step targets could not be revalidated").
+            try:
+                from backend.services import screen_ui_elements as _sue
+                _sue._element_cache.clear()
+            except Exception:
+                pass
             try:
                 plan2 = plan_command(text)
             except Exception:
@@ -7745,6 +7784,16 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
             return {"kind": "screen_control", "status": "ok",
                     "fragment": resolved, "output_content": resolved}
         if status == "executed":
+            if verified_state is False:
+                # [LIVE FIX 34 / B98] the post-action look says the step's
+                # stated effect did NOT happen (the search bar is empty, the
+                # text went elsewhere): the step is a FAILURE, so a dependent
+                # step ("click the first video from the search results") is
+                # skipped instead of clicking whatever is on screen. The
+                # fragment keeps the honest caveat text.
+                return {"kind": "screen_control", "status": "failed",
+                        "fragment": out_text
+                        or "That screen action didn't visibly take effect."}
             if (unverified_type
                     and "not fully sure it worked" not in out_text.lower()):
                 out_text = (
@@ -7758,6 +7807,12 @@ def _mi_screen_control_step(step, chain_plan=None, chain_index=None):
                 or "That screen action didn't go through."}
 
     if status == "executed":
+        if verified_state is False:
+            # [LIVE FIX 34 / B98] same contract as above: a disproven effect
+            # is a failed step, never a silent "ok".
+            return {"kind": "screen_control", "status": "failed",
+                    "fragment": str(out)
+                    or "That screen action didn't visibly take effect."}
         return {"kind": "screen_control", "status": "ok",
                 "fragment": str(out), "output_content": str(out)}
     return {"kind": "screen_control", "status": "failed",
@@ -8216,11 +8271,16 @@ def get_last_action():
 #: Bare repetition with no other content — "minimize it again" (referent +
 #: repeat) stays with the router's history-aware rules; only the bare form
 #: resolves here, against the action registry.
+#: [LIVE FIX 32 / B86] a leading consent word ("yes do it again") is allowed:
+#: the confirmation gates run BEFORE this gate, so a live approval still
+#: consumes "yes" first; when none is pending, "yes do it again" repeats.
 _REPEAT_LAST_RE = re.compile(
-    r"^(?:please\s+|kindly\s+|jarvis\s*,?\s+)?"
-    r"(again|do\s+it\s+again|one\s+more\s+time|ek\s+baar\s+aur|"
-    r"phir\s+se|repeat)"
-    r"[\s.,!]*$",
+    r"^(?:(?:please|kindly|jarvis|sir|yes|yeah|yep|sure|ok(?:ay)?|now|"
+    r"haan)\s*,?\s*)*"
+    r"(again|do\s+it\s+again|do\s+that\s+again|run\s+it\s+again|"
+    r"try\s+it\s+again|one\s+more\s+time|once\s+more|ek\s+baar\s+aur|"
+    r"phir\s+se|repeat(?:\s+it)?)"
+    r"(?:\s*,?\s*(?:please|sir|jarvis))?[\s.,!]*$",
     re.IGNORECASE,
 )
 
@@ -8292,6 +8352,24 @@ _SCREEN_ACTION_COMPLAINT_RE = re.compile(
 )
 
 
+#: [LIVE FIX 32 / B82] an EMBEDDED explicit complaint clause anywhere in the
+#: turn ("the second window is still up jarvis you didnt minimize both",
+#: "you didnt minimize the terminal window"). Requires an explicit
+#: "you didn't / did not / haven't / never <verb>", so a genuine question
+#: ("did you minimize…") or a fresh command ("minimize 3 windows") never
+#: matches. The anchored net above misses these because the complaint is not
+#: the whole turn.
+_SCREEN_COMPLAINT_EMBEDDED_RE = re.compile(
+    r"\byou\s+(?:didn'?t|did\s+not|haven'?t|have\s+not|never)\s+"
+    r"(?P<emb_verb>minimi[sz]e|maximi[sz]e|restore|click|tap|press|type|"
+    r"scroll|close)\b"
+    r"(?:\s+(?:it|that|this|them|those|both|all|anything|"
+    r"(?:the|a|an|my|this|that|second|first|third|other|last|next)?\s*"
+    r"[\w\-]{0,24}\s*windows?|the\s+[\w\-]+))?",
+    re.IGNORECASE,
+)
+
+
 def _is_screen_action_complaint(msg):
     """True when *msg* complains that a screen/window action was not done."""
     try:
@@ -8299,6 +8377,10 @@ def _is_screen_action_complaint(msg):
         if not text or _memory_recall_request(text) or is_status_question(text):
             return False
         if _SCREEN_ACTION_COMPLAINT_RE.match(text):
+            return True
+        # [LIVE FIX 32 / B82] an embedded explicit complaint ("…jarvis you
+        # didnt minimize both", "you didnt minimize the terminal window").
+        if _SCREEN_COMPLAINT_EMBEDDED_RE.search(text):
             return True
         # [LIVE FIX 30 / B74] count-feedback is a complaint too.
         return bool(_is_screen_count_feedback(text))
@@ -8312,9 +8394,14 @@ def _is_screen_action_complaint(msg):
 _SCREEN_COUNT_FEEDBACK_RE = re.compile(
     r"^\s*(?:(?:look|check)\s+(?:at\s+)?(?:my\s+|the\s+)?screen\s*,?\s*)?"
     r"(?:"
-    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-    r"(?:more\s+)?windows?\s+(?:are\s+)?still\s+"
-    r"(?:open|left|up|visible)\b"
+    # [LIVE FIX 32 / B82] a definite/ordinal window still up ("the second
+    # window is still up", "a window is still open", "my window is still up").
+    r"(?:(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"|the\s+(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|"
+    r"tenth|other|last|next)\s+"
+    r"|a\s+|an\s+|my\s+|this\s+|that\s+)?"
+    r"(?:more\s+)?(?:[\w\-]+\s+)?windows?\s+(?:are\s+|is\s+)?still\s+"
+    r"(?:open|left|up|visible|on\s+(?:my\s+|the\s+)?screen)\b"
     r"|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
     r"windows?\s+(?:werent|weren't|were\s+not)\b"
     r"|only\s+(?:minimi[sz]ed?)\s+(?:\d+|one|two|three)\b"
@@ -8433,27 +8520,90 @@ def _screen_action_complaint_command(msg):
         return ""
 
 
-#: [LIVE FIX 25 / B32] whole-task repeat ("do the whole task again",
-#: "start it all over again") re-runs the stored chain from step 1.
-#: "do the whole task" WITHOUT "again" is deliberately NOT matched — that
+#: [LIVE FIX 25 / B32 + LIVE FIX 32 / B87] whole-task repeat ("do the whole
+#: task again", "start it all over again", "do it again all over", "do the
+#: task from start") re-runs the stored chain from step 1. "do the whole
+#: task" WITHOUT "again"/"from the start" is deliberately NOT matched — that
 #: phrasing usually means "finish it", which belongs to resume.
+#: [LIVE FIX 34 / B101] the "last/previous task" form is an explicit repeat
+#: too ("do the last task again", "run the previous task once more") — it
+#: used to fall to the task path and get re-confirmed as a NEW opencode job.
 _REPEAT_WHOLE_TASK_RE = re.compile(
-    r"^\s*(?:(?:please|kindly|jarvis|ok(?:ay)?|now|sir)\s*,?\s*)*"
-    r"(?:(?:redo|repeat)\s+(?:(?:the|that|this)\s+)?"
-    r"(?:whole|entire|full|complete)\s+"
+    r"^\s*(?:(?:please|kindly|jarvis|ok(?:ay)?|now|sir|yes|yeah|no)\s*,?\s*)*"
+    r"(?:"
+    r"(?:redo|repeat|restart)\s+(?:(?:the|that|this|my|your|previous|last)\s+)*"
+    r"(?:(?:whole|entire|full|complete)\s+)?"
     r"(?:task|thing|chain|sequence|process|request|job)"
-    r"(?:\s+(?:again|once\s+more|from\s+the\s+(?:start|top|beginning)))?"
-    r"|(?:do|run|perform|try)\s+(?:(?:the|that|this)\s+)?"
+    r"(?:\s+(?:again|once\s+more|all\s+over(?:\s+again)?|"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch)))?"
+    r"|(?:do|run|perform|try|start|execute)\s+"
+    r"(?:(?:the|that|this|my|previous|last)\s+)*"
     r"(?:whole|entire|full|complete)\s+"
     r"(?:task|thing|chain|sequence|process|request|job)\s+"
-    r"(?:again|once\s+more|one\s+more\s+time|"
-    r"from\s+the\s+(?:start|top|beginning))"
-    r"|(?:do|run|start)\s+(?:it|that|everything)\s+(?:all\s+)?"
-    r"over(?:\s+again)?"
-    r"|start\s+(?:it\s+)?(?:all\s+)?over(?:\s+again)?)"
-    r"(?:\s*,?\s*(?:please|sir|jarvis))?[\s.!]*$",
+    r"(?:again|once\s+more|one\s+more\s+time|all\s+over(?:\s+again)?|"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch))"
+    r"|(?:do|run|perform|try|start|execute|repeat|redo|restart)\s+"
+    r"(?:(?:the|that|this|my|your)\s+)?(?:last|previous)\s+"
+    r"(?:task|thing|chain|sequence|process|request|job)\s+"
+    r"(?:again|once\s+more|one\s+more\s+time|all\s+over(?:\s+again)?|"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch))"
+    r"|(?:do|run|perform|try|start|restart|repeat|redo)\s+"
+    r"(?:(?:the|that|this|my|previous|last)\s+)*"
+    r"(?:task|thing|chain|sequence|process|request|job|it|that|everything)\s+"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch)(?:\s+again)?"
+    r"|(?:do|run|start|try|repeat|redo)\s+"
+    r"(?:it|that|this|everything|the\s+task)\s+"
+    r"(?:again\s+)?(?:all\s+)?over(?:\s+again)?"
+    r"|start\s+(?:it\s+)?(?:all\s+)?over(?:\s+again)?"
+    r")"
+    r"(?:\s*,?\s*(?:please|sir|jarvis|for\s+me|right\s+now))?[\s.!]*$",
     re.IGNORECASE,
 )
+
+#: [LIVE FIX 32 / B87] an embedded whole-task repeat inside a complaint or
+#: directive wrapper ("dont ask me to press enter do the whole task again im
+#: asking you"). Only the explicit whole-task forms, so a passing mention
+#: ("tell me about the whole task again") never matches.
+_EMBEDDED_WHOLE_TASK_REPEAT_RE = re.compile(
+    r"\b(?:"
+    r"(?:do|run|perform|try|repeat|redo|restart)\s+"
+    r"(?:(?:the|that|this)\s+)?"
+    r"(?:whole|entire|full|complete)\s+"
+    r"(?:task|thing|chain|sequence|process|request|job)\s+"
+    r"(?:again|once\s+more|one\s+more\s+time|all\s+over|"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch))"
+    r"|(?:do|run|repeat|redo|restart|start)\s+"
+    r"(?:(?:the|that|this|previous|last)\s+)?"
+    r"(?:(?:whole|entire|full|complete)\s+)?"
+    r"(?:task|chain|sequence)\s+from\s+(?:the\s+)?"
+    r"(?:start|top|beginning|scratch)"
+    r"|(?:do|run|perform|try|start|execute|repeat|redo|restart)\s+"
+    r"(?:(?:the|that|this|my|your)\s+)?(?:last|previous)\s+"
+    r"(?:task|thing|chain|sequence|process|request|job)\s+"
+    r"(?:again|once\s+more|one\s+more\s+time|all\s+over|"
+    r"from\s+(?:the\s+)?(?:start|top|beginning|scratch))"
+    r"|(?:do|run|start)\s+it\s+(?:again\s+all\s+over|all\s+over\s+again)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_whole_task_repeat(msg):
+    """[LIVE FIX 32 / B87] True when *msg* asks to repeat the whole task/chain
+    from the beginning, standalone OR wrapped in a complaint/directive. Never
+    raises.
+    """
+    try:
+        t = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if not t or "?" in t:
+            return False
+        if multi_intent._FUTURE_TALK_RE.match(t):
+            return False
+        if _REPEAT_WHOLE_TASK_RE.match(t):
+            return True
+        return bool(_EMBEDDED_WHOLE_TASK_REPEAT_RE.search(t))
+    except Exception:
+        return False
 
 
 def _repeatable_last_command():
@@ -8472,6 +8622,59 @@ def _repeatable_last_command():
     except Exception:
         pass
     return ""
+
+
+def _last_action_belongs_to_stored_chain():
+    """[LIVE FIX 32 / B86] True when a fresh stored chain is the most recent
+    executed action (or the last recorded action is one of that chain's own
+    steps).
+
+    Each chain step calls _notify_action_executed -> note_executed_action, so
+    after a chain the registry holds the FINAL step ("press enter"), not the
+    chain. When no newer standalone command ran since the chain, a bare
+    repeat ("do it again") must re-run the WHOLE chain from step 1 rather
+    than repeat only the last step. Never raises.
+    """
+    try:
+        chain = _take_chain_plan()
+        if not chain or not isinstance(chain.get("plan"), dict):
+            return False
+        chain_at = float(chain.get("at") or 0.0)
+        if chain_at > 0.0 and (time.time() - chain_at) >= _LAST_ACTION_TTL:
+            return False
+        plan = chain.get("plan") or {}
+        source = str(
+            plan.get("source") or plan.get("command_text") or "").strip()
+        steps = plan.get("steps") or []
+        if len(steps) < 2 and not source:
+            return False
+        last = get_last_action() or {}
+        last_cmd = str(last.get("command") or "").strip()
+        last_kind = str(last.get("kind") or "").strip()
+        last_at = float(last.get("at") or 0.0)
+        if not last_cmd or (time.time() - last_at) >= _LAST_ACTION_TTL:
+            return True
+        if last_kind == "chain":
+            return True
+        # The chain was recorded at (or just after) the last step.
+        if chain_at >= last_at - 2.0:
+            return True
+        step_texts = {
+            str(s.get("text") or "").strip().lower()
+            for s in steps if isinstance(s, dict) and s.get("text")
+        }
+        # "play the first video" is planned/recorded as "click the first
+        # video" — accept the rewritten form too.
+        for st in list(step_texts):
+            if st.startswith("play "):
+                step_texts.add(re.sub(r"^play\b", "click", st, count=1))
+        if last_cmd.lower() in step_texts:
+            return True
+        if source and last_cmd.lower() == source.lower():
+            return True
+        return False
+    except Exception:
+        return False
 
 
 #: [LIVE FIX 26 / B37] deictic re-run ("now do that task", "do that task",
@@ -12299,7 +12502,7 @@ def _process_message_inner(
     # Rank-2 gate (a fresh chain keeps priority) and before resume (a
     # whole-task repeat is not a tail resume).
     if (not msg.lower().startswith("command")
-            and _REPEAT_WHOLE_TASK_RE.match(msg.strip())):
+            and _is_whole_task_repeat(msg)):
         try:
             _rerun_reply = _rerun_whole_chain(
                 msg, from_voice=from_voice, voice_compact=voice_compact)
@@ -12338,6 +12541,30 @@ def _process_message_inner(
         except Exception as exc:
             logging.warning("[CHAIN] deictic re-run failed: %s", exc)
             _deictic_cmd = ""
+        # [LIVE FIX 34 / B100] when NO pending source answers the repeat and
+        # the most recent action belongs to a stored multi-step chain,
+        # "do that task again" re-runs the WHOLE chain from step 1 — never
+        # only the chain's final step (the live "do it again" that re-pressed
+        # Enter instead of redoing the search chain). The pending-source
+        # ledger (refused chain, newest screen request) keeps priority, so a
+        # refusal carried across a toggle still re-runs ITS command.
+        if not _deictic_cmd and _last_action_belongs_to_stored_chain():
+            try:
+                _chain_reply_d = _rerun_whole_chain(
+                    msg, from_voice=from_voice, voice_compact=voice_compact)
+            except Exception as exc:
+                logging.warning(
+                    "[CHAIN] deictic whole-chain rerun failed: %s", exc)
+                _chain_reply_d = None
+            if _chain_reply_d is not None:
+                _remember_user_turn(msg)
+                try:
+                    add_message("assistant", _chain_reply_d)
+                except Exception:
+                    pass
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, _chain_reply_d)
+                return _chain_reply_d
         if _deictic_cmd:
             print("[REPEAT] Deictic re-run -> %s" % _deictic_cmd[:80])
             try:
@@ -12384,6 +12611,26 @@ def _process_message_inner(
     # chain gates and before resume (an explicit verb re-plans here; a bare
     # "you didn't do it" defers to the chain-resume gate below).
     if not msg.lower().startswith("command") and _is_screen_action_complaint(msg):
+        # [LIVE FIX 34 / B100] a complaint about the last thing when that
+        # thing was a multi-step chain re-runs the WHOLE chain from step 1
+        # instead of re-planning only its final step.
+        if _last_action_belongs_to_stored_chain():
+            try:
+                _chain_reply_c = _rerun_whole_chain(
+                    msg, from_voice=from_voice, voice_compact=voice_compact)
+            except Exception as exc:
+                logging.warning(
+                    "[CHAIN] complaint whole-chain rerun failed: %s", exc)
+                _chain_reply_c = None
+            if _chain_reply_c is not None:
+                _remember_user_turn(msg)
+                try:
+                    add_message("assistant", _chain_reply_c)
+                except Exception:
+                    pass
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, _chain_reply_c)
+                return _chain_reply_c
         _comp_cmd = _screen_action_complaint_command(msg)
         if _comp_cmd:
             print("[REPEAT] Screen complaint re-run -> %s" % _comp_cmd[:80])
@@ -12630,6 +12877,25 @@ def _process_message_inner(
     # bare "again" can never reach the chat model. Non-bare shapes
     # ("minimize it again") keep their referent and stay with the router.
     if not is_explicit_command and _REPEAT_LAST_RE.match(msg.strip()):
+        # [LIVE FIX 32 / B86] When the last action was a multi-intent chain
+        # (whose final step overwrote _last_action), re-run the WHOLE chain
+        # from step 1 instead of repeating only the final step.
+        if _last_action_belongs_to_stored_chain():
+            try:
+                _chain_repeat = _rerun_whole_chain(
+                    msg, from_voice=from_voice, voice_compact=voice_compact)
+            except Exception as exc:
+                logging.warning("[REPEAT] Chain bare-repeat failed: %s", exc)
+                _chain_repeat = None
+            if _chain_repeat is not None:
+                _remember_user_turn(msg)
+                try:
+                    add_message("assistant", _chain_repeat)
+                except Exception:
+                    pass
+                if from_voice and sync_voice:
+                    sync_voice_log(voice_log_message, _chain_repeat)
+                return _chain_repeat
         cmd = _repeatable_last_command()
         if not cmd:
             response = "There's nothing recent to repeat, sir."

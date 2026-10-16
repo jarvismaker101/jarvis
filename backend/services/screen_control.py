@@ -1,3 +1,4 @@
+import ctypes
 import difflib
 import json
 import logging
@@ -2780,6 +2781,37 @@ def _point_in_declared_space(space, x, y, capture):
     return False
 
 
+def _repair_out_of_space_point(space, x, y, capture):
+    """[LIVE FIX 34 / B97] Bounded repair for an out-of-space point.
+
+    The observed provider mismatch: the model reads exact PIXELS off the
+    screenshot but declares ``normalized_1000``, so the point falls out of
+    the declared frame while describing a real spot on the captured screen.
+    When the ONLY reading that lands inside the capture is screen pixels,
+    trust it and let the caller convert — instead of rejecting an otherwise
+    valid target. Returns ``(space, x, y)`` in ``screen_pixels``, or None
+    when no reading is in-frame (the point is then genuinely outside the
+    screen and must be rejected, never clamped into an edge click).
+
+    Never raises.
+    """
+    try:
+        if space == screen_geometry.COORD_SCREEN_PIXELS:
+            # Already a screen-pixel point; out of frame is out of frame.
+            return None
+        if _point_in_declared_space(
+                screen_geometry.COORD_SCREEN_PIXELS, x, y, capture):
+            logging.info(
+                "[VISION] repairing out-of-space point (%s,%s) declared as %s"
+                " — it lands inside the captured screen as screen pixels",
+                x, y, space,
+            )
+            return (screen_geometry.COORD_SCREEN_PIXELS, int(x), int(y))
+        return None
+    except Exception:
+        return None
+
+
 def _command_references_window_title(command_text, title):
     normalized_command = _normalize_text(command_text)
     normalized_title = _normalize_text(title)
@@ -2823,56 +2855,83 @@ def _is_window_local_command(command_text, capture=None):
 
 
 def _extract_box_center(raw_step):
+    """The click point of a step's bounding box, or None.
+
+    [LIVE FIX 34 / B96] the per-shape centre-vs-corner contract lives in
+    :func:`_box_center_point`. Never raises.
+    """
     for key in ("box", "bbox", "bounds"):
         box = raw_step.get(key)
         if not isinstance(box, dict):
             continue
 
-        left = _coerce_int(box.get("left", box.get("x", box.get("x1"))), None)
-        top = _coerce_int(box.get("top", box.get("y", box.get("y1"))), None)
-        right = _coerce_int(box.get("right", box.get("x2")), None)
-        bottom = _coerce_int(box.get("bottom", box.get("y2")), None)
+        point = _box_center_point(box)
+        if point is not None:
+            return point
 
-        if right is None and left is not None:
-            width = _coerce_int(box.get("width"), None)
-            if width is not None:
-                right = left + width
+    # Also support bbox returned directly as top-level keys (e.g. {"x":10,"y":20,"width":100,"height":50}
+    # or {"left":10,"top":20,"right":110,"bottom":70}) without wrapper - plain x/y remains fallback
+    if isinstance(raw_step, dict) and any(
+            k in raw_step for k in ("width", "height", "right", "bottom", "x2", "y2")):
+        return _box_center_point(raw_step)
 
-        if bottom is None and top is not None:
-            height = _coerce_int(box.get("height"), None)
-            if height is not None:
-                bottom = top + height
+    return None
 
-        if None in (left, top, right, bottom):
-            continue
-        if right <= left or bottom <= top:
-            continue
 
+def _box_center_point(box):
+    """The click point for ONE bounding-box dict, or None. Never raises.
+
+    [LIVE FIX 34 / B96] the planner CONTRACT (pinned in the vision prompt) is
+    that ``{"x": .., "y": .., "width": .., "height": ..}`` carries the
+    target's CENTRE in x,y — "make x,y the CENTER of the target ... we will
+    click its center". The executor used to read x,y as the top-left corner
+    and click (x + width/2, y + height/2), displacing every box click by half
+    the box: the live log (2026-10-15 14:42-14:46) shows a YouTube search-bar
+    box {x:469,y:120,w:354,h:33}, whose reason said "bounding box centered on
+    the field", executed as a click at (646,136) — the bar's far edge, off
+    the field — instead of the centred (469,120) the model described; a video
+    thumbnail box {x:305,y:410,w:250,h:260} was likewise clicked 250px away
+    from its centre. Corner-style keys keep corner math: a complete
+    {"left","top","right","bottom"} (or x1/y1/x2/y2) box returns its
+    midpoint, and the legacy {"left","top","width","height"} corner form
+    returns (left + width/2, top + height/2).
+    """
+    left = _coerce_int(box.get("left", box.get("x1")), None)
+    top = _coerce_int(box.get("top", box.get("y1")), None)
+    right = _coerce_int(box.get("right", box.get("x2")), None)
+    bottom = _coerce_int(box.get("bottom", box.get("y2")), None)
+    x = _coerce_int(box.get("x"), None)
+    y = _coerce_int(box.get("y"), None)
+    width = _coerce_int(box.get("width"), None)
+    height = _coerce_int(box.get("height"), None)
+
+    # Complete corner box -> midpoint.
+    if None not in (left, top, right, bottom) and right > left and bottom > top:
         return (
             int(round((left + right) / 2.0)),
             int(round((top + bottom) / 2.0)),
         )
 
-    # Also support bbox returned directly as top-level keys (e.g. {"x":10,"y":20,"width":100,"height":50}
-    # or {"left":10,"top":20,"right":110,"bottom":70}) without wrapper - plain x/y remains fallback
-    if isinstance(raw_step, dict) and any(k in raw_step for k in ("width", "height", "right", "bottom", "x2", "y2")):
-        left = _coerce_int(raw_step.get("left", raw_step.get("x", raw_step.get("x1"))), None)
-        top = _coerce_int(raw_step.get("top", raw_step.get("y", raw_step.get("y1"))), None)
-        right = _coerce_int(raw_step.get("right", raw_step.get("x2")), None)
-        bottom = _coerce_int(raw_step.get("bottom", raw_step.get("y2")), None)
-        if right is None and left is not None:
-            width = _coerce_int(raw_step.get("width"), None)
-            if width is not None:
-                right = left + width
-        if bottom is None and top is not None:
-            height = _coerce_int(raw_step.get("height"), None)
-            if height is not None:
-                bottom = top + height
-        if None not in (left, top, right, bottom) and right > left and bottom > top:
-            return (
-                int(round((left + right) / 2.0)),
-                int(round((top + bottom) / 2.0)),
-            )
+    # Legacy corner form: {left, top, width, height} keeps corner names.
+    if (left is not None and top is not None and x is None and y is None
+            and (width is not None or height is not None)):
+        w = width or 0
+        h = height or 0
+        if w <= 0 or h <= 0:
+            return None
+        return (int(round(left + w / 2.0)), int(round(top + h / 2.0)))
+
+    # Corner-style with x/y as the top-left corner and explicit right/bottom.
+    if (x is not None and y is not None
+            and (right is not None or bottom is not None)):
+        r = right if right is not None else (x + (width or 0))
+        b = bottom if bottom is not None else (y + (height or 0))
+        if r > x and b > y:
+            return (int(round((x + r) / 2.0)), int(round((y + b) / 2.0)))
+
+    # B96: {x, y, width, height} — x,y IS the centre (the prompt contract).
+    if x is not None and y is not None and (width is not None or height is not None):
+        return (x, y)
 
     return None
 
@@ -3528,11 +3587,22 @@ def _normalize_vision_plan(plan, capture, element_id_map=None):
                 if x is not None and y is not None:
                     # F45: out-of-range points are rejected, not clamped into
                     # an actionable pixel at the edge of the capture.
+                    # [LIVE FIX 34 / B97] one bounded repair first: a point
+                    # whose declared space is normalized yet whose values are
+                    # plainly PIXEL-scale (outside 0..1000 but inside the
+                    # captured screen) is the documented pixel-vs-normalized
+                    # provider mismatch — trust the pixel reading instead of
+                    # discarding an otherwise-valid target. Only when no
+                    # reading is in-frame does the rejection stand.
                     if not _point_in_declared_space(step_space, x, y, capture):
-                        return _reject(
-                            "The screen planner returned a coordinate outside "
-                            "the captured screen area."
-                        )
+                        repaired = _repair_out_of_space_point(
+                            step_space, x, y, capture)
+                        if repaired is None:
+                            return _reject(
+                                "The screen planner returned a coordinate "
+                                "outside the captured screen area."
+                            )
+                        step_space, x, y = repaired
                     converted = _step_point_to_screen(step_space, x, y, capture)
                     if converted is None:
                         return _reject(
@@ -3770,7 +3840,8 @@ def _build_tree_prompt(command_text, capture, ui_context="", image_only=False):
             "1000 = right/bottom edge. Grid ticks are drawn every 10 percent with labels 100, 200, "
             "... 900 in both axes. Prefer a bounding box ({x, y, width, height} or {left, top, "
             "right, bottom}, same normalized scale) over a plain point when the target is larger "
-            "than a few pixels; we click the box center. Estimate coordinates from the screenshot "
+            "than a few pixels; we click the box center, so in a {x, y, width, height} box x,y "
+            "IS the centre — never the top-left corner. Estimate coordinates from the screenshot "
             "grid; never copy example numbers.\n"
             "Set \"coordinate_space\" to \"normalized_1000\" in every reply so we can validate the "
             "coordinate space you used.\n"
@@ -3805,6 +3876,11 @@ def _build_tree_prompt(command_text, capture, ui_context="", image_only=False):
         '"needs_confirmation": false, "coordinate_space": "normalized_1000", '
         '"reason": "Used screenshot coordinates because the icon was not in the UI tree.", '
         '"steps": [{"action": "click", "x": 922, "y": 83}]}\n\n'
+        'Example - user says "click the search bar" (the bar is visible in the screenshot; its CENTRE is x=420, y=125 and it spans about 200 wide and 30 tall):\n'
+        '{"ok": true, "confidence": 0.90, "summary": "Clicking the search bar, sir.", '
+        '"needs_confirmation": false, "coordinate_space": "normalized_1000", '
+        '"reason": "Used screenshot coordinates because the bar was not in the UI tree.", '
+        '"steps": [{"action": "click", "x": 420, "y": 125, "width": 200, "height": 30}]}\n\n'
     )
 
     return (
@@ -3822,7 +3898,7 @@ def _build_tree_prompt(command_text, capture, ui_context="", image_only=False):
         "Allowed step actions: click, double_click, right_click, type, press, hotkey, scroll.\n"
         "CRITICAL: You MUST use EXACTLY one of these allowed action verbs. Do NOT write descriptive actions like 'Locate element' or 'Simulate click event'. Just write 'click'.\n"
         "For click-like steps, PREFER to return the integer ID of the target element in the 'element_id' field when a listed ID matches the target. Only use element_id values that appear verbatim in the UI tree below.\n"
-        "If no listed ID matches but the target is clearly visible in the screenshot, PREFER returning a bounding box for the target. A plain x,y point tends to land on the corner of an icon instead of its center and cause misses - return a bounding box whenever the target is larger than a few pixels, and make x,y the CENTER of the target. Return the step with a bounding box when you can -- either {x, y, width, height} or {left, top, right, bottom} (as {\"x\":, \"y\":, \"width\":, \"height\":} or {\"left\":, \"top\":, \"right\":, \"bottom\":}) with all box coordinates in the same NORMALIZED 0..1000 scale as x,y and we will click its center; plain x and y remains an acceptable fallback if you cannot estimate the box. Return x, y, and any bounding box in NORMALIZED 0..1000 coordinates on each axis: 0 = left/top edge of the image, 1000 = right/bottom edge. Numbered boxes are element ids from the UI tree; grid ticks are drawn every 10 percent with labels 100, 200, ... 900 in both axes (normalized 0..1000). When several visually similar icons are on screen, prefer the one in the main content or feed area over sidebars and navigation panels. Estimate coordinates from the screenshot grid and boxes; never copy example numbers.\n"
+        "If no listed ID matches but the target is clearly visible in the screenshot, PREFER returning a bounding box for the target. A plain x,y point tends to land on the corner of an icon instead of its center and cause misses - return a bounding box whenever the target is larger than a few pixels, and make x,y the CENTER of the target (x,y is the centre itself - never a corner; width/height only describe the box around it). Return the step with a bounding box when you can -- either {x, y, width, height} or {left, top, right, bottom} (as {\"x\":, \"y\":, \"width\":, \"height\":} or {\"left\":, \"top\":, \"right\":, \"bottom\":}) with all box coordinates in the same NORMALIZED 0..1000 scale as x,y and we will click its center; plain x and y remains an acceptable fallback if you cannot estimate the box. Return x, y, and any bounding box in NORMALIZED 0..1000 coordinates on each axis: 0 = left/top edge of the image, 1000 = right/bottom edge. Numbered boxes are element ids from the UI tree; grid ticks are drawn every 10 percent with labels 100, 200, ... 900 in both axes (normalized 0..1000). When several visually similar icons are on screen, prefer the one in the main content or feed area over sidebars and navigation panels. Estimate coordinates from the screenshot grid and boxes; never copy example numbers.\n"
         "For type steps include text. For press/hotkey steps include keys as a JSON array.\n"
         "If the user wants text entered into a visible field, include a click step on the field's ID before the type step.\n"
         "Prefer UI Automation elements over OCR-only text when both describe the same target.\n"
@@ -4057,6 +4133,50 @@ def _request_vision_plan(command_text, capture, ocr_context="", ui_context="", e
                 "vision_attempts": list(attempts.get("attempts") or []),
             }
     plan = _normalize_vision_plan(raw_obj, capture, element_id_map)
+    # [LIVE FIX 34 / B97] one bounded corrective retry: a plan rejected for a
+    # coordinate that even the repair could not place inside the capture is
+    # not final — re-ask the SAME cascade once, on the SAME capture image,
+    # with the rejection appended, so a fixable units/frame mistake (or an
+    # off-screen hallucination) gets a second, grounded answer before the
+    # step fails honestly. Exactly one extra call; it only replaces the plan
+    # when it is valid, so a second bad reply changes nothing.
+    if (not plan.get("ok")
+            and "outside the captured screen area"
+            in str(plan.get("reason") or "").lower()):
+        retry_prompt = (
+            prompt
+            + "\n\nCORRECTION: your previous reply was rejected because a "
+            "coordinate fell OUTSIDE the captured screen area. Reply again "
+            "with ONE corrected plan. Every x,y (and every box) must be "
+            "inside the 0..1000 grid shown in the image, and "
+            "\"coordinate_space\" must be \"normalized_1000\". If you cannot "
+            "locate the target within the frame, reply ok:false with the "
+            "reason instead of guessing."
+        )
+        retry_attempts = {}
+        retry_result = _ask_vision_cascade(
+            retry_prompt,
+            capture["image_data_url"],
+            max_completion_tokens=800,
+            response_format={"type": "json_object"},
+            attempts_out=retry_attempts,
+        )
+        retry_content = _extract_response_content(retry_result)
+        if retry_content is not None:
+            retry_plan = _normalize_vision_plan(
+                _extract_json_object(retry_content), capture, element_id_map)
+            if retry_plan.get("ok"):
+                plan = retry_plan
+                content = retry_content
+                if not provider:
+                    provider = retry_attempts.get("provider")
+                if not model:
+                    model = retry_attempts.get("model")
+                logging.info(
+                    "[VISION] corrective retry produced a valid plan")
+        attempts["attempts"] = (
+            list(attempts.get("attempts") or [])
+            + list(retry_attempts.get("attempts") or []))
     plan["source"] = "Vision Match"
     plan["raw_vision"] = content
     plan["vision_model"] = model
@@ -5193,28 +5313,68 @@ def _read_typed_field_values(typed, hwnd=None, include_control=False):
     return observed
 
 
+def _steps_have_submit_key(steps):
+    """True when *steps* type text and then press Enter/Return (B84)."""
+    saw_type = False
+    for s in (steps or []):
+        if not isinstance(s, dict):
+            continue
+        act = str(s.get("action") or "").lower()
+        if act == "type":
+            saw_type = True
+        elif saw_type and act in ("press", "hotkey"):
+            keys = [str(k or "").lower() for k in (s.get("keys") or [])]
+            if any(k in ("enter", "return") for k in keys):
+                return True
+    return False
+
+
 def _verify_action_locally(steps, capture=None, hwnd=None):
     """F41: verify the value of the field the plan actually typed into.
 
     The old check searched the whole window's text, so text that landed in the
     WRONG field still "verified". Only the intended field's own value counts
     now, and an unreadable field yields uncertainty rather than success.
+    [LIVE FIX 32 / B84] When the UIA ValuePattern is unavailable (observed is
+    None), OR a submit key (Enter) in the same step moved focus/navigated away
+    from the input, the ALREADY-TAKEN capture is inspected (foreground UIA
+    names + local OCR) before falling through to vision — a real, bounded,
+    deterministic look rather than blind uncertainty.
     """
     typed = _typed_targets(steps)
     if not typed:
         # No text postcondition exists locally for a click/scroll plan.
         return None
 
+    has_submit = _steps_have_submit_key(steps)
     observed = _read_typed_field_values(typed, hwnd=hwnd)
-    if observed is None:
-        return None
-
-    for intended, actual in observed:
-        needle = re.sub(r"\s+", " ", intended.lower()).strip()
-        hay = re.sub(r"\s+", " ", actual.lower()).strip()
-        if needle and needle not in hay:
+    if observed is not None:
+        all_matched = True
+        for intended, actual in observed:
+            needle = re.sub(r"\s+", " ", intended.lower()).strip()
+            hay = re.sub(r"\s+", " ", actual.lower()).strip()
+            if needle and needle not in hay:
+                all_matched = False
+                break
+        if all_matched:
+            return True
+        if not has_submit:
             return False
-    return True
+
+    if capture is not None:
+        try:
+            haystack = _verification_text_haystack(capture)
+        except Exception:
+            haystack = ""
+        if haystack:
+            needles = [
+                re.sub(r"\s+", " ", str(t.get("text") or "").lower()).strip()
+                for t in typed if str(t.get("text") or "").strip()
+            ]
+            if needles and all(n in haystack for n in needles):
+                return True
+
+    return None
 
 
 def _verify_hwnd_state_steps(steps):
@@ -5518,7 +5678,14 @@ def _verify_action_with_steps(steps_description, steps=None, hwnd=None,
 
     if need_capture:
         try:
-            time.sleep(0.25)  # let the UI settle
+            # [LIVE FIX 34 / B98] typing/submit actions need longer to show
+            # their effect (a search submits and loads a new page) — give the
+            # look enough settle time to judge the REAL post-action state.
+            _settle = 0.25
+            if (_typed_texts_from_steps(steps or [])
+                    or _steps_have_submit_key(steps or [])):
+                _settle = 0.8
+            time.sleep(_settle)  # let the UI settle
             capture = capture_active_window()
         except Exception:
             capture = None
@@ -5542,17 +5709,31 @@ def _verify_action_with_steps(steps_description, steps=None, hwnd=None,
     elif not _cloud_verification_enabled():
         return None
 
-    if not _cloud_verification_enabled():
+    # [LIVE FIX 34 / B98] a typing plan whose text landed somewhere unreadable
+    # used to end as bare "uncertain" — and the chain then treated whatever
+    # was on screen next as the search's results. When the plan TYPED text,
+    # one looking pass over the post-action capture settles it by default
+    # (the vision verification below); pure pointer plans keep the opt-in
+    # cloud gate.
+    if (not _cloud_verification_enabled()
+            and not _typed_texts_from_steps(steps or [])):
         return None
 
     prompt = (
         "You just executed a screen action on this desktop. "
         f"The action was: {steps_description}\n"
-        "Look at the screenshot and determine whether the action appears to have succeeded. "
-        "Signs of success include: the expected element changing state, a dialog appearing, "
-        "text being entered, a new page loading, or any visible change matching the intent.\n"
+        "This screenshot was taken AFTER the action. Judge whether the "
+        "action's STATED EFFECT is actually visible.\n"
+        "Signs of success include the expected element changing state, a "
+        "dialog appearing, text being entered in the intended field, a "
+        "search or page transition having happened, or any visible change "
+        "matching the intent.\n"
+        "If the action was supposed to put text into a specific field or "
+        "submit a search, verified is false unless the screenshot really "
+        "shows it — an empty field, an unchanged page, or the text visible "
+        "in the wrong place is a failure even though 'something' happened.\n"
         "Return a JSON object with two keys:\n"
-        '  verified (boolean) - true if the action likely succeeded\n'
+        '  verified (boolean) - true only if the stated effect is visible\n'
         '  observation (string) - one-sentence description of what you see\n'
     )
 
@@ -5793,16 +5974,27 @@ def _plan_gate(plan):
     authoritative *inside* execution: focus acquisition and every step are
     re-checked against the generation the request was created under, and the
     check is serialized against :func:`screen_state.set_enabled`.
+
+    [LIVE FIX 34 / B99] the capture-epoch refusal is scoped to plans the USER
+    confirmed against a preview (``user_confirmed``). Auto-executed plans are
+    planned and executed in one breath, and our own post-action verification
+    (and any concurrent look) mints a fresh capture epoch between them — the
+    live 14:45:09 refusal replayed a plan identical to one that had just
+    executed fine, killed only by that in-house re-capture. The executor
+    still revalidates window identity, hit-tests every point, and the F19
+    revocation boundary below applies to every plan.
     """
     stamp = plan.get("screen_generation")
     plan_epoch = plan.get("capture_epoch")
+    user_confirmed = bool(plan.get("user_confirmed"))
 
     def _gate():
         boundary = screen_state.effect_gate(stamp)
-        # H4: refuse when the screen was re-observed since this plan's capture -
-        # the preview the user confirmed described a DIFFERENT screen. (Per
-        # effect, exactly where F19 already re-checks revocation.)
-        if plan_epoch is not None:
+        # H4: refuse when the screen was re-observed since a USER-CONFIRMED
+        # plan's capture — the preview the user confirmed described a
+        # DIFFERENT screen. (Per effect, exactly where F19 already re-checks
+        # revocation.)
+        if user_confirmed and plan_epoch is not None:
             from backend.services import screen_capture
             if screen_capture.current_capture_epoch() != plan_epoch:
                 raise RuntimeError(
@@ -5861,6 +6053,27 @@ def _collect_window_plan_leftovers(plan, steps):
                 # Vanished hwnds contribute nothing when a live list exists
                 # (closed mid-run is a skip, not a failure). The empty-
                 # enumeration fallback below handles the no-list case.
+                # [LIVE FIX 32 / B84] A targeted hwnd absent from the FILTERED
+                # enumeration may still be ON SCREEN (dropped by an
+                # enumeration filter — e.g. a title/own-window filter — not
+                # closed). Check Win32 directly before assuming it closed: an
+                # alive, visible window that missed its target state is a
+                # leftover, never a silent success. Guarded on a non-empty
+                # enumeration so the empty-enumeration fallback below is not
+                # duplicated.
+                if live_windows:
+                    try:
+                        _u32 = ctypes.windll.user32
+                        if _u32.IsWindow(h) and _u32.IsWindowVisible(h):
+                            if _verify_hwnd_state_steps([s]) is False:
+                                leftovers.append({
+                                    "hwnd": h,
+                                    "title": _clean_window_title(
+                                        str(s.get("title") or "a window")),
+                                    "action": act,
+                                })
+                    except Exception:
+                        pass
                 continue
             try:
                 live_title = str(live.get("title") or s.get("title")
@@ -6346,6 +6559,48 @@ def _execute_plan_tagged(plan, command_text, ttl=None, _allow_retry=True):
         error = str(exc)
         _write_screen_command_log(command_text, plan, "EXECUTION_FAILED", error=error)
         if not is_hwnd_plan:
+            # [LIVE FIX 32 / B84] A UIA revalidation failure ("could not be
+            # revalidated in the live accessibility tree") leaves a STALE UIA
+            # element cache behind; a retry then re-reads the same dead
+            # runtime id and fails identically (the live loop in T6). Clear
+            # the cache and do ONE fresh re-plan — mirroring the verified-
+            # False retry below, including its Direct-Match branch. The
+            # failure happened BEFORE any typing, so the retry never
+            # double-types.
+            if (_allow_retry
+                    and "could not be revalidated" in error.lower()
+                    and not screen_state.stopped_after(exec_started)
+                    and screen_state.guard(plan.get("screen_generation"))[0]):
+                try:
+                    screen_ui_elements._element_cache.clear()
+                except Exception:
+                    pass
+                retry_plan = None
+                try:
+                    if plan.get("source") == "Direct Match":
+                        retry_plan = _build_direct_plan(
+                            _strip_leading_fillers(command_text))
+                    else:
+                        retry_plan = plan_command(command_text)
+                except Exception:
+                    retry_plan = None
+                if (isinstance(retry_plan, dict) and retry_plan.get("ok")
+                        and retry_plan.get("steps")
+                        and not screen_state.stopped_after(exec_started)):
+                    retry_plan.setdefault(
+                        "screen_generation",
+                        plan.get("screen_generation", screen_state.generation()),
+                    )
+                    if plan.get("intent_context"):
+                        retry_plan["intent_context"] = plan["intent_context"]
+                    r_status, r_out = _execute_plan_tagged(
+                        retry_plan, command_text, ttl=ttl, _allow_retry=False)
+                    if r_status == "queued":
+                        screen_state.clear_pending_plan()
+                    elif r_status == "executed":
+                        return "executed", r_out
+                    elif r_status == "blocked" and r_out:
+                        error = str(r_out)
             return "blocked", error
     if is_hwnd_plan:
         # [LIVE FIX 30 / B77+B72] ALL hwnd plans reconcile through the
@@ -7228,6 +7483,10 @@ def maybe_handle_screen_control_message(text):
                 _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTION_FAILED", error=race_error)
                 return race_error
             error = None
+            # [LIVE FIX 34 / B99] this exact plan was previewed to the user and
+            # confirmed — only now does the capture-epoch guard apply, so the
+            # preview can never drift onto a different screen underneath it.
+            plan["user_confirmed"] = True
             try:
                 execute_steps(plan["steps"], target_hwnd=target_hwnd,
                               gate=_plan_gate(plan),
@@ -7235,6 +7494,33 @@ def maybe_handle_screen_control_message(text):
             except Exception as exc:
                 # C3: broadened from RuntimeError (see EXECUTION_FAILED site).
                 error = str(exc)
+                # [LIVE FIX 34 / B99] a confirmed plan whose screen changed
+                # underneath it is not a dead end: re-plan the same command
+                # ONCE against the fresh screen and run that — a fresh plan
+                # that itself needs confirmation re-arms instead of running.
+                if "screen changed after I captured" in error.lower():
+                    fresh = None
+                    try:
+                        fresh = plan_command(cmd_text)
+                    except Exception:
+                        fresh = None
+                    if (isinstance(fresh, dict) and fresh.get("ok")
+                            and fresh.get("steps")):
+                        fresh.setdefault("screen_generation",
+                                         screen_state.generation())
+                        try:
+                            f_status, f_out = _execute_plan_tagged(
+                                fresh, cmd_text, _allow_retry=False)
+                        except Exception:
+                            f_status, f_out = "blocked", ""
+                        if f_status == "executed" and f_out:
+                            _write_screen_command_log(
+                                cmd_text, plan, "CONFIRMED_REPLANNED")
+                            return f_out
+                        if f_status == "queued" and f_out:
+                            return f_out
+                        if f_status == "blocked" and f_out:
+                            error = str(f_out)
                 _write_screen_command_log(cmd_text, plan, "CONFIRMED_EXECUTION_FAILED", error=error)
                 return error
             summary = plan.get("summary") or "Done, sir."
@@ -7314,15 +7600,22 @@ def maybe_handle_screen_control_message(text):
                 _fb_plan = _build_direct_plan(_strip_leading_fillers(_fb_cmd))
             except Exception:
                 _fb_plan = None
-            if (isinstance(_fb_plan, dict) and _fb_plan.get("ok")
-                    and _fb_plan.get("steps")):
-                _fb_plan["screen_generation"] = screen_state.generation()
-                _notify_action_executed(_fb_cmd, "")
-                try:
-                    screen_state.note_request(_fb_cmd)
-                except Exception:
-                    pass
-                return _execute_or_queue(_fb_plan, _fb_cmd)
+            if isinstance(_fb_plan, dict) and _fb_plan.get("ok"):
+                if _fb_plan.get("steps"):
+                    _fb_plan["screen_generation"] = screen_state.generation()
+                    _notify_action_executed(_fb_cmd, "")
+                    try:
+                        screen_state.note_request(_fb_cmd)
+                    except Exception:
+                        pass
+                    return _execute_or_queue(_fb_plan, _fb_cmd)
+                # [LIVE FIX 32 / B82] An ok-but-EMPTY re-plan ("everything else
+                # is already put away") is an HONEST verdict about the
+                # re-planned command. Discarding it and answering an
+                # unprompted census is exactly how a complaint got answered
+                # as a status question (T2).
+                if _fb_plan.get("summary"):
+                    return str(_fb_plan.get("summary"))
         try:
             _census = _parse_window_count_question(
                 "how many windows are open on my screen")

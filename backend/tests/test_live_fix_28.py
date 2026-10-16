@@ -737,7 +737,11 @@ class TestBrowserStyleVerifyResolve:
             finally:
                 brain.plan_command = old_plan
                 brain._execute_plan_tagged = old_exec
-            assert result["status"] == "ok", result
+            # [LIVE FIX 34 / B98] a step whose own report says the effect is
+            # unproven is a FAILED step — a dependent step ("click the first
+            # video from the search results") must skip it, never assume the
+            # search happened. The fragment keeps the honest caveat.
+            assert result["status"] == "failed", result
             assert "not fully sure" in result["fragment"], result
 
 

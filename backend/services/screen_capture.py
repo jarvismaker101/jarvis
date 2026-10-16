@@ -3,6 +3,7 @@ import ctypes
 import importlib
 import io
 import logging
+import re
 import time
 from ctypes import wintypes
 
@@ -23,8 +24,45 @@ _dpi_initialized = False
 #: described by stale bounds.
 _last_user_target = {"hwnd": None, "title": "", "process_id": None}
 
-#: Window-title fragments that identify Jarvis's own UI (never a user target).
-_OWN_WINDOW_MARKERS = ("jarvis", "jarvis overlay", "jarvis-assistant")
+#: [LIVE FIX 32 / B83] Jarvis's own desktop UI is identified by IDENTITY,
+#: never by a loose title substring. The old substring match ("jarvis" in
+#: the title) dropped every real user window whose title merely mentioned
+#: the project — most importantly the backend console, titled with the repo
+#: path "C:\\Users\\...\\jarvis-assistant\\...", which vanished from the
+#: window census and made "minimize all windows" undercount (and the count
+#: swing as the console title changed).
+_OWN_WINDOW_EXACT_TITLES = frozenset({
+    "jarvis",
+    "jarvis overlay",
+    "jarvis assistant",
+    "jarvis-assistant",
+})
+
+#: Terminal/console window classes: always a user window, never Jarvis's UI.
+_USER_TERMINAL_CLASSES = frozenset({
+    "consolewindowclass",
+    "cascadia_hosting_window_class",
+    "pseudoconsolewindow",
+    "virtualconsoleclass",
+    "mintty",
+})
+
+#: Process image names that are user hosts (shells, browsers, editors) —
+#: never Jarvis's own UI, even when their window title mentions "jarvis".
+_USER_HOST_PROCESSES = frozenset({
+    "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
+    "conhost.exe", "openconsole.exe", "mintty.exe", "bash.exe",
+    "brave.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+    "code.exe", "cursor.exe", "windsurf.exe", "devenv.exe",
+    "notepad.exe", "explorer.exe",
+})
+
+#: The Jarvis desktop UI is an Electron app; a Chrome_WidgetWin_1 window
+#: owned by one of these processes is Jarvis's own (keeps the overlay
+#: excluded even when its title is not one of the exact strings above).
+_JARVIS_APP_PROCESSES = frozenset({
+    "electron.exe", "jarvis.exe", "jarvis-assistant.exe",
+})
 
 #: F43: monotonically increasing capture epoch. Every capture carries the epoch
 #: it was taken in, so a consumer can tell whether a frame, a UIA tree and a
@@ -151,12 +189,87 @@ def get_window_bounds(hwnd):
     return _window_bounds(hwnd)
 
 
+def _window_class_name(hwnd):
+    """The Win32 class name of *hwnd* ("" when unreadable). Never raises."""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, len(buf))
+        return (buf.value or "").strip()
+    except Exception:
+        return ""
+
+
+def _window_process_name(hwnd):
+    """The base image name (lowercased) of the process owning *hwnd*, else "".
+
+    [LIVE FIX 32 / B83] argtypes/restype are pinned so the 64-bit process
+    HANDLE is never truncated to 32 bits by ctypes' default int marshalling.
+    Never raises.
+    """
+    try:
+        pid = _window_process_id(hwnd)
+        if not pid:
+            return ""
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(len(buf))
+            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            kernel32.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD)]
+            if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)):
+                full = (buf.value or "").strip()
+                return full.rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower()
+        finally:
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
 def is_own_window(hwnd):
-    """True when *hwnd* is one of Jarvis's own UI windows (F43)."""
+    """True when *hwnd* is one of Jarvis's own UI/overlay windows (F43/B83).
+
+    [LIVE FIX 32 / B83] Identity-based, never a loose title substring: a
+    user console/editor/browser whose title merely CONTAINS the repo path
+    or the word "jarvis" (e.g. "C:\\Users\\...\\jarvis-assistant\\...")
+    must never be dropped from the window census. A window is Jarvis's own
+    only when it carries a known overlay title, or is the Jarvis Electron
+    UI (Chrome_WidgetWin_1 + the app's electron process) — and never when
+    it is a terminal/console or a known user host process.
+    """
     if not hwnd:
         return False
-    title = (_get_window_title(hwnd) or "").strip().lower()
-    return any(marker in title for marker in _OWN_WINDOW_MARKERS)
+    raw_title = (_get_window_title(hwnd) or "").strip()
+    if not raw_title:
+        return False
+    title = raw_title.lower()
+    # A title carrying a filesystem path or drive prefix is a user shell /
+    # editor / file window (e.g. the backend console titled with the repo
+    # path) — never the Jarvis overlay. Fail open: do not drop it.
+    if "\\" in title or "/" in title or re.search(r"\b[a-z]:", title):
+        return False
+    wclass = _window_class_name(hwnd).lower()
+    if wclass in _USER_TERMINAL_CLASSES:
+        return False
+    proc = _window_process_name(hwnd)
+    if proc in _USER_HOST_PROCESSES:
+        return False
+    if title in _OWN_WINDOW_EXACT_TITLES:
+        return True
+    if wclass == "chrome_widgetwin_1" and proc in _JARVIS_APP_PROCESSES:
+        return True
+    return False
 
 
 def note_foreground_target():

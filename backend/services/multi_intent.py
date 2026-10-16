@@ -105,20 +105,47 @@ _RESEARCH_RE = re.compile(
 #: when a file noun follows ("type the report in the file" stays a task);
 #: ordinal "play the first/next X" is a screen click while plain "play X"
 #: stays a tool request.
+#: [LIVE FIX 32 / B85] Speech-to-text frequently drops or transposes the
+#: leading letters of a clause-initial "type <content>" ("ype mr.beast in the
+#: search bar"). The control verb is recognised typo-tolerantly so a mangled
+#: "type" is still a screen-CONTROL step — never a bare screen LOOK.
+_TYPE_VERB_TOKEN = r"(?:type|ype|tye|tpe|tup)"
+_TYPE_TYPO_LEAD_RE = re.compile(
+    r"^(\s*(?:(?:please|kindly|jarvis)\b[\s,]*)?)(?:ype|tye|tpe|tup)\b(?=\s+\S)",
+    re.IGNORECASE,
+)
+
+
+def _repair_type_typo(text):
+    """Repair a clause-initial STT-mangled 'ype/tye/tpe/tup' -> 'type'.
+
+    [LIVE FIX 32 / B85] Only at the clause start and only when real content
+    follows, and never when a file noun follows (a file write stays a task).
+    Never raises.
+    """
+    try:
+        t = str(text or "")
+        if _JUXT_FILE_NOUN_RE.search(t[:60]):
+            return t
+        return _TYPE_TYPO_LEAD_RE.sub(r"\1type", t, count=1)
+    except Exception:
+        return str(text or "")
+
+
 _SCREEN_CONTROL_RE = re.compile(
-    r"\b(click|double-?click|right-?click|tap|press|hit|type|enter|write|"
+    r"\b(click|double-?click|right-?click|tap|press|hit|" + _TYPE_VERB_TOKEN + r"|enter|write|"
     r"copy|scroll|drag|drop|move|hover|select|focus|minimize|minimise|maximize|"
     r"maximise|restore|switch|close|paste|cut)\b[^.?!]{0,48}\b(screen|windows?|"
     r"desktop|button|link|tabs?|icon|checkbox|menu|toolbar|search\s*bar|"
     r"search\s*box|text\s*box|textbox|field|mouse|cursor|apps?|"
     r"applications?|dialog|popup)\b"
     r"|\b(screen|windows?|desktop|button|link|tabs?|icon|mouse|cursor)\b"
-    r"[^.?!]{0,24}\b(click|press|type|scroll|minimize|minimise)\b"
+    r"[^.?!]{0,24}\b(click|press|" + _TYPE_VERB_TOKEN + r"|scroll|minimize|minimise)\b"
     r"|\b(scroll\s+(?:up|down|left|right)|press\s+enter|hit\s+enter|"
     r"minimize|minimise|maximize|maximise|restore)\b"
     # A control verb aimed at the previous step's target ("and click it",
     # "then close that") is a follow-on control step, not a fragment.
-    r"|\b(click|double-?click|right-?click|tap|press|type|scroll|"
+    r"|\b(click|double-?click|right-?click|tap|press|" + _TYPE_VERB_TOKEN + r"|scroll|"
     r"minimize|minimise|close)\s+(it|this|that|them|these|those)\b"
     # [LIVE FIX 22 / B9] field-content editing without a named target.
     r"|\bbackspace\b"
@@ -126,8 +153,9 @@ _SCREEN_CONTROL_RE = re.compile(
     r"what(?:'s| is)?\s+\w+|in\s+(?:it|this|that)|it|this|that|all|"
     r"everything|field|box|bar|text)\b"
     # [LIVE FIX 22 / B9] typing content into the focused element ("type
-    # mr.beast") — blocked when a file noun follows (file writes stay task).
-    r"|^\s*(?:(?:please|kindly|jarvis)\b[^.?!]{0,12})?type\b"
+    # mr.beast", "ype mr.beast") — blocked when a file noun follows (file
+    # writes stay task). [LIVE FIX 32 / B85] typo-tolerant verb.
+    r"|^\s*(?:(?:please|kindly|jarvis)\b[^.?!]{0,12})?" + _TYPE_VERB_TOKEN + r"\b"
     r"(?![^.?!]{0,48}\b(?:file|folder|directory|report|document|note|txt|"
     r"script|code)\b)[^.?!]{0,48}\S"
     r"|\bpaste\b|\bcut\b"
@@ -322,6 +350,8 @@ def split_clauses(text):
         # [LIVE FIX 26 / B40] a stray leading glyph ("✕ click…") must not
         # survive into a clause — it defeats anchored matchers below.
         part = _strip_stray_glyphs((part or "").strip(" \t,;."))
+        # [LIVE FIX 32 / B85] repair a clause-initial STT-mangled "type".
+        part = _repair_type_typo(part)
         if len(part) < 3:
             continue
         out.append(part)
@@ -341,7 +371,7 @@ _JUXTAPOSED_TYPE_RE = re.compile(
     r"(?:\b(?:bar|box|field|button|icon|link|tab|textbox|input|window|it|this|"
     r"that|there)"
     r"|\b(?:on|at|in)\s+(?:my|the)\s+(?:screen|desktop|browser|window)))"
-    r"\s+(?P<right>(?:type|enter|write)\s+\S.*)$",
+    r"\s+(?P<right>(?:" + _TYPE_VERB_TOKEN + r"|enter|write)\s+\S.*)$",
     re.IGNORECASE)
 _JUXT_RIGHT_BLOCK_RE = re.compile(
     r"^(?:type|enter|write)\s+(?:of|key|button|field|box|bar|icon|tab|"
@@ -350,6 +380,50 @@ _JUXT_RIGHT_BLOCK_RE = re.compile(
 _JUXT_FILE_NOUN_RE = re.compile(
     r"\b(?:file|folder|directory|report|document|note|txt|script|code)\b",
     re.IGNORECASE)
+
+#: [LIVE FIX 32 / B85] a typing clause followed by a separate submit verb with
+#: no connector ("type mr.beast in it press enter") is TWO steps — the type and
+#: the submit — never one merged command. The left half carries a type verb
+#: (typo-tolerant), the right half is a bare press/hit/click enter|return.
+_JUXTAPOSED_SUBMIT_RE = re.compile(
+    r"^[^\w]*(?P<left>(?:(?:please|kindly|jarvis)\b[\s,]*)?"
+    r"(?:" + _TYPE_VERB_TOKEN + r"|write|enter)\b\s+\S.*?"
+    r"(?:\b(?:in|into|inside|on|at)\s+(?:it|this|that|there|"
+    r"(?:my|the)\s+(?:[\w\-]+\s+){0,3}?(?:bar|box|field|input|screen|window)))?)"
+    r"\s+(?P<right>(?:press|hit|click(?:ing)?)\s+(?:enter|return)\b.*)$",
+    re.IGNORECASE)
+
+#: [LIVE FIX 32 / B85] a UI "search bar/box/field" is a TARGET noun, not a
+#: web-lookup request — stripped before testing for research markers so a
+#: topic phrase naming a search bar is not mistaken for research (which used
+#: to defeat the topic-folding guard and turn a control clause into a look).
+_UI_SEARCH_NOUN_RE = re.compile(
+    r"\bsearch\s*(?:bar|box|field|icon|button|input)\b", re.IGNORECASE)
+
+
+def _strip_ui_search_nouns(text):
+    """Remove UI "search bar/box/field/icon/button/input" nouns. Never raises."""
+    try:
+        return _UI_SEARCH_NOUN_RE.sub(" ", str(text or ""))
+    except Exception:
+        return str(text or "")
+
+
+#: [LIVE FIX 34 / B98] a step whose OBJECT is a previous step's OUTPUT
+#: ("play the first video from the search results", "click the top result",
+#: "open the first link") depends on the whole preceding screen flow: without
+#: the search there are no results. Without this link the step ran anyway and
+#: clicked whatever happened to be on screen — the live 14:44-14:46 chain
+#: clicked the YouTube home feed believing it showed the results of a search
+#: that never happened.
+_RESULTS_REF_RE = re.compile(
+    r"\b(?:from|in|of|among)\s+(?:the|those|these|its|my)\s+"
+    r"(?:search\s+|query\s+)?results?\b"
+    r"|\b(?:search|query)\s+results?\b"
+    r"|\b(?:first|second|third|1st|2nd|3rd|top|next|last)\s+"
+    r"(?:video|result|link|item|match|entry|clip)\b",
+    re.IGNORECASE,
+)
 
 
 #: [LIVE FIX 26 / B39] ordinal-play is a COMPLETE screen action ("play the
@@ -368,14 +442,35 @@ _TRAILING_RESULT_RE = re.compile(
 
 
 def _split_control_juxtaposition(clauses):
-    """Cut "click X type Y" (no connector) into two control clauses."""
+    """Cut 'click X type Y' or 'type X press enter' (no connector) into two control clauses.
+
+    [LIVE FIX 32 / B85] the second split handles a typing clause followed by a
+    bare submit ("type mr.beast in it press enter") — previously it stayed one
+    merged command.
+    """
     out = []
     for clause in clauses or []:
-        m = _JUXTAPOSED_TYPE_RE.match(clause or "")
-        if (m and not _JUXT_RIGHT_BLOCK_RE.match(m.group("right"))
+        clause = _repair_type_typo(clause or "")
+        m = _JUXTAPOSED_TYPE_RE.match(clause)
+        if (m and not _JUXT_RIGHT_BLOCK_RE.match(_repair_type_typo(m.group("right")))
                 and not _JUXT_FILE_NOUN_RE.search(m.group("right")[:60])):
-            out.append(m.group("left").strip(" \t,;."))
-            out.append(m.group("right").strip(" \t,;"))
+            left_c = _repair_type_typo(m.group("left").strip(" \t,;."))
+            right_c = _repair_type_typo(m.group("right").strip(" \t,;"))
+            out.append(left_c)
+            # The right half may itself end with a juxtaposed "press enter".
+            m_sub = _JUXTAPOSED_SUBMIT_RE.match(right_c)
+            if (m_sub
+                    and not _JUXT_FILE_NOUN_RE.search(m_sub.group("left")[:60])):
+                out.append(_repair_type_typo(
+                    m_sub.group("left").strip(" \t,;.")))
+                out.append(m_sub.group("right").strip(" \t,;"))
+            else:
+                out.append(right_c)
+            continue
+        m_sub = _JUXTAPOSED_SUBMIT_RE.match(clause)
+        if m_sub and not _JUXT_FILE_NOUN_RE.search(m_sub.group("left")[:60]):
+            out.append(_repair_type_typo(m_sub.group("left").strip(" \t,;.")))
+            out.append(m_sub.group("right").strip(" \t,;"))
         else:
             out.append(clause)
     return out
@@ -459,7 +554,7 @@ def build_chain(text):
         if (kind == "screen" and not _LOOK_VERB_RE.search(clause)
                 and not _SCREEN_CONTROL_RE.search(clause)
                 and not _QUESTION_WORD_RE.search(clause)
-                and not _RESEARCH_RE.search(clause)
+                and not _RESEARCH_RE.search(_strip_ui_search_nouns(clause))
                 and not clause.strip().endswith("?")):
             if merged and merged[-1]["kind"] == "screen_control":
                 merged[-1]["text"] = merged[-1]["text"] + " and " + clause
@@ -584,7 +679,20 @@ def build_chain(text):
     steps = []
     for i, m in enumerate(merged):
         consumes = []
-        if i > 0 and _ANAPHORA_RE.search(m["text"]):
+        _pre_controls = [j for j in range(i)
+                         if merged[j]["kind"] == "screen_control"]
+        if (m["kind"] == "screen_control" and _pre_controls
+                and _RESULTS_REF_RE.search(m["text"])):
+            # [LIVE FIX 34 / B98] a step whose object IS a previous step's
+            # OUTPUT ("play the first video from the search results", "click
+            # the top result") depends on every preceding screen-control
+            # step: without the search there are no results, so the click is
+            # skipped when the typing/submit failed instead of clicking
+            # whatever happens to be on screen — the live 14:44-14:46 chain
+            # clicked the YouTube home feed believing it showed the results
+            # of a search that never ran.
+            consumes = _pre_controls
+        elif i > 0 and _ANAPHORA_RE.search(m["text"]):
             consumes = [i - 1]
         elif (i > 0 and merged[i - 1]["kind"] == "screen_control"
               and m["kind"] == "screen_control"
@@ -592,6 +700,14 @@ def build_chain(text):
             # [LIVE FIX 21] "then close it" runs after the step it points
             # at (ordering-only: the executor re-plans on the fresh
             # screen, never replays coordinates).
+            consumes = [i - 1]
+        elif (i > 0 and merged[i - 1]["kind"] == "screen_control"
+              and m["kind"] == "screen_control"
+              and _is_submit_shape(m["text"])):
+            # [LIVE FIX 32 / B88] a submit step ("press enter") depends on the
+            # step it submits: if the typing step failed or blocked, the Enter
+            # must not fire blindly (the runner skips a step whose consumed
+            # step's status is not "ok").
             consumes = [i - 1]
         elif (i > 0 and merged[i - 1]["kind"] == "screen"
               and m["kind"] == "research"

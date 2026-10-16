@@ -848,7 +848,8 @@ class ScreenControlTests(unittest.TestCase):
                 "source": "ui", "label": "SmallControl", "uid": "small",
             },
         }
-        # normalized box center 800,400 -> 1536,432 after conversion
+        # [LIVE FIX 34 / B96] {x, y, width, height}: x,y IS the centre —
+        # normalized 700,300 -> 1344,324 after conversion.
         plan = {
             "ok": True,
             "confidence": 0.9,
@@ -861,21 +862,28 @@ class ScreenControlTests(unittest.TestCase):
         normalized = screen_control._normalize_vision_plan(plan, capture, element_id_map)
         self.assertTrue(normalized["ok"])
         step = normalized["steps"][0]
-        # bbox center (800,400) normalized also lives only inside the giant container - must
-        # pass through unchanged (after conversion) instead of snapping to 960,608.
-        self.assertEqual(step["x"], 1536)
-        self.assertEqual(step["y"], 432)
+        # the centre point also lives inside the giant container - it must
+        # pass through unchanged (after conversion) instead of snapping to
+        # the container's own 960,608 centre.
+        self.assertEqual(step["x"], 1344)
+        self.assertEqual(step["y"], 324)
         self.assertNotIn("ui_uid", step)
 
     # --- P1.1: bounding box support ---
 
     def test_extract_box_center_xywh_and_ltrb_shapes(self):
+        # [LIVE FIX 34 / B96] {x, y, width, height}: x,y IS the centre (the
+        # prompt contract) — adding width/2, height/2 displaced every box
+        # click by half the box (the live YouTube search-bar miss).
         c = screen_control._extract_box_center({"box": {"x": 100, "y": 50, "width": 20, "height": 10}})
-        self.assertEqual(c, (110, 55))
+        self.assertEqual(c, (100, 50))
         c = screen_control._extract_box_center({"bbox": {"left": 100, "top": 50, "right": 120, "bottom": 60}})
         self.assertEqual(c, (110, 55))
         # top-level keys without a wrapper are also supported
         c = screen_control._extract_box_center({"action": "click", "x": 100, "y": 50, "width": 20, "height": 10})
+        self.assertEqual(c, (100, 50))
+        # legacy corner form {left, top, width, height} keeps corner math
+        c = screen_control._extract_box_center({"box": {"left": 100, "top": 50, "width": 20, "height": 10}})
         self.assertEqual(c, (110, 55))
         self.assertIsNone(screen_control._extract_box_center({"action": "click", "x": 100, "y": 50}))
 
@@ -1325,7 +1333,8 @@ class ScreenControlTests(unittest.TestCase):
         normalized = screen_control._normalize_vision_plan(plan, capture)
         self.assertEqual(normalized["steps"][0]["x"], 1248)
         self.assertEqual(normalized["steps"][0]["y"], 599)
-        # bbox in normalized 0..1000: box 600,500 width100 height100 -> center 650,550 -> 1248,594
+        # [LIVE FIX 34 / B96] {x, y, width, height}: x,y IS the centre (the
+        # prompt contract) - box 600,500 width100 height100 -> 1152,540.
         plan2 = {
             "ok": True,
             "confidence": 0.9,
@@ -1336,8 +1345,8 @@ class ScreenControlTests(unittest.TestCase):
             "steps": [{"action": "click", "box": {"x": 600, "y": 500, "width": 100, "height": 100}}],
         }
         normalized2 = screen_control._normalize_vision_plan(plan2, capture)
-        self.assertEqual(normalized2["steps"][0]["x"], 1248)
-        self.assertEqual(normalized2["steps"][0]["y"], 594)
+        self.assertEqual(normalized2["steps"][0]["x"], 1152)
+        self.assertEqual(normalized2["steps"][0]["y"], 540)
 
     def test_element_id_point_not_converted(self):
         capture = {
