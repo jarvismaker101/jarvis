@@ -83,6 +83,14 @@ MEMORY_DB_PATH = os.getenv("JARVIS_MEMORY_DB") or str(
 # Every knob is read at import in the owning module; hardware/model-dependent
 # pieces degrade gracefully (see the audit [ASSUMPTION] notes).
 AEC_ENABLED = os.getenv("JARVIS_AEC_ENABLED", "1") != "0"
+# [B108] Stamp the AEC reference with the device's reported output latency:
+# a chunk fed when stream.write() returns is actually heard this much later,
+# which used to be absorbed by the lag search (and could push the true lag
+# outside its range). Clamped; telemetry exposes the lead as lead_seconds.
+AEC_STAMP_DEVICE_LATENCY = os.getenv(
+    "JARVIS_AEC_STAMP_DEVICE_LATENCY", "1") != "0"
+AEC_DEVICE_LATENCY_MAX = float(
+    os.getenv("JARVIS_AEC_DEVICE_LATENCY_MAX", "0.5"))
 # [F33] The API process voices replies while the voice process listens, so the
 # AEC reference must cross the process boundary. The voice side asks the API
 # for the rendered PCM that overlaps its mic window (see /aec/reference);

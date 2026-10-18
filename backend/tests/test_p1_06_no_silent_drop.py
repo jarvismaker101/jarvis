@@ -75,7 +75,7 @@ def _once_then_shutdown(text):
     """
     served = {"done": False}
 
-    def _impl(marks=None):
+    def _impl(marks=None, **_kwargs):
         if not served["done"]:
             served["done"] = True
             return text

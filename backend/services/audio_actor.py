@@ -156,6 +156,13 @@ class SoundDeviceStream:
             _start_with_retry(self._stream)
             self._started = True
 
+    def output_latency_seconds(self):
+        """[B108] Configured output latency, for AEC reference stamping."""
+        latency = getattr(self._stream, "latency", None)
+        if isinstance(latency, (tuple, list)):
+            latency = latency[-1]
+        return None if latency is None else float(latency)
+
     def write(self, pcm_bytes):
         import numpy as np
 
@@ -221,6 +228,13 @@ class RawPcmStream:
         if not self._started:
             self._stream.start()
             self._started = True
+
+    def output_latency_seconds(self):
+        """[B108] Configured output latency, for AEC reference stamping."""
+        latency = getattr(self._stream, "latency", None)
+        if isinstance(latency, (tuple, list)):
+            latency = latency[-1]
+        return None if latency is None else float(latency)
 
     def write(self, pcm_bytes):
         import numpy as np
@@ -322,6 +336,26 @@ def get_stream_factory():
         return _stream_factory_override or _default_stream_factory
 
 
+def _stream_output_latency(stream):
+    """[B108] Seconds between write() returning and the sound leaving.
+
+    The probe is optional: test fakes and other stream wrappers simply do
+    not expose it, so the AEC reference keeps today's timestamp.
+    """
+    probe = getattr(stream, "output_latency_seconds", None)
+    try:
+        value = probe() if callable(probe) else None
+        value = None if value is None else float(value)
+    except Exception:
+        return None
+    return value if value is not None and 0.0 <= value <= 1.0 else None
+
+
+def output_latency_seconds():
+    """[B108] The latency of the stream the actor is playing through."""
+    return getattr(_actor, "_output_latency", None)
+
+
 class AudioActor:
     """Single owner of output-stream playback, PCM buffering and the
     current-generation contract."""
@@ -355,6 +389,9 @@ class AudioActor:
         self._chunk_wait = threading.Event()
         self._stop = threading.Event()
         self._stream = None
+        #: [B108] Reported output latency of the current stream; 0/None
+        #: means "stamp the reference at write-return time" (old behaviour).
+        self._output_latency = None
 
         #: [P1-07] A true pause. Unlike an abort this is NOT a cancellation:
         #: the play loop PARKS (still draining the producer so a backpressured
@@ -611,6 +648,7 @@ class AudioActor:
         #: (a caller's, or the test-injected factory) is torn down in finally.
         persistent = self._owns_device and not owns_sentence_stream
         self._stream = stream
+        self._output_latency = _stream_output_latency(stream)
         written = 0
         with self._gen_lock:
             self._loops += 1
@@ -703,6 +741,7 @@ class AudioActor:
                                 raise
                             stream = fresh
                             self._stream = fresh
+                            self._output_latency = _stream_output_latency(fresh)
                             stream.write(chunk.pcm)
                         else:
                             raise

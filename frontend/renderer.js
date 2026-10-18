@@ -485,7 +485,13 @@ function renderVoiceState(state = {}) {
   const raw = String((state && (state.status || state.state)) || 'listening').toLowerCase();
   const valid = ['idle','listening','hearing','thinking','speaking','offline','reconnecting','error','command-armed'];
   const status = valid.includes(raw) ? raw : (STATUS_LABELS[raw] ? raw : 'listening');
-  const hud = ['idle','listening','hearing','thinking','speaking','error','command-armed'].includes(status) ? status : (status==='offline'||status==='reconnecting' ? 'idle' : status);
+  // [LF36] Voice INPUT off = text mode. The mic is closed, so the passive
+  // pipeline states ("listening"/"hearing") would claim Jarvis is listening
+  // when it is not - the exact thing this toggle exists to turn off. Active
+  // states (thinking/speaking/offline) still describe real work and stay.
+  const voiceOff = !!(state && state.voice_input_enabled === false);
+  const textMode = voiceOff && ['listening','idle','hearing','command-armed'].includes(status);
+  const hud = textMode ? 'idle' : (['idle','listening','hearing','thinking','speaking','error','command-armed'].includes(status) ? status : (status==='offline'||status==='reconnecting' ? 'idle' : status));
   document.body.dataset.state = hud;
   document.body.classList.remove(...['idle','listening','hearing','thinking','speaking','error','command-armed'].map(x => `state-${x}`));
   document.body.classList.add(`state-${hud}`);
@@ -495,9 +501,9 @@ function renderVoiceState(state = {}) {
   const ring = document.getElementById("status-ring");
   const liveStatus = document.getElementById("live-status");
   const reactor = document.getElementById("reactor");
-  if (badge) { badge.textContent = STATUS_LABELS[status] || STATUS_LABELS.listening || status.toUpperCase(); badge.className = `badge ${status}`; }
-  if (ring) ring.className = `status-ring ${status}`;
-  if (liveStatus) liveStatus.textContent = buildStatusSubtext(state, status);
+  if (badge) { badge.textContent = textMode ? 'TEXT MODE' : (STATUS_LABELS[status] || STATUS_LABELS.listening || status.toUpperCase()); badge.className = `badge ${textMode ? 'idle' : status}`; }
+  if (ring) ring.className = `status-ring ${textMode ? 'idle' : status}`;
+  if (liveStatus) liveStatus.textContent = textMode ? 'Voice input off \u2014 type to chat' : buildStatusSubtext(state, status);
   if (reactor) {
     reactor.style.filter = status === "speaking" ? "brightness(1.25) saturate(1.2)" : status === "hearing" ? "brightness(1.15)" : "none";
     reactor.style.transform = status === "thinking" ? "scale(1.06)" : "scale(1)";

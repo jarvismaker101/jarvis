@@ -98,27 +98,98 @@ AEC_BREAKER_COOLDOWN_SECONDS = float(
 #     one 32 ms frame;
 #   * keeps the remote reference fresh from a background thread so the
 #     capture loop stops paying the fetch inside a real-time frame.
-AEC_MAX_LAG_SECONDS = float(os.getenv("JARVIS_AEC_MAX_LAG", "0.4"))
+AEC_MAX_LAG_SECONDS = float(os.getenv("JARVIS_AEC_MAX_LAG", "0.6"))
 AEC_LAG_CONFIRMATIONS = int(os.getenv("JARVIS_AEC_LAG_CONFIRMATIONS", "3"))
 #: A vote below this correlation is noise, not a timing opinion.
-AEC_LAG_MIN_CORRELATION = 0.30
+AEC_LAG_MIN_CORRELATION = float(
+    os.getenv("JARVIS_AEC_LAG_MIN_CORRELATION", "0.30")
+)
+#: [B105] Joint evidence window: the correlation fit spans this much of the
+#: mic history instead of a single ~32 ms frame, so the estimate survives
+#: the timing jitter and nonlinearity a laptop-speaker path adds. Votes
+#: are separated by at least one window, so this also bounds the cadence.
+AEC_LAG_WINDOW_SECONDS = max(
+    0.064,
+    min(
+        0.256,
+        float(os.getenv("JARVIS_AEC_LAG_WINDOW", "0.192")),
+    ),
+)
 #: Votes must agree within this spread (about one frame) to lock.
 AEC_LAG_SPREAD_SECONDS = 0.04
+#: [B108] Lags this session proved WRONG are remembered (bounded) and
+#: excluded from later estimates, so a rejected false peak cannot win again.
+AEC_LAG_REJECT_MEMORY = 4
 #: Frames the gate fits jointly (5 x ~32 ms = ~160 ms of compare window).
 AEC_GATE_HISTORY_FRAMES = int(os.getenv("JARVIS_AEC_GATE_HISTORY", "5"))
 #: Keep the remote reference prefetching this long after capture activity.
 AEC_PREFETCH_SECONDS = float(os.getenv("JARVIS_AEC_PREFETCH", "2.0"))
 AEC_PREFETCH_INTERVAL_SECONDS = max(0.05, AEC_CACHE_TTL_SECONDS / 2.0)
+# [LF35] The frequency-domain adaptive canceller ("fdaf"). py-webrtc-aec3
+# does not exist on PyPI (verified: no distribution under either name), so
+# the wiring's preferred model could never install and the signal path ran
+# the no-op canceller + correlation gate. Laptop speakers fail that gate -
+# OS "audio enhancements" and AGC distort the echo nonlinearly - and every
+# frame that slips through is heard as the user: Jarvis barges into its own
+# reply and then answers its own words. These knobs tune the in-house
+# replacement (see FrequencyDomainEchoCanceller).
+#: Transfer smoothing per frame: H = FDAF_ADAPT*H + (1-FDAF_ADAPT)*H_new.
+FDAF_ADAPT = float(os.getenv("JARVIS_AEC_FDAF_ADAPT", "0.45"))
+#: Adaptation freezes when the residual holds this much of the mic energy
+#: AND is uncorrelated with the echo estimate (double-talk).
+FDAF_FREEZE_RATIO = float(os.getenv("JARVIS_AEC_FDAF_FREEZE", "0.30"))
+#: A window counts as our own playback when subtraction removed at least
+#: this many dB (10 dB means the residual is under a third of the mic).
+FDAF_SUPPRESS_DB = float(os.getenv("JARVIS_AEC_FDAF_SUPPRESS_DB", "10.0"))
+#: Per-bin transfer-magnitude cap (runaway bins on quiet reference).
+FDAF_GAIN_MAX = float(os.getenv("JARVIS_AEC_FDAF_GAIN_MAX", "12.0"))
+#: Fixed transform size. Covers the mic window PLUS the whole lag search
+#: range, so the unknown speaker->mic delay lives inside the per-bin phase
+#: of H and never needs a separate delay lock.
+FDAF_TRANSFORM_SIZE = 8192
+#: After this long without any reference the path estimate is rebuilt from
+#: scratch (a device switch or volume change may have moved the path).
+FDAF_RESET_AFTER_SECONDS = float(os.getenv("JARVIS_AEC_FDAF_RESET_AFTER", "20"))
+#: Per-bin reference-magnitude floor, relative to the mean magnitude: bins
+#: where nothing was played carry no transfer information.
+FDAF_REF_MAG_FLOOR = 1e-3
+#: [LF35] Frames of unconditional adaptation after (re)initialization.
+#: Without this the double-talk freeze deadlocks a cold start: the first
+#: frames estimate H from whatever the mic has (often not the echo yet),
+#: every later frame then looks "loud and uncorrelated" and freezes before
+#: H can learn the path.
+FDAF_WARMUP_FRAMES = int(os.getenv("JARVIS_AEC_FDAF_WARMUP", "15"))
+#: Watchdog: this many consecutive frames where H explains almost nothing
+#: mean the estimate went stale - rebuild it (re-enters warmup).
+FDAF_LOW_ERLE_STREAK = int(os.getenv("JARVIS_AEC_FDAF_STREAK", "30"))
+FDAF_LOW_ERLE_DB = 4.0
+#: [B108] A lock must PROVE itself: some frame whose *a-priori* ERLE (the
+#: estimate from BEFORE that frame's update - never the in-sample fit of
+#: the current window) reaches this many dB within
+#: :data:`FDAF_LOCK_PROOF_FRAMES` locked frames. A lock that never proves
+#: is re-learned once and then rejected, so a wrong delay can no longer
+#: freeze the canceller at 0 dB for the whole session.
+FDAF_LOCK_PROOF_DB = float(os.getenv("JARVIS_AEC_FDAF_LOCK_PROOF_DB", "6.0"))
+FDAF_LOCK_PROOF_FRAMES = int(
+    os.getenv("JARVIS_AEC_FDAF_LOCK_PROOF_FRAMES", "60"))
+FDAF_RELOCK_ERLE_FRAMES = 8
 
 
 class CaptureFrame(namedtuple("CaptureFrame",
-                              "pcm had_reference suppressed sample_rate")):
+                              "pcm had_reference suppressed sample_rate "
+                              "generation",
+                              defaults=(None,))):
     """One analysed capture frame (F33).
 
     *pcm* is what the mic contributed after cancellation, *had_reference*
     says playback overlapped the frame, and *suppressed* says the frame was
     recognised as the assistant's own playback (so it must never be committed
     as user speech).
+
+    [B113] *generation* is the canceller's path generation when this frame
+    was produced (None for cancellers that do not track one). It changes on
+    EVERY drop of the path estimate, so proof from an older generation is
+    void: the suppressed frame proved an H that no longer exists.
     """
 
     __slots__ = ()
@@ -301,79 +372,297 @@ class DelayEstimator:
     and the lock takes :data:`AEC_LAG_CONFIRMATIONS` votes that agree within
     one frame of each other. The lag is a property of the audio path, so it
     is estimated once per session and then simply applied.
+
+    [B105] Evidence is fitted over a JOINT window
+    (:data:`AEC_LAG_WINDOW_SECONDS`) accumulated across real capture
+    frames instead of one frame: a single ~32 ms window against a delayed,
+    imperfectly-linear laptop-speaker path often peaks below the
+    correlation bar, and the lock never engages - every later frame then
+    passes through uncancelled while the reply is heard as the user. Votes
+    are separated by at least one window so consecutive votes carry
+    independent evidence, and the lock is decided by the last
+    :data:`AEC_LAG_CONFIRMATIONS` votes only, so one old outlier can never
+    block three fresh consistent ones.
     """
 
     name = "delay-estimator"
 
     def __init__(self, max_lag_seconds=AEC_MAX_LAG_SECONDS,
-                 min_correlation=AEC_LAG_MIN_CORRELATION):
+                 min_correlation=AEC_LAG_MIN_CORRELATION,
+                 window_seconds=AEC_LAG_WINDOW_SECONDS):
         self.max_lag_seconds = max(0.0, float(max_lag_seconds))
         self.min_correlation = float(min_correlation)
         self.votes = []
         self.locked_lag_seconds = None
+        self.window_seconds = max(0.0, float(window_seconds))
+        self._window_samples = max(
+            1, int(round(self.window_seconds * AEC_SAMPLE_RATE)))
+        #: [B105] Capture-local evidence: the last window of mic samples
+        #: (bytes), cleared at capture boundaries and reference gaps.
+        self._mic_history = b""
+        self._samples_since_vote = 0
+        self.last_correlation = None
+        self.last_candidate_seconds = None
+        self.last_search_seconds = 0.0
+        self.last_reason = "not-estimated"
+        #: [B108] Independent evidence for a DIFFERENT lag while locked.
+        self.challenge_votes = []
+        #: [B108] Lags already proved wrong (bounded by
+        #: :data:`AEC_LAG_REJECT_MEMORY`); excluded from later estimates.
+        self.rejected_lags = []
+        self.rejections = 0
+        self.relocks = 0
+        #: [B108] Peak sharpness diagnostics: how far the winning
+        #: correlation stands above the best peak outside its spread.
+        self.last_peak_sharpness = None
+        self.last_runner_up_seconds = None
 
     @property
     def locked(self):
         return self.locked_lag_seconds is not None
 
-    def reset(self):
+    def clear_window(self):
+        """[B105] Drop capture-local evidence, keep a proven path lag."""
+        self._mic_history = b""
+        self._samples_since_vote = 0
+        self.last_correlation = None
+        self.last_candidate_seconds = None
+        self.last_search_seconds = 0.0
+        self.last_reason = "window-cleared"
+        # [B108] Challenges are capture-local too: a gap in the reference
+        # must never concatenate evidence across two different playbacks.
+        self.challenge_votes = []
+        self.last_peak_sharpness = None
+        self.last_runner_up_seconds = None
+
+    def state(self):
+        """[B105] Plain-dict diagnostics for telemetry (never raises)."""
+        return {
+            "locked": self.locked,
+            "locked_seconds": self.locked_lag_seconds,
+            "votes": len(self.votes),
+            "best_correlation": self.last_correlation,
+            "candidate_seconds": self.last_candidate_seconds,
+            "search_seconds": self.last_search_seconds,
+            "max_lag_seconds": self.max_lag_seconds,
+            "window_seconds": self.window_seconds,
+            "min_correlation": self.min_correlation,
+            "reason": self.last_reason,
+            # [B108] Lock health: challenges and lags proved wrong.
+            "challenge_votes": list(self.challenge_votes),
+            "rejected_lags": list(self.rejected_lags),
+            "rejections": self.rejections,
+            "relocks": self.relocks,
+            "peak_sharpness": self.last_peak_sharpness,
+            "runner_up_seconds": self.last_runner_up_seconds,
+        }
+
+    def reset(self, keep_rejections=False):
         self.votes = []
         self.locked_lag_seconds = None
+        self.clear_window()
+        # [B108] The watchdog reset keeps the knowledge that a lag was
+        # already proved wrong; only a device-change reset forgets it.
+        if not keep_rejections:
+            self.rejected_lags = []
+        self.last_reason = "reset"
+
+    @staticmethod
+    def _median(values):
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        return (ordered[middle] if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2.0)
+
+    def _note_locked_evidence(self, correlation, lag_seconds, window_samples):
+        """[B108] Record independent evidence while locked, never move on it.
+
+        A lock no longer ends measurement. A strong, independent correlation
+        peak at a DIFFERENT lag is a *challenge*; the canceller decides
+        whether the challenge is consistent enough (and whether its own
+        cancellation is bad enough) to relock.
+        """
+        self.last_reason = "locked"
+        if (correlation < self.min_correlation
+                or self._samples_since_vote < window_samples):
+            return
+        self._samples_since_vote = 0
+        if abs(lag_seconds - self.locked_lag_seconds) <= AEC_LAG_SPREAD_SECONDS:
+            self.challenge_votes = []          # agreeing evidence
+            return
+        keep = max(1, AEC_LAG_CONFIRMATIONS) * 2
+        self.challenge_votes = (self.challenge_votes + [lag_seconds])[-keep:]
+        self.last_reason = "locked-challenged"
+
+    def challenger(self):
+        """[B108] Median of the last N consistent challenges, else None."""
+        n = max(1, AEC_LAG_CONFIRMATIONS)
+        recent = self.challenge_votes[-n:]
+        if len(recent) < n or max(recent) - min(recent) > AEC_LAG_SPREAD_SECONDS:
+            return None
+        return self._median(recent)
+
+    def relock(self, lag_seconds):
+        """[B108] Adopt a challenged lag without forgetting it was contested."""
+        self.votes = list(self.challenge_votes[-max(1, AEC_LAG_CONFIRMATIONS):])
+        self.locked_lag_seconds = float(lag_seconds)
+        self.challenge_votes = []
+        self.relocks += 1
+        self.last_reason = "relocked"
+
+    def reject_lock(self):
+        """[B108] A lock that never proved itself is wrong: exclude it."""
+        if self.locked_lag_seconds is None:
+            return None
+        lag = self.locked_lag_seconds
+        self.rejected_lags = (self.rejected_lags + [lag])[-AEC_LAG_REJECT_MEMORY:]
+        self.locked_lag_seconds = None
+        self.votes = []
+        self.challenge_votes = []
+        self.rejections += 1
+        self.last_reason = "lock-rejected"
+        return lag
 
     def estimate(self, mic_pcm, ref_pcm):
-        """The best lag in seconds for one frame, or None (no usable vote).
+        """[B105] Fit bounded joint evidence; return an accepted new vote.
 
-        *ref_pcm* must be at least as long as the mic window; anything
-        beyond it widens the searchable lag range.
+        *mic_pcm* is one capture frame; the last
+        :data:`AEC_LAG_WINDOW_SECONDS` of mic audio (this frame included)
+        is correlated against *ref_pcm*, whose tail may extend
+        :data:`AEC_MAX_LAG_SECONDS` beyond the window. Returns the lag in
+        seconds when this call cast a vote, else None. Diagnostics
+        (``last_correlation``, ``last_candidate_seconds``,
+        ``last_search_seconds``, ``last_reason``) are updated on EVERY
+        call, including while locked, so telemetry can tell a cold window
+        apart from a decorrelated one.
         """
-        if self.locked or self.max_lag_seconds <= 0.0:
-            return None
-        if not mic_pcm or not ref_pcm:
-            return None
         import numpy as np
 
-        def as_float(data):
-            usable = (len(data) // 2) * 2
-            return np.frombuffer(data[:usable], dtype="<i2").astype(np.float64)
+        self.last_correlation = None
+        self.last_candidate_seconds = None
+        self.last_search_seconds = 0.0
 
-        mic = as_float(mic_pcm)
-        ref = as_float(ref_pcm)
-        mic_size = mic.size
-        if mic_size == 0 or ref.size <= mic_size:
+        if not mic_pcm or not ref_pcm:
+            self.clear_window()
+            self.last_reason = "no-reference-or-mic"
             return None
+        if self.max_lag_seconds <= 0.0:
+            self.last_reason = "search-disabled"
+            return None
+
+        mic_pcm = bytes(mic_pcm[:(len(mic_pcm) // 2) * 2])
+        ref_pcm = bytes(ref_pcm[:(len(ref_pcm) // 2) * 2])
+        frame_samples = len(mic_pcm) // 2
+        if frame_samples == 0:
+            self.last_reason = "empty-mic"
+            return None
+
+        window_samples = max(frame_samples, self._window_samples)
+        self._mic_history = (
+            self._mic_history + mic_pcm
+        )[-window_samples * 2:]
+        self._samples_since_vote += frame_samples
+
+        if len(self._mic_history) < window_samples * 2:
+            self.last_reason = "collecting-window"
+            return None
+
+        mic = np.frombuffer(self._mic_history, dtype="<i2").astype(np.float64)
+        ref = np.frombuffer(ref_pcm, dtype="<i2").astype(np.float64)
+        if ref.size < mic.size:
+            self.last_reason = "reference-too-short"
+            return None
+
+        max_lag_samples = int(round(self.max_lag_seconds * AEC_SAMPLE_RATE))
+        # Never search outside the configured range, even if a larger span
+        # arrived.
+        ref = ref[-(mic.size + max_lag_samples):]
+        self.last_search_seconds = (ref.size - mic.size) / float(
+            AEC_SAMPLE_RATE)
+
+        mic = mic - mic.mean()
         mic_energy = float(np.dot(mic, mic))
-        if mic_energy <= 0.0:
+        if mic_energy <= 1e-9:
+            self.last_reason = "quiet-mic"
             return None
-        # dots[i] = <mic, ref[i:i+mic_size]>; the window at position i ends at
-        # ref index i + mic_size - 1, so the lag it represents is
-        # (ref.size - mic_size - i) samples, i in [0, ref.size - mic_size].
-        dots = np.correlate(ref, mic, mode="valid")
-        positions = dots.size
-        if positions <= 0:
-            return None
-        squared = np.square(ref)
-        cumulative = np.concatenate(([0.0], np.cumsum(squared)))
-        starts = np.arange(positions)
-        ref_energies = (cumulative[starts + mic_size] - cumulative[starts])
-        correlations = np.zeros(positions)
-        usable = ref_energies > (mic_energy * 1e-6)
-        correlations[usable] = np.abs(dots[usable]) / np.sqrt(
-            mic_energy * ref_energies[usable])
+
+        # FFT convolution computes the same valid cross-correlation
+        # without a growing O(window * search_range) capture-loop cost.
+        fft_size = 1 << int(mic.size + ref.size - 2).bit_length()
+        convolution = np.fft.irfft(
+            np.fft.rfft(ref, n=fft_size)
+            * np.fft.rfft(mic[::-1], n=fft_size),
+            n=fft_size,
+        )
+        dots = convolution[mic.size - 1:ref.size]
+
+        sums = np.concatenate(([0.0], np.cumsum(ref)))
+        squares = np.concatenate(([0.0], np.cumsum(ref * ref)))
+        starts = np.arange(dots.size)
+        window_sums = sums[starts + mic.size] - sums[starts]
+        ref_energy = (
+            squares[starts + mic.size]
+            - squares[starts]
+            - window_sums * window_sums / mic.size
+        )
+        ref_energy = np.maximum(ref_energy, 0.0)
+        usable = ref_energy > mic_energy * 1e-6
+        correlations = np.zeros(dots.size)
+        correlations[usable] = (
+            np.abs(dots[usable])
+            / np.sqrt(mic_energy * ref_energy[usable])
+        )
+        correlations = np.clip(correlations, 0.0, 1.0)
+
+        # [B108] Lags this session proved WRONG are excluded, so a
+        # re-estimate can never land on the same false peak again.
+        lags = (dots.size - 1 - np.arange(dots.size)) / float(AEC_SAMPLE_RATE)
+        for rejected in self.rejected_lags:
+            correlations[np.abs(lags - rejected) <= AEC_LAG_SPREAD_SECONDS] = 0.0
+
         best = int(np.argmax(correlations))
-        if correlations[best] < self.min_correlation:
+        correlation = float(correlations[best])
+        lag_seconds = float(lags[best])
+        self.last_correlation = correlation
+        self.last_candidate_seconds = lag_seconds
+        # [B108] Peak sharpness: a flatter correlation landscape is a
+        # weaker timing opinion even when its absolute peak clears the bar.
+        far = np.abs(lags - lag_seconds) > AEC_LAG_SPREAD_SECONDS
+        if np.any(far):
+            runner = int(np.argmax(np.where(far, correlations, -1.0)))
+            runner_corr = float(correlations[runner])
+            self.last_runner_up_seconds = float(lags[runner])
+            self.last_peak_sharpness = (correlation / runner_corr
+                                        if runner_corr > 1e-9 else None)
+
+        if self.locked:
+            # [B108] A lock no longer ends measurement: independent,
+            # correlated evidence for a DIFFERENT lag is recorded as a
+            # challenge (the canceller decides whether to relock).
+            self._note_locked_evidence(correlation, lag_seconds, mic.size)
             return None
-        lag_seconds = (positions - 1 - best) / float(AEC_SAMPLE_RATE)
+        if correlation < self.min_correlation:
+            self.last_reason = "below-correlation-threshold"
+            return None
+        if self._samples_since_vote < mic.size:
+            self.last_reason = "waiting-for-independent-window"
+            return None
+
+        self._samples_since_vote = 0
         self.votes.append(lag_seconds)
-        if len(self.votes) > 24:
-            self.votes.pop(0)
-        if len(self.votes) >= max(1, AEC_LAG_CONFIRMATIONS):
-            spread = max(self.votes) - min(self.votes)
-            if spread <= AEC_LAG_SPREAD_SECONDS:
-                ordered = sorted(self.votes)
-                middle = len(ordered) // 2
-                self.locked_lag_seconds = (
-                    ordered[middle] if len(ordered) % 2
-                    else (ordered[middle - 1] + ordered[middle]) / 2.0)
+        self.votes = self.votes[-24:]
+
+        confirmations = max(1, AEC_LAG_CONFIRMATIONS)
+        recent = self.votes[-confirmations:]
+        if (
+            len(recent) == confirmations
+            and max(recent) - min(recent) <= AEC_LAG_SPREAD_SECONDS
+        ):
+            self.locked_lag_seconds = self._median(recent)
+            self.last_reason = "locked"
+        else:
+            self.last_reason = "accepted-vote"
+
         return lag_seconds
 
 
@@ -475,13 +764,452 @@ class ReferenceEchoGate:
         return True, np.clip(residual, -32768, 32767).astype(np.int16).tobytes(), metrics
 
 
+class FrequencyDomainEchoCanceller(EchoCanceller):
+    """[LF35] Real in-house echo canceller: a block frequency-domain
+    adaptive filter.
+
+    The standard block FDAF shape, in numpy, no third-party model:
+
+    * per frequency bin, the transfer H mapping the rendered reference to
+      the mic is estimated as Y/X and smoothed over frames (adaptation);
+    * the speaker->mic delay is measured FIRST (the same cross-correlation
+      lock the degraded gate uses): an unaligned mic/reference pair is
+      edge-limited to a few dB no matter how good the estimator is, so H
+      is estimated against the lag-ALIGNED reference window, where the
+      per-bin relation is exact for a linear echo path; if the delay never
+      locks on heavily distorted hardware, the mic passes through
+      honestly and the listener's other LF35 layers carry the protection;
+    * the estimated echo (H*X, back in time domain) is subtracted; the
+      residual is what the user actually contributed, so genuine
+      double-talk survives (that is what makes barge-in keep working on
+      speakers);
+    * adaptation FREEZES while the residual is loud AND uncorrelated with
+      the echo estimate (a human speaking over playback), so the user's
+      voice is never "adapted away". A path CHANGE leaves the residual
+      echo-correlated, so adaptation continues through it.
+
+    ``last_suppressed`` (per cancel() call) says the window was essentially
+    entirely our own playback: subtraction removed at least
+    :data:`FDAF_SUPPRESS_DB` of energy. The signal path turns that into
+    ``CaptureFrame.suppressed``, which the listener must never commit as
+    user speech or let fire a barge-in.
+    """
+
+    name = "fdaf"
+    degraded = False
+    #: Wants the reference span covering window + lag range: the extra
+    #: history feeds the internal delay estimator and keeps the reference
+    #: tail long enough to slice lag-aligned windows from it.
+    wants_full_reference = True
+    reports_suppression = True
+
+    def __init__(self, adapt=FDAF_ADAPT, freeze_ratio=FDAF_FREEZE_RATIO,
+                 suppress_db=FDAF_SUPPRESS_DB, gain_max=FDAF_GAIN_MAX,
+                 transform_size=FDAF_TRANSFORM_SIZE,
+                 warmup_frames=FDAF_WARMUP_FRAMES,
+                 max_lag_seconds=AEC_MAX_LAG_SECONDS):
+        self.adapt = float(adapt)
+        self.freeze_ratio = float(freeze_ratio)
+        self.suppress_db = float(suppress_db)
+        self.gain_max = float(gain_max)
+        self.transform_size = int(transform_size)
+        self.warmup_frames = max(0, int(warmup_frames))
+        #: The speaker->mic delay, measured not absorbed (see the class
+        #: docstring: alignment first, estimate second).
+        self._lag = DelayEstimator(max_lag_seconds=max_lag_seconds)
+        self._h = None
+        #: Frames of unconditional adaptation left (cold start / after a
+        #: watchdog reset). See FDAF_WARMUP_FRAMES.
+        self._warmup_left = 0
+        #: Freeze hold-off after double-talk: once the user's voice is in
+        #: the estimation window, every per-frame Y/X estimate is polluted
+        #: until the window has rolled past it, so adaptation stays frozen
+        #: for one window-length after the double-talk ends.
+        self._dt_holdoff = 0
+        #: Consecutive frames where H explained almost nothing.
+        self._low_erle_streak = 0
+        #: Rolling signal history (float samples). The mic tail holds one
+        #: transform window; the reference tail holds window + lag range so
+        #: a lag-aligned window can be sliced out of it. Tails advance by
+        #: exactly the frame length per call - one shared timeline.
+        self._mic_tail = None
+        self._ref_tail = None
+        self._ref_capacity = int(transform_size +
+                                 max_lag_seconds * AEC_SAMPLE_RATE)
+        self.last_suppressed = False
+        self.last_erle_db = None
+        #: [B108] ERLE of the estimate from BEFORE this frame's update.
+        #: This is the only honest "did our playback cancel?" number: the
+        #: a-posteriori residual contains the frame's own Y/X fit.
+        self.last_erle_prior_db = None
+        #: [B108] Lock proof / relearn / reject state.
+        self._lock_frames = 0
+        self._lock_proven = False
+        self._lock_relearns = 0
+        self._recent_erle = deque(maxlen=FDAF_RELOCK_ERLE_FRAMES)
+        #: [B113] Monotonic id of the current H estimate. It bumps on EVERY
+        #: H drop (reset, watchdog reset, relearn, relock, lock rejection), so
+        #: the listener can invalidate proof granted by a dead estimate.
+        self._path_generation = 0
+        self.metrics = {"frames": 0, "adapted": 0, "frozen": 0,
+                        "suppressed": 0, "resets": 0, "lag_locked": False,
+                        "lag_seconds": None, "last_erle_db": None,
+                        "lag_best_correlation": None,
+                        "lag_candidate_seconds": None,
+                        "lag_votes": 0,
+                        "lag_search_seconds": 0.0,
+                        "lag_reason": "not-estimated",
+                        "lock_proven": False, "lock_frames": 0,
+                        "relearns": 0, "relocks": 0,
+                        "lock_rejections": 0, "last_erle_prior_db": None,
+                        "lag_challenge_votes": 0, "lag_rejected": [],
+                        "lag_peak_sharpness": None,
+                        "path_generation": 0}
+
+    @property
+    def path_generation(self):
+        """[B113] Monotonic id of the current H estimate (bumps on drop)."""
+        return self._path_generation
+
+    def reset(self, keep_rejections=False):
+        """Drop the delay estimate, the path estimate and the signal
+        history (a long silence may mean a device or volume change moved
+        the acoustic path)."""
+        self._lag.reset(keep_rejections=keep_rejections)
+        self._h = None
+        self._mic_tail = None
+        self._ref_tail = None
+        self._warmup_left = 0
+        self._dt_holdoff = 0
+        self._low_erle_streak = 0
+        # [B108] A reset drops the lock proof and all lock-health counters'
+        # per-lock state; cumulative counters (resets/relearns/relocks/
+        # rejections) are deliberately kept.
+        self._drop_estimate()
+        self.last_erle_prior_db = None
+        self.metrics["resets"] += 1
+        # [B103] A reset drops the lag lock and the ERLE history: exported
+        # telemetry must never report a stale delay lock after it.
+        # [B105] The lag diagnostics go with it - no stale correlation
+        # peak, candidate or vote count survives reset.
+        self.metrics["lag_locked"] = False
+        self.metrics["lag_seconds"] = None
+        self.metrics["last_erle_db"] = None
+        self.metrics["last_erle_prior_db"] = None
+        self.last_suppressed = False
+        self.last_erle_db = None
+        self.metrics.update({
+            "lag_best_correlation": None,
+            "lag_candidate_seconds": None,
+            "lag_votes": 0,
+            "lag_search_seconds": 0.0,
+            "lag_reason": "reset",
+            "lag_challenge_votes": 0,
+            "lag_rejected": [],
+            "lag_peak_sharpness": None,
+        })
+
+    def _advance_tail(self, tail, samples, capacity):
+        import numpy as np
+
+        if samples.size:
+            tail = samples if tail is None else np.concatenate((tail, samples))
+        if tail is not None and tail.size > capacity:
+            tail = tail[tail.size - capacity:]
+        return tail
+
+    def _clip_gain(self, h):
+        import numpy as np
+
+        mag = np.abs(h)
+        over = mag > self.gain_max
+        if np.any(over):
+            h = np.where(over, h * (self.gain_max / np.maximum(mag, 1e-12)),
+                         h)
+        return h
+
+    def _window_from(self, tail, back_samples=0):
+        """Last ``transform_size`` samples of *tail*, ending *back_samples*
+        before the tail's end (the lag alignment), zero-padded at the
+        front when the history is still short."""
+        import numpy as np
+
+        m = self.transform_size
+        win = np.zeros(m)
+        if tail is None or not tail.size:
+            return win
+        end = tail.size - int(back_samples)
+        if end <= 0:
+            return win
+        take = min(m, end)
+        win[m - take:] = tail[end - take:end]
+        return win
+
+    # ── [B108] lock health ─────────────────────────────────────────────
+
+    def _drop_estimate(self, keep_relearns=False):
+        """Re-learn H from scratch on the current lock (or a new one)."""
+        # [B113] Every H drop (reset, watchdog reset, relearn, relock, lock
+        # rejection) starts a new estimate: listeners must re-prove trust.
+        self._path_generation += 1
+        self.metrics["path_generation"] = self._path_generation
+        self._h = None
+        self._warmup_left = 0
+        self._dt_holdoff = 0
+        self._low_erle_streak = 0
+        self._lock_frames = 0
+        self._lock_proven = False
+        if not keep_relearns:
+            self._lock_relearns = 0
+        self._recent_erle.clear()
+        self.metrics["lock_proven"] = False
+        self.metrics["lock_frames"] = 0
+
+    def _sync_lag_metrics(self):
+        s = self._lag.state()
+        self.metrics.update({
+            "lag_locked": s["locked"], "lag_seconds": s["locked_seconds"],
+            "lag_best_correlation": s["best_correlation"],
+            "lag_candidate_seconds": s["candidate_seconds"],
+            "lag_votes": s["votes"], "lag_search_seconds": s["search_seconds"],
+            "lag_reason": s["reason"],
+            "lag_challenge_votes": len(s["challenge_votes"]),
+            "lag_rejected": [round(x, 3) for x in s["rejected_lags"]],
+            "lag_peak_sharpness": s["peak_sharpness"],
+        })
+
+    def _erle_recently_low(self):
+        if len(self._recent_erle) < 5:
+            return False
+        ordered = sorted(self._recent_erle)
+        return ordered[len(ordered) // 2] < FDAF_LOW_ERLE_DB
+
+    def _note_lock_evidence(self, erle_prior, did_adapt):
+        """[B108] Lock proof + watchdog, on a-priori ERLE only.
+
+        A lock that never cancels anything must not survive: after
+        :data:`FDAF_LOCK_PROOF_FRAMES` locked frames without one honest
+        proof, H is re-learned once (the estimate may simply be wrong);
+        if it still never proves, the LAG is wrong and is rejected.
+        Frames are counted whether or not adaptation happened, so an
+        estimate frozen on every frame can no longer escape the watchdog.
+        """
+        if erle_prior is None:
+            return
+        self._recent_erle.append(erle_prior)
+        self._lock_frames += 1
+        if erle_prior >= FDAF_LOCK_PROOF_DB:
+            self._lock_proven = True
+        self.metrics["lock_proven"] = self._lock_proven
+        self.metrics["lock_frames"] = self._lock_frames
+        if not self._lock_proven:
+            if self._lock_frames >= FDAF_LOCK_PROOF_FRAMES:
+                if self._lock_relearns == 0:
+                    # 1st: the estimate may have converged on the wrong
+                    # window. Re-learn H on the same lock first.
+                    self._lock_relearns = 1
+                    self.metrics["relearns"] += 1
+                    self._drop_estimate(keep_relearns=True)
+                else:
+                    # 2nd: H was given a fair chance and still cancels
+                    # nothing, so the LAG itself is wrong.
+                    self._lag.reject_lock()
+                    self.metrics["lock_rejections"] += 1
+                    self._drop_estimate()
+                self._sync_lag_metrics()
+            return
+        if erle_prior >= FDAF_LOW_ERLE_DB:
+            self._low_erle_streak = 0
+        elif did_adapt:
+            self._low_erle_streak += 1
+        if self._low_erle_streak >= FDAF_LOW_ERLE_STREAK:
+            # The gate keeps the rejection memory: a reset drops H, not
+            # the knowledge that a particular lag was already proved bad.
+            self.reset(keep_rejections=True)
+
+    def cancel(self, mic_pcm, ref_pcm):
+        self.last_suppressed = False
+        self.last_erle_db = None
+        self.last_erle_prior_db = None
+        # Never let a previous frame's prior ERLE describe an early return
+        # (silence, no reference, unlocked) in telemetry.
+        self.metrics["last_erle_prior_db"] = None
+        if not mic_pcm:
+            return mic_pcm
+
+        import numpy as np
+
+        def as_float(data):
+            usable = (len(data) // 2) * 2
+            return np.frombuffer(data[:usable], dtype="<i2").astype(np.float64)
+
+        mic = as_float(mic_pcm)
+        n = mic.size
+        m = self.transform_size
+        if n == 0 or m <= n:
+            # Degenerate window (no lag room): pass through, never suppress.
+            return mic_pcm
+
+        # Advance the shared timeline FIRST: even a silent or reference-free
+        # frame moves both tails, so the windows stay time-aligned.
+        ref = as_float(ref_pcm) if ref_pcm else np.zeros(0)
+        self._mic_tail = self._advance_tail(self._mic_tail, mic, m)
+        # Only the FRESHEST n samples of the span join the reference tail -
+        # consecutive spans overlap by the lag range, and appending the
+        # whole span would duplicate history.
+        fresh_ref = np.zeros(n)
+        take = min(n, ref.size)
+        if take:
+            fresh_ref[n - take:] = ref[ref.size - take:]
+        self._ref_tail = self._advance_tail(self._ref_tail, fresh_ref,
+                                            self._ref_capacity)
+
+        mic_energy = float(np.dot(mic, mic))
+        mic_rms = math.sqrt(mic_energy / n)
+        if mic_rms < 3.0:
+            # Digital silence: certainly not the user; nothing to subtract.
+            self.metrics["frames"] += 1
+            self.metrics["suppressed"] += 1
+            self.last_suppressed = True
+            return mic_pcm
+        if ref.size <= n:
+            # No overlapping playback: pass the mic through untouched and
+            # KEEP the path estimate - the acoustic path outlives a gap.
+            # [B105] The joint lag window does NOT survive the gap: its
+            # evidence must never concatenate across reference-free audio.
+            self._lag.clear_window()
+            self.metrics["frames"] += 1
+            return mic_pcm
+
+        # The speaker->mic delay must be known before H can be estimated.
+        # Until the cross-correlation lock agrees, pass through honestly.
+        # [B105] Estimation runs on EVERY reference-bearing frame: after
+        # the lock it only updates diagnostics (correlation peak, candidate
+        # lag, searched range, reason) so telemetry can tell a cold window
+        # apart from a genuinely decorrelated path.
+        self._lag.estimate(mic_pcm, ref_pcm)
+        # [B108] A locked lag that consistently disagrees with the measured
+        # correlation peak WHILE H removes nothing is the wrong lag: relock.
+        if self._lag.locked and self._erle_recently_low():
+            challenger = self._lag.challenger()
+            if challenger is not None:
+                self._lag.relock(challenger)
+                self._drop_estimate()
+                self.metrics["relocks"] += 1
+        self._sync_lag_metrics()
+        if not self._lag.locked:
+            self.metrics["frames"] += 1
+            self.metrics["last_erle_db"] = None
+            return mic_pcm
+
+        lag_samples = int(self._lag.locked_lag_seconds * AEC_SAMPLE_RATE)
+
+        mic_win = self._window_from(self._mic_tail)
+        ref_win = self._window_from(self._ref_tail,
+                                    back_samples=lag_samples)
+
+        x = np.fft.rfft(ref_win)
+        y = np.fft.rfft(mic_win)
+        x_mag = np.abs(x)
+        x_energy = float(np.dot(x_mag, x_mag))
+        if x_energy <= 0.0:
+            self.metrics["frames"] += 1
+            return mic_pcm
+
+        floor = FDAF_REF_MAG_FLOOR * math.sqrt(x_energy / x_mag.size)
+        usable = x_mag > floor
+        h_new = np.zeros_like(x)
+        h_new[usable] = y[usable] / x[usable]
+        h_new = self._clip_gain(h_new)
+
+        def residual_with(h):
+            e = np.fft.irfft(h * x, n=m)[m - n:]
+            return mic - e, e
+
+        # [B108] ERLE of the estimate from BEFORE this frame's update. The
+        # a-posteriori number below includes this frame's own Y/X fit, which
+        # is exactly what must never decide "our own playback".
+        erle_prior = None
+        if self._h is None:
+            self._h = h_new
+            self._warmup_left = self.warmup_frames
+            self.metrics["adapted"] += 1
+            did_adapt = True
+        else:
+            residual, echo = residual_with(self._h)
+            res_energy = float(np.dot(residual, residual))
+            echo_energy = float(np.dot(echo, echo))
+            ratio = res_energy / mic_energy
+            erle_prior = 10.0 * math.log10(1.0 / max(ratio, 1e-12))
+            if res_energy > 0.0 and echo_energy > 0.0:
+                corr = (abs(float(np.dot(residual, echo))) /
+                        math.sqrt(res_energy * echo_energy))
+            else:
+                corr = 0.0
+            # Adaptation is allowed while warming up (a cold start must not
+            # deadlock behind the double-talk freeze), when the residual is
+            # quiet (pure echo, nothing to protect), or when the residual is
+            # still echo-CORRELATED (a path change, not a human voice).
+            adapt = (self._warmup_left > 0 or
+                     ratio <= self.freeze_ratio or corr >= 0.5)
+            if self._warmup_left > 0:
+                self._warmup_left -= 1
+            if not adapt:
+                # Fresh double-talk: hold the freeze for one window-length
+                # AFTER it ends - the estimation window still contains the
+                # user's voice until it has rolled past, and adapting on a
+                # polluted window re-learns their voice into H.
+                self._dt_holdoff = -(-m // n)
+            elif self._dt_holdoff > 0:
+                self._dt_holdoff -= 1
+                adapt = False
+            if adapt:
+                blended = self._h.copy()
+                blended[usable] = (self.adapt * self._h[usable] +
+                                   (1.0 - self.adapt) * h_new[usable])
+                self._h = self._clip_gain(blended)
+                self.metrics["adapted"] += 1
+                did_adapt = True
+            else:
+                self.metrics["frozen"] += 1
+                did_adapt = False
+
+        residual, _echo = residual_with(self._h)
+        res_energy = float(np.dot(residual, residual))
+        erle = 10.0 * math.log10(mic_energy / max(res_energy, 1e-9))
+        self.last_erle_db = erle
+        self.last_erle_prior_db = erle_prior
+        self.metrics["last_erle_db"] = round(erle, 1)
+        self.metrics["last_erle_prior_db"] = (None if erle_prior is None
+                                              else round(erle_prior, 1))
+        # [B108] "Our own playback" must be PREDICTED cancellation: the
+        # a-posteriori residual includes this frame's own Y/X fit, which
+        # cancels ANY mic content (on the first locked frame, exactly) -
+        # including a user's voice.
+        self.last_suppressed = (erle_prior is not None and
+                                min(erle, erle_prior) >= self.suppress_db)
+        self.metrics["frames"] += 1
+        if self.last_suppressed:
+            self.metrics["suppressed"] += 1
+        self._note_lock_evidence(erle_prior, did_adapt)
+        out = np.clip(residual, -32768, 32767).astype(np.int16)
+        return out.tobytes()
+
+
 def build_canceller():
     """Select the best AEC implementation available at runtime."""
     if AEC_ENABLED and _import_webrtcaec3() is not None:
         try:
             return WebRtcAec3Canceller()
         except Exception as exc:
-            print(f"[AEC] webrtcaec3 init failed ({exc}) - no-op path")
+            print(f"[AEC] webrtcaec3 init failed ({exc}) - trying fdaf")
+    if AEC_ENABLED:
+        # [LF35] The in-house canceller: py-webrtc-aec3 is not installable,
+        # so this is the path every real session takes.
+        try:
+            return FrequencyDomainEchoCanceller()
+        except Exception as exc:
+            print(f"[AEC] fdaf init failed ({exc}) - no-op path")
     return NoOpEchoCanceller()
 
 
@@ -859,6 +1587,9 @@ class ReferencePcmBuffer:
         self._last_feed_ts = 0.0
         self._last_t_end = 0.0
         self._resample_failures = 0
+        #: [B108] How far ahead of wall-clock the last chunk was stamped
+        #: (the device's reported output latency). Telemetry only.
+        self._last_lead_seconds = 0.0
 
     # ── feeding ────────────────────────────────────────────────────────
     def feed(self, pcm_bytes, sample_rate=None, sample_width=None, t_end=None,
@@ -879,6 +1610,7 @@ class ReferencePcmBuffer:
         if not resampled:
             return 0
         now = time.monotonic() if t_end is None else float(t_end)
+        self._last_lead_seconds = max(0.0, now - time.monotonic())
         with self._lock:
             self._chunks.append((now, resampled))
             self._total_feeds += 1
@@ -992,6 +1724,7 @@ class ReferencePcmBuffer:
                 "last_feed_ts": self._last_feed_ts,
                 "last_t_end": self._last_t_end,
                 "resample_failures": self._resample_failures,
+                "lead_seconds": round(self._last_lead_seconds, 3),
                 "age_seconds": (max(0.0, time.monotonic() - self._chunks[-1][0])
                                 if self._chunks else None),
             }
@@ -1066,6 +1799,9 @@ class AecSignalPath:
         self._gate_history = deque(maxlen=max(0, AEC_GATE_HISTORY_FRAMES - 1))
         self.stats["lag_estimates"] = 0
         self.stats["lag_locked_seconds"] = None
+        #: [LF35] Monotonic time the last frame with overlapping playback was
+        #: seen; fdaf resets its path estimate only after a long silence.
+        self._last_had_reference_at = None
 
     # ── reference side ─────────────────────────────────────────────────
     def feed_reference(self, pcm_bytes, sample_rate=None, sample_width=None,
@@ -1096,6 +1832,12 @@ class AecSignalPath:
 
         Returns an opaque token; pass it to :meth:`frame_id`.
         """
+        # [B105] New capture, fresh joint evidence: the lag windows never
+        # carry audio across a capture boundary (a proven lock and the
+        # fitted H do survive - the acoustic path outlives short gaps).
+        self._lag_estimator.clear_window()
+        if isinstance(self.canceller, FrequencyDomainEchoCanceller):
+            self.canceller._lag.clear_window()
         with self._frame_lock:
             self._frame_cache.clear()
             self._frame_order.clear()
@@ -1156,22 +1898,27 @@ class AecSignalPath:
         ``cancelled_capture_frame`` is the richer variant: it also reports
         whether the window was identified as our own playback.
         """
-        pcm, had_reference, _suppressed, _rate = self.cancelled_capture_frame(
+        frame = self.cancelled_capture_frame(
             mic_pcm, duration_bytes=duration_bytes, mic_t_end=mic_t_end,
             frame_id=frame_id, sample_rate=sample_rate,
             sample_width=sample_width, duration_seconds=duration_seconds)
-        return pcm, had_reference
+        return frame.pcm, frame.had_reference
 
     def cancelled_capture_frame(self, mic_pcm, duration_bytes=None,
                                 mic_t_end=None, frame_id=None,
                                 sample_rate=None, sample_width=None,
                                 duration_seconds=None):
-        """Return ``CaptureFrame(pcm, had_reference, suppressed, sample_rate)``.
+        """Return ``CaptureFrame(pcm, had_reference, suppressed, rate, gen)``.
 
         *suppressed* True means this window was recognised as the assistant's
         own playback (see ``ReferenceEchoGate``) and *pcm* is the residual the
         user actually contributed - which is near-silence for assistant-only
         audio. Callers must not let a suppressed frame become user speech.
+
+        [B113] *generation* is the canceller's path generation. A replayed
+        (cached) frame keeps the generation it was produced with; a fresh
+        frame is stamped AFTER the cancellation call, so the frame on which
+        H was dropped already carries the new number.
 
         [P0-13] *frame_id* must identify a frame uniquely for the WHOLE process,
         not just within one capture: a bare index restarts at 0 on every capture
@@ -1191,7 +1938,8 @@ class AecSignalPath:
         pcm, had_reference, suppressed = self._cancel_once(
             mic_pcm, duration_bytes, mic_t_end, sample_rate, sample_width,
             duration_seconds)
-        result = CaptureFrame(pcm, had_reference, suppressed, AEC_SAMPLE_RATE)
+        result = CaptureFrame(pcm, had_reference, suppressed, AEC_SAMPLE_RATE,
+                              getattr(self.canceller, "path_generation", None))
         if frame_id is not None:
             with self._frame_lock:
                 self._frame_cache[frame_id] = result
@@ -1214,18 +1962,36 @@ class AecSignalPath:
                 duration_seconds = duration_bytes / float(
                     AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
         want = int(duration_seconds * AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
-        # [S28] The lag-corrected reference end: the sound left the speaker
-        # this much after the reference timeline says it did, so the span the
-        # mic actually heard ended EARLIER on the reference clock. Until the
-        # estimate locks, the degraded path fetches a span long enough to
-        # search the whole lag range by cross-correlation.
-        lag = self._lag_estimator.locked_lag_seconds or 0.0
+        # [B105] The active estimator owns the search range: fdaf measures
+        # its own delay inside the canceller and absorbs it in H, so the
+        # spans it needs come from ITS estimator (a larger AEC_MAX_LAG on
+        # the canceller must widen the fetched span, not silently keep the
+        # unrelated degraded-path default).
+        full_reference = bool(getattr(self.canceller, "wants_full_reference",
+                                      False))
+        active_estimator = (
+            self.canceller._lag
+            if full_reference and isinstance(
+                self.canceller, FrequencyDomainEchoCanceller)
+            else self._lag_estimator
+        )
+        # [S28] Until the estimate locks, the degraded path fetches a span
+        # long enough to search the whole lag range by cross-correlation.
         estimating = (getattr(self.canceller, "degraded", False)
                       and not self._lag_estimator.locked
                       and self._lag_estimator.max_lag_seconds > 0.0)
-        lag_bytes = (int(self._lag_estimator.max_lag_seconds *
-                         AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
-                     if estimating else 0)
+        # [B105] FDAF performs its own alignment; never apply its lag a
+        # second time here.
+        lag = (0.0 if full_reference
+               else self._lag_estimator.locked_lag_seconds or 0.0)
+        # The joint lag window needs one extra window-length of reference
+        # on top of the search range so the oldest window the estimator
+        # correlates still has its overlap inside the span.
+        extra_seconds = 0.0
+        if estimating or full_reference:
+            extra_seconds = (active_estimator.max_lag_seconds
+                             + active_estimator.window_seconds)
+        lag_bytes = int(extra_seconds * AEC_SAMPLE_RATE * AEC_SAMPLE_WIDTH)
         fetch_t_end = (mic_t_end - lag) if mic_t_end is not None else None
         ref_pcm = self.reference.aligned_reference(
             want + lag_bytes, mic_t_end=fetch_t_end)
@@ -1237,8 +2003,7 @@ class AecSignalPath:
         if self.transport is not None and (not ref_pcm or
                                            (local_age or 0.0) > 0.25):
             remote, remote_age = self.transport.fetch_reference(
-                duration_seconds + (self._lag_estimator.max_lag_seconds
-                                    if estimating else 0.0),
+                duration_seconds + extra_seconds,
                 mic_t_end=fetch_t_end)
             if remote and (remote_age is None or
                            remote_age <= REFERENCE_MAX_DRIFT_SECONDS):
@@ -1250,6 +2015,9 @@ class AecSignalPath:
         had_reference = bool(ref_pcm)
         if had_reference:
             self.stats["had_reference"] += 1
+            # [LF35] When the last overlapping playback was seen (fdaf path
+            # resets its estimate only after a long silence).
+            self._last_had_reference_at = time.monotonic()
         sources = self.stats.setdefault("reference_sources",
                                         {"local": 0, "remote": 0, "none": 0})
         sources[source] = sources.get(source, 0) + 1
@@ -1294,10 +2062,35 @@ class AecSignalPath:
                 return residual, True, True
             filtered = self.canceller.cancel(mic_16k, ref_frame)
             return filtered, True, False
+        if had_reference and getattr(self.canceller, "reports_suppression",
+                                     False):
+            # [LF35] fdaf: subtract the estimated echo over the FULL
+            # lag-covering span (the delay lives inside H) and take the
+            # frame-level echo verdict from the canceller itself. A window
+            # where subtraction removed >= FDAF_SUPPRESS_DB is our own
+            # playback, never user speech.
+            ref_for_cancel = (ref_pcm if full_reference else ref_frame)
+            filtered = self.canceller.cancel(mic_16k, ref_for_cancel)
+            suppressed = bool(getattr(self.canceller, "last_suppressed",
+                                      False))
+            if suppressed:
+                self.stats["echo_suppressed"] += 1
+            return filtered, True, suppressed
         if not had_reference:
             # A playback gap invalidates the joint window; the next reference
             # span must build a fresh history.
             self._gate_history.clear()
+            # [LF35] fdaf keeps its path estimate across short gaps (the
+            # acoustic path outlives them), but a LONG silence after real
+            # playback may mean a device or volume change - rebuild the
+            # estimate from scratch.
+            last_at = self._last_had_reference_at
+            if (last_at is not None and
+                    time.monotonic() - last_at > FDAF_RESET_AFTER_SECONDS):
+                reset = getattr(self.canceller, "reset", None)
+                if callable(reset):
+                    reset()
+                    self._last_had_reference_at = None
         filtered = self.canceller.cancel(mic_16k, ref_pcm)
         return filtered, had_reference, suppressed
 
@@ -1321,6 +2114,17 @@ class AecSignalPath:
         if age is not None and age > REFERENCE_MAX_DRIFT_SECONDS:
             reason = (reason + "; " if reason else "") + \
                 "reference is stale (%.1fs old)" % age
+        # [B105] Telemetry must show the estimator that actually decides
+        # this path (fdaf measures its own delay inside the canceller), not
+        # the unused degraded-path one - the live misses were invisible
+        # because state() reported the wrong locks and votes.
+        if isinstance(self.canceller, FrequencyDomainEchoCanceller):
+            lag_snapshot = self.canceller._lag.state()
+            lag_snapshot["source"] = "fdaf"
+        else:
+            lag_snapshot = self._lag_estimator.state()
+            lag_snapshot["source"] = "signal-path"
+        lag_snapshot["gate_history_frames"] = len(self._gate_history)
         snapshot = {
             "mode": mode,
             "degraded": degraded,
@@ -1328,17 +2132,20 @@ class AecSignalPath:
             "process": self.process,
             "reference_age_seconds": age,
             "mic_sample_rate": self.mic_sample_rate,
+            # [LF35] The canceller's own counters (fdaf adaptation/ERLE), so
+            # /aec/state shows whether subtraction is actually working.
+            "canceller": {
+                "name": getattr(self.canceller, "name", "?"),
+                "metrics": dict(getattr(self.canceller, "metrics", {})
+                                or {}),
+            },
             "reference": self.reference.stats(),
             "transport": (self.transport.state()
                           if self.transport is not None else None),
             "counters": dict(self.stats),
-            # [S28] speaker-delay alignment (degraded/gate path only)
-            "lag": {
-                "locked_seconds": self._lag_estimator.locked_lag_seconds,
-                "locked": self._lag_estimator.locked,
-                "votes": len(self._lag_estimator.votes),
-                "gate_history_frames": len(self._gate_history),
-            },
+            # [B105] The active estimator's full diagnostics: correlation
+            # peak, candidate lag, searched range, votes, reason.
+            "lag": lag_snapshot,
         }
         return snapshot
 

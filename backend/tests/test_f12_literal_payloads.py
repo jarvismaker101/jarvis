@@ -108,13 +108,13 @@ class WatcherRawTranscriptTests(unittest.TestCase):
             ["C:\\Temp\\jarvis-notes.txt"]))
 
     def test_recognize_candidates_returns_raw_candidates(self):
+        # [LF36] The wake path is local-only; its raw text is what leaves it.
         with patch.object(watcher, "whisper_daemon_ok", True), \
              patch.object(watcher, "whisper_model", None), \
              patch.object(watcher, "_transcribe_with_daemon",
                           return_value=(
                               "Hey Jarvis, Patch {{step0}}.py --Dry-Run",
-                              {})), \
-             patch.object(watcher, "recognize_google_or_groq") as online:
+                              {})):
             candidates, wake_match = watcher.recognize_candidates(
                 sr.AudioData(b"\x00" * 3200, 16000, 2))
         self.assertEqual(wake_match, "Hey Jarvis, Patch {{step0}}.py --Dry-Run")
@@ -123,7 +123,6 @@ class WatcherRawTranscriptTests(unittest.TestCase):
         self.assertEqual(
             wake_engine.extract_command(wake_match, candidates),
             "Patch {{step0}}.py --Dry-Run")
-        online.assert_not_called()
 
     def test_forwarding_does_not_normalize_the_command(self):
         import json as _json

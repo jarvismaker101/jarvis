@@ -140,6 +140,11 @@ class PushApplyTests(unittest.TestCase):
         vm._task_running_checked_at = 0.0
         vm._voice_flag_last_known = True
         vm._voice_flag_checked_at = 0.0
+        # [LF36] A pushed flip is mirrored into this process's listener_state
+        # copy (that is what the worker publishes); restore the default so the
+        # mirror never leaks into another test's speech/mode expectations.
+        set_voice_input_enabled(True)
+        self.addCleanup(set_voice_input_enabled, True)
 
     def test_a_pushed_task_flip_updates_the_cache_instantly(self):
         before = self.vm._task_running_checked_at

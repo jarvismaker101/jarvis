@@ -43,10 +43,23 @@ FRAME_BYTES = FRAME_SAMPLES * WIDTH
 
 
 class DelayEstimatorTests(unittest.TestCase):
-    """Acceptance: the lag is measured, not assumed."""
+    """Acceptance: the lag is measured, not assumed.
+
+    [B105] These tests pin a one-frame evidence window so each call casts
+    one vote and the estimator's vote/lock mechanics (planted lag recovered,
+    consistent votes lock, disagreement blocks, a lock stops estimating)
+    are tested directly. The joint multi-frame DEFAULT window - the fix
+    for the live "voted below correlation on one frame, never locked"
+    failure - is covered in test_live_fix_35.py (TestB105DelayEvidence),
+    and end-to-end by LagCorrectedCancellationTests below.
+    """
+
+    def _estimator(self):
+        return echo_cancel.DelayEstimator(
+            window_seconds=FRAME_SAMPLES / RATE)
 
     def test_a_planted_lag_is_recovered(self):
-        est = echo_cancel.DelayEstimator()
+        est = self._estimator()
         ref = _arr(FRAME_SAMPLES + 1920)  # window + 120 ms of search
         lag = 1920
         mic = ref[ref.size - FRAME_SAMPLES - lag:ref.size - lag]
@@ -55,14 +68,14 @@ class DelayEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(best, lag / RATE, places=3)
 
     def test_uncorrelated_noise_casts_no_vote(self):
-        est = echo_cancel.DelayEstimator()
+        est = self._estimator()
         ref = _arr(FRAME_SAMPLES + 1920, seed=1)
         mic = _arr(FRAME_SAMPLES, seed=2)
         self.assertIsNone(est.estimate(mic.tobytes(), ref.tobytes()))
         self.assertEqual(est.votes, [])
 
     def test_lock_takes_consistent_votes(self):
-        est = echo_cancel.DelayEstimator()
+        est = self._estimator()
         ref = _arr(FRAME_SAMPLES + 1920)
         lag = 1920
         mic = ref[ref.size - FRAME_SAMPLES - lag:ref.size - lag]
@@ -74,7 +87,7 @@ class DelayEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(est.locked_lag_seconds, lag / RATE, places=3)
 
     def test_a_locked_estimator_stops_estimating(self):
-        est = echo_cancel.DelayEstimator()
+        est = self._estimator()
         ref = _arr(FRAME_SAMPLES + 1920)
         mic = ref[ref.size - FRAME_SAMPLES - 1920:ref.size - 1920]
         for _ in range(echo_cancel.AEC_LAG_CONFIRMATIONS):
@@ -83,7 +96,7 @@ class DelayEstimatorTests(unittest.TestCase):
         self.assertIsNone(est.estimate(mic.tobytes(), ref.tobytes()))
 
     def test_disagreeing_votes_do_not_lock(self):
-        est = echo_cancel.DelayEstimator()
+        est = self._estimator()
         ref = _arr(FRAME_SAMPLES + 1920)
         first = ref[ref.size - FRAME_SAMPLES - 192:ref.size - 192]
         second = ref[ref.size - FRAME_SAMPLES - 1728:ref.size - 1728]
@@ -135,11 +148,19 @@ class ReferenceEchoGateJointWindowTests(unittest.TestCase):
 
 
 class LagCorrectedCancellationTests(unittest.TestCase):
-    """Acceptance: end-to-end, a delayed echo is suppressed after lock."""
+    """Acceptance: end-to-end, a delayed echo is suppressed after lock.
+
+    [B105] The estimator votes on a joint multi-frame window now, so a
+    lock needs about ``3 x AEC_LAG_WINDOW_SECONDS`` of playback first
+    (~0.58 s with the defaults) - these tests drive enough frames to both
+    reach the lock and observe the suppressed frames after it. The
+    reference timeline carries the extra span the enlarged fetch asks
+    for.
+    """
 
     LAG_SECONDS = 0.12
     REF_START = 8.0
-    REF_END = 10.0
+    REF_END = 11.0
 
     def _reference_chunks(self):
         """Feed the reference the way the actor does: small stamped chunks."""
@@ -171,7 +192,7 @@ class LagCorrectedCancellationTests(unittest.TestCase):
                                 channels=1)
         token = path.begin_capture()
         suppressed_frames = 0
-        for index in range(8):
+        for index in range(24):
             t_end = 9.700 + index * (FRAME_SAMPLES / RATE)
             mic = self._echo_window(ref_pcm, t_end)
             frame = path.cancelled_capture_frame(
@@ -179,7 +200,8 @@ class LagCorrectedCancellationTests(unittest.TestCase):
                 mic_t_end=t_end, frame_id=path.frame_id(index, token))
             if frame.suppressed:
                 suppressed_frames += 1
-        # The first frames estimate; the rest are suppressed.
+        # The first frames estimate (three separated votes lock around
+        # frame 18); the rest are suppressed.
         self.assertGreaterEqual(suppressed_frames, 4)
         self.assertIsNotNone(path.stats["lag_locked_seconds"])
         self.assertAlmostEqual(path.stats["lag_locked_seconds"],
@@ -196,7 +218,7 @@ class LagCorrectedCancellationTests(unittest.TestCase):
                                 sample_width=WIDTH, t_end=t_end,
                                 channels=1)
         token = path.begin_capture()
-        for index in range(6):
+        for index in range(22):
             t_end = 9.700 + index * (FRAME_SAMPLES / RATE)
             mic = self._echo_window(ref_pcm, t_end)
             path.cancelled_capture_frame(

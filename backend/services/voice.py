@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import traceback
+from collections import deque
 
 import pyttsx3
 
@@ -37,6 +38,15 @@ _current_text = ""
 _speech_generation = 0
 _state_lock = threading.Lock()
 _engine = None
+#: [LF35] What this process said aloud recently: ``(text, started_at,
+#: ended_at)`` with monotonic timestamps, ``ended_at`` None while still
+#: speaking. The listener's echo-transcript guard compares incoming
+#: transcripts against this, so a transcript of our own reply is never
+#: answered as a user query (speakers instead of earphones).
+_SPOKEN_TEXTS = deque(maxlen=6)
+_SPOKEN_LOCK = threading.Lock()
+#: [LF35] Unique-marker sequence for spoken-text entries.
+_SPOKEN_SEQ = [0]
 PREFER_LOCAL_TTS = os.getenv("JARVIS_PREFER_LOCAL_TTS", "1") != "0"
 LOCAL_TTS_RATE = int(os.getenv("JARVIS_LOCAL_TTS_RATE", "180"))
 REMOTE_TTS_CHAR_LIMIT = int(os.getenv("JARVIS_REMOTE_TTS_CHAR_LIMIT", "150"))
@@ -350,6 +360,12 @@ def stop_speaking(signal_ready=True):
         _speech_generation += 1
         is_speaking = False
         listener_state.set_speaking(False)
+
+    # [LF35/B102] A stop (barge-in or explicit) ends whatever was being
+    # spoken NOW: close the open spoken-text entry so its age counts from
+    # this moment and the room-tail window starts here. A scoped cleanup in
+    # the same session's later close() stays a no-op.
+    note_spoken_finished()
 
     if should_signal_ready and signal_ready:
         # [P1-02] Never reached from barge-in (signal_ready=False there). Kept
@@ -675,12 +691,148 @@ def _speak_chunk(chunk, generation, is_first_chunk=False, provider=None):
     return True
 
 
+def _close_open_spoken_entries_locked(now):
+    """[LF35/B102] Close every open spoken-text entry. Caller holds _SPOKEN_LOCK."""
+    for index, (old_text, old_marker, old_ended) in enumerate(_SPOKEN_TEXTS):
+        if old_ended is None:
+            _SPOKEN_TEXTS[index] = (old_text, old_marker, now)
+
+
+def note_spoken_text(text):
+    """[LF35] Record that this process is about to say *text* aloud.
+
+    Any still-open entry is closed first (a new speak supersedes the old
+    one), so at most one entry is ever "still speaking". Returns a unique
+    marker to hand to :func:`note_spoken_finished`, so a superseded
+    speak's cleanup cannot close the NEW entry - a bare ``time.monotonic()``
+    marker can collide when two speaks start inside one clock tick.
+    """
+    clean = (text or "").strip()
+    now = time.monotonic()
+    with _SPOKEN_LOCK:
+        _SPOKEN_SEQ[0] += 1
+        marker = ("spoken", _SPOKEN_SEQ[0])
+        _close_open_spoken_entries_locked(now)
+        if clean:
+            _SPOKEN_TEXTS.append((clean, marker, None))
+    return marker
+
+
+def _begin_spoken_stream():
+    """[LF35/B102] Mint the scoped marker for a new StreamSpeaker session.
+
+    Supersedes (closes) any still-open entry from an earlier speak/stream
+    immediately, exactly like :func:`note_spoken_text` does for a new speak.
+    The session's own entry appears with the first audible chunk
+    (:func:`note_spoken_stream_chunk`), so a turn that never speaks leaves
+    no trace.
+    """
+    now = time.monotonic()
+    with _SPOKEN_LOCK:
+        _SPOKEN_SEQ[0] += 1
+        marker = ("spoken", _SPOKEN_SEQ[0])
+        _close_open_spoken_entries_locked(now)
+    return marker
+
+
+def note_spoken_stream_chunk(marker, text):
+    """[LF35/B102] Open or extend the spoken-text entry for *marker*.
+
+    Called from ``StreamSpeaker._enqueue`` as each final, stripped chunk is
+    handed to playback - the same moment it enters the audible future. The
+    text grows chunk by chunk so the listener's sliding-window echo guard can
+    match slices of an IN-PROGRESS reply (the end timestamp never arrives
+    when a reply is barged in mid-stream).
+
+    A superseded marker can still extend its own entry - what it said aloud
+    stays matchable - but never reopens it and never closes a newer session's
+    open entry. Known minor limitation: if an unrelated ``speak()`` starts
+    mid-stream, the growing entry is stamped ended at that moment; its text
+    stays matchable for the full age window from then on.
+    """
+    clean = re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+    if not clean or marker is None:
+        return marker
+    now = time.monotonic()
+    with _SPOKEN_LOCK:
+        is_latest_session = (
+            isinstance(marker, tuple)
+            and len(marker) == 2
+            and marker[1] == _SPOKEN_SEQ[0]
+        )
+        for index, (old_text, old_marker, old_ended) in enumerate(_SPOKEN_TEXTS):
+            if old_marker == marker:
+                combined = ("%s %s" % (old_text, clean)).strip() if old_text else clean
+                if is_latest_session:
+                    _close_open_spoken_entries_locked(now)
+                    _SPOKEN_TEXTS[index] = (combined, marker, None)
+                else:
+                    _SPOKEN_TEXTS[index] = (
+                        combined, marker,
+                        old_ended if old_ended is not None else now)
+                return marker
+        if is_latest_session:
+            _close_open_spoken_entries_locked(now)
+            _SPOKEN_TEXTS.append((clean, marker, None))
+        else:
+            _SPOKEN_TEXTS.append((clean, marker, now))
+    return marker
+
+
+def note_spoken_finished(started_at=None):
+    """[LF35] Close the open spoken-text entry (normal end, stop, or abort).
+
+    With *started_at* (the marker :func:`note_spoken_text` returned) only
+    that entry is closed, so cleanup of a superseded speak is a no-op.
+    Never raises.
+    """
+    with _SPOKEN_LOCK:
+        for index, (text, marker, ended) in enumerate(_SPOKEN_TEXTS):
+            if ended is None and (started_at is None or
+                                  marker == started_at):
+                _SPOKEN_TEXTS[index] = (text, marker, time.monotonic())
+                return
+
+
+def recent_spoken_texts(max_age_seconds=8.0, now=None):
+    """[LF35] ``(text, age_seconds)`` this process said aloud, newest first.
+
+    An entry still being spoken has age ``0.0``; a finished entry's age is
+    measured from when it ENDED, because the echo can only be heard until
+    then (plus the room tail). Entries older than *max_age_seconds* are not
+    returned.
+    """
+    now = time.monotonic() if now is None else now
+    with _SPOKEN_LOCK:
+        entries = list(_SPOKEN_TEXTS)
+    out = []
+    for text, _started, ended in reversed(entries):
+        if not text:
+            continue
+        if ended is None:
+            out.append((text, 0.0))
+        elif (now - ended) <= max_age_seconds:
+            out.append((text, now - ended))
+    return out
+
+
 def speak(text):
     global is_speaking, _current_text, _speech_generation
+
+    # [LF36] Text mode: the voice-mode toggle is a full voice/text switch,
+    # not just a mic mute. With voice input OFF the user asked for typed
+    # chat only, so the backend must not talk back - not the typed reply,
+    # not a task narration, not an async summary. The voice I/O worker
+    # speaks its own turns through StreamSpeaker (_speak_chunk), so an
+    # in-flight voice turn is unaffected; there are no new ones while off.
+    if not listener_state.is_voice_input_enabled():
+        print("[VOICE] Text mode - speech suppressed")
+        return
 
     def _run():
         global is_speaking, _current_text, _engine
 
+        spoken_marker = None
         try:
             clean = clean_text(text)
 
@@ -689,6 +841,10 @@ def speak(text):
                 _current_text = clean
                 listener_state.set_speaking(True)
                 listener_state.set_remaining("")
+
+            # [LF35] The echo-transcript guard needs to know what this
+            # process says aloud, with start/end timestamps.
+            spoken_marker = note_spoken_text(clean)
 
             if not clean:
                 return
@@ -747,6 +903,10 @@ def speak(text):
                     is_speaking = False
                     listener_state.set_speaking(False)
                     should_signal_ready = True
+
+            # [LF35] Close the spoken-text entry for THIS speak (a stop, an
+            # abort, or the natural end all land here).
+            note_spoken_finished(spoken_marker)
 
             if should_signal_ready:
                 play_ready_earcon()
@@ -843,6 +1003,15 @@ class StreamSpeaker:
         with _state_lock:
             _speech_generation += 1
             self._generation = _speech_generation
+        # [LF35/B102] Scoped spoken-text registry marker for this streaming
+        # session: supersedes (closes) any entry from an earlier speak/stream
+        # immediately, and carries this session's growing text so the
+        # listener's echo-transcript guard can match what is audible NOW.
+        self._spoken_marker = _begin_spoken_stream()
+        #: [LF35/B102] True while the worker is inside a chunk's playback (or
+        #: its pause gate): finish() must not close the entry while a chunk
+        #: is still about to be heard.
+        self._speaking_chunk = False
         #: [P1-08] This reply session's tts engine, resolved on FIRST use and
         #: then carried: the audio path used to ask the settings registry three
         #: times per chunk. The registry still re-stats its file per resolve, so
@@ -1004,12 +1173,25 @@ class StreamSpeaker:
                 to_enqueue = rest.strip()
         if to_enqueue:
             self._enqueue(to_enqueue)
+        elif (not self._speaking_chunk
+              and not self._ws_mode
+              and self._reply_session_over()):
+            # [LF35/B102] Nothing left to speak and the worker is idle: end
+            # the spoken-text entry now so its age starts here. If audio is
+            # still queued or playing, the worker's own session-over check
+            # closes it instead (and any later announcement reopens it).
+            note_spoken_finished(self._spoken_marker)
 
     def close(self):
         """Stop the worker once the queue drains (no more announcements)."""
         if self._closed:
+            note_spoken_finished(self._spoken_marker)
             return
         self._closed = True
+        # [LF35/B102] Close this session's registry entry immediately: no
+        # NEW chunk can be recorded after close, so the reply text is final
+        # (the queue itself may still drain for a moment).
+        note_spoken_finished(self._spoken_marker)
         self._queue.put(_STREAM_STOP)
 
     def pending_text(self):
@@ -1043,6 +1225,18 @@ class StreamSpeaker:
             self._queue.put(item)
         parts.extend(str(item) for item in items if item)
         return " ".join(part for part in parts if part).strip()
+
+    def _record_spoken_chunk(self, chunk):
+        """[LF35/B102] Extend this session's spoken-text registry entry.
+
+        Called the instant a final, stripped chunk is handed to the playback
+        queue - the moment it enters the audible future. A closed or
+        superseded speaker records nothing: its audio either already played
+        (recorded then) or was dropped by the generation check.
+        """
+        if self._closed or not _is_current_generation(self._generation):
+            return
+        note_spoken_stream_chunk(self._spoken_marker, chunk)
 
     def _enqueue(self, sentence):
         # [S12] Safety net: strip markdown/URLs from each finished chunk so the
@@ -1082,6 +1276,7 @@ class StreamSpeaker:
                     if chunk.strip():
                         self._enqueue(chunk.strip())
             else:
+                self._record_spoken_chunk(first)
                 self._spoken_any = True
                 pending_ahead = self._queue.qsize()
                 self._queue.put(first)
@@ -1097,6 +1292,7 @@ class StreamSpeaker:
                 if chunk.strip():
                     self._enqueue(chunk.strip())
             return
+        self._record_spoken_chunk(sentence)
         self._spoken_any = True
         pending_ahead = self._queue.qsize()
         self._queue.put(sentence)
@@ -1342,99 +1538,124 @@ class StreamSpeaker:
                         # (and its audio awaited) here before the flag clears.
                         if self._ws_mode:
                             self._finish_ws_playback()
+                        # [LF35/B102] The reply is COMPLETE and everything
+                        # played: end the spoken-text entry so its age starts
+                        # here (idempotent - repeated idle ticks are no-ops).
+                        note_spoken_finished(self._spoken_marker)
                         set_speaking_state(False)
                     continue
                 if item is _STREAM_STOP:
                     if self._ws_mode:
                         self._finish_ws_playback(handback_if_silent=False)
+                    # [LF35/B102] Closing ends this session's registry entry
+                    # for good (idempotent with close()'s own call).
+                    note_spoken_finished(self._spoken_marker)
                     break
                 if not _is_current_generation(self._generation):
                     continue
                 sentence = item
-                if not self._active:
-                    _current_text = sentence
-                    listener_state.set_remaining("")
-                    set_speaking_state(True)
-                # [P1-07] A paused reply starts no new chunk: the gate parks here
-                # until "continue", so the queue keeps its place and the next
-                # sentence never plays over the pause. A real STOP opens the gate
-                # with False (the generation moved on), and that chunk is
-                # deliberately dropped — a stop discards, a pause preserves.
-                if not self._pass_pause_gate(sentence):
-                    continue
+                self._speaking_chunk = True
+                try:
+                    if not self._active:
+                        _current_text = sentence
+                        listener_state.set_remaining("")
+                        set_speaking_state(True)
+                    # [P1-07] A paused reply starts no new chunk: the gate parks here
+                    # until "continue", so the queue keeps its place and the next
+                    # sentence never plays over the pause. A real STOP opens the gate
+                    # with False (the generation moved on), and that chunk is
+                    # deliberately dropped — a stop discards, a pause preserves.
+                    if not self._pass_pause_gate(sentence):
+                        continue
 
-                # [S7] Live Fish session: the first sentence opens ONE WebSocket
-                # for this reply and every following sentence is FED to it —
-                # the whole reply plays as a single continuous utterance
-                # instead of one HTTP request per sentence.
-                session = None
-                if self._ws_ended:
-                    continue
-                if not self._ws_mode and not self._ws_disabled:
-                    if self._tts_engine() == "fish":
-                        fish_ws_begin_reply()
-                        session = fish_ws_session()
-                    if session is not None:
-                        self._ws_fed = []
-                        self._start_ws_playback(session)
-                if self._ws_mode:
-                    if session is None:
-                        session = fish_ws_session()
-                    if session is not None and session.failed():
-                        if not ws_audio_reached_device():
-                            # Nothing was spoken: hand the whole reply
-                            # back to the per-sentence ladder, in order.
+                    # [S7] Live Fish session: the first sentence opens ONE WebSocket
+                    # for this reply and every following sentence is FED to it —
+                    # the whole reply plays as a single continuous utterance
+                    # instead of one HTTP request per sentence.
+                    session = None
+                    if self._ws_ended:
+                        continue
+                    if not self._ws_mode and not self._ws_disabled:
+                        if self._tts_engine() == "fish":
+                            fish_ws_begin_reply()
+                            session = fish_ws_session()
+                        if session is not None:
+                            self._ws_fed = []
+                            self._start_ws_playback(session)
+                    if self._ws_mode:
+                        if session is None:
+                            session = fish_ws_session()
+                        if session is not None and session.failed():
+                            if not ws_audio_reached_device():
+                                # Nothing was spoken: hand the whole reply
+                                # back to the per-sentence ladder, in order.
+                                self._ws_fed.append(sentence)
+                                self._finish_ws_playback()
+                                continue
+                            # Audio already reached the device — never replay.
+                            self._finish_ws_playback(handback_if_silent=False)
+                            if self._reply_session_over():
+                                # [LF35/B102] Session complete: end the
+                                # spoken-text entry.
+                                note_spoken_finished(self._spoken_marker)
+                                set_speaking_state(False)
+                            continue
+                        if (session is not None
+                                and self._ws_thread is not None
+                                and not self._ws_thread.is_alive()):
+                            # The stream is over without a reported failure (the
+                            # server closed it). Whatever the session SPOKE must
+                            # never replay; what it never spoke goes back to the
+                            # ladder, this sentence first so the order holds.
+                            if ws_audio_reached_device():
+                                self._finish_ws_playback(handback_if_silent=False)
+                                if self._reply_session_over():
+                                    note_spoken_finished(self._spoken_marker)
+                                    set_speaking_state(False)
+                                continue
                             self._ws_fed.append(sentence)
                             self._finish_ws_playback()
                             continue
-                        # Audio already reached the device — never replay.
-                        self._finish_ws_playback(handback_if_silent=False)
+                    if self._ws_mode:
+                        self._ws_fed.append(sentence)
+                        session.feed(sentence)
+                        self._played_first = True
                         if self._reply_session_over():
+                            self._finish_ws_playback()
+                            note_spoken_finished(self._spoken_marker)
                             set_speaking_state(False)
                         continue
-                    if (session is not None
-                            and self._ws_thread is not None
-                            and not self._ws_thread.is_alive()):
-                        # The stream is over without a reported failure (the
-                        # server closed it). Whatever the session SPOKE must
-                        # never replay; what it never spoke goes back to the
-                        # ladder, this sentence first so the order holds.
-                        if ws_audio_reached_device():
-                            self._finish_ws_playback(handback_if_silent=False)
-                            if self._reply_session_over():
-                                set_speaking_state(False)
-                            continue
-                        self._ws_fed.append(sentence)
-                        self._finish_ws_playback()
-                        continue
-                if self._ws_mode:
-                    self._ws_fed.append(sentence)
-                    session.feed(sentence)
+                    _speak_chunk(sentence, self._generation,
+                                 is_first_chunk=not self._played_first,
+                                 provider=self._tts_engine())
                     self._played_first = True
+                    # [P1-06] The speaking flag means "Jarvis is mid-reply" for the
+                    # WHOLE reply session. It is NOT derived from momentary queue
+                    # occupancy: clearing it the instant the queue happened to drain
+                    # made the flag flicker off in the gap between two sentences of
+                    # the SAME reply, which is what made the listener's old
+                    # "ignore while speaking" gate unpredictable (sometimes an
+                    # interruption landed, sometimes the utterance vanished without
+                    # a trace). The session ends only once the reply is COMPLETE
+                    # (``finish()``/``close()``) and everything queued has actually
+                    # been played — see ``_reply_session_over``.
                     if self._reply_session_over():
-                        self._finish_ws_playback()
+                        # [LF35/B102] The reply completed and its last chunk
+                        # finished playing: the spoken-text entry ends here.
+                        note_spoken_finished(self._spoken_marker)
                         set_speaking_state(False)
-                    continue
-                _speak_chunk(sentence, self._generation,
-                             is_first_chunk=not self._played_first,
-                             provider=self._tts_engine())
-                self._played_first = True
-                # [P1-06] The speaking flag means "Jarvis is mid-reply" for the
-                # WHOLE reply session. It is NOT derived from momentary queue
-                # occupancy: clearing it the instant the queue happened to drain
-                # made the flag flicker off in the gap between two sentences of
-                # the SAME reply, which is what made the listener's old
-                # "ignore while speaking" gate unpredictable (sometimes an
-                # interruption landed, sometimes the utterance vanished without
-                # a trace). The session ends only once the reply is COMPLETE
-                # (``finish()``/``close()``) and everything queued has actually
-                # been played — see ``_reply_session_over``.
-                if self._reply_session_over():
-                    set_speaking_state(False)
+                finally:
+                    self._speaking_chunk = False
         except Exception:
             print("Stream voice error:")
             traceback.print_exc()
         finally:
+            self._speaking_chunk = False
+            # [LF35/B102] The worker is exiting (stop, close or error): this
+            # session will never record another chunk, so end its spoken-text
+            # entry now. Idempotent with close()/finish() and the session-over
+            # closes above.
+            note_spoken_finished(self._spoken_marker)
             if self._ws_mode:
                 try:
                     self._finish_ws_playback(handback_if_silent=False)

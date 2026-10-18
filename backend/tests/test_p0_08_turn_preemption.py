@@ -585,6 +585,80 @@ class CancelledTurnNeverShowsNoneTests(unittest.TestCase):
         speak.assert_called_once_with("real reply")
 
 
+class TestB112CancelledStreamIsClean(unittest.TestCase):
+    """[B112] A barge-in that closes the SSE response mid-read is a clean
+    cancel: no failure line, no reconnect, no fallback request."""
+
+    def setUp(self):
+        self._prev = vm.TURNS
+        vm.TURNS = vm._TurnManager()
+        for item in (patch.object(vm, "_backend_headers", return_value={}),
+                     patch.object(vm._latency, "local_now_ns", return_value=0),
+                     patch.object(vm, "_cancel_backend_request_async",
+                                  return_value=True),
+                     patch.object(vm.time, "sleep")):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def tearDown(self):
+        vm.TURNS = self._prev
+
+    @staticmethod
+    def _response(lines, before_raise=None, exc=None):
+        class _Resp:
+            closed = False
+
+            def __iter__(self):
+                for line in lines:
+                    yield line
+                if before_raise:
+                    before_raise()
+                if exc is not None:
+                    raise exc
+
+            def close(self):
+                self.closed = True
+        return _Resp()
+
+    def test_barge_in_mid_stream_is_a_clean_cancel(self):
+        rid = "voice-b112-1"
+        vm.TURNS.start(rid, _SpeakerStub())
+        urls = []
+
+        def fake_urlopen(request, timeout=None):
+            urls.append(request.full_url)
+            return self._response(
+                [b'data: {"type":"delta","seq":1,"text":"Hi"}\n'],
+                before_raise=lambda: vm.TURNS.cancel_current("barge-in"),
+                exc=AttributeError("'NoneType' object has no attribute "
+                                   "'peek'"))
+
+        with patch.object(vm, "urlopen", side_effect=fake_urlopen), \
+             patch("builtins.print") as printed:
+            reply = vm._ask_backend("hello", rid, stream_sink=lambda d: None)
+        self.assertIsNone(reply)
+        self.assertEqual(len(urls), 1, "a cancelled turn was re-submitted")
+        self.assertFalse(any("stream read failed" in str(c)
+                             for c in printed.call_args_list))
+        self.assertEqual(vm.TURNS.stats["stream_cancel_exits"], 1)
+
+    def test_genuine_drop_still_logs_and_reconnects(self):
+        rid = "voice-b112-2"
+        vm.TURNS.start(rid, _SpeakerStub())
+        responses = [
+            self._response([], exc=ConnectionResetError("reset by peer")),
+            self._response([b'data: {"type":"completed","seq":2,'
+                            b'"reply":"done"}\n']),
+        ]
+        with patch.object(vm, "urlopen", side_effect=responses), \
+             patch("builtins.print") as printed:
+            reply = vm._ask_backend("hello", rid)
+        self.assertEqual(reply, "done")
+        self.assertTrue(any("stream read failed" in str(c)
+                            for c in printed.call_args_list))
+        self.assertEqual(vm.TURNS.stats["stream_cancel_exits"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -19,7 +19,11 @@ from backend.config import BACKEND_PORT
 from backend import listener_state
 from backend.services import latency as _latency
 from backend.services import listener as _listener_module
-from backend.services.listener import listen, _close_microphone_source
+from backend.services.listener import (
+    listen,
+    _close_microphone_source,
+    discard_pending_capture,
+)
 from backend.services import local_auth
 from backend.services.fish_voice import warm_up_fish_tts
 from backend.services.voice import (
@@ -137,6 +141,28 @@ def backend_task_running():
 _EVENTS_READ_TIMEOUT_S = 30.0
 
 
+def _mirror_voice_flag(value):
+    """[LF36] Keep this process's ``listener_state`` copy of the flag truthful.
+
+    The flag is owned by the backend (``POST /voice-mode``) and learned here
+    over HTTP, but the state this worker PUBLISHES (``/voice-state/publish``)
+    is built from its own ``listener_state`` copy. That copy used to keep its
+    import-time default (True) forever, so every heartbeat re-published
+    "voice_input_enabled: true" and the backend's merge let the stale worker
+    snapshot override the toggle the user had just set: the UI button flipped
+    back to "Voice: On" within one poll and the switch looked broken.
+
+    Mirroring also wakes the publisher immediately (the setter fires the state
+    hooks), so the corrected flag reaches the UI in milliseconds instead of on
+    the next heartbeat. Never raises: a mirror failure must never break the
+    poll or the push loop.
+    """
+    try:
+        listener_state.set_voice_input_enabled(bool(value))
+    except Exception:
+        pass
+
+
 def _apply_pushed_state(evt):
     """[S19] Fold a pushed state event into the two poll caches.
 
@@ -155,6 +181,7 @@ def _apply_pushed_state(evt):
     if "voice_input_enabled" in evt:
         _voice_flag_last_known = bool(evt.get("voice_input_enabled", True))
         _voice_flag_checked_at = time.monotonic()
+        _mirror_voice_flag(_voice_flag_last_known)
 
 
 def _task_state_push_loop(stop_event=None):
@@ -327,6 +354,17 @@ def _publish_voice_state_loop(stop_event=None):
             snapshot["publisher_id"] = _VOICE_LAUNCH_ID
             snapshot["aec_errors"] = int(
                 getattr(_listener_module, "_aec_error_count", 0) or 0)
+            # [B103] The mic-side echo defense lives in THIS process; publish
+            # its state alongside the error count so a live speaker test can
+            # be diagnosed from /voice-state (mode, lag lock, suppression,
+            # guard counters). Plain-dict passthrough - no route changes.
+            aec_telemetry_fn = getattr(
+                _listener_module, "aec_voice_telemetry", None)
+            if callable(aec_telemetry_fn):
+                try:
+                    snapshot["aec"] = aec_telemetry_fn()
+                except Exception:
+                    pass
             _post_backend("/voice-state/publish", snapshot, timeout=1.0)
             _ship_turn_marks()
         except Exception:
@@ -483,6 +521,16 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
             # The stream ended without a terminal frame: a dropped connection.
             return terminal_reply, False, cursor_local, spoken_local
         except Exception as exc:
+            # [B112] A barge-in (TURNS.cancel_current) or a pre-empting turn
+            # (TURNS.start) CLOSES this response from another thread to free
+            # the blocked read; the stdlib then raises from the torn-down fp
+            # ("'NoneType' object has no attribute 'peek'", ValueError on a
+            # closed file, ...). The manager marks the request superseded
+            # BEFORE closing, so this check is race-free. A deliberate
+            # cancellation is a clean, finished exit - never a reconnect.
+            if TURNS.superseded(request_id):
+                TURNS.note_stream_cancelled()
+                return terminal_reply, True, cursor_local, spoken_local
             # [P1-13] a socket timeout / reset is a DROPPED CONNECTION, not an
             # exception through the caller: the retry loop above decides whether
             # to reconnect from the cursor or fall back to /ask.
@@ -510,11 +558,16 @@ def _ask_backend(text, request_id, stream_sink=None, replace_sink=None,
         payload["_spoken"] = spoken
         if finished:
             return reply or None
+        if TURNS.superseded(request_id):
+            return reply or None        # [B112] never re-POST a cancelled turn
         # Reconnect from the cursor: the resumed stream skips everything the
         # speaker already heard.
         time.sleep(0.2)
 
     # Non-stream fallback: same runtime, one JSON round-trip.
+    if TURNS.superseded(request_id):
+        # [B112] A cancelled turn must not start a fresh backend request.
+        return None
     try:
         request = Request(
             f"http://127.0.0.1:{BACKEND_PORT}/ask",
@@ -663,6 +716,8 @@ class _TurnManager:
             "preempted": 0,
             "barge_in_cancels": 0,
             "stale_replies_dropped": 0,
+            # [B112] Deliberate stream cancellations (never reconnected).
+            "stream_cancel_exits": 0,
         }
 
     # -- lifecycle ---------------------------------------------------------
@@ -797,6 +852,11 @@ class _TurnManager:
     def note_stale_reply(self):
         with self._lock:
             self.stats["stale_replies_dropped"] += 1
+
+    def note_stream_cancelled(self):
+        """[B112] Count a read that failed because WE cancelled the turn."""
+        with self._lock:
+            self.stats["stream_cancel_exits"] += 1
 
     def active_request_id(self):
         with self._lock:
@@ -1228,6 +1288,14 @@ def control_owner(command):
         "sleep": "supervisor",
         "shutdown": "supervisor",
     }.get(command)
+
+
+try:  # [B111] the listener's echo guard must never eat an F35 command
+    from backend.services.listener import register_control_classifier
+
+    register_control_classifier(classify_control)
+except Exception:
+    pass
 
 # ─────────────────────────────────────────
 # NORMAL SETUP VARIANTS
@@ -1757,6 +1825,7 @@ def _fetch_voice_flag():
         with urlopen(request, timeout=0.5) as response:
             data = json.loads(response.read().decode("utf-8"))
         _voice_flag_last_known = bool(data.get("voice_input_enabled", True))
+        _mirror_voice_flag(_voice_flag_last_known)
     except Exception:
         pass  # keep the last known value on request failure
     return _voice_flag_last_known
@@ -1771,6 +1840,10 @@ def listener_thread():
         try:
             if not voice_input_enabled():
                 try:
+                    # [B116] A prefetched capture belongs to a voice-on turn;
+                    # drop it before closing the mic so it cannot surface
+                    # after the toggle.
+                    discard_pending_capture()
                     _close_microphone_source()
                 except Exception:
                     pass
@@ -1781,8 +1854,25 @@ def listener_thread():
             # the text to the brain thread, which ships it to the backend under
             # the request_id it submits the utterance with.
             turn = _latency.new_local_turn()
-            text = listen(marks=turn)
+            # [B116] Keep reading the mic while this utterance's ONE STT call
+            # runs; the next call consumes the prefetched audio.
+            text = listen(marks=turn, overlap_capture=True)
             if not text:
+                continue
+
+            # [LF36] The toggle can land while this capture is running (a
+            # capture lasts until its pause threshold, up to the phrase
+            # limit). Re-check before the transcript becomes a turn: with
+            # voice input OFF the mic was still open only for this in-flight
+            # capture, so what it heard was never addressed to a listener.
+            if not voice_input_enabled():
+                print("[LISTENER] Voice input off - dropping the utterance "
+                      "captured before the toggle")
+                try:
+                    discard_pending_capture()
+                    _close_microphone_source()
+                except Exception:
+                    pass
                 continue
 
             print("👤:", text)

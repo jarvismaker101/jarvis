@@ -28,6 +28,7 @@ from urllib.request import Request
 import speech_recognition as sr
 
 from backend import watcher
+from backend.services import listener
 from backend.services import wake_engine
 
 
@@ -41,18 +42,28 @@ class CloudPolicyTests(unittest.TestCase):
     def setUp(self):
         self.whisper_ok = patch.object(watcher, "whisper_daemon_ok", True)
         self.whisper_model = patch.object(watcher, "whisper_model", None)
-        self.online = patch.object(watcher, "recognize_google_or_groq")
         self.daemon = patch.object(watcher, "_transcribe_with_daemon")
         self.mock_whisper_ok = self.whisper_ok.start()
         self.whisper_model.start()
-        self.mock_online = self.online.start()
         self.mock_daemon = self.daemon.start()
-        for p in (self.whisper_ok, self.whisper_model, self.online, self.daemon):
+        for p in (self.whisper_ok, self.whisper_model, self.daemon):
             self.addCleanup(p.stop)
         os.environ.pop("JARVIS_STT_CLOUD_POLICY", None)
         os.environ.pop("JARVIS_STT_LOCAL_ONLY", None)
         self.addCleanup(os.environ.pop, "JARVIS_STT_CLOUD_POLICY", None)
         self.addCleanup(os.environ.pop, "JARVIS_STT_LOCAL_ONLY", None)
+
+    def assert_no_cloud_transcriber(self):
+        """[LF36] The wake path holds no cloud engine at all.
+
+        The strongest form of "zero online calls": not "it chose not to call
+        one" but "there is nothing here that could". The selected model and
+        the cloud policy govern the conversation path only.
+        """
+        for name in ("recognize_sarvam", "recognize_inworld",
+                     "recognize_google_or_groq"):
+            self.assertFalse(hasattr(watcher, name),
+                             "the wake path can still reach %s" % name)
 
     def test_policy_off_makes_zero_online_calls(self):
         os.environ["JARVIS_STT_CLOUD_POLICY"] = "off"
@@ -60,7 +71,7 @@ class CloudPolicyTests(unittest.TestCase):
         candidates, wake_match = watcher.recognize_candidates(_audio())
         self.assertIsNone(wake_match)
         self.assertEqual(candidates, ["just some background chatter"])
-        self.mock_online.assert_not_called()
+        self.assert_no_cloud_transcriber()
 
     def test_policy_off_keeps_local_wake_detection_working(self):
         os.environ["JARVIS_STT_CLOUD_POLICY"] = "off"
@@ -68,7 +79,7 @@ class CloudPolicyTests(unittest.TestCase):
         candidates, wake_match = watcher.recognize_candidates(_audio())
         self.assertEqual(wake_match, "Jarvis, open Chrome")
         self.assertEqual(candidates, ["Jarvis, open Chrome"])
-        self.mock_online.assert_not_called()
+        self.assert_no_cloud_transcriber()
 
     def test_local_only_shorthand_is_honoured(self):
         os.environ["JARVIS_STT_LOCAL_ONLY"] = "1"
@@ -76,37 +87,36 @@ class CloudPolicyTests(unittest.TestCase):
         self.assertEqual(wake_engine.cloud_stt_policy(), "off")
 
     def test_default_policy_still_allows_a_cloud_selection(self):
-        # [S5] The policy gates whether a cloud engine MAY be used; it does not
-        # decide WHICH engine runs. With a cloud engine selected, that engine is
-        # the one used.
+        # [S5] The policy gates whether a cloud engine MAY be used on the
+        # CONVERSATION path; it does not decide WHICH engine runs there.
+        # [LF36] The wake path is local-only regardless of this policy.
         self.assertTrue(wake_engine.cloud_stt_allowed())
 
-    def test_a_local_selection_is_never_followed_by_an_online_engine(self):
-        # [S5] The old ladder asked the online engine when the daemon came back
-        # empty, so the transcript that produced the wake verdict could come
-        # from a model the user never selected. A failed SELECTED engine is now
-        # a failed turn: no candidates, and zero online calls.
-        with patch.object(watcher, "_selected_engine", return_value="whisper"), \
-             patch.object(watcher, "recognize_inworld") as inworld:
-            self.mock_daemon.return_value = None
-            candidates, wake_match = watcher.recognize_candidates(_audio())
+    def test_a_failed_local_model_is_a_failed_turn(self):
+        # [LF36] The old ladder asked the online engine when the local model
+        # came back empty, so a wake verdict could come from an upload. A
+        # failed local model is now the end of the turn: no candidates, and
+        # no cloud transcriber exists to ask.
+        self.mock_daemon.return_value = None
+        candidates, wake_match = watcher.recognize_candidates(_audio())
         self.assertEqual(candidates, [])
         self.assertIsNone(wake_match)
-        self.mock_online.assert_not_called()
-        inworld.assert_not_called()
+        self.assert_no_cloud_transcriber()
 
-    def test_the_selected_cloud_engine_is_the_only_engine_asked(self):
-        # [S5] ...and symmetrically: a selected cloud engine is not preceded by
-        # a local guess, so the transcript IS that engine's output.
-        with patch.object(watcher, "_selected_engine", return_value="inworld"), \
-             patch.object(watcher, "recognize_inworld",
-                          return_value="hello there") as inworld:
+    def test_a_cloud_selection_cannot_reach_the_wake_path(self):
+        # [LF36] Symmetrically: the settings select a cloud engine and the
+        # policy is on - the wake path still runs the local model, because
+        # the sleeping loop must never upload what it hears.
+        os.environ["JARVIS_STT_CLOUD_POLICY"] = "on"
+        with patch.object(listener, "_engine_for_listening_role",
+                          return_value="sarvam"), \
+             patch.object(listener, "_cloud_stt_policy", return_value="on"):
+            self.mock_daemon.return_value = ("hello there", {})
             candidates, wake = watcher.recognize_candidates(_audio())
-        inworld.assert_called_once()
-        self.mock_daemon.assert_not_called()
-        self.mock_online.assert_not_called()
+        self.mock_daemon.assert_called_once()
         self.assertEqual(candidates, ["hello there"])
         self.assertIsNone(wake)
+        self.assert_no_cloud_transcriber()
 
 
 class WakeOnlyPhraseTests(unittest.TestCase):

@@ -208,9 +208,12 @@ class CrossProcessTransportTests(unittest.TestCase):
         def fake_urlopen(request, timeout=None):
             self.assertIn("/aec/reference", request.full_url)
             # [S28] while the speaker lag is still being estimated the span
-            # asks for window + search range (0.1 + 0.4); after the lock it
-            # asks for the window alone again.
-            self.assertRegex(request.full_url, r"seconds=0\.(100|500)")
+            # asks for window + search range; [B105] the joint lag evidence
+            # window rides along too (0.1 + 0.6 + 0.192) so the accumulated
+            # window's overlap is inside the fetched span. After the lock
+            # it asks for the window alone again. [B108] the search range
+            # widened from 0.4 to 0.6 to cover device+capture latency.
+            self.assertRegex(request.full_url, r"seconds=0\.(100|892)")
             return _Response(self._payload(pcm, 0.05))
 
         path = echo_cancel.AecSignalPath(
@@ -402,8 +405,31 @@ class ListenerCommitTests(unittest.TestCase):
         self.assertIsNone(result, "the echo gate let playback through")
         listener.barge_in_on_speech_onset.assert_not_called()
 
+    def _seed_proven_gate(self):
+        """[B109] Make this test's premise explicit: the canceller has
+        already proved it can cancel this playback, so the onset is
+        authorized without depending on a previous test's leftovers."""
+        now = time.monotonic()
+        saved = (listener._aec_last_reference_at,
+                 listener._aec_last_suppressed_at,
+                 listener._aec_gate_blocked_since,
+                 listener._aec_epoch_started_at)
+
+        def restore():
+            (listener._aec_last_reference_at,
+             listener._aec_last_suppressed_at,
+             listener._aec_gate_blocked_since,
+             listener._aec_epoch_started_at) = saved
+
+        self.addCleanup(restore)
+        listener._aec_last_reference_at = now - 0.1
+        listener._aec_last_suppressed_at = now - 0.1
+        listener._aec_gate_blocked_since = None
+        listener._aec_epoch_started_at = now - 0.1
+
     def test_double_talk_keeps_the_user_speech_and_barges_in(self):
         """Perfect cancellation of the playback leaves the user's words."""
+        self._seed_proven_gate()
         playback = _tone(0.4, 250.0, 16000, amplitude=12000.0)
         user = _tone(0.4, 180.0, 16000, amplitude=15000.0)
         mic = (np.frombuffer(playback, dtype=np.int16).astype(np.float64) +
@@ -453,9 +479,10 @@ class ListenerCommitTests(unittest.TestCase):
         seen = []
         orig_confirm = listener._should_confirm_speech_start
 
-        def confirm_spy(window):
+        def confirm_spy(window, **kwargs):
+            # [LF35] the onset test now also receives playback_active.
             seen.append(len(window))
-            return orig_confirm(window)
+            return orig_confirm(window, **kwargs)
 
         def aec(pcm, **kwargs):
             return echo_cancel.CaptureFrame(b"\x00" * len(pcm), True, True,

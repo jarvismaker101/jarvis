@@ -544,7 +544,7 @@ def ask(query: Query):
         _latency.finish(state.request_id)
 
     print("[API] Sending reply:", reply)
-    if query.speak:
+    if _typed_speech_allowed(query.speak):
         _maybe_speak(reply)
     return {"reply": reply, "request_id": state.request_id}
 
@@ -589,7 +589,8 @@ def ask_stream(query: Query):
         state.progress("started", stage="start")
         # G11 / F50 — a voice-worker submission (speak=False) runs the very
         # same request runtime but stays silent: the I/O worker speaks it.
-        speak = bool(query.speak)
+        # [LF36] ...and a TYPED request stays silent in text mode (voice off).
+        speak = _typed_speech_allowed(query.speak)
         # [PERF] A spoken turn gets the compact profile (short answer, 300
         # max tokens, spoken filler words stripped in command mode) and is
         # marked from_voice so the brain's voice-specific paths actually run.
@@ -735,9 +736,32 @@ def get_voice_mode():
     return {"voice_input_enabled": listener_state.is_voice_input_enabled()}
 
 
+def _typed_speech_allowed(speak_requested: bool) -> bool:
+    """[LF36] May a TYPED request be spoken aloud?
+
+    Only while voice mode is ON. The toggle is a voice/text switch: with it
+    off the user asked for typed chat only, so a typed reply must not talk
+    back. Voice-worker submissions already carry ``speak=False`` and own
+    their playback, so this only ever narrows typed requests.
+    """
+    return bool(speak_requested) and listener_state.is_voice_input_enabled()
+
+
 @router.post("/voice-mode")
 def set_voice_mode(payload: VoiceModeUpdate):
     enabled = listener_state.set_voice_input_enabled(payload.enabled)
+    # [LF36] Turning voice OFF is a mode switch, not just a mute: cut what
+    # is being said right now so "text chat only" starts immediately. The
+    # same instant-stop the barge-in path uses (generation bump + narration
+    # mute); idempotent and never raises.
+    if not enabled:
+        try:
+            # signal_ready=False: the "I stopped, your turn" cue is a
+            # voice-mode sound and would be nonsense in text mode.
+            stop_speaking(signal_ready=False)
+            set_narration_enabled(False)
+        except Exception:
+            pass
     return {"voice_input_enabled": enabled}
 
 
@@ -808,6 +832,13 @@ def get_voice_state():
     if published:
         state.update(published)
     state.update(screen_state.get_state())
+    # [LF36] The voice-input flag is a CONTROL-PLANE value owned by THIS
+    # process (``POST /voice-mode``); a worker's published snapshot only
+    # mirrors it over HTTP — up to a poll interval behind, or a whole restart
+    # behind when a fresh worker re-publishes its import-time default. Serving
+    # that mirror back let the UI toggle flip to "Voice: On" within one poll
+    # of being turned off, so the authoritative copy always wins here.
+    state["voice_input_enabled"] = listener_state.is_voice_input_enabled()
     return state
 
 
@@ -945,6 +976,9 @@ def get_ui_state():
     if published:
         state.update(published)
     state.update(screen_state.get_state())
+    # [LF36] Same authority rule as ``get_voice_state``: the toggle is owned
+    # here, the worker only mirrors it (see the comment there).
+    state["voice_input_enabled"] = listener_state.is_voice_input_enabled()
     return {
         "state": state,
         "voice_log": {
@@ -1095,6 +1129,33 @@ def speech_remaining():
     remaining = listener_state.get_remaining() or ""
     return {"remaining": remaining, "has_remaining": bool(remaining),
             "chars": len(remaining)}
+
+
+@router.get("/speak/last-text")
+def speak_last_text():
+    """[LF35] Texts this process said aloud recently (echo-transcript guard).
+
+    The voice process's listener compares incoming transcripts against its
+    OWN spoken texts, but replies voiced HERE (typed UI, announcements) are
+    invisible to it - so it asks. ``age_seconds`` is measured on this
+    process's clock, exactly like ``/aec/reference``. The 8.0s window
+    matches the listener's ECHO_TRANSCRIPT_MAX_AGE default.
+    """
+    try:
+        from backend.services import voice
+
+        texts = voice.recent_spoken_texts(8.0)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"spoken-text state unavailable: {exc}")
+    return {"texts": [{"text": text, "age_seconds": round(age, 2)}
+                      for text, age in texts],
+            # [B115] An age of 0.0 means the entry is still playing on THIS
+            # clock. The voice process ORs this into its "was Jarvis audible
+            # at onset" evidence, so API-voiced replies are not invisible to
+            # the transcript guard.
+            "speaking": any(age <= 0.0 for _text, age in texts)}
 
 
 @router.get("/aec/state")

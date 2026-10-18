@@ -11,7 +11,14 @@ import requests
 from pydub import AudioSegment
 from pydub.playback import play
 
-from backend.config import FISH_API_KEY, FISH_MODEL, FISH_REFERENCE_ID, FISH_VOLUME_BOOST_DB
+from backend.config import (
+    AEC_DEVICE_LATENCY_MAX,
+    AEC_STAMP_DEVICE_LATENCY,
+    FISH_API_KEY,
+    FISH_MODEL,
+    FISH_REFERENCE_ID,
+    FISH_VOLUME_BOOST_DB,
+)
 # F32: one playback owner + identity-keyed audio; F33: every chunk that
 # actually reaches the device feeds the AEC reference path.
 from backend.services.audio_actor import (
@@ -24,6 +31,7 @@ from backend.services.audio_actor import (
     actor_play,
     audio_cache_key,
     make_sounddevice_factory,
+    output_latency_seconds as _actor_output_latency,
 )
 from backend.services.echo_cancel import (
     feed_reference as _aec_feed_reference,
@@ -730,16 +738,36 @@ def _boost_pcm_chunk(chunk_bytes):
         return chunk_bytes
 
 
+def _reference_t_end():
+    """[B108] When the last sample of the chunk just written will actually
+    leave the speaker: now + the device's reported output latency."""
+    now = time.monotonic()
+    if not AEC_STAMP_DEVICE_LATENCY:
+        return now
+    try:
+        latency = _actor_output_latency()
+    except Exception:
+        latency = None
+    if latency is None:
+        return now
+    return now + max(0.0, min(float(latency), AEC_DEVICE_LATENCY_MAX))
+
+
 def _aec_chunk_for(rate, channels):
     """Build the AEC reference hook for a playback format.
 
     [F32/F33] Every chunk that reaches the DEVICE feeds the reference path,
     tagged with the format it was rendered in, so the listener-side alignment
     measures real time instead of assuming a rate.
+
+    [B108] The chunk is stamped for when it is actually HEARD, not when the
+    blocking write returned, so the canceller's lag search no longer has to
+    absorb the device latency.
     """
     def _hook(chunk):
         try:
-            _aec_feed_reference(chunk, rate, 2, channels=channels)
+            _aec_feed_reference(chunk, rate, 2, channels=channels,
+                                t_end=_reference_t_end())
         except Exception:
             pass
 
@@ -749,7 +777,8 @@ def _aec_chunk_for(rate, channels):
 def _aec_chunk(chunk):
     """F32/F33: every chunk that reaches the DEVICE feeds the AEC reference."""
     try:
-        _aec_feed_reference(chunk, 44100, 2, channels=1)
+        _aec_feed_reference(chunk, 44100, 2, channels=1,
+                            t_end=_reference_t_end())
     except Exception:
         pass
 
