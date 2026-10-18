@@ -1156,7 +1156,12 @@ _aec_trust_invalidations = 0
 #: [B109] Onset provenance counters (telemetry / live diagnosis).
 _onset_stats = {"trusted": 0, "provisional": 0, "voided": 0,
                 "qualify_cuts": 0, "qualify_overruns": 0,
-                "held_fallback": 0, "last": "none"}
+                "held_fallback": 0,
+                #: [B119] provisional onsets whose ONLY playback evidence was
+                #: a speaking flag (no reference frame: ElevenLabs/SAPI, or a
+                #: late/stale reference). Telemetry only.
+                "provisional_no_reference": 0,
+                "last": "none"}
 
 
 def _note_onset(kind):
@@ -1191,6 +1196,11 @@ def _onset_authorizes_stop(now, playback_active):
     Nothing playing means no echo risk. With playback active, only proof
     from the CURRENT reply may cut it: an unproven onset must be qualified
     by the transcript instead (see listener_thread).
+
+    [B119] *playback_active* is the caller's AUDIBLE evidence - reference
+    recency OR the local speaking flag OR the cached remote flag - never the
+    reference timeline alone: engines that do not feed the reference
+    (ElevenLabs, SAPI) and a cold/late reference are still audible.
     """
     if not playback_active:
         return True
@@ -1316,7 +1326,8 @@ def _should_confirm_speech_start(chunks, playback_active=False):
 
 
 def _echo_capture_verdict(suppressed_frames, other_frames, speech_started,
-                          had_reference_frames, onset_trusted=None):
+                          had_reference_frames, onset_trusted=None,
+                          audible=False):
     """[LF35] Should this capture be dropped as our own playback?
 
     ``drop`` when every frame was playback (the pre-LF35 rule), or when the
@@ -1339,6 +1350,12 @@ def _echo_capture_verdict(suppressed_frames, other_frames, speech_started,
     False = provisional (unproven canceller). A provisional onset never
     makes a playback-overlapped capture "keep": the transcript guard
     decides. None = legacy caller (pre-B110 behaviour).
+
+    [B119] *audible* (default False: every pre-wave caller is unchanged)
+    says Jarvis was audible at the start of the capture by a speaking flag
+    even though no frame had a reference. Such a capture can never prove
+    anything at the signal level, so it is "check-transcript" - never
+    "drop" (fail open; the transcript guard is the narrow fail-closed layer).
     """
     total = suppressed_frames + other_frames
     if total <= 0:
@@ -1355,6 +1372,11 @@ def _echo_capture_verdict(suppressed_frames, other_frames, speech_started,
         return "drop"
     if (not speech_started and had_reference_frames > 0 and
             suppressed_frames == 0):
+        return "check-transcript"
+    if (audible and had_reference_frames <= 0 and suppressed_frames == 0
+            and onset_trusted is not True):
+        # [B119] Audible without a reference frame: the canceller proved
+        # nothing, so this is uncertain, not proven echo.
         return "check-transcript"
     return "keep"
 
@@ -1581,16 +1603,24 @@ def _capture_audio(marks=None, wait_timeout=None, begin_turn=True):
             now = time.monotonic()
             playback_active = (now - last_reference_at
                                < SPEECH_START_PLAYBACK_TAIL_SECONDS)
+            # [B119] "Jarvis is audible" is a first-class boolean: a recent
+            # reference frame OR the local speaking flag OR the cached
+            # remote flag. ElevenLabs/SAPI never feed the reference and a
+            # cold, late or stale reference reads as silence, so the
+            # reference alone must not decide the raised VAD bar, the
+            # destructive stop, or the qualify bound. Pure, no I/O.
+            audible_source = _playback_evidence(now, playback_active)
+            audible = bool(audible_source)
             if playback_at_start is None:
-                playback_at_start = _playback_evidence(now, playback_active)
+                playback_at_start = audible_source
             if (not speech_started
                     and provisional_onset_at is None
                     and not _cold_aec_blocks_onset(now)
                     and _should_confirm_speech_start(
-                        onset_chunks, playback_active=playback_active)):
-                source = _playback_evidence(now, playback_active)
-                onset_speaking, speaking_source = bool(source), source or "none"
-                if _onset_authorizes_stop(now, playback_active):
+                        onset_chunks, playback_active=audible)):
+                onset_speaking = audible
+                speaking_source = audible_source or "none"
+                if _onset_authorizes_stop(now, audible):
                     speech_started = True
                     onset_trust = "trusted"
                     _note_onset("trusted")
@@ -1605,11 +1635,14 @@ def _capture_audio(marks=None, wait_timeout=None, begin_turn=True):
                     provisional_onset_at = now
                     onset_trust = "provisional"
                     _note_onset("provisional")
+                    if audible_source != "reference":
+                        with _echo_guard_lock:
+                            _onset_stats["provisional_no_reference"] += 1
                     print("[LISTENER] Onset held: canceller unproven for "
                           "this playback - the transcript decides")
             elif provisional_onset_at is not None:
                 provisional_audio_seconds += _audio_duration_seconds(chunk)
-                if (playback_active and not qualify_overrun
+                if (audible and not qualify_overrun
                         and provisional_audio_seconds
                         >= AEC_ONSET_QUALIFY_SECONDS):
                     # [B117] The 2 s bound is a HOLD bound: log it once and
@@ -1685,7 +1718,8 @@ def _capture_audio(marks=None, wait_timeout=None, begin_turn=True):
         verdict = _echo_capture_verdict(
             aec_suppressed["frames"], aec_suppressed["other"], onset_any,
             aec_during["frames"],
-            onset_trusted=(speech_started if onset_any else None))
+            onset_trusted=(speech_started if onset_any else None),
+            audible=bool(onset_speaking))
         # [B107] Record what the defence actually saw IMMEDIATELY, before
         # either a drop or the post-capture fallback: telemetry for
         # captures dropped before STT must never stay stale - that is what
@@ -1735,9 +1769,12 @@ def _capture_audio(marks=None, wait_timeout=None, begin_turn=True):
             # never committed as user speech. [B109] The hold is now the
             # proof rule, not only the cold-start budget.
             now = time.monotonic()
-            if (_cold_aec_blocks_onset(now) or not _onset_authorizes_stop(
-                    now, now - last_reference_at
-                    < SPEECH_START_PLAYBACK_TAIL_SECONDS)):
+            # [B119] Same audible evidence as the onset site.
+            fallback_audible = bool(_playback_evidence(
+                now, now - last_reference_at
+                < SPEECH_START_PLAYBACK_TAIL_SECONDS))
+            if (_cold_aec_blocks_onset(now)
+                    or not _onset_authorizes_stop(now, fallback_audible)):
                 _note_onset("held_fallback")
                 print("[LISTENER] Barge-in held: canceller has not proven "
                       "cancellation for the active playback - the "
@@ -2197,11 +2234,16 @@ def _echo_candidates():
 def _capture_is_uncertain(capture):
     """[B111] The capture overlapped playback, its speech began while
     Jarvis was speaking, and the canceller proved nothing (or B109/B110
-    flagged it). Only then do the relaxed rules apply."""
-    if int(capture.get("had_reference_frames", 0) or 0) <= 0:
-        return False
+    flagged it). Only then do the relaxed rules apply.
+
+    [B120] A capture with NO reference frame while Jarvis was audible
+    (speaking_at_onset from the local/remote flag) is uncertain by
+    construction: without a reference the canceller cannot prove anything.
+    """
     if not capture.get("speaking_at_onset"):
         return False
+    if int(capture.get("had_reference_frames", 0) or 0) <= 0:
+        return int(capture.get("suppressed_frames", 0) or 0) == 0
     return (capture.get("verdict") == "check-transcript"
             or capture.get("onset_trust") == "provisional"
             or int(capture.get("suppressed_frames", 0) or 0) == 0)
@@ -2382,9 +2424,10 @@ def _is_echo_of_spoken_reply(normalized, *, playback_overlapped=False,
 
     [B106] Long transcripts (>= :data:`ECHO_TRANSCRIPT_MIN_WORDS` words)
     are always checked against the spoken-text registry. Short fragments
-    of 2-4 words are only checked when *playback_overlapped* says the
-    capture contained reference frames - the live failure mode where the
-    tail of a reply string is transcribed verbatim.
+    of 2-4 words are only checked when *playback_overlapped* says Jarvis
+    was audible during the capture (reference frames, a speaking flag at
+    onset, or a recently-ended API entry - B120) - the live failure mode
+    where the tail of a reply string is transcribed verbatim.
 
     [B111] *uncertain* (see :func:`_capture_is_uncertain`) enables evidence
     that survives re-transcription: one-word echoes of the reply being
@@ -2702,6 +2745,7 @@ def listen(marks=None, overlap_capture=False):
     try:
         print("[LISTENER] Processing speech...")
         _mark_turn(marks, "stt_start")
+        stt_started_at = time.monotonic()
         raw, text, language = recognize_multilingual(audio)
         if slot is not None:
             slot.stt_done.set()
@@ -2725,21 +2769,36 @@ def listen(marks=None, overlap_capture=False):
         # [B106] The capture's own overlap evidence decides whether short
         # (2-4 word) fragments are checked; without it, a real short
         # command spoken after playback must not be eaten.
-        playback_overlapped = int(
+        had_reference = int(
             capture.get("had_reference_frames", 0) or 0) > 0
-        # [B115] The capture-time evidence is process-local: an API-voiced
-        # reply or an announcement sets the API process's speaking flag, not
-        # this one. The cached remote "still speaking" flag is the missing
-        # cross-process half; refresh it on this (STT) thread, never on the
-        # capture thread.
-        if playback_overlapped and not capture.get("speaking_at_onset"):
+        # [B115/B120] The capture-time evidence is process-local, and the
+        # cached remote flag may be stale on the capture thread. Refresh the
+        # cross-process half on this (STT) thread whenever local evidence is
+        # missing - NOT only when reference frames exist: a reply voiced by
+        # ElevenLabs/SAPI or by the API process has no reference at all,
+        # and the old condition made that refresh circular.
+        remote_texts = []
+        if not capture.get("speaking_at_onset"):
             try:
-                _remote_spoken_texts()
+                remote_texts = list(_remote_spoken_texts() or [])
             except Exception:
-                pass
+                remote_texts = []
             if _remote_is_speaking():
                 capture["speaking_at_onset"] = True
                 capture["speaking_source"] = "remote-flag"
+        # [B120] An API-process entry that ENDED within this capture's span
+        # (STT time + audio length + room tail) overlapped the capture too.
+        # Bounded by the cache TTL; it only enables the short/one-word
+        # matchers, which drop nothing but slices of that reply.
+        overlap_window = ((time.monotonic() - stt_started_at)
+                          + _audio_duration_seconds(audio)
+                          + SPEECH_START_PLAYBACK_TAIL_SECONDS)
+        remote_recent = any(age <= overlap_window
+                            for _text, age in remote_texts)
+        # [B120] Overlap is AUDIBLE evidence, not only reference frames.
+        playback_overlapped = (had_reference
+                               or bool(capture.get("speaking_at_onset"))
+                               or remote_recent)
         normalized = _normalize_text(text)
         rescued_control = False
         if _is_echo_of_spoken_reply(

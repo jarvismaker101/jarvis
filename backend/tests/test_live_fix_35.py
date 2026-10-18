@@ -1965,7 +1965,13 @@ class TestB111EchoGuardEvidence(unittest.TestCase):
         self.assertTrue(u(dict(base, suppressed_frames=12,
                                onset_trust="provisional")))
         self.assertFalse(u(dict(base, speaking_at_onset=False)))
-        self.assertFalse(u(dict(base, had_reference_frames=0)))
+        # [B119-B121 wave / B120] A no-reference capture while Jarvis was
+        # audible is uncertain by construction (no reference = no proof).
+        # This used to be pinned False; the replacement pins are below and
+        # in TestB120AudibleOverlapAtCommit.
+        self.assertTrue(u(dict(base, had_reference_frames=0)))
+        self.assertFalse(u(dict(base, had_reference_frames=0,
+                                speaking_at_onset=False)))
 
     def test_control_command_ahead_of_echo_is_kept(self):
         rescue = self.listener._control_prefix_rescue
@@ -2704,9 +2710,15 @@ class TestB116SttOverlapCapture(unittest.TestCase):
 
         def fake_capture(marks=None, wait_timeout=None, begin_turn=True):
             with lst._echo_guard_lock:
-                lst._last_capture_echo_stats.update(
-                    {"had_reference_frames": 30 if wait_timeout is None
-                     else 0})
+                # A real capture resets the whole stats block at its start;
+                # this fake must not leak a previous test's speaking flag
+                # into the [B120] audible-overlap decision.
+                lst._last_capture_echo_stats.update({
+                    "had_reference_frames": 30 if wait_timeout is None
+                    else 0,
+                    "speaking_at_onset": False,
+                    "speaking_source": "none",
+                })
             return self.a if wait_timeout is None else self.b
 
         def guard(normalized, playback_overlapped=False, uncertain=False):
@@ -2870,6 +2882,429 @@ class TestB117QualifyBoundKeepsTheUtterance(unittest.TestCase):
         self.assertEqual(self.listener._onset_stats["qualify_cuts"],
                          before + 1)
         self.listener.barge_in_on_speech_onset.assert_not_called()
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# [B119] Jarvis audible without a reference frame is still playback
+# ─────────────────────────────────────────────────────────────────────
+
+class TestB119AudibleWithoutReference(unittest.TestCase):
+    """[B119] ElevenLabs/SAPI and a late/stale reference play with no
+    reference frame: the speaking flags must still raise the VAD bar,
+    make the onset provisional and hold the fallback barge-in."""
+
+    def setUp(self):
+        from backend.services import listener
+        self.listener = listener
+        listener.discard_pending_capture(wait_seconds=0)
+        self.addCleanup(listener.discard_pending_capture, 0)
+        _reset_gate(listener)
+        self.addCleanup(_reset_gate, listener)
+        saved_onset = dict(listener._onset_stats)
+        self.addCleanup(lambda: listener._onset_stats.update(saved_onset))
+        with listener._echo_guard_lock:
+            saved = dict(listener._last_capture_echo_stats)
+        self.addCleanup(lambda: listener._last_capture_echo_stats
+                        .update(saved))
+
+    def _chunks(self, seconds=0.6, size=3200):
+        pcm = _speechish(seconds, seed=131, amp=12000.0) \
+            .astype(np.int16).tobytes()
+        return [_FakeCaptureChunk(pcm[i:i + size])
+                for i in range(0, len(pcm), size)]
+
+    def _drive(self, chunks, *, local=False, remote=False, confirm=True,
+               human=True, frames=None):
+        """Modelled on TestB107NoProofPolicy._drive_capture, plus the two
+        speaking flags; records the VAD bar of every onset test."""
+        listener = self.listener
+        bars = []
+
+        def fake_listen(source, timeout=None, phrase_time_limit=None,
+                        stream=False):
+            return iter(chunks)
+
+        def fake_confirm(_chunks, playback_active=False):
+            bars.append(playback_active)
+            return confirm
+
+        if frames is None:
+            def frames(data, **kw):
+                return echo_cancel.CaptureFrame(data, False, False, 16000)
+
+        patches = [
+            mock.patch.object(listener, "_get_microphone_source",
+                              return_value=mock.MagicMock()),
+            mock.patch.object(listener.recognizer, "listen",
+                              side_effect=fake_listen),
+            mock.patch.object(listener, "_aec_capture_frame",
+                              side_effect=frames),
+            mock.patch.object(listener, "barge_in_on_speech_onset"),
+            mock.patch.object(listener, "play_capture_complete_earcon"),
+            mock.patch.object(listener, "_recalibrate_listener"),
+            mock.patch.object(listener, "_reset_microphone_source"),
+            mock.patch.object(listener, "_should_confirm_speech_start",
+                              side_effect=fake_confirm),
+            mock.patch.object(listener, "is_human_voice",
+                              return_value=human),
+            mock.patch.object(listener, "make_speech_endpoint",
+                              return_value=None),
+            mock.patch.object(listener.listener_state, "is_speaking",
+                              return_value=local),
+            mock.patch.object(listener, "_remote_is_speaking",
+                              return_value=remote),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        listener.listener_state.mark_user_speaking(False)
+        listener.empty_listen_count = 0
+        return listener._capture_audio(), bars
+
+    def test_local_flag_without_reference_holds_the_onset(self):
+        before = self.listener._onset_stats["provisional_no_reference"]
+        audio, bars = self._drive(self._chunks(), local=True)
+        self.listener.barge_in_on_speech_onset.assert_not_called()
+        self.assertIsNotNone(audio, "the transcript decides")
+        stats = self.listener._last_capture_echo_stats
+        self.assertEqual(stats["had_reference_frames"], 0)
+        self.assertEqual(stats["onset_trust"], "provisional")
+        self.assertTrue(stats["speaking_at_onset"])
+        self.assertEqual(stats["speaking_source"], "local-flag")
+        self.assertEqual(stats["verdict"], "check-transcript")
+        self.assertTrue(bars and all(bars), "raised VAD bar while audible")
+        self.assertEqual(
+            self.listener._onset_stats["provisional_no_reference"],
+            before + 1)
+
+    def test_remote_flag_without_reference_holds_the_onset(self):
+        self._drive(self._chunks(), remote=True)
+        self.listener.barge_in_on_speech_onset.assert_not_called()
+        stats = self.listener._last_capture_echo_stats
+        self.assertEqual(stats["onset_trust"], "provisional")
+        self.assertEqual(stats["speaking_source"], "remote-flag")
+
+    def test_nothing_audible_keeps_the_instant_barge_in(self):
+        audio, bars = self._drive(self._chunks())
+        self.listener.barge_in_on_speech_onset.assert_called_once()
+        stats = self.listener._last_capture_echo_stats
+        self.assertEqual(stats["onset_trust"], "trusted")
+        self.assertEqual(stats["verdict"], "keep")
+        self.assertFalse(any(bars))
+
+    def test_proven_reference_with_local_flag_keeps_instant_barge_in(self):
+        calls = {"n": 0}
+
+        def frames(data, **kw):
+            calls["n"] += 1
+            return echo_cancel.CaptureFrame(data, True, calls["n"] <= 2,
+                                            16000)
+
+        self._drive(self._chunks(1.0), local=True, frames=frames)
+        self.listener.barge_in_on_speech_onset.assert_called_once()
+        self.assertEqual(self.listener._last_capture_echo_stats[
+            "onset_trust"], "trusted")
+
+    def test_fallback_barge_in_is_held_while_audible_without_reference(self):
+        self._drive(self._chunks(), local=True, confirm=False, human=True)
+        self.listener.barge_in_on_speech_onset.assert_not_called()
+        self.assertEqual(self.listener._onset_stats["last"], "held_fallback")
+
+    def test_fallback_barge_in_fires_when_nothing_is_audible(self):
+        self._drive(self._chunks(), confirm=False, human=True)
+        self.listener.barge_in_on_speech_onset.assert_called_once()
+
+    def test_provisional_no_reference_capture_is_bounded(self):
+        with mock.patch.object(self.listener, "AEC_PROVISIONAL_MAX_SECONDS",
+                               4.0):
+            audio, _ = self._drive(self._chunks(8.0), local=True)
+        self.assertIsNotNone(audio)
+        self.assertTrue(
+            self.listener._last_capture_echo_stats["qualify_overrun"])
+        self.assertEqual(self.listener._onset_stats["last"], "qualify_cut")
+        self.listener.barge_in_on_speech_onset.assert_not_called()
+
+
+class TestB119AudibleVerdict(unittest.TestCase):
+    """[B119] The optional *audible* verdict argument."""
+
+    def setUp(self):
+        from backend.services import listener
+        self.v = listener._echo_capture_verdict
+
+    def test_audible_no_reference_is_check_transcript(self):
+        self.assertEqual(self.v(0, 30, True, 0, onset_trusted=False,
+                                audible=True), "check-transcript")
+        self.assertEqual(self.v(0, 30, False, 0, audible=True),
+                         "check-transcript")
+
+    def test_default_keeps_the_pre_wave_contract(self):
+        self.assertEqual(self.v(0, 30, True, 0, onset_trusted=False), "keep")
+        self.assertEqual(self.v(0, 30, False, 0), "keep")
+
+    def test_audible_never_drops(self):
+        self.assertEqual(self.v(0, 0, False, 0, audible=True), "keep")
+        for started, trusted in ((False, None), (True, False), (True, True)):
+            with self.subTest(started=started, trusted=trusted):
+                self.assertNotEqual(
+                    self.v(0, 30, started, 0, onset_trusted=trusted,
+                           audible=True), "drop")
+
+    def test_reference_rules_are_unchanged_by_audible(self):
+        self.assertEqual(self.v(30, 0, False, 30, audible=True), "drop")
+        self.assertEqual(self.v(60, 40, False, 100, audible=True), "drop")
+        self.assertEqual(self.v(60, 40, True, 100, onset_trusted=True,
+                                audible=True), "keep")
+        self.assertEqual(self.v(0, 30, False, 30, audible=True),
+                         "check-transcript")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# [B120] audible evidence, not reference frames, opens the short guard
+# ─────────────────────────────────────────────────────────────────────
+
+class TestB120AudibleOverlapAtCommit(unittest.TestCase):
+    REPLY = ("Got it, fifteen thousand. What would you like me to do with "
+             "it, sir?")
+    GREETING = ("Good evening, sir. Welcome back, sir. What are we working "
+                "on today?")
+
+    def setUp(self):
+        from backend.services import listener, voice
+        self.listener, self.voice = listener, voice
+        listener.discard_pending_capture(wait_seconds=0)
+        self.addCleanup(listener.discard_pending_capture, 0)
+        self.old_guard = dict(listener._echo_guard_stats)
+        self.old_cache = dict(listener._remote_spoken_cache)
+        with listener._echo_guard_lock:
+            self.old_capture = dict(listener._last_capture_echo_stats)
+        with voice._SPOKEN_LOCK:
+            self.old_entries = list(voice._SPOKEN_TEXTS)
+            voice._SPOKEN_TEXTS.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        lst = self.listener
+        with lst._echo_guard_lock:
+            lst._echo_guard_stats.clear()
+            lst._echo_guard_stats.update(self.old_guard)
+            lst._last_capture_echo_stats.update(self.old_capture)
+        lst._remote_spoken_cache.clear()
+        lst._remote_spoken_cache.update(self.old_cache)
+        with self.voice._SPOKEN_LOCK:
+            self.voice._SPOKEN_TEXTS.clear()
+            self.voice._SPOKEN_TEXTS.extend(self.old_entries)
+
+    def _speaking(self, text):          # open entry (age 0.0)
+        with self.voice._SPOKEN_LOCK:
+            self.voice._SPOKEN_TEXTS.clear()
+        self.voice.note_spoken_text(text)
+
+    def _spoken_finished(self, text):
+        with self.voice._SPOKEN_LOCK:
+            self.voice._SPOKEN_TEXTS.clear()
+        self.voice.note_spoken_finished(self.voice.note_spoken_text(text))
+
+    def _reason(self):
+        return self.listener._echo_guard_stats["last_reason"]
+
+    def _listen(self, transcript, *, audible=True, remote_texts=(),
+                remote_speaking=False, audio_seconds=0.1):
+        lst = self.listener
+        audio = lst.sr.AudioData(b"\x00\x00" * int(16000 * audio_seconds),
+                                 16000, 2)
+        stats = {"had_reference_frames": 0, "suppressed_frames": 0,
+                 "other_frames": 40, "onset_confirmed": True,
+                 "verdict": "check-transcript" if audible else "keep",
+                 "onset_trust": "provisional" if audible else "trusted",
+                 "speaking_at_onset": audible,
+                 "speaking_source": "local-flag" if audible else "none"}
+
+        def fake_capture(marks=None):
+            with lst._echo_guard_lock:
+                lst._last_capture_echo_stats.update(stats)
+            return audio
+
+        def remote():
+            lst._remote_spoken_cache.update(
+                {"at": time.monotonic(), "texts": list(remote_texts),
+                 "speaking": remote_speaking})
+            return list(remote_texts)
+
+        remote_mock = mock.MagicMock(side_effect=remote)
+        stab = mock.MagicMock()
+        stab.push.return_value = None
+        stab.committed.return_value = ""
+        with mock.patch.object(lst, "_capture_audio",
+                               side_effect=fake_capture), \
+             mock.patch.object(lst, "recognize_multilingual",
+                               return_value=(transcript, transcript, "en")), \
+             mock.patch.object(lst, "is_hallucinated_transcript",
+                               return_value=False), \
+             mock.patch.object(lst, "_record_empty_listen"), \
+             mock.patch.object(lst, "_remote_spoken_texts", remote_mock), \
+             mock.patch.object(lst, "_turn_stabilizer", stab), \
+             mock.patch("builtins.print"):
+            result = lst.listen()
+        return result, remote_mock
+
+    def test_one_word_echo_without_reference_frames_is_dropped(self):
+        self._speaking(self.REPLY)
+        result, _ = self._listen("15000.")
+        self.assertIsNone(result)
+        self.assertEqual(self._reason(), "one-word-echo")
+
+    def test_short_greeting_slice_without_reference_is_dropped(self):
+        self._speaking(self.GREETING)
+        result, _ = self._listen("welcome back sir")
+        self.assertIsNone(result)
+        self.assertIn(self._reason(), ("short-echo", "relaxed-short-echo"))
+
+    def test_long_mangled_echo_without_reference_uses_coverage(self):
+        self._speaking("I have noted the fifteen thousand. How would you "
+                       "like me to proceed with this amount?")
+        result, _ = self._listen("I have noted the account. How would you "
+                                 "like me to receive your payment?")
+        self.assertIsNone(result)
+        self.assertTrue(self.listener._echo_guard_stats["last_uncertain"])
+
+    def test_unrelated_short_utterances_survive(self):
+        self._speaking(self.GREETING)
+        for heard in ("open settings", "what time is it", "spotify"):
+            with self.subTest(heard=heard):
+                result, _ = self._listen(heard)
+                self.assertIsNotNone(result)
+
+    def test_control_words_survive_without_reference(self):
+        self._speaking("Stop. Wait. Cancel. Yes, sir.")
+        for word in ("stop", "wait", "cancel", "yes"):
+            with self.subTest(word=word):
+                result, _ = self._listen(word)
+                self.assertIsNotNone(result)
+                self.assertEqual(self._reason(), "control-exempt")
+
+    def test_no_audible_evidence_keeps_the_b106_bypass(self):
+        self._spoken_finished("The quick brown fox jumps over the lazy dog.")
+        result, _ = self._listen("quick brown fox", audible=False)
+        self.assertIsNotNone(result)
+        self.assertEqual(self._reason(), "short-without-overlap")
+
+    def test_api_voiced_reply_is_refreshed_without_reference(self):
+        result, remote = self._listen(
+            "15000.", audible=False, remote_texts=[(self.REPLY, 0.0)],
+            remote_speaking=True)
+        self.assertTrue(remote.called, "the refresh is no longer circular")
+        self.assertIsNone(result)
+        self.assertEqual(self._reason(), "one-word-echo")
+
+    def test_recently_ended_remote_entry_counts_as_overlap(self):
+        result, _ = self._listen("15000.", audible=False,
+                                 remote_texts=[(self.REPLY, 0.3)])
+        self.assertIsNone(result)
+
+    def test_old_remote_entry_does_not_open_the_one_word_check(self):
+        result, _ = self._listen("15000.", audible=False,
+                                 remote_texts=[(self.REPLY, 5.0)])
+        self.assertIsNotNone(result)
+        self.assertEqual(self._reason(), "one-word-exempt")
+
+    def test_no_reference_uncertainty_needs_audible_evidence(self):
+        u = self.listener._capture_is_uncertain
+        base = {"had_reference_frames": 0, "suppressed_frames": 0,
+                "verdict": "check-transcript", "onset_trust": "provisional",
+                "speaking_at_onset": True}
+        self.assertTrue(u(base))
+        self.assertFalse(u(dict(base, speaking_at_onset=False)))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# [B121] the listener is armed before the boot greeting is queued
+# ─────────────────────────────────────────────────────────────────────
+
+class _StopLoop(BaseException):
+    """Escapes listener_thread's `except Exception` to end the loop."""
+
+
+class TestB121ListenerArmedBeforeGreeting(unittest.TestCase):
+
+    def setUp(self):
+        from backend import voice_mode
+        self.vm = voice_mode
+
+    def _boot(self, listener_arms=True):
+        import threading
+        vm, order, lock = self.vm, [], threading.Lock()
+
+        def fake_listener(armed=None):
+            with lock:
+                order.append("listener")
+            if listener_arms and armed is not None:
+                armed.set()
+
+        def fake_speak(text):
+            with lock:
+                order.append("speak")
+
+        with mock.patch.object(vm, "get_time_based_greeting",
+                               return_value="Good evening, sir."), \
+             mock.patch.object(vm, "warm_up_fish_tts"), \
+             mock.patch.object(vm, "speak", side_effect=fake_speak), \
+             mock.patch.object(vm, "listener_thread",
+                               side_effect=fake_listener), \
+             mock.patch.object(vm, "_publish_voice_state_loop"), \
+             mock.patch.object(vm, "_task_state_push_loop"), \
+             mock.patch.object(vm, "brain_thread"), \
+             mock.patch.object(vm, "LISTENER_ARM_TIMEOUT_SECONDS", 0.2), \
+             mock.patch("builtins.print"):
+            vm.start_voice_mode()
+        return order
+
+    def test_listener_is_armed_before_the_greeting(self):
+        order = self._boot()
+        self.assertEqual(order.count("speak"), 1)
+        self.assertLess(order.index("listener"), order.index("speak"))
+
+    def test_greeting_fails_open_when_the_listener_never_arms(self):
+        started = time.monotonic()
+        order = self._boot(listener_arms=False)
+        self.assertEqual(order.count("speak"), 1)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_source_order_pins_the_reorder(self):
+        import inspect
+        src = inspect.getsource(self.vm.start_voice_mode)
+        self.assertEqual(src.count("speak(reply)"), 1)
+        self.assertLess(src.index("t_listener.start()"),
+                        src.index("speak(reply)"))
+
+    def test_listener_thread_arms_before_the_first_listen(self):
+        import threading
+        vm, armed, seen = self.vm, threading.Event(), []
+
+        def fake_listen(marks=None, overlap_capture=False):
+            seen.append(armed.is_set())
+            raise _StopLoop()
+
+        with mock.patch.object(vm, "voice_input_enabled", return_value=True), \
+             mock.patch.object(vm._latency, "new_local_turn",
+                               return_value=None), \
+             mock.patch.object(vm, "listen", side_effect=fake_listen):
+            with self.assertRaises(_StopLoop):
+                vm.listener_thread(armed)
+        self.assertEqual(seen, [True])
+
+    def test_listener_thread_arms_when_voice_input_is_off(self):
+        import threading
+        vm, armed = self.vm, threading.Event()
+        with mock.patch.object(vm, "voice_input_enabled",
+                               return_value=False), \
+             mock.patch.object(vm, "discard_pending_capture",
+                               side_effect=_StopLoop), \
+             mock.patch.object(vm, "_close_microphone_source"):
+            with self.assertRaises(_StopLoop):
+                vm.listener_thread(armed)
+        self.assertTrue(armed.is_set())
 
 
 if __name__ == "__main__":

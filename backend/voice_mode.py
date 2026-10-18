@@ -1835,10 +1835,13 @@ def voice_input_enabled():
     return _fetch_voice_flag()
 
 
-def listener_thread():
+def listener_thread(armed=None):
     while True:
         try:
             if not voice_input_enabled():
+                # [B121] Nothing to arm: never hold the boot greeting.
+                if armed is not None:
+                    armed.set()
                 try:
                     # [B116] A prefetched capture belongs to a voice-on turn;
                     # drop it before closing the mic so it cannot surface
@@ -1854,6 +1857,10 @@ def listener_thread():
             # the text to the brain thread, which ships it to the backend under
             # the request_id it submits the utterance with.
             turn = _latency.new_local_turn()
+            # [B121] Armed: the first capture starts now, so the boot
+            # greeting is heard by the AEC and the echo guards.
+            if armed is not None:
+                armed.set()
             # [B116] Keep reading the mic while this utterance's ONE STT call
             # runs; the next call consumes the prefetched audio.
             text = listen(marks=turn, overlap_capture=True)
@@ -2184,6 +2191,12 @@ def brain_thread():
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
+#: [B121] Bounded wait for the listener thread's first decision (about to
+#: capture, or voice input off) before the boot greeting is queued. Fail
+#: open: a slow first poll never suppresses the greeting.
+LISTENER_ARM_TIMEOUT_SECONDS = 1.0
+
+
 def start_voice_mode():
     greeting = get_time_based_greeting()
     reply    = f"{greeting} {random.choice(BOOT_RESPONSES)}"
@@ -2193,6 +2206,18 @@ def start_voice_mode():
     # Warm the Fish TTS model + connection in the background so the first
     # real reply isn't slowed by a cold synthesis request.
     threading.Thread(target=warm_up_fish_tts, daemon=True).start()
+
+    # [B121] Arm the listener BEFORE any audio is queued: the greeting is
+    # the AEC's warm-up playback - captured, held provisional (B119) and
+    # checked by the transcript guard (B120). We wait only for the thread
+    # to arm (bounded), never for the greeting to end.
+    listener_armed = threading.Event()
+    t_listener = threading.Thread(target=listener_thread,
+                                  args=(listener_armed,), daemon=True)
+    t_listener.start()
+    if not listener_armed.wait(timeout=LISTENER_ARM_TIMEOUT_SECONDS):
+        print("[VOICE] Listener not armed in %.1fs - greeting anyway"
+              % LISTENER_ARM_TIMEOUT_SECONDS)
 
     speak(reply)
 
@@ -2210,9 +2235,6 @@ def start_voice_mode():
     # process where those jobs actually run — the old in-process callback
     # registrations here were dead code against module copies that never run
     # anything (F50 removes exactly that pattern).
-
-    t_listener = threading.Thread(target=listener_thread, daemon=True)
-    t_listener.start()
 
     try:
         brain_thread()
